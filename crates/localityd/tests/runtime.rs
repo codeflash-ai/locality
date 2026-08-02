@@ -1344,6 +1344,60 @@ fn runtime_shutdown_waits_for_in_flight_hydration_before_stopping() {
 }
 
 #[test]
+fn shutdown_ack_waits_beyond_two_seconds_for_in_flight_hydration() {
+    let config = relay_config("shutdown-ack-slow-drain");
+    let mount_root = temp_root("shutdown-ack-slow-drain-mount");
+    seed_clean_remote_changed_page(&config.state_root, &mount_root);
+    let (started_tx, started_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config,
+        BlockingHydrationRunner {
+            started: started_tx,
+            release: Arc::clone(&release),
+        },
+    )
+    .expect("spawn runtime");
+    let handle = runtime.handle();
+    assert!(
+        handle
+            .request(DaemonRequest::RemoteFastForward {
+                mount_id: "notion-main".to_string(),
+                remote_id: "page-1".to_string(),
+                path: PathBuf::from("Roadmap.md"),
+            })
+            .ok
+    );
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("hydration started");
+
+    let (ack_tx, ack_rx) = mpsc::channel();
+    let shutdown = thread::spawn(move || {
+        ack_tx
+            .send(handle.request(DaemonRequest::Shutdown))
+            .expect("report shutdown acknowledgement");
+    });
+    assert!(
+        ack_rx.recv_timeout(Duration::from_millis(2_100)).is_err(),
+        "shutdown acknowledged before the slow hydration drained"
+    );
+
+    let (lock, condvar) = &*release;
+    *lock.lock().expect("lock release") = true;
+    condvar.notify_all();
+    let response = ack_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("shutdown acknowledged after hydration drained");
+    assert_eq!(
+        response,
+        DaemonResponse::ok(json!({ "status": "shutting_down" }))
+    );
+    shutdown.join().expect("join shutdown request");
+    runtime.shutdown();
+}
+
+#[test]
 fn runtime_routes_push_request_through_runner() {
     let (push_tx, push_rx) = mpsc::channel();
     let runtime = DaemonRuntime::spawn_with_runner(

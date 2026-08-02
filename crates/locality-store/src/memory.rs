@@ -454,6 +454,18 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
         Ok(self.workspace_remount_recoveries.get(recovery_id).cloned())
     }
 
+    fn list_workspace_remount_recoveries(
+        &self,
+    ) -> StoreResult<Vec<(String, MountId, WorkspaceRemountRecoveryOutcome)>> {
+        Ok(self
+            .workspace_remount_recoveries
+            .iter()
+            .map(|(recovery_id, (mount_id, outcome))| {
+                (recovery_id.clone(), mount_id.clone(), *outcome)
+            })
+            .collect())
+    }
+
     fn finish_workspace_remount_recovery(&mut self, recovery_id: &str) -> StoreResult<()> {
         self.workspace_remount_recoveries.remove(recovery_id);
         Ok(())

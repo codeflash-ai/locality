@@ -93,7 +93,7 @@ pub struct DaemonRuntimeHandle {
     sender: Sender<RuntimeMessage>,
 }
 
-const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const FRESHNESS_JOB_BUDGET_UNITS: u16 = 5;
 const MAX_WORKSPACE_FRESHNESS_JOBS_PER_TICK: usize = 100;
 const LIVE_MODE_REMOTE_OBSERVE_QUEUE_SHARE: f64 = 1.0 / 3.0;

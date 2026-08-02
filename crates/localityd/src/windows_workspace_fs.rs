@@ -66,6 +66,7 @@ const CLEANUP_FILE_ACCESS: u32 =
 const READ_FILE_ACCESS: u32 = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const LOCK_FILE_ACCESS: u32 = FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+const ANCHOR_SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 const LOCK_SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 
 pub(crate) struct WindowsDirectory {
@@ -73,6 +74,33 @@ pub(crate) struct WindowsDirectory {
 }
 
 impl WindowsDirectory {
+    pub(crate) fn open_absolute_anchor(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+            .share_mode(ANCHOR_SHARING)
+            .custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
+                    | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            .open(path)?;
+        let handle: OwnedHandle = file.into();
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn open_directory_anchor(&self, name: &OsStr) -> io::Result<Self> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            READ_DIRECTORY_ACCESS,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
     pub(crate) fn open_absolute(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -154,6 +182,19 @@ impl WindowsDirectory {
         Ok(Self { handle })
     }
 
+    pub(crate) fn open_directory_for_anchored_cleanup(&self, name: &OsStr) -> io::Result<Self> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            CLEANUP_DIRECTORY_ACCESS,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
     pub(crate) fn open_directory_for_attributes(&self, name: &OsStr) -> io::Result<Self> {
         let handle = nt_open_relative(
             &self.handle,
@@ -227,6 +268,17 @@ impl WindowsDirectory {
         )?;
         reject_reparse(&handle)?;
         Ok(handle)
+    }
+
+    fn open_any_cleanup_handle_allow_reparse(&self, name: &OsStr) -> io::Result<OwnedHandle> {
+        nt_open_relative(
+            &self.handle,
+            name,
+            FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | DELETE | SYNCHRONIZE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT,
+            SHARING,
+        )
     }
 
     fn open_file_read_handle(&self, name: &OsStr) -> io::Result<OwnedHandle> {
@@ -316,7 +368,7 @@ impl WindowsDirectory {
                     child.remove_contents(&entry.path(), expected_device)?;
                     child.mark_delete()?;
                 }
-                Err(directory_error) => match self.open_file_cleanup_handle(&name) {
+                Err(directory_error) => match self.open_any_cleanup_handle_allow_reparse(&name) {
                     Ok(file) => {
                         if handle_identity(&file)?.device != expected_device {
                             return Err(io::Error::other(
@@ -375,40 +427,65 @@ impl WindowsDirectory {
         destination_parent: &WindowsDirectory,
         destination_name: &OsStr,
     ) -> io::Result<()> {
-        let name = wide_name(destination_name)?;
-        let byte_len = name
-            .len()
-            .checked_mul(2)
-            .and_then(|length| u32::try_from(length).ok())
-            .ok_or_else(|| io::Error::other("workspace destination name is too long"))?;
-        let total = rename_information_buffer_size(name.len())?;
-        let total_u32 = u32::try_from(total)
-            .map_err(|_| io::Error::other("workspace rename buffer is too large"))?;
-        let words = total.div_ceil(size_of::<usize>());
-        let mut storage = vec![0_usize; words];
-        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
-        // SAFETY: `storage` is suitably aligned and large enough for the fixed
-        // header plus the exact UTF-16 name payload. Both source and parent
-        // handles remain owned for the synchronous native rename call.
-        unsafe {
-            (*info).Anonymous.ReplaceIfExists = false;
-            (*info).RootDirectory = raw_handle(&destination_parent.handle);
-            (*info).FileNameLength = byte_len;
-            ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
-            let mut status_block: IO_STATUS_BLOCK = zeroed();
-            let status = NtSetInformationFile(
-                raw_handle(&self.handle),
-                &mut status_block,
-                info.cast(),
-                total_u32,
-                FileRenameInformation,
-            );
-            if status < 0 || status == STATUS_OBJECT_NAME_EXISTS {
-                return Err(rename_status_error(status));
-            }
-        }
-        Ok(())
+        rename_handle_no_replace(&self.handle, destination_parent, destination_name)
     }
+
+    pub(crate) fn rename_child_no_replace_allow_final_reparse(
+        &self,
+        source_name: &OsStr,
+        destination_parent: &WindowsDirectory,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        let source = nt_open_relative(
+            &self.handle,
+            source_name,
+            FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT,
+            SHARING,
+        )?;
+        rename_handle_no_replace(&source, destination_parent, destination_name)
+    }
+}
+
+fn rename_handle_no_replace(
+    source: &OwnedHandle,
+    destination_parent: &WindowsDirectory,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    let name = wide_name(destination_name)?;
+    let byte_len = name
+        .len()
+        .checked_mul(2)
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| io::Error::other("workspace destination name is too long"))?;
+    let total = rename_information_buffer_size(name.len())?;
+    let total_u32 = u32::try_from(total)
+        .map_err(|_| io::Error::other("workspace rename buffer is too large"))?;
+    let words = total.div_ceil(size_of::<usize>());
+    let mut storage = vec![0_usize; words];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: `storage` is suitably aligned and large enough for the fixed
+    // header plus the exact UTF-16 name payload. Both source and parent
+    // handles remain owned for the synchronous native rename call.
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = raw_handle(&destination_parent.handle);
+        (*info).FileNameLength = byte_len;
+        ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+        let mut status_block: IO_STATUS_BLOCK = zeroed();
+        let status = NtSetInformationFile(
+            raw_handle(source),
+            &mut status_block,
+            info.cast(),
+            total_u32,
+            FileRenameInformation,
+        );
+        if status < 0 || status == STATUS_OBJECT_NAME_EXISTS {
+            return Err(rename_status_error(status));
+        }
+    }
+    Ok(())
 }
 
 fn rename_information_buffer_size(name_units: usize) -> io::Result<usize> {
@@ -723,6 +800,15 @@ mod lock_tests {
         assert_eq!(
             LOCK_SHARING & (FILE_SHARE_READ | FILE_SHARE_WRITE),
             LOCK_SHARING
+        );
+    }
+
+    #[test]
+    fn ancestor_anchor_handles_deny_reparse_substitution() {
+        assert_eq!(ANCHOR_SHARING & FILE_SHARE_DELETE, 0);
+        assert_eq!(
+            ANCHOR_SHARING & (FILE_SHARE_READ | FILE_SHARE_WRITE),
+            ANCHOR_SHARING
         );
     }
 

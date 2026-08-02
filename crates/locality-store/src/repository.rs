@@ -116,6 +116,14 @@ pub trait WorkspaceBindingRepository {
         ))
     }
 
+    fn list_workspace_remount_recoveries(
+        &self,
+    ) -> StoreResult<Vec<(String, MountId, WorkspaceRemountRecoveryOutcome)>> {
+        Err(StoreError::NotImplemented(
+            "durable workspace remount recovery",
+        ))
+    }
+
     fn finish_workspace_remount_recovery(&mut self, _recovery_id: &str) -> StoreResult<()> {
         Err(StoreError::NotImplemented(
             "durable workspace remount recovery",

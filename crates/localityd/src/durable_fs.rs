@@ -66,8 +66,8 @@ pub(crate) fn copy_new_file_durable_with_sync(
     sync_file: impl FnOnce(&File) -> io::Result<()>,
     mut sync_parent: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<u64> {
-    validate_no_symlink_or_reparse_ancestors(source)?;
-    validate_no_symlink_or_reparse_ancestors(destination)?;
+    validate_from_parent(source)?;
+    validate_from_parent(destination)?;
     let mut source = File::open(source)?;
     let mut destination_file = OpenOptions::new()
         .create_new(true)
@@ -91,7 +91,7 @@ pub(crate) fn write_new_file_durable_with_sync(
     sync_file: impl FnOnce(&File) -> io::Result<()>,
     mut sync_parent: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    validate_no_symlink_or_reparse_ancestors(path)?;
+    validate_from_parent(path)?;
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
     file.write_all(contents)?;
     sync_file(&file)?;
@@ -105,12 +105,16 @@ pub(crate) fn write_new_file_durable_with_sync(
 }
 
 pub fn rename_noreplace_durable(source: &Path, destination: &Path) -> io::Result<()> {
+    validate_from_parent(source)?;
+    validate_from_parent(destination)?;
     #[cfg(all(
         unix,
         any(target_os = "linux", target_vendor = "apple", target_os = "redox")
     ))]
     {
-        return rename_noreplace_durable_unix(source, destination);
+        let source_root = source.parent().expect("validated source parent");
+        let destination_root = destination.parent().expect("validated destination parent");
+        return rename_noreplace_durable_unix(source_root, destination_root, source, destination);
     }
     #[cfg(not(all(
         unix,
@@ -121,15 +125,124 @@ pub fn rename_noreplace_durable(source: &Path, destination: &Path) -> io::Result
     }
 }
 
+pub fn rename_noreplace_durable_anchored(
+    trusted_root: &Path,
+    source: &Path,
+    destination: &Path,
+) -> io::Result<()> {
+    #[cfg(windows)]
+    validate_no_symlink_or_reparse_ancestors_allow_final(trusted_root, source)?;
+    #[cfg(not(windows))]
+    validate_no_symlink_or_reparse_ancestors(trusted_root, source)?;
+    validate_no_symlink_or_reparse_ancestors(trusted_root, destination)?;
+    #[cfg(all(
+        unix,
+        any(target_os = "linux", target_vendor = "apple", target_os = "redox")
+    ))]
+    {
+        return rename_noreplace_durable_unix(trusted_root, trusted_root, source, destination);
+    }
+    #[cfg(windows)]
+    {
+        return rename_noreplace_durable_windows_anchored(trusted_root, source, destination);
+    }
+    #[cfg(not(any(
+        all(
+            unix,
+            any(target_os = "linux", target_vendor = "apple", target_os = "redox")
+        ),
+        windows
+    )))]
+    {
+        rename_noreplace_durable_with_sync(source, destination, sync_directory)
+    }
+}
+
+#[cfg(windows)]
+fn rename_noreplace_durable_windows_anchored(
+    trusted_root: &Path,
+    source: &Path,
+    destination: &Path,
+) -> io::Result<()> {
+    let (source_parents, source_name) = open_windows_parent_anchored(trusted_root, source)?;
+    let (destination_parents, destination_name) =
+        open_windows_parent_anchored(trusted_root, destination)?;
+    let source_parent = source_parents.last().expect("anchored source parent");
+    let destination_parent = destination_parents
+        .last()
+        .expect("anchored destination parent");
+    source_parent.rename_child_no_replace_allow_final_reparse(
+        &source_name,
+        destination_parent,
+        &destination_name,
+    )?;
+    destination_parent.sync()?;
+    if source.parent() != destination.parent() {
+        source_parent.sync()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_windows_parent_anchored(
+    trusted_root: &Path,
+    path: &Path,
+) -> io::Result<(
+    Vec<crate::windows_workspace_fs::WindowsDirectory>,
+    std::ffi::OsString,
+)> {
+    validate_no_symlink_or_reparse_ancestors_allow_final(trusted_root, path)?;
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path `{}` has no parent", path.display()),
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path `{}` has no filename", path.display()),
+        )
+    })?;
+    let relative = parent.strip_prefix(trusted_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path `{}` is outside trusted root", path.display()),
+        )
+    })?;
+    let mut parents =
+        vec![crate::windows_workspace_fs::WindowsDirectory::open_absolute_anchor(trusted_root)?];
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path `{}` contains unsafe components", path.display()),
+            ));
+        };
+        let child = parents
+            .last()
+            .expect("anchored parent")
+            .open_directory_anchor(component)?;
+        parents.push(child);
+    }
+    Ok((parents, name.to_os_string()))
+}
+
 #[cfg(all(
     unix,
     any(target_os = "linux", target_vendor = "apple", target_os = "redox")
 ))]
-fn rename_noreplace_durable_unix(source: &Path, destination: &Path) -> io::Result<()> {
+fn rename_noreplace_durable_unix(
+    source_root: &Path,
+    destination_root: &Path,
+    source: &Path,
+    destination: &Path,
+) -> io::Result<()> {
     use rustix::fs::RenameFlags;
 
-    let (source_parent, source_name) = open_unix_parent_without_symlinks(source)?;
-    let (destination_parent, destination_name) = open_unix_parent_without_symlinks(destination)?;
+    let (source_parent, source_name) = open_unix_parent_without_symlinks(source_root, source)?;
+    let (destination_parent, destination_name) =
+        open_unix_parent_without_symlinks(destination_root, destination)?;
     rustix::fs::renameat_with(
         &source_parent,
         &source_name,
@@ -150,18 +263,12 @@ fn rename_noreplace_durable_unix(source: &Path, destination: &Path) -> io::Resul
     any(target_os = "linux", target_vendor = "apple", target_os = "redox")
 ))]
 fn open_unix_parent_without_symlinks(
+    trusted_root: &Path,
     path: &Path,
 ) -> io::Result<(std::os::fd::OwnedFd, std::ffi::OsString)> {
-    use std::path::Component;
-
     use rustix::fs::{Mode, OFlags};
 
-    if !path.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path `{}` is not absolute", path.display()),
-        ));
-    }
+    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -175,22 +282,27 @@ fn open_unix_parent_without_symlinks(
         )
     })?;
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let mut directory = rustix::fs::open("/", flags, Mode::empty()).map_err(io::Error::from)?;
-    for component in parent.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(component) => {
-                directory = rustix::fs::openat(&directory, component, flags, Mode::empty())
-                    .map_err(io::Error::from)?;
-            }
-            Component::CurDir => {}
-            Component::ParentDir | Component::Prefix(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("path `{}` contains unsafe components", path.display()),
-                ));
-            }
-        }
+    let mut directory =
+        rustix::fs::open(trusted_root, flags, Mode::empty()).map_err(io::Error::from)?;
+    let relative_parent = parent.strip_prefix(trusted_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "path `{}` is outside trusted root `{}`",
+                path.display(),
+                trusted_root.display()
+            ),
+        )
+    })?;
+    for component in relative_parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path `{}` contains unsafe components", path.display()),
+            ));
+        };
+        directory = rustix::fs::openat(&directory, component, flags, Mode::empty())
+            .map_err(io::Error::from)?;
     }
     Ok((directory, name.to_os_string()))
 }
@@ -207,8 +319,8 @@ pub(crate) fn rename_noreplace_durable_with_sync(
     destination: &Path,
     mut sync: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    validate_no_symlink_or_reparse_ancestors(source)?;
-    validate_no_symlink_or_reparse_ancestors(destination)?;
+    validate_from_parent(source)?;
+    validate_from_parent(destination)?;
     rename_noreplace(source, destination)?;
     let source_parent = source.parent().ok_or_else(|| {
         io::Error::new(
@@ -233,11 +345,30 @@ pub fn remove_dir_all_durable(path: &Path) -> io::Result<()> {
     remove_dir_all_durable_with_sync(path, sync_directory)
 }
 
+pub fn remove_dir_all_durable_anchored(trusted_root: &Path, path: &Path) -> io::Result<()> {
+    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
+    #[cfg(windows)]
+    {
+        let (parents, name) = open_windows_parent_anchored(trusted_root, path)?;
+        let parent = parents.last().expect("anchored cleanup parent");
+        let directory = parent.open_directory_for_anchored_cleanup(&name)?;
+        let device = directory.identity()?.device;
+        directory.remove_contents(path, device)?;
+        directory.mark_delete()?;
+        parent.sync()?;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        remove_dir_all_durable(path)
+    }
+}
+
 pub(crate) fn remove_dir_all_durable_with_sync(
     path: &Path,
     mut sync_parent: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    validate_no_symlink_or_reparse_ancestors(path)?;
+    validate_from_parent(path)?;
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -256,7 +387,7 @@ pub(crate) fn remove_path_durable_with_sync(
     path: &Path,
     mut sync_parent: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    validate_no_symlink_or_reparse_ancestors(path)?;
+    validate_from_parent(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Err(io::Error::new(
@@ -338,20 +469,63 @@ pub(crate) fn same_volume(_left: &Path, _right: &Path) -> io::Result<bool> {
     ))
 }
 
-pub fn validate_no_symlink_or_reparse_ancestors(path: &Path) -> io::Result<()> {
-    if !path.is_absolute() {
+pub fn validate_no_symlink_or_reparse_ancestors(
+    trusted_root: &Path,
+    path: &Path,
+) -> io::Result<()> {
+    validate_no_symlink_or_reparse_ancestors_impl(trusted_root, path, false)
+}
+
+pub fn validate_no_symlink_or_reparse_ancestors_allow_final(
+    trusted_root: &Path,
+    path: &Path,
+) -> io::Result<()> {
+    validate_no_symlink_or_reparse_ancestors_impl(trusted_root, path, true)
+}
+
+fn validate_no_symlink_or_reparse_ancestors_impl(
+    trusted_root: &Path,
+    path: &Path,
+    allow_final_reparse: bool,
+) -> io::Result<()> {
+    if !trusted_root.is_absolute() || !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("path `{}` is not absolute", path.display()),
+            format!(
+                "trusted root `{}` and path `{}` must be absolute",
+                trusted_root.display(),
+                path.display()
+            ),
         ));
     }
-    for ancestor in path.ancestors() {
+    path.strip_prefix(trusted_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "path `{}` is outside trusted root `{}`",
+                path.display(),
+                trusted_root.display()
+            ),
+        )
+    })?;
+    let mut reached_root = false;
+    for (index, ancestor) in path.ancestors().enumerate() {
+        if ancestor == trusted_root {
+            reached_root = true;
+        }
         let metadata = match fs::symlink_metadata(ancestor) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if reached_root {
+                    break;
+                }
+                continue;
+            }
             Err(error) => return Err(error),
         };
-        if metadata.file_type().is_symlink() || metadata_is_windows_reparse_point(&metadata) {
+        if (metadata.file_type().is_symlink() || metadata_is_windows_reparse_point(&metadata))
+            && !(allow_final_reparse && index == 0)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -361,8 +535,31 @@ pub fn validate_no_symlink_or_reparse_ancestors(path: &Path) -> io::Result<()> {
                 ),
             ));
         }
+        if reached_root {
+            break;
+        }
+    }
+    if !reached_root {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "path `{}` does not reach trusted root `{}` without unsafe components",
+                path.display(),
+                trusted_root.display()
+            ),
+        ));
     }
     Ok(())
+}
+
+fn validate_from_parent(path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path `{}` has no parent", path.display()),
+        )
+    })?;
+    validate_no_symlink_or_reparse_ancestors(parent, path)
 }
 
 #[cfg(windows)]
@@ -385,7 +582,23 @@ pub fn sync_directory(path: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 pub fn sync_directory(path: &Path) -> io::Result<()> {
-    sync_windows_directory_with(path, |directory| directory.sync_all())
+    sync_windows_directory_with(path, |directory| match directory.sync_all() {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::InvalidInput
+                    | io::ErrorKind::Unsupported
+            ) =>
+        {
+            // FlushFileBuffers is not supported for directory handles on all
+            // Windows filesystems. File bodies are flushed separately and
+            // renames request MOVEFILE_WRITE_THROUGH.
+            Ok(())
+        }
+        Err(error) => Err(error),
+    })
 }
 
 #[cfg(windows)]
@@ -399,13 +612,21 @@ fn sync_windows_directory_with(
         FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    validate_no_symlink_or_reparse_ancestors(path)?;
+    validate_no_symlink_or_reparse_ancestors(path, path)?;
     let directory = OpenOptions::new()
-        .read(true)
+        .access_mode(windows_directory_sync_access())
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     flush(&directory)
+}
+
+#[cfg(windows)]
+fn windows_directory_sync_access() -> u32 {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, SYNCHRONIZE,
+    };
+    FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -580,18 +801,57 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = temp_root("symlink-ancestor");
-        let real = root.join("real");
-        let alias = root.join("alias");
+        let owned = root.join("owned");
+        let real = root.join("outside");
+        let alias = owned.join("alias");
+        fs::create_dir_all(&owned).expect("create owned root");
         fs::create_dir_all(&real).expect("create real directory");
         symlink(&real, &alias).expect("create alias");
         let path = alias.join("record");
 
-        let error = write_new_file_durable(&path, b"must not be written")
+        let error = validate_no_symlink_or_reparse_ancestors(&owned, &path)
             .expect_err("symlink ancestor must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("symlink"));
         assert!(!real.join("record").exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_root_ignores_symlinked_system_prefix() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("trusted-system-prefix");
+        let real_prefix = root.join("real-prefix");
+        let alias_prefix = root.join("system-prefix");
+        let real_owned = real_prefix.join("owned");
+        fs::create_dir_all(&real_owned).expect("create owned root");
+        symlink(&real_prefix, &alias_prefix).expect("create system prefix alias");
+        let trusted_root = alias_prefix.join("owned");
+        let path = trusted_root.join("record");
+
+        validate_no_symlink_or_reparse_ancestors(&trusted_root, &path)
+            .expect("aliases above the explicit trusted root are accepted");
+        write_new_file_durable(&path, b"record").expect("write beneath trusted root");
+        assert_eq!(
+            fs::read_to_string(real_owned.join("record")).unwrap(),
+            "record"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn macos_var_temp_prefix_is_outside_validation_boundary() {
+        let trusted_root =
+            std::env::temp_dir().join(format!("locality-macos-prefix-{}", std::process::id()));
+        fs::create_dir_all(&trusted_root).expect("create trusted temp root");
+        let path = trusted_root.join("record");
+
+        validate_no_symlink_or_reparse_ancestors(&trusted_root, &path)
+            .expect("the /var system alias is above the trusted root");
+        let _ = fs::remove_dir_all(trusted_root);
     }
 
     #[cfg(windows)]
@@ -627,6 +887,16 @@ mod tests {
 
         assert_eq!(error.to_string(), "injected directory flush failure");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_flush_requests_write_access() {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA};
+
+        let access = windows_directory_sync_access();
+        assert_ne!(access & FILE_WRITE_DATA, 0);
+        assert_ne!(access & FILE_WRITE_ATTRIBUTES, 0);
     }
 
     #[cfg(any(

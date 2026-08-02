@@ -2235,7 +2235,7 @@ impl WorkspaceBindingRepository for SqliteStateStore {
             )));
         };
         validate_workspace_binding_commit(&mount, &host_binding, &record)?;
-        clear_mount_source_state(&transaction, &mount.mount_id)?;
+        clear_mount_source_state_after_durable_preservation(&transaction, &mount.mount_id)?;
         save_mount_row(&transaction, &mount)?;
         commit_workspace_binding_in_transaction(&transaction, &mount, &host_binding, &record)?;
         cleanup()?;
@@ -2322,6 +2322,38 @@ impl WorkspaceBindingRepository for SqliteStateStore {
                 ))),
             })
             .transpose()
+    }
+
+    fn list_workspace_remount_recoveries(
+        &self,
+    ) -> StoreResult<Vec<(String, MountId, WorkspaceRemountRecoveryOutcome)>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT recovery_id, mount_id, committed
+             FROM workspace_remount_recoveries ORDER BY recovery_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .map(|row| {
+                let (recovery_id, mount_id, committed) = row?;
+                let outcome = match committed {
+                    0 => WorkspaceRemountRecoveryOutcome::Prepared,
+                    1 => WorkspaceRemountRecoveryOutcome::Committed,
+                    _ => {
+                        return Err(StoreError::InvalidState(format!(
+                            "workspace remount recovery `{recovery_id}` has invalid outcome"
+                        )));
+                    }
+                };
+                Ok((recovery_id, MountId::new(mount_id), outcome))
+            })
+            .collect()
     }
 
     fn finish_workspace_remount_recovery(&mut self, recovery_id: &str) -> StoreResult<()> {
@@ -4560,6 +4592,23 @@ fn mount_source_identity_changed(existing: &MountConfig, next: &MountConfig) -> 
 }
 
 fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> StoreResult<()> {
+    clear_mount_source_state_with_policy(connection, mount_id, false)
+}
+
+/// Coordinator-only source reset used after Desktop has durably copied every
+/// pending local mutation into the remount recovery directory.
+fn clear_mount_source_state_after_durable_preservation(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<()> {
+    clear_mount_source_state_with_policy(connection, mount_id, true)
+}
+
+fn clear_mount_source_state_with_policy(
+    connection: &Connection,
+    mount_id: &MountId,
+    local_mutations_were_durably_preserved: bool,
+) -> StoreResult<()> {
     let pending_virtual_mutation: Option<String> = connection
         .query_row(
             "SELECT local_id FROM virtual_mutations WHERE mount_id = ?1 LIMIT 1",
@@ -4567,7 +4616,9 @@ fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> Stor
             |row| row.get(0),
         )
         .optional()?;
-    if let Some(local_id) = pending_virtual_mutation {
+    if let Some(local_id) = pending_virtual_mutation
+        && !local_mutations_were_durably_preserved
+    {
         return Err(StoreError::InvalidState(format!(
             "mount `{}` cannot change source while virtual mutation `{local_id}` is pending",
             mount_id.0

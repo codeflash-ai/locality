@@ -40,12 +40,9 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 #[cfg(windows)]
-#[path = "windows_workspace_fs.rs"]
-mod windows_workspace_fs;
+pub(crate) use crate::windows_workspace_fs::read_regular_file_no_follow as read_windows_publication_state_file;
 #[cfg(windows)]
-pub(crate) use windows_workspace_fs::read_regular_file_no_follow as read_windows_publication_state_file;
-#[cfg(windows)]
-use windows_workspace_fs::{
+use crate::windows_workspace_fs::{
     WindowsDirectory, lock_file_exclusive as lock_windows_file_exclusive,
     set_file_read_only as set_windows_file_read_only,
 };
