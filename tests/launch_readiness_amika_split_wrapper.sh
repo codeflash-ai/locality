@@ -99,21 +99,16 @@ fail_delete_while_operation_is_active() {
   done
 }
 
-if [ "${1:-}" != "sandbox" ]; then
-  printf 'unexpected fake amika command: %s\n' "$*" >&2
-  exit 2
-fi
-
-if [ "${2:-}" = "create" ] && [[ " $* " == *" --snapshot ${FAKE_AMIKA_FAIL_CREATE_SNAPSHOT:-__never__} "* ]]; then
+if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "create" ] && [[ " $* " == *" --snapshot ${FAKE_AMIKA_FAIL_CREATE_SNAPSHOT:-__never__} "* ]]; then
   exit "${FAKE_AMIKA_FAIL_CREATE_RC:-23}"
 fi
-if [ "${2:-}" = "delete" ] && [ "${FAKE_AMIKA_FAIL_DELETE:-0}" = "1" ]; then
+if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "delete" ] && [ "${FAKE_AMIKA_FAIL_DELETE:-0}" = "1" ]; then
   exit 29
 fi
-if [ "${2:-}" = "ssh" ] && [ -n "${FAKE_AMIKA_FAIL_SSH_RC:-}" ]; then
+if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "ssh" ] && [ -n "${FAKE_AMIKA_FAIL_SSH_RC:-}" ]; then
   exit "$FAKE_AMIKA_FAIL_SSH_RC"
 fi
-if [ "${2:-}" = "ssh" ] && [ "${3:-}" != "--print" ] && [ -n "${FAKE_AMIKA_FAIL_SSH_CALL:-}" ]; then
+if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "ssh" ] && [ "${3:-}" != "--print" ] && [ -n "${FAKE_AMIKA_FAIL_SSH_CALL:-}" ]; then
   call_file="${FAKE_AMIKA_CALL_DIR:?}/${3}.count"
   mkdir -p "$FAKE_AMIKA_CALL_DIR"
   call_count=0
@@ -127,22 +122,41 @@ if [ "${2:-}" = "ssh" ] && [ "${3:-}" != "--print" ] && [ -n "${FAKE_AMIKA_FAIL_
   fi
 fi
 
-case "${2:-}" in
-  list)
-    printf '%s\n' "${FAKE_AMIKA_LIST_JSON:?}"
+case "${1:-}:${2:-}" in
+  sandbox:list)
+    if [ "$#" -ne 3 ] || [ "${3:-}" != "--remote" ]; then
+      printf 'unexpected fake amika command: %s\n' "$*" >&2
+      exit 2
+    fi
+    if [ -n "${FAKE_AMIKA_SANDBOX_LIST_RC:-}" ]; then
+      printf 'fake remote sandbox list failure\n' >&2
+      exit "$FAKE_AMIKA_SANDBOX_LIST_RC"
+    fi
+    printf '%s\n' "${FAKE_AMIKA_SANDBOX_TABLE:-NAME STATE LOCATION BRANCH REPO CREATOR CREATED
+existing-box stopped remote - - Test 2026-08-02T00:00:00Z}"
     exit 0
     ;;
-  create)
+  snapshot:list)
+    if [ "$#" -ne 2 ]; then
+      printf 'unexpected fake amika command: %s\n' "$*" >&2
+      exit 2
+    fi
+    printf '%s\n' "${FAKE_AMIKA_SNAPSHOT_TABLE:-NAME STATE PROVIDER SOURCE CREATED
+locality-snapshot active daytona aseem-locality 2026-08-02T00:00:00Z
+mcp-snapshot active daytona aseem-mcp 2026-08-02T00:00:00Z}"
+    exit 0
+    ;;
+  sandbox:create)
     block_operation_if_requested create
     shift 2
     exit 0
     ;;
-  delete)
+  sandbox:delete)
     fail_delete_while_operation_is_active
     shift 2
     exit 0
     ;;
-  ssh)
+  sandbox:ssh)
     block_operation_if_requested ssh
     ;;
   *)
@@ -326,7 +340,6 @@ run_default_out="${tmp_root}/default-out"
 concurrency_dir="${tmp_root}/concurrency"
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$fake_log" \
-  FAKE_AMIKA_LIST_JSON='[]' \
   FAKE_AMIKA_CONCURRENCY_DIR="$concurrency_dir" \
   RUN_ID="testrun" \
   SYNC_ARTIFACTS=0 \
@@ -348,7 +361,9 @@ assert_contains "$run_default_out/run.env" "sync_artifacts=0"
 assert_contains "$run_default_out/run.env" "strategy_execution=parallel"
 assert_contains "$run_default_out/artifacts.tsv" "locality"$'\t'"launch-readiness-testrun-locality"
 assert_contains "$run_default_out/artifacts.tsv" "notion-mcp"$'\t'"launch-readiness-testrun-mcp"
-assert_contains "$fake_log" "amika sandbox list --remote -o json"
+assert_contains "$fake_log" "amika sandbox list --remote"
+assert_contains "$fake_log" "amika snapshot list"
+assert_not_contains "$fake_log" "-o json"
 assert_contains "$fake_log" "amika sandbox create --remote --no-git --snapshot locality-snapshot --name launch-readiness-testrun-locality"
 assert_contains "$fake_log" "amika sandbox create --remote --no-git --snapshot mcp-snapshot --name launch-readiness-testrun-mcp"
 assert_contains "$fake_log" "amika sandbox delete --remote --force launch-readiness-testrun-locality launch-readiness-testrun-mcp"
@@ -368,11 +383,85 @@ assert_contains "$fake_log" "scenario2"
 assert_not_contains "$fake_log" "test-with-notion-connector"
 assert_not_contains "$fake_log" "onyx-falcon"
 
+preflight_list_failure_log="${tmp_root}/preflight-list-failure-amika.log"
+preflight_list_failure_err="${tmp_root}/preflight-list-failure.err"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$preflight_list_failure_log" \
+  FAKE_AMIKA_SANDBOX_LIST_RC=41 \
+  RUN_ID="preflight-list-failure" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/preflight-list-failure-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"$preflight_list_failure_err"
+preflight_list_failure_rc=$?
+set -e
+if [ "$preflight_list_failure_rc" -ne 41 ]; then
+  fail "remote sandbox-list failure should preserve exit 41, got ${preflight_list_failure_rc}"
+fi
+assert_contains "$preflight_list_failure_err" "Amika remote sandbox preflight failed"
+assert_contains "$preflight_list_failure_err" "fake remote sandbox list failure"
+assert_not_contains "$preflight_list_failure_log" "amika sandbox create"
+
+missing_snapshot_log="${tmp_root}/missing-snapshot-amika.log"
+missing_snapshot_err="${tmp_root}/missing-snapshot.err"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$missing_snapshot_log" \
+  FAKE_AMIKA_SNAPSHOT_TABLE=$'NAME STATE PROVIDER SOURCE CREATED\nmcp-snapshot active daytona aseem-mcp 2026-08-02T00:00:00Z' \
+  RUN_ID="missing-snapshot" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/missing-snapshot-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"$missing_snapshot_err"
+missing_snapshot_rc=$?
+set -e
+if [ "$missing_snapshot_rc" -eq 0 ]; then
+  fail "a missing required Amika snapshot should fail before creation"
+fi
+assert_contains "$missing_snapshot_err" "required Amika snapshot not found: locality-snapshot"
+assert_not_contains "$missing_snapshot_log" "amika sandbox create"
+
+failed_snapshot_log="${tmp_root}/failed-snapshot-amika.log"
+failed_snapshot_err="${tmp_root}/failed-snapshot.err"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$failed_snapshot_log" \
+  FAKE_AMIKA_SNAPSHOT_TABLE=$'NAME STATE PROVIDER SOURCE CREATED\nlocality-snapshot failed daytona aseem-locality 2026-08-02T00:00:00Z\nmcp-snapshot active daytona aseem-mcp 2026-08-02T00:00:00Z' \
+  RUN_ID="failed-snapshot" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/failed-snapshot-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"$failed_snapshot_err"
+failed_snapshot_rc=$?
+set -e
+if [ "$failed_snapshot_rc" -eq 0 ]; then
+  fail "an inactive required Amika snapshot should fail before creation"
+fi
+assert_contains "$failed_snapshot_err" "required Amika snapshot is not active: locality-snapshot (state=failed)"
+assert_not_contains "$failed_snapshot_log" "amika sandbox create"
+
+invalid_attempts_log="${tmp_root}/invalid-attempts-amika.log"
+invalid_attempts_err="${tmp_root}/invalid-attempts.err"
+: > "$invalid_attempts_log"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$invalid_attempts_log" \
+  AMIKA_CREATE_ATTEMPTS=0 \
+  RUN_ID="invalid-attempts" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/invalid-attempts-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"$invalid_attempts_err"
+invalid_attempts_rc=$?
+set -e
+if [ "$invalid_attempts_rc" -eq 0 ]; then
+  fail "AMIKA_CREATE_ATTEMPTS=0 should fail before creation"
+fi
+assert_contains "$invalid_attempts_err" "AMIKA_CREATE_ATTEMPTS must be a positive integer"
+assert_not_contains "$invalid_attempts_log" "amika sandbox create"
+
 collision_log="${tmp_root}/collision-amika.log"
 set +e
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$collision_log" \
-  FAKE_AMIKA_LIST_JSON='[{"name":"launch-readiness-collision-locality"}]' \
+  FAKE_AMIKA_SANDBOX_TABLE=$'NAME STATE LOCATION BRANCH REPO CREATOR CREATED\nexisting-box stopped remote - - Test 2026-08-02T00:00:00Z\nlaunch-readiness-collision-locality stopped remote - - Test 2026-08-02T00:00:00Z' \
   RUN_ID="collision" \
   SYNC_ARTIFACTS=0 \
   LOCAL_OUT_DIR="${tmp_root}/collision-out" \
@@ -389,7 +478,7 @@ mcp_collision_log="${tmp_root}/mcp-collision-amika.log"
 set +e
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$mcp_collision_log" \
-  FAKE_AMIKA_LIST_JSON='[{"name":"launch-readiness-mcp-collision-mcp"}]' \
+  FAKE_AMIKA_SANDBOX_TABLE=$'NAME STATE LOCATION BRANCH REPO CREATOR CREATED\nexisting-box stopped remote - - Test 2026-08-02T00:00:00Z\nlaunch-readiness-mcp-collision-mcp stopped remote - - Test 2026-08-02T00:00:00Z' \
   RUN_ID="mcp-collision" \
   SYNC_ARTIFACTS=0 \
   LOCAL_OUT_DIR="${tmp_root}/mcp-collision-out" \
@@ -406,7 +495,6 @@ first_create_log="${tmp_root}/first-create-amika.log"
 set +e
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$first_create_log" \
-  FAKE_AMIKA_LIST_JSON='[]' \
   FAKE_AMIKA_FAIL_CREATE_SNAPSHOT="locality-snapshot" \
   RUN_ID="first-create" \
   SYNC_ARTIFACTS=0 \
@@ -425,7 +513,6 @@ partial_create_log="${tmp_root}/partial-create-amika.log"
 set +e
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$partial_create_log" \
-  FAKE_AMIKA_LIST_JSON='[]' \
   FAKE_AMIKA_FAIL_CREATE_SNAPSHOT="mcp-snapshot" \
   RUN_ID="partial" \
   SYNC_ARTIFACTS=0 \
@@ -443,7 +530,6 @@ no_sync_log="${tmp_root}/no-sync-amika.log"
 no_sync_err="${tmp_root}/no-sync.err"
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$no_sync_log" \
-  FAKE_AMIKA_LIST_JSON='[]' \
   RUN_ID="no-sync" \
   SYNC_ARTIFACTS=0 \
   LOCAL_OUT_DIR="${tmp_root}/no-sync-out" \
@@ -456,7 +542,6 @@ sync_after_failure_call_dir="${tmp_root}/sync-after-failure-calls"
 set +e
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$sync_after_failure_log" \
-  FAKE_AMIKA_LIST_JSON='[]' \
   FAKE_AMIKA_FAIL_SSH_CALL=2 \
   FAKE_AMIKA_FAIL_SSH_CALL_RC=47 \
   FAKE_AMIKA_CALL_DIR="$sync_after_failure_call_dir" \
@@ -495,7 +580,6 @@ term_activity="${tmp_root}/term-activity"
 term_rc="$(
   PATH="${fake_bin}:$PATH" \
     FAKE_AMIKA_LOG="$term_log" \
-    FAKE_AMIKA_LIST_JSON='[]' \
     FAKE_AMIKA_BLOCK_OPERATION=ssh \
     FAKE_AMIKA_ACTIVITY_DIR="$term_activity" \
     RUN_ID="term-signal" \
@@ -515,7 +599,6 @@ int_activity="${tmp_root}/int-activity"
 int_rc="$(
   PATH="${fake_bin}:$PATH" \
     FAKE_AMIKA_LOG="$int_log" \
-    FAKE_AMIKA_LIST_JSON='[]' \
     FAKE_AMIKA_BLOCK_OPERATION=create \
     FAKE_AMIKA_BLOCK_MATCH='--snapshot mcp-snapshot' \
     FAKE_AMIKA_ACTIVITY_DIR="$int_activity" \
@@ -542,7 +625,6 @@ PATH="${forced_tty_bin}:${fake_bin}:$PATH" \
   FAKE_SSH_INVALID_ARTIFACT=1 \
   FAKE_TRANSPORT_LOG="$forced_tty_transport_log" \
   FAKE_AMIKA_LOG="$forced_tty_log" \
-  FAKE_AMIKA_LIST_JSON='[]' \
   RUN_ID="forced-tty-extract" \
   AMIKA_SSH_FORCE_TTY=1 \
   SYNC_ARTIFACTS=1 \
@@ -560,7 +642,7 @@ custom_log="${tmp_root}/custom-amika.log"
 custom_out="${tmp_root}/custom-out"
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$custom_log" \
-  FAKE_AMIKA_LIST_JSON='[]' \
+  FAKE_AMIKA_SNAPSHOT_TABLE=$'NAME STATE PROVIDER SOURCE CREATED\ncustom-locality-snapshot active daytona aseem-locality 2026-08-02T00:00:00Z\ncustom-mcp-snapshot active daytona aseem-mcp 2026-08-02T00:00:00Z' \
   RUN_ID="customrun" \
   SYNC_ARTIFACTS=0 \
   LOCALITY_SANDBOX="custom-locality" \
@@ -588,7 +670,6 @@ cleanup_failure_log="${tmp_root}/cleanup-failure-amika.log"
 set +e
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$cleanup_failure_log" \
-  FAKE_AMIKA_LIST_JSON='[]' \
   FAKE_AMIKA_FAIL_DELETE=1 \
   RUN_ID="cleanup-failure" \
   SYNC_ARTIFACTS=0 \
@@ -606,7 +687,6 @@ combined_failure_err="${tmp_root}/combined-failure.err"
 set +e
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$combined_failure_log" \
-  FAKE_AMIKA_LIST_JSON='[]' \
   FAKE_AMIKA_FAIL_SSH_RC=41 \
   FAKE_AMIKA_FAIL_DELETE=1 \
   RUN_ID="combined-failure" \

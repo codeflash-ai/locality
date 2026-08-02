@@ -213,6 +213,11 @@ fi
 mkdir -p "$LOCAL_OUT_DIR"
 LOCAL_OUT_DIR="$(cd "$LOCAL_OUT_DIR" && pwd)"
 
+AMIKA_CREATE_ATTEMPTS="${AMIKA_CREATE_ATTEMPTS:-3}"
+AMIKA_READINESS_TIMEOUT_SECONDS="${AMIKA_READINESS_TIMEOUT_SECONDS:-180}"
+AMIKA_READINESS_POLL_SECONDS="${AMIKA_READINESS_POLL_SECONDS:-3}"
+AMIKA_LIFECYCLE_LOG="$LOCAL_OUT_DIR/amika-lifecycle.log"
+
 declare -a AMIKA_FLAGS=()
 if [ -n "${AMIKA_SANDBOX_FLAGS:-}" ]; then
   read -r -a AMIKA_FLAGS <<< "$AMIKA_SANDBOX_FLAGS"
@@ -384,31 +389,90 @@ remote_ssh() {
   fi
 }
 
-create_amika_sandboxes() {
+amika_table_state() {
+  local name="$1"
+  local table="$2"
+
+  printf '%s\n' "$table" | awk -v name="$name" 'NR > 1 && $1 == name { print $2; exit }'
+}
+
+load_amika_sandbox_table() {
+  local table
+  local command_rc
+
+  if table="$(amika sandbox list --remote)"; then
+    printf '%s\n' "$table"
+    return 0
+  else
+    command_rc=$?
+  fi
+
+  printf 'Amika remote sandbox preflight failed (amika sandbox list --remote exited %s)\n' "$command_rc" >&2
+  return "$command_rc"
+}
+
+load_amika_snapshot_table() {
+  local table
+  local command_rc
+
+  if table="$(amika snapshot list)"; then
+    printf '%s\n' "$table"
+    return 0
+  else
+    command_rc=$?
+  fi
+
+  printf 'Amika snapshot preflight failed (amika snapshot list exited %s)\n' "$command_rc" >&2
+  return "$command_rc"
+}
+
+validate_positive_integer() {
+  local name="$1"
+  local value="$2"
+
+  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s must be a positive integer\n' "$name" >&2
+    return 2
+  fi
+}
+
+preflight_amika_environment() {
   [ "$REMOTE_PROVIDER" = "amika" ] || return 0
 
-  local sandboxes_json
-  sandboxes_json="$(amika sandbox list --remote -o json)"
+  validate_positive_integer AMIKA_CREATE_ATTEMPTS "$AMIKA_CREATE_ATTEMPTS" || return $?
+  validate_positive_integer AMIKA_READINESS_TIMEOUT_SECONDS "$AMIKA_READINESS_TIMEOUT_SECONDS" || return $?
+  validate_positive_integer AMIKA_READINESS_POLL_SECONDS "$AMIKA_READINESS_POLL_SECONDS" || return $?
 
-  LOCALITY_SANDBOX="$LOCALITY_SANDBOX" MCP_SANDBOX="$MCP_SANDBOX" python3 -c '
-import json
-import os
-import sys
+  local sandbox_table
+  local snapshot_table
+  local name
+  local state
 
-try:
-    sandboxes = json.load(sys.stdin)
-except json.JSONDecodeError as error:
-    raise SystemExit(f"could not parse amika sandbox list JSON: {error}")
+  sandbox_table="$(load_amika_sandbox_table)" || return $?
+  for name in "$LOCALITY_SANDBOX" "$MCP_SANDBOX"; do
+    state="$(amika_table_state "$name" "$sandbox_table")"
+    if [ -n "$state" ]; then
+      printf 'amika sandbox already exists: %s\n' "$name" >&2
+      return 2
+    fi
+  done
 
-existing_names = {
-    sandbox.get("name")
-    for sandbox in sandboxes
-    if isinstance(sandbox, dict) and isinstance(sandbox.get("name"), str)
+  snapshot_table="$(load_amika_snapshot_table)" || return $?
+  for name in "$LOCALITY_SNAPSHOT" "$MCP_SNAPSHOT"; do
+    state="$(amika_table_state "$name" "$snapshot_table")"
+    if [ -z "$state" ]; then
+      printf 'required Amika snapshot not found: %s\n' "$name" >&2
+      return 2
+    fi
+    if [ "$state" != "active" ]; then
+      printf 'required Amika snapshot is not active: %s (state=%s)\n' "$name" "$state" >&2
+      return 2
+    fi
+  done
 }
-for name in (os.environ["LOCALITY_SANDBOX"], os.environ["MCP_SANDBOX"]):
-    if name in existing_names:
-        raise SystemExit(f"amika sandbox already exists: {name}")
-' <<< "$sandboxes_json"
+
+create_amika_sandboxes() {
+  [ "$REMOTE_PROVIDER" = "amika" ] || return 0
 
   run_managed_command amika sandbox create --remote --no-git --snapshot "$LOCALITY_SNAPSHOT" --name "$LOCALITY_SANDBOX"
   CREATED_AMIKA_SANDBOXES+=("$LOCALITY_SANDBOX")
@@ -1156,6 +1220,7 @@ load_mcp_credentials_from_zshrc
 trap cleanup_amika_sandboxes_on_exit EXIT
 trap 'stop_strategy_pipelines 130' INT
 trap 'stop_strategy_pipelines 143' TERM
+preflight_amika_environment
 if [ "$REMOTE_PROVIDER" = "amika" ] && [ "$SYNC_ARTIFACTS" = "0" ]; then
   echo "SYNC_ARTIFACTS=0; ephemeral Amika sandboxes will be deleted without retaining remote artifacts" >&2
 fi
