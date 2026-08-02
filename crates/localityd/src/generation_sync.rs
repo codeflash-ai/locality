@@ -209,6 +209,97 @@ pub enum GenerationSourceSyncOutcome {
     },
 }
 
+/// Errors specific to selecting and synchronizing one or more sources on a
+/// shared mount. This additive surface keeps [`GenerationSyncError`]
+/// source-compatible for downstream exhaustive matches.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum GenerationSourceSyncError {
+    Generation(GenerationSyncError),
+    MissingObservedGenerationSource {
+        mount_id: MountId,
+        source_connection_id: SourceConnectionId,
+    },
+    FullExportRequired {
+        mount_id: MountId,
+        source_connection_id: SourceConnectionId,
+    },
+    DeliveryRequestMismatch,
+}
+
+impl GenerationSourceSyncError {
+    fn into_legacy(self) -> GenerationSyncError {
+        match self {
+            Self::Generation(error) => error,
+            Self::MissingObservedGenerationSource { mount_id, .. } => {
+                GenerationSyncError::MissingObservedGeneration(mount_id)
+            }
+            Self::FullExportRequired {
+                mount_id,
+                source_connection_id,
+            } => GenerationSyncError::Contract(format!(
+                "mount `{}` source `{}` requires a full export",
+                mount_id.0,
+                source_connection_id.as_str()
+            )),
+            Self::DeliveryRequestMismatch => GenerationSyncError::Contract(
+                "generation delivery does not match the requested mount, source, and base generation"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+impl Display for GenerationSourceSyncError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Generation(error) => Display::fmt(error, formatter),
+            Self::MissingObservedGenerationSource {
+                mount_id,
+                source_connection_id,
+            } => write!(
+                formatter,
+                "mount `{}` source `{}` has no observed backend generation",
+                mount_id.0,
+                source_connection_id.as_str()
+            ),
+            Self::FullExportRequired {
+                mount_id,
+                source_connection_id,
+            } => write!(
+                formatter,
+                "mount `{}` source `{}` requires a full export",
+                mount_id.0,
+                source_connection_id.as_str()
+            ),
+            Self::DeliveryRequestMismatch => formatter.write_str(
+                "generation delivery does not match the requested mount, source, and base generation",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GenerationSourceSyncError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Generation(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<GenerationSyncError> for GenerationSourceSyncError {
+    fn from(value: GenerationSyncError) -> Self {
+        Self::Generation(value)
+    }
+}
+
+impl From<locality_store::StoreError> for GenerationSourceSyncError {
+    fn from(value: locality_store::StoreError) -> Self {
+        Self::Generation(GenerationSyncError::Store(value))
+    }
+}
+
 pub struct GenerationSyncClient<T> {
     transport: T,
 }
@@ -235,6 +326,7 @@ where
             .get_observed_generation(mount_id)?
             .ok_or_else(|| GenerationSyncError::MissingObservedGeneration(mount_id.clone()))?;
         self.sync_mount_source(store, mount_id, &observed.source_connection_id, mount_root)
+            .map_err(GenerationSourceSyncError::into_legacy)
     }
 
     /// Synchronizes one exact source head on a mount that may be shared.
@@ -244,7 +336,7 @@ where
         mount_id: &MountId,
         source_connection_id: &SourceConnectionId,
         mount_root: &Path,
-    ) -> Result<GenerationSyncSummary, GenerationSyncError> {
+    ) -> Result<GenerationSyncSummary, GenerationSourceSyncError> {
         recover_generation_delivery_staging(store)?;
         reconcile_all_completed_inode_evidence(store)?;
         if let Some(resumed) = self.resume_active_mount_apply(store, mount_id, mount_root)?
@@ -262,7 +354,7 @@ where
         store: &mut SqliteStateStore,
         mount_id: &MountId,
         mount_root: &Path,
-    ) -> Result<Vec<GenerationSourceSyncSummary>, GenerationSyncError> {
+    ) -> Result<Vec<GenerationSourceSyncSummary>, GenerationSourceSyncError> {
         let outcomes = self.sync_shared_mount_v2(store, mount_id, mount_root)?;
         let mut summaries = Vec::with_capacity(outcomes.len());
         for outcome in outcomes {
@@ -271,7 +363,7 @@ where
                 GenerationSourceSyncOutcome::FullExportRequired {
                     source_connection_id,
                 } => {
-                    return Err(GenerationSyncError::FullExportRequired {
+                    return Err(GenerationSourceSyncError::FullExportRequired {
                         mount_id: mount_id.clone(),
                         source_connection_id,
                     });
@@ -288,7 +380,7 @@ where
         store: &mut SqliteStateStore,
         mount_id: &MountId,
         mount_root: &Path,
-    ) -> Result<Vec<GenerationSourceSyncOutcome>, GenerationSyncError> {
+    ) -> Result<Vec<GenerationSourceSyncOutcome>, GenerationSourceSyncError> {
         recover_generation_delivery_staging(store)?;
         reconcile_all_completed_inode_evidence(store)?;
         let resumed = self.resume_active_mount_apply(store, mount_id, mount_root)?;
@@ -378,16 +470,18 @@ where
         mount_id: &MountId,
         source_connection_id: &SourceConnectionId,
         mount_root: &Path,
-    ) -> Result<GenerationSyncSummary, GenerationSyncError> {
+    ) -> Result<GenerationSyncSummary, GenerationSourceSyncError> {
         replay_pending_acknowledgments(store, mount_id, &mut self.transport)?;
         let observed = store
             .get_observed_generation_for_source_v2(mount_id, source_connection_id)?
-            .ok_or_else(|| GenerationSyncError::MissingObservedGenerationSource {
-                mount_id: mount_id.clone(),
-                source_connection_id: source_connection_id.clone(),
-            })?;
+            .ok_or_else(
+                || GenerationSourceSyncError::MissingObservedGenerationSource {
+                    mount_id: mount_id.clone(),
+                    source_connection_id: source_connection_id.clone(),
+                },
+            )?;
         if observed.refresh_mode == GenerationBaselineRefreshModeV1::FullExportOnly {
-            return Err(GenerationSyncError::FullExportRequired {
+            return Err(GenerationSourceSyncError::FullExportRequired {
                 mount_id: mount_id.clone(),
                 source_connection_id: source_connection_id.clone(),
             });
@@ -443,7 +537,7 @@ where
 fn validate_delivery_request_binding(
     delivery: &AuthorizedGenerationDelivery,
     request: &VersionedGenerationDeliveryRequest,
-) -> Result<(), GenerationSyncError> {
+) -> Result<(), GenerationSourceSyncError> {
     delivery
         .terminal_receipt
         .validate_against(&delivery.delta)
@@ -452,7 +546,7 @@ fn validate_delivery_request_binding(
         || delivery.delta.source_connection_id != request.source_connection_id
         || delivery.delta.base_generation_id != request.observed_generation_id
     {
-        return Err(GenerationSyncError::DeliveryRequestMismatch);
+        return Err(GenerationSourceSyncError::DeliveryRequestMismatch);
     }
     Ok(())
 }
@@ -1705,10 +1799,7 @@ fn validate_local_base(
 ) -> Result<(), GenerationSyncError> {
     let observed = store
         .get_observed_generation_for_source(mount_id, &delta.source_connection_id)?
-        .ok_or_else(|| GenerationSyncError::MissingObservedGenerationSource {
-            mount_id: mount_id.clone(),
-            source_connection_id: delta.source_connection_id.clone(),
-        })?;
+        .ok_or_else(|| GenerationSyncError::MissingObservedGeneration(mount_id.clone()))?;
     if observed.generation_id != delta.base_generation_id
         || observed.workspace_layout_version != delta.workspace_layout_version
         || observed.workspace_layout_digest != delta.workspace_layout_digest.as_str()
@@ -2854,15 +2945,6 @@ pub enum GenerationSyncError {
     Transport(String),
     Contract(String),
     MissingObservedGeneration(MountId),
-    MissingObservedGenerationSource {
-        mount_id: MountId,
-        source_connection_id: SourceConnectionId,
-    },
-    FullExportRequired {
-        mount_id: MountId,
-        source_connection_id: SourceConnectionId,
-    },
-    DeliveryRequestMismatch,
     UnexpectedMount,
     InvalidStagePath,
     ContentMismatch(String),
@@ -2902,27 +2984,6 @@ impl Display for GenerationSyncError {
                 formatter,
                 "mount `{}` has no observed backend generation",
                 mount_id.0
-            ),
-            Self::MissingObservedGenerationSource {
-                mount_id,
-                source_connection_id,
-            } => write!(
-                formatter,
-                "mount `{}` source `{}` has no observed backend generation",
-                mount_id.0,
-                source_connection_id.as_str()
-            ),
-            Self::FullExportRequired {
-                mount_id,
-                source_connection_id,
-            } => write!(
-                formatter,
-                "mount `{}` source `{}` requires a full export",
-                mount_id.0,
-                source_connection_id.as_str()
-            ),
-            Self::DeliveryRequestMismatch => formatter.write_str(
-                "generation delivery does not match the requested mount, source, and base generation",
             ),
             Self::UnexpectedMount => formatter.write_str("generation delta names another mount"),
             Self::InvalidStagePath => formatter.write_str("generation stage path is not UTF-8"),
@@ -5449,6 +5510,39 @@ mod tests {
     }
 
     #[test]
+    fn exact_source_sync_reports_typed_missing_observed_generation() {
+        let fixture = Fixture::new("shared-mount-missing-source");
+        let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+        store
+            .save_mount(MountConfig::new(
+                fixture.mount_id.clone(),
+                "backend",
+                &fixture.mount_root,
+            ))
+            .unwrap();
+        let source_connection_id = SourceConnectionId::new("missing-source");
+        let mut client = GenerationSyncClient::new(FakeTransport::default());
+
+        let error = client
+            .sync_mount_source(
+                &mut store,
+                &fixture.mount_id,
+                &source_connection_id,
+                &fixture.mount_root,
+            )
+            .expect_err("an exact unseeded source must be reported");
+
+        assert!(matches!(
+            error,
+            GenerationSourceSyncError::MissingObservedGenerationSource {
+                mount_id,
+                source_connection_id: missing_source,
+            } if mount_id == fixture.mount_id && missing_source == source_connection_id
+        ));
+        assert!(client.transport().requests.is_empty());
+    }
+
+    #[test]
     fn poll_delivery_is_bound_to_the_exact_requested_source_and_base() {
         let make_seed = |fixture: &Fixture, source: &str, generation: &str| {
             GenerationBaselineSeedRecord::new(
@@ -5496,7 +5590,7 @@ mod tests {
             .expect_err("a custom transport cannot cross a source request");
         assert!(matches!(
             error,
-            GenerationSyncError::DeliveryRequestMismatch
+            GenerationSourceSyncError::DeliveryRequestMismatch
         ));
         assert!(store.list_generation_applies().unwrap().is_empty());
         assert_eq!(client.transport().content_fetches, 0);
@@ -5545,7 +5639,7 @@ mod tests {
             .expect_err("a custom transport cannot cross the observed base");
         assert!(matches!(
             error,
-            GenerationSyncError::DeliveryRequestMismatch
+            GenerationSourceSyncError::DeliveryRequestMismatch
         ));
         assert!(store.list_generation_applies().unwrap().is_empty());
         assert_eq!(client.transport().content_fetches, 0);
@@ -5597,7 +5691,7 @@ mod tests {
         assert!(client.transport().requests.is_empty());
         assert!(matches!(
             client.sync_shared_mount(&mut store, &fixture.mount_id, &fixture.mount_root),
-            Err(GenerationSyncError::FullExportRequired { .. })
+            Err(GenerationSourceSyncError::FullExportRequired { .. })
         ));
         assert!(client.transport().requests.is_empty());
     }
@@ -5999,7 +6093,10 @@ mod tests {
                 &fixture.mount_root,
             )
             .expect_err("source B acknowledgment fails after its apply is durable");
-        assert!(matches!(first_error, GenerationSyncError::Transport(_)));
+        assert!(matches!(
+            first_error,
+            GenerationSourceSyncError::Generation(GenerationSyncError::Transport(_))
+        ));
         assert_eq!(
             store
                 .list_pending_generation_acknowledgments(&fixture.mount_id)
