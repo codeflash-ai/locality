@@ -1191,6 +1191,79 @@ fn generation2_profile_waits_for_freshness_before_export() {
 }
 
 #[test]
+fn generation2_profile_does_not_wait_for_unrelated_bootstrapping() {
+    let directory = TestDirectory::new("workspace-v2-unrelated-bootstrapping");
+    let session = WorkspaceProfileSessionV2::decode_json(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON)
+        .expect("workspace session fixture");
+    let mut status = workspace_v2_bootstrapping_status();
+    status["error"]["code"] = serde_json::json!("unavailable");
+    status["error"]["message"] = serde_json::json!("an unrelated dependency is unavailable");
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&status),
+    ]);
+
+    let error = run_sandbox_init_with_profile_key(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxProfileKey::new("a".repeat(64)).expect("profile key"),
+        SandboxContentEncodingPreference::Automatic,
+    )
+    .expect_err("unrelated bootstrapping must preserve immediate not-ready behavior");
+
+    assert_eq!(error.code(), "session_not_ready");
+    assert!(error.to_string().contains("Bootstrapping (Unavailable)"));
+    let _negotiation = server.request();
+    let _status = server.request();
+    server.assert_no_request();
+}
+
+#[test]
+fn generation2_profile_anchors_deadline_when_wait_headers_arrive() {
+    let directory = TestDirectory::new("workspace-v2-wait-header-deadline");
+    let (session, offer, tar) = workspace_v2_fixture();
+    let compressed = zstd::stream::encode_all(tar.as_slice(), 1).expect("compress workspace tar");
+    let ready_status: Value = serde_json::from_slice(WORKSPACE_SESSION_STATUS_V2_GOLDEN_JSON)
+        .expect("ready workspace status");
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&workspace_v2_bootstrapping_status()),
+        ResponseFixture::json(&serde_json::json!({}))
+            .with_header("Date", "Fri, 31 Jul 2026 12:00:08 GMT")
+            .with_body_from_request(short_deadline_waiting_freshness_attempt)
+            .with_split_after(0, Duration::from_millis(2_100)),
+        ResponseFixture::json(&ready_status),
+        ResponseFixture::json(&offer),
+        ResponseFixture::export("zstd", compressed),
+    ]);
+
+    let report = run_sandbox_init_with_profile_key(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxProfileKey::new("a".repeat(64)).expect("profile key"),
+        SandboxContentEncodingPreference::Automatic,
+    )
+    .expect("body transfer after the server deadline must not extend the wait");
+
+    assert_eq!(report.files, 2);
+    let _negotiation = server.request();
+    let _status = server.request();
+    let wait = server.request();
+    let final_status = server.request();
+    let export_attempt = server.request();
+    let export = server.request();
+    assert!(wait.path.ends_with("/freshness-wait-attempts"));
+    assert_eq!(final_status.path, "/v2/sessions/session-scope-7");
+    assert!(export_attempt.path.ends_with("/export-attempts"));
+    assert!(export.path.ends_with("/export"));
+    server.assert_no_request();
+}
+
+#[test]
 fn generation2_profile_preserves_session_not_ready_when_wait_route_is_unavailable() {
     let directory = TestDirectory::new("workspace-v2-no-freshness-route");
     let session = WorkspaceProfileSessionV2::decode_json(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON)
@@ -2895,6 +2968,15 @@ fn workspace_v2_bootstrapping_status() -> Value {
 
 fn waiting_freshness_attempt(request: &CapturedRequest) -> Vec<u8> {
     freshness_attempt_for_request(request, "waiting")
+}
+
+fn short_deadline_waiting_freshness_attempt(request: &CapturedRequest) -> Vec<u8> {
+    let mut attempt: Value = serde_json::from_slice(&waiting_freshness_attempt(request))
+        .expect("waiting freshness fixture");
+    attempt["created_at"] = serde_json::json!("2026-07-31T11:59:40Z");
+    attempt["original_deadline_at"] = serde_json::json!("2026-07-31T12:00:10Z");
+    attempt["poll"]["retry"]["retry_after_seconds"] = serde_json::json!(1);
+    serde_json::to_vec(&attempt).expect("serialize short-deadline freshness response")
 }
 
 fn satisfied_freshness_attempt(request: &CapturedRequest) -> Vec<u8> {

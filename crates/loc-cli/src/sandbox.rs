@@ -1062,6 +1062,15 @@ fn run_generation2_workspace_init(
     let mut status = client.workspace_session_status(&session, &capabilities)?;
     mark_profile(&mut profile, PROFILE_SESSION_STATUS);
     if status.state() == SandboxSessionState::Bootstrapping
+        && status.error().is_some_and(|error| {
+            error.retriable
+                && matches!(
+                    error.code,
+                    SessionErrorCode::Bootstrapping
+                        | SessionErrorCode::Stale
+                        | SessionErrorCode::Incomplete
+                )
+        })
         && status.freshness_requirement().on_stale
             == locality_protocol::StaleSessionBehavior::WaitThenFail
         && capabilities.supports_freshness_wait()
@@ -1928,6 +1937,7 @@ enum FreshnessWaitPostResult {
     Response {
         bytes: Vec<u8>,
         authenticated_server_time: String,
+        response_headers_received_at: Instant,
     },
     RouteUnavailable,
     DeadlineReached,
@@ -2203,12 +2213,17 @@ impl SandboxHttpClient {
             .validate()
             .map_err(|error| invalid_freshness_wait_response(error.to_string()))?;
 
-        let (accepted, server_time) =
+        let (accepted, server_time, response_headers_received_at) =
             match self.post_freshness_wait_attempt(session, &request, None)? {
                 FreshnessWaitPostResult::Response {
                     bytes,
                     authenticated_server_time,
-                } => (bytes, authenticated_server_time),
+                    response_headers_received_at,
+                } => (
+                    bytes,
+                    authenticated_server_time,
+                    response_headers_received_at,
+                ),
                 FreshnessWaitPostResult::RouteUnavailable => {
                     return Ok(FreshnessWaitAvailability::Unavailable);
                 }
@@ -2219,7 +2234,11 @@ impl SandboxHttpClient {
         let mut attempt = FreshnessWaitAttempt::decode_json(&accepted, &request, &server_time)
             .map_err(|error| invalid_freshness_wait_response(error.to_string()))?;
         let mut local_deadline = if attempt.state == FreshnessWaitAggregateState::Waiting {
-            Some(freshness_wait_local_deadline(&attempt, &server_time)?)
+            Some(freshness_wait_local_deadline(
+                &attempt,
+                &server_time,
+                response_headers_received_at,
+            )?)
         } else {
             None
         };
@@ -2246,12 +2265,17 @@ impl SandboxHttpClient {
             }
             thread::sleep(retry_after);
 
-            let (successor_bytes, successor_server_time) =
+            let (successor_bytes, successor_server_time, successor_headers_received_at) =
                 match self.post_freshness_wait_attempt(session, &request, Some(deadline))? {
                     FreshnessWaitPostResult::Response {
                         bytes,
                         authenticated_server_time,
-                    } => (bytes, authenticated_server_time),
+                        response_headers_received_at,
+                    } => (
+                        bytes,
+                        authenticated_server_time,
+                        response_headers_received_at,
+                    ),
                     FreshnessWaitPostResult::RouteUnavailable => {
                         return Ok(FreshnessWaitAvailability::Unavailable);
                     }
@@ -2269,8 +2293,11 @@ impl SandboxHttpClient {
                 .validate_successor(&attempt, &request, &successor_server_time)
                 .map_err(|error| invalid_freshness_wait_response(error.to_string()))?;
 
-            let successor_deadline =
-                freshness_wait_local_deadline(&successor, &successor_server_time)?;
+            let successor_deadline = freshness_wait_local_deadline(
+                &successor,
+                &successor_server_time,
+                successor_headers_received_at,
+            )?;
             local_deadline = Some(deadline.min(successor_deadline));
             attempt = successor;
         }
@@ -2333,10 +2360,11 @@ impl SandboxHttpClient {
                 continue;
             }
             match read_freshness_wait_response(response) {
-                Ok((bytes, authenticated_server_time)) => {
+                Ok((bytes, authenticated_server_time, response_headers_received_at)) => {
                     return Ok(FreshnessWaitPostResult::Response {
                         bytes,
                         authenticated_server_time,
+                        response_headers_received_at,
                     });
                 }
                 Err(error)
@@ -2752,7 +2780,8 @@ fn read_json_response_bytes(
 
 fn read_freshness_wait_response(
     mut response: Response,
-) -> Result<(Vec<u8>, String), SandboxInitError> {
+) -> Result<(Vec<u8>, String, Instant), SandboxInitError> {
+    let response_headers_received_at = Instant::now();
     ensure_status(&response, "freshness wait attempt", StatusCode::OK)?;
     require_media_type(
         response.headers(),
@@ -2775,7 +2804,11 @@ fn read_freshness_wait_response(
             limit: MAX_FRESHNESS_WAIT_ATTEMPT_BYTES as u64,
         });
     }
-    Ok((bytes, authenticated_server_time))
+    Ok((
+        bytes,
+        authenticated_server_time,
+        response_headers_received_at,
+    ))
 }
 
 fn authenticated_server_time(headers: &HeaderMap) -> Result<String, SandboxInitError> {
@@ -2799,6 +2832,7 @@ fn authenticated_server_time(headers: &HeaderMap) -> Result<String, SandboxInitE
 fn freshness_wait_local_deadline(
     attempt: &FreshnessWaitAttempt,
     authenticated_server_time: &str,
+    response_headers_received_at: Instant,
 ) -> Result<Instant, SandboxInitError> {
     let server_time = DateTime::parse_from_rfc3339(authenticated_server_time)
         .map_err(|error| invalid_freshness_wait_response(error.to_string()))?;
@@ -2807,7 +2841,7 @@ fn freshness_wait_local_deadline(
     let remaining = deadline.signed_duration_since(server_time).num_seconds();
     let remaining = u64::try_from(remaining.max(0))
         .map_err(|error| invalid_freshness_wait_response(error.to_string()))?;
-    Instant::now()
+    response_headers_received_at
         .checked_add(Duration::from_secs(remaining))
         .ok_or_else(|| invalid_freshness_wait_response("deadline overflow".to_string()))
 }
