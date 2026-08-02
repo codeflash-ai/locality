@@ -60,7 +60,7 @@ pub use repository::{
     FreshnessStateRepository, HydrationJobRepository, JournalRepository,
     MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
     RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
-    VirtualMutationRepository, WorkspaceBindingRepository,
+    VirtualMutationRepository, WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
 };
 pub use reset::{
     LocalStateResetCredentialError, LocalStateResetError, LocalStateResetStorageReport,

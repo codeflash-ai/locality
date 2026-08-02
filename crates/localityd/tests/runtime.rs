@@ -1299,6 +1299,51 @@ fn runtime_shutdown_request_stops_runtime() {
 }
 
 #[test]
+fn runtime_shutdown_waits_for_in_flight_hydration_before_stopping() {
+    let config = relay_config("shutdown-drains-hydration");
+    let mount_root = temp_root("shutdown-drains-hydration-mount");
+    seed_clean_remote_changed_page(&config.state_root, &mount_root);
+    let (started_tx, started_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config,
+        BlockingHydrationRunner {
+            started: started_tx,
+            release: Arc::clone(&release),
+        },
+    )
+    .expect("spawn runtime");
+
+    let response = runtime.handle().request(DaemonRequest::RemoteFastForward {
+        mount_id: "notion-main".to_string(),
+        remote_id: "page-1".to_string(),
+        path: PathBuf::from("Roadmap.md"),
+    });
+    assert!(response.ok, "queue hydration: {response:?}");
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("hydration started");
+
+    let (stopped_tx, stopped_rx) = mpsc::channel();
+    let shutdown = thread::spawn(move || {
+        runtime.shutdown();
+        stopped_tx.send(()).expect("report stopped");
+    });
+    assert!(
+        stopped_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "runtime reported stopped while hydration could still mutate projection state"
+    );
+
+    let (lock, condvar) = &*release;
+    *lock.lock().expect("lock release") = true;
+    condvar.notify_all();
+    stopped_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("runtime stopped after hydration drained");
+    shutdown.join().expect("join shutdown");
+}
+
+#[test]
 fn runtime_routes_push_request_through_runner() {
     let (push_tx, push_rx) = mpsc::channel();
     let runtime = DaemonRuntime::spawn_with_runner(

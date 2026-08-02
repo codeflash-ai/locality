@@ -27,6 +27,12 @@ pub trait MountRepository {
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>>;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceRemountRecoveryOutcome {
+    Prepared,
+    Committed,
+}
+
 /// Durable portable placement metadata keyed by the existing mount identity.
 /// A missing record is valid legacy layout 0 state and must not be synthesized
 /// from an invalid, ambiguous, or colliding root.
@@ -85,6 +91,34 @@ pub trait WorkspaceBindingRepository {
     {
         Err(StoreError::NotImplemented(
             "transactional portable workspace mount cleanup",
+        ))
+    }
+
+    /// Reserve an externally journaled remount before any projection path is
+    /// staged. The matching mount transaction atomically advances this record
+    /// to `Committed`; a rolled-back transaction leaves it `Prepared`.
+    fn begin_workspace_remount_recovery(
+        &mut self,
+        _recovery_id: &str,
+        _mount_id: &MountId,
+    ) -> StoreResult<()> {
+        Err(StoreError::NotImplemented(
+            "durable workspace remount recovery",
+        ))
+    }
+
+    fn get_workspace_remount_recovery(
+        &self,
+        _recovery_id: &str,
+    ) -> StoreResult<Option<(MountId, WorkspaceRemountRecoveryOutcome)>> {
+        Err(StoreError::NotImplemented(
+            "durable workspace remount recovery",
+        ))
+    }
+
+    fn finish_workspace_remount_recovery(&mut self, _recovery_id: &str) -> StoreResult<()> {
+        Err(StoreError::NotImplemented(
+            "durable workspace remount recovery",
         ))
     }
 

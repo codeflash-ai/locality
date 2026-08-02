@@ -157,8 +157,8 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "durable:workspace_bindings".to_string(),
                 "durable_json".to_string(),
-                3,
-                3,
+                4,
+                4,
                 1,
                 0,
             ),
@@ -451,7 +451,8 @@ state_components: component_id, component_kind, version, min_reader_version, req
 state_migrations: migration_id, from_schema_version, to_schema_version, app_version, app_build_id, daemon_build_id, started_at, finished_at, status, error_json
 virtual_mutations: mount_id, local_id, mutation_kind_json, target_remote_id, parent_remote_id, original_path, projected_path, title, content_path, created_at, updated_at
 workspace_bindings: mount_id, workspace_id, binding_json, target_collision_key
-workspace_host_bindings: workspace_id, binding_json"
+workspace_host_bindings: workspace_id, binding_json
+workspace_remount_recoveries: recovery_id, mount_id, committed"
     );
 }
 

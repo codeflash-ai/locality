@@ -61,8 +61,8 @@ use crate::repository::{
     FreshnessStateRepository, HydrationJobRepository, JournalRepository,
     MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
     RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
-    VirtualMutationRepository, WorkspaceBindingRepository, validate_virtual_move_transition,
-    virtual_move_content_changed, virtual_move_missing,
+    VirtualMutationRepository, WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
+    validate_virtual_move_transition, virtual_move_content_changed, virtual_move_missing,
 };
 use crate::workspace_binding::{
     LegacyWorkspaceMount, WorkspaceBinding, WorkspaceBindingRecord, WorkspaceHostBinding,
@@ -188,11 +188,11 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "durable:workspace_bindings",
         component_kind: "durable_json",
-        current_version: 3,
-        min_reader_version: 3,
+        current_version: 4,
+        min_reader_version: 4,
         required: true,
         rebuildable: false,
-        data_json: "{\"format\":\"workspace_binding.v2\",\"layout_0_without_binding\":true,\"legacy_v1_readable\":true,\"target_scope\":\"workspace_id\"}",
+        data_json: "{\"format\":\"workspace_binding.v2\",\"layout_0_without_binding\":true,\"legacy_v1_readable\":true,\"target_scope\":\"workspace_id\",\"remount_recovery\":\"v1\"}",
     },
     StateComponentDefinition {
         component_id: "durable:metadata_discovery",
@@ -2215,13 +2215,122 @@ impl WorkspaceBindingRepository for SqliteStateStore {
             ));
         }
         let mut connection = self.connection()?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prepared = {
+            let mut statement = transaction.prepare(
+                "SELECT recovery_id FROM workspace_remount_recoveries
+                 WHERE mount_id = ?1 AND committed = 0",
+            )?;
+            statement
+                .query_map(params![mount.mount_id.as_str()], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let [recovery_id] = prepared.as_slice() else {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` must have exactly one prepared workspace remount recovery",
+                mount.mount_id.as_str()
+            )));
+        };
         validate_workspace_binding_commit(&mount, &host_binding, &record)?;
         clear_mount_source_state(&transaction, &mount.mount_id)?;
         save_mount_row(&transaction, &mount)?;
         commit_workspace_binding_in_transaction(&transaction, &mount, &host_binding, &record)?;
         cleanup()?;
+        let updated = transaction.execute(
+            "UPDATE workspace_remount_recoveries
+             SET committed = 1
+             WHERE recovery_id = ?1 AND mount_id = ?2 AND committed = 0",
+            params![recovery_id, mount.mount_id.as_str()],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::InvalidState(format!(
+                "workspace remount recovery `{recovery_id}` lost its prepared outcome"
+            )));
+        }
         transaction.commit()?;
+        Ok(())
+    }
+
+    fn begin_workspace_remount_recovery(
+        &mut self,
+        recovery_id: &str,
+        mount_id: &MountId,
+    ) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        let existing = connection
+            .query_row(
+                "SELECT mount_id, committed FROM workspace_remount_recoveries
+                 WHERE recovery_id = ?1",
+                params![recovery_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((existing_mount_id, 0)) if existing_mount_id == mount_id.as_str() => Ok(()),
+            Some(_) => Err(StoreError::InvalidState(format!(
+                "workspace remount recovery `{recovery_id}` already exists with different state"
+            ))),
+            None => connection
+                .execute(
+                    "INSERT INTO workspace_remount_recoveries (
+                        recovery_id, mount_id, committed
+                     ) VALUES (?1, ?2, 0)",
+                    params![recovery_id, mount_id.as_str()],
+                )
+                .map(|_| ())
+                .map_err(|error| {
+                    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                        StoreError::InvalidState(format!(
+                            "mount `{}` already has a workspace remount recovery",
+                            mount_id.as_str()
+                        ))
+                    } else {
+                        error.into()
+                    }
+                }),
+        }
+    }
+
+    fn get_workspace_remount_recovery(
+        &self,
+        recovery_id: &str,
+    ) -> StoreResult<Option<(MountId, WorkspaceRemountRecoveryOutcome)>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT mount_id, committed FROM workspace_remount_recoveries
+                 WHERE recovery_id = ?1",
+                params![recovery_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .map(|(mount_id, committed)| match committed {
+                0 => Ok((
+                    MountId::new(mount_id),
+                    WorkspaceRemountRecoveryOutcome::Prepared,
+                )),
+                1 => Ok((
+                    MountId::new(mount_id),
+                    WorkspaceRemountRecoveryOutcome::Committed,
+                )),
+                _ => Err(StoreError::InvalidState(format!(
+                    "workspace remount recovery `{recovery_id}` has invalid outcome"
+                ))),
+            })
+            .transpose()
+    }
+
+    fn finish_workspace_remount_recovery(&mut self, recovery_id: &str) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.execute(
+            "DELETE FROM workspace_remount_recoveries WHERE recovery_id = ?1",
+            params![recovery_id],
+        )?;
         Ok(())
     }
 
@@ -4765,7 +4874,7 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
         });
     }
     if user_version == SCHEMA_VERSION {
-        migrate_workspace_bindings_component_to_v3(connection)?;
+        migrate_workspace_bindings_component_to_v4(connection)?;
         ensure_state_components_safe_before_mutation(connection, user_version)?;
         validate_workspace_bindings(connection)?;
         retire_removed_state_components(connection)?;
@@ -5408,7 +5517,7 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
     Ok(())
 }
 
-fn migrate_workspace_bindings_component_to_v3(connection: &mut Connection) -> StoreResult<()> {
+fn migrate_workspace_bindings_component_to_v4(connection: &mut Connection) -> StoreResult<()> {
     if !table_exists(connection, "state_components")? {
         return Ok(());
     }
@@ -5421,7 +5530,7 @@ fn migrate_workspace_bindings_component_to_v3(connection: &mut Connection) -> St
         .optional()?;
     let needs_table_migration = table_exists(connection, "workspace_bindings")?
         && !column_exists(connection, "workspace_bindings", "workspace_id")?;
-    if version != Some(2) && !needs_table_migration {
+    if !matches!(version, Some(2 | 3)) && !needs_table_migration {
         return Ok(());
     }
 
@@ -5430,14 +5539,15 @@ fn migrate_workspace_bindings_component_to_v3(connection: &mut Connection) -> St
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     create_workspace_host_bindings_table(&transaction)?;
     migrate_workspace_bindings_table_to_v3(&transaction)?;
-    if version == Some(2) {
+    create_workspace_remount_recoveries_table(&transaction)?;
+    if matches!(version, Some(2 | 3)) {
         transaction.execute(
             "UPDATE state_components
-             SET version = 3,
-                 min_reader_version = 3,
+             SET version = 4,
+                 min_reader_version = 4,
                  data_json = ?1
-             WHERE component_id = 'durable:workspace_bindings' AND version = 2",
-            params!["{\"format\":\"workspace_binding.v2\",\"layout_0_without_binding\":true,\"legacy_v1_readable\":true,\"target_scope\":\"workspace_id\"}"],
+             WHERE component_id = 'durable:workspace_bindings' AND version IN (2, 3)",
+            params!["{\"format\":\"workspace_binding.v2\",\"layout_0_without_binding\":true,\"legacy_v1_readable\":true,\"target_scope\":\"workspace_id\",\"remount_recovery\":\"v1\"}"],
         )?;
     }
     validate_workspace_bindings(&transaction)?;
@@ -5572,10 +5682,10 @@ fn state_component_issue_allows_schema_migration(
         StateCompatibilityIssue::OlderComponent {
             component_id,
             found,
-            current: 3,
+            current: 4,
         } if component_id == "durable:workspace_bindings"
-            && ((*found == 2 && user_version == SCHEMA_VERSION)
-                || (matches!(*found, 1 | 2) && user_version < SCHEMA_VERSION))
+            && ((matches!(*found, 2 | 3) && user_version == SCHEMA_VERSION)
+                || (matches!(*found, 1 | 2 | 3) && user_version < SCHEMA_VERSION))
     ) || matches!(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
@@ -5613,6 +5723,7 @@ fn migrate_workspace_bindings_schema_v21(
     migrate_entity_search_component_to_v2(&transaction)?;
     create_workspace_host_bindings_table(&transaction)?;
     migrate_workspace_bindings_table_to_v3(&transaction)?;
+    create_workspace_remount_recoveries_table(&transaction)?;
     if user_version < 27 {
         discard_untrusted_legacy_workspace_bindings(&transaction)?;
     }
@@ -5640,6 +5751,20 @@ fn create_workspace_bindings_table(connection: &Connection) -> StoreResult<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS workspace_bindings_legacy_target_unique
             ON workspace_bindings(target_collision_key)
             WHERE workspace_id IS NULL;",
+    )?;
+    Ok(())
+}
+
+fn create_workspace_remount_recoveries_table(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspace_remount_recoveries (
+            recovery_id TEXT PRIMARY KEY,
+            mount_id TEXT NOT NULL,
+            committed INTEGER NOT NULL CHECK (committed IN (0, 1)),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS workspace_remount_recoveries_mount_unique
+            ON workspace_remount_recoveries(mount_id);",
     )?;
     Ok(())
 }

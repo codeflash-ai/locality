@@ -10,7 +10,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    Condvar, Mutex, OnceLock,
+    Condvar, Mutex, OnceLock, RwLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
@@ -114,12 +114,18 @@ use locality_store::{
     MountLiveModeStateChangeError, MountRepository, ProjectionMode, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, SqliteStateStore, StoreError,
     VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
     is_live_mode_state_change_signal_path, open_credential_store, reset_locality_state_storage,
     save_mount_live_mode_and_publish_signal,
 };
 #[cfg(test)]
 use locality_store::{ConnectorProfileId, ConnectorProfileRecord, ConnectorProfileRepository};
 use localityd::autosave::auto_save_timestamp;
+use localityd::durable_fs::{
+    copy_new_file_durable, create_dir_all_durable, remove_dir_all_durable,
+    rename_noreplace_durable, sync_directory, validate_no_symlink_or_reparse_ancestors,
+    write_new_file_durable,
+};
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
 use localityd::google_docs::resolve_google_docs_connector_for_mount;
 use localityd::hydration::HydrationSource;
@@ -562,6 +568,7 @@ static CONNECT_GOOGLE_CALENDAR_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static CONNECT_GMAIL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static CONNECT_SLACK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static DAEMON_LIFECYCLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static DESKTOP_MOUNT_ACTIVITY_FENCE: OnceLock<RwLock<()>> = OnceLock::new();
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static DESKTOP_SNAPSHOT_CACHE: OnceLock<Mutex<DesktopSnapshotCache>> = OnceLock::new();
 static SURFACE_REFRESH_STATE: OnceLock<Mutex<SurfaceRefreshState>> = OnceLock::new();
@@ -576,6 +583,7 @@ static LIVE_MODE_LOCAL_RECONCILE_TIMES: OnceLock<Mutex<BTreeMap<PathBuf, Instant
     OnceLock::new();
 static LIVE_MODE_TICK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static LOCAL_STATE_RESET_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static REMOUNT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR: OnceLock<
     Mutex<WindowsCloudFilesProviderSupervisor>,
@@ -2693,6 +2701,9 @@ fn live_mode_tick_blocking() -> ActionReport {
 }
 
 fn live_mode_tick_blocking_at_state_root(state_root: &Path) -> ActionReport {
+    let _activity_guard = desktop_mount_activity_fence()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mount = match live_mode_enabled_mount(&state_root) {
         Ok(Some(mount)) => mount,
         Ok(None) => {
@@ -7693,11 +7704,6 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         GOOGLE_CALENDAR_CONNECTOR_ID | "gmail" | "granola" | "linear" | SLACK_CONNECTOR_ID => None,
         _ => unreachable!("unsupported desktop connector should be rejected before mount setup"),
     };
-    let remount_preparation = if can_remount_existing_workspace {
-        plan_existing_workspace_mount_for_remount(&mut store, &state_root, &mount_id)?
-    } else {
-        None
-    };
     let settings_json = if connector == SLACK_CONNECTOR_ID {
         SlackMountSettings::default()
             .to_json()
@@ -7706,32 +7712,137 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         "{}".to_string()
     };
 
-    let (mount_report, preserved) = commit_desktop_mount(
-        &mut store,
-        &state_root,
-        MountOptions {
-            mount_id,
-            connector,
-            root,
-            remote_root_id,
-            connection_id,
-            read_only,
-            projection: projection.clone(),
-            settings_json,
-        },
-        remount_preparation,
-    )?;
+    let options = MountOptions {
+        mount_id,
+        connector,
+        root,
+        remote_root_id,
+        connection_id,
+        read_only,
+        projection: projection.clone(),
+        settings_json,
+    };
+    if can_remount_existing_workspace {
+        drop(store);
+        return create_desktop_remount_quiesced(&state_root, options);
+    }
+
+    let (mount_report, preserved) = commit_desktop_mount(&mut store, &state_root, options, None)?;
 
     ensure_daemon_running(&state_root)?;
     reload_daemon_mounts(&state_root)?;
 
+    finish_desktop_mount_setup(&store, &state_root, mount_report, preserved)
+}
+
+struct RemountInProgressGuard;
+
+impl RemountInProgressGuard {
+    fn begin() -> Self {
+        REMOUNT_IN_PROGRESS.store(true, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for RemountInProgressGuard {
+    fn drop(&mut self) {
+        REMOUNT_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
+
+fn create_desktop_remount_quiesced(
+    state_root: &Path,
+    options: MountOptions,
+) -> Result<String, String> {
+    let mount_id = options.mount_id.clone();
+    let _activity_guard = desktop_mount_activity_fence()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _daemon_guard = daemon_lifecycle_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _remount_guard = RemountInProgressGuard::begin();
+
+    stop_windows_cloud_files_provider_supervisor(state_root)?;
+    let stop_report = run_daemon_control(&daemon_control_args_any_manager("stop", state_root))
+        .map_err(|error| {
+            format!(
+                "Could not quiesce localityd before remounting: {}",
+                error.message()
+            )
+        })?;
+    if stop_report.state != DaemonRunState::Stopped || daemon_is_ready(state_root) {
+        return Err("localityd did not reach the stopped state before remounting.".to_string());
+    }
+
+    let commit_result = (|| {
+        let mut store = SqliteStateStore::open(state_root.to_path_buf())
+            .map_err(|error| format!("Could not reopen Locality state for remount: {error}"))?;
+        let preparation =
+            plan_existing_workspace_mount_for_remount(&mut store, state_root, &options.mount_id)?
+                .ok_or_else(|| {
+                "The existing workspace mount disappeared before remounting.".to_string()
+            })?;
+        let (report, preserved) =
+            commit_desktop_mount(&mut store, state_root, options, Some(preparation))?;
+        Ok::<_, String>((store, report, preserved))
+    })();
+
+    let restart_result = ensure_daemon_running_locked(state_root);
+    let (store, mount_report, preserved) = match (commit_result, restart_result) {
+        (Ok(result), Ok(())) => result,
+        (Err(error), Ok(())) => {
+            return Err(
+                match reactivate_mount_after_failed_remount(state_root, &mount_id) {
+                    Ok(()) => error,
+                    Err(reactivation_error) => format!(
+                        "{error}; restoring the previous projection runtime also failed: {reactivation_error}"
+                    ),
+                },
+            );
+        }
+        (Ok(_), Err(restart_error)) => return Err(restart_error),
+        (Err(error), Err(restart_error)) => {
+            return Err(format!(
+                "{error}; localityd restart after remount failure also failed: {restart_error}"
+            ));
+        }
+    };
+    reload_daemon_mounts(state_root)?;
+    finish_desktop_mount_setup(&store, state_root, mount_report, preserved)
+}
+
+fn reactivate_mount_after_failed_remount(
+    state_root: &Path,
+    mount_id: &MountId,
+) -> Result<(), String> {
+    reload_daemon_mounts(state_root)?;
+    let store = SqliteStateStore::open(state_root.to_path_buf()).map_err(|error| {
+        format!("Could not reopen Locality state after remount failure: {error}")
+    })?;
+    let mount = store
+        .get_mount(mount_id)
+        .map_err(|error| format!("Could not reload the previous mount: {error}"))?
+        .ok_or_else(|| "The previous mount was not found after remount failure.".to_string())?;
+    if mount.projection.uses_virtual_filesystem() {
+        activate_virtual_projection_mount(state_root, &mount, true)?;
+    }
+    Ok(())
+}
+
+fn finish_desktop_mount_setup(
+    store: &SqliteStateStore,
+    state_root: &Path,
+    mount_report: MountReport,
+    preserved: Option<PreservedLocalChanges>,
+) -> Result<String, String> {
     let mount = store
         .get_mount(&MountId::new(mount_report.mount_id.clone()))
         .map_err(|error| format!("Could not reload created mount: {error}"))?
         .ok_or_else(|| "Created mount was not found in Locality state.".to_string())?;
 
     let projection_warning = if mount.projection.uses_virtual_filesystem() {
-        match activate_virtual_projection_mount(&state_root, &mount, true) {
+        match activate_virtual_projection_mount(state_root, &mount, true) {
             Ok(()) => None,
             Err(error) if recoverable_macos_file_provider_activation_error(&error) => Some(error),
             Err(error) => return Err(error),
@@ -7740,7 +7851,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         None
     };
 
-    let canonical_mount_root = resolve_workspace_mount_root(&store, &mount)
+    let canonical_mount_root = resolve_workspace_mount_root(store, &mount)
         .map_err(|error| format!("Could not resolve portable workspace path: {error}"))?;
     let mut message = format!(
         "Mounted {} at {} with {}.",
@@ -7792,6 +7903,26 @@ where
     let intended_mount = mount_config_for_options(&options);
     let mut cleanup =
         WorkspaceProjectionCleanupTransaction::new(state_root, &preparation, intended_mount);
+    let recovery_id = match cleanup.begin(store) {
+        Ok(recovery_id) => recovery_id,
+        Err(error) => {
+            let rollback_error = cleanup.rollback().err();
+            let marker_error = cleanup.finish_recovery_marker().err();
+            return Err(match (rollback_error, marker_error) {
+                (Some(rollback_error), marker_error) => {
+                    let marker_detail = marker_error
+                        .map(|error| format!("; marker cleanup also failed: {error}"))
+                        .unwrap_or_default();
+                    format!("{error}; remount recovery rollback also failed: {rollback_error}")
+                        + &marker_detail
+                }
+                (None, Some(marker_error)) => {
+                    format!("{error}; remount recovery marker cleanup also failed: {marker_error}")
+                }
+                (None, None) => error,
+            });
+        }
+    };
     let mount_result = run_mount_with_workspace_cleanup(store, options, || {
         cleanup.stage().map_err(|error| {
             StoreError::InvalidState(format!("desktop projection cleanup failed: {error}"))
@@ -7802,10 +7933,20 @@ where
     });
     match mount_result {
         Ok(report) => {
+            #[cfg(test)]
+            if std::env::var("LOCALITY_REMOUNT_CRASH_PHASE").as_deref() == Ok("post_commit") {
+                std::process::abort();
+            }
             cleanup.finalize().map_err(|error| {
                 format!(
                     "The source remount committed, but old projection cleanup remains pending and will be retried at the next Locality startup: {error}"
                 )
+            })?;
+            store
+                .finish_workspace_remount_recovery(&recovery_id)
+                .map_err(|error| format!("Could not finish remount recovery outcome: {error}"))?;
+            cleanup.finish_recovery_marker().map_err(|error| {
+                format!("Could not finish remount recovery marker cleanup: {error}")
             })?;
             Ok((report, preparation.preserved))
         }
@@ -7813,6 +7954,16 @@ where
             let mut rollback_errors = Vec::new();
             if let Err(rollback_error) = cleanup.rollback() {
                 rollback_errors.push(rollback_error);
+            } else if let Err(rollback_error) =
+                store.finish_workspace_remount_recovery(&recovery_id)
+            {
+                rollback_errors.push(format!(
+                    "could not finish remount recovery outcome: {rollback_error}"
+                ));
+            } else if let Err(rollback_error) = cleanup.finish_recovery_marker() {
+                rollback_errors.push(format!(
+                    "could not finish remount recovery marker cleanup: {rollback_error}"
+                ));
             }
             if rollback_errors.is_empty() {
                 Err(error.message())
@@ -7968,6 +8119,10 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
 
 fn daemon_lifecycle_lock() -> &'static Mutex<()> {
     DAEMON_LIFECYCLE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn desktop_mount_activity_fence() -> &'static RwLock<()> {
+    DESKTOP_MOUNT_ACTIVITY_FENCE.get_or_init(|| RwLock::new(()))
 }
 
 fn ensure_daemon_running_locked(state_root: &Path) -> Result<(), String> {
@@ -9866,7 +10021,9 @@ fn start_windows_cloud_files_provider_supervisor() {
         std::thread::spawn(|| {
             let state_root = default_state_root();
             loop {
-                if LOCAL_STATE_RESET_IN_PROGRESS.load(Ordering::Acquire) {
+                if LOCAL_STATE_RESET_IN_PROGRESS.load(Ordering::Acquire)
+                    || REMOUNT_IN_PROGRESS.load(Ordering::Acquire)
+                {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                     continue;
                 }
@@ -11113,7 +11270,7 @@ struct WorkspaceRemountPreparation {
 
 static REMOUNT_CLEANUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const REMOUNT_RECOVERY_DIRECTORY: &str = ".locality-remount-recovery";
-const REMOUNT_RECOVERY_VERSION: u32 = 1;
+const REMOUNT_RECOVERY_VERSION: u32 = 2;
 
 #[derive(Debug)]
 struct StagedProjectionPath {
@@ -11161,12 +11318,9 @@ impl WorkspaceProjectionCleanupTransaction {
             return Err("projection cleanup was invoked more than once".to_string());
         }
         self.started = true;
-        self.recovery_marker = Some(WorkspaceRemountRecoveryMarker::create(
-            &self.state_root,
-            &self.mount,
-            &self.intended_mount,
-            self.preserved_directory.as_deref(),
-        )?);
+        if self.recovery_marker.is_none() {
+            return Err("remount recovery was not durably prepared before staging".to_string());
+        }
 
         if self.mount.projection != ProjectionMode::MacosFileProvider {
             for root in daemon_file_provider::mount_access_roots(&self.mount) {
@@ -11209,6 +11363,12 @@ impl WorkspaceProjectionCleanupTransaction {
     }
 
     fn create_staging_directory(&mut self, parent: &Path) -> Result<PathBuf, String> {
+        validate_no_symlink_or_reparse_ancestors(parent).map_err(|error| {
+            format!(
+                "unsafe cleanup staging parent `{}`: {error}",
+                parent.display()
+            )
+        })?;
         let sequence = REMOUNT_CLEANUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let directory = parent.join(format!(
             ".locality-remount-staging-{}-{sequence}",
@@ -11218,15 +11378,9 @@ impl WorkspaceProjectionCleanupTransaction {
             path: directory.clone(),
         })?;
         self.staging_directories.push(directory.clone());
-        fs::create_dir(&directory).map_err(|error| {
+        create_dir_all_durable(&directory).map_err(|error| {
             format!(
                 "could not create cleanup staging directory `{}`: {error}",
-                directory.display()
-            )
-        })?;
-        sync_directory(parent).map_err(|error| {
-            format!(
-                "could not persist cleanup staging directory `{}`: {error}",
                 directory.display()
             )
         })?;
@@ -11239,6 +11393,14 @@ impl WorkspaceProjectionCleanupTransaction {
         staging_directory: &Path,
         require_empty_directory: bool,
     ) -> Result<bool, String> {
+        validate_no_symlink_or_reparse_ancestors(path)
+            .map_err(|error| format!("unsafe cleanup path `{}`: {error}", path.display()))?;
+        validate_no_symlink_or_reparse_ancestors(staging_directory).map_err(|error| {
+            format!(
+                "unsafe cleanup staging directory `{}`: {error}",
+                staging_directory.display()
+            )
+        })?;
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -11310,6 +11472,24 @@ impl WorkspaceProjectionCleanupTransaction {
             .append(record)
     }
 
+    fn begin(&mut self, store: &mut SqliteStateStore) -> Result<String, String> {
+        if self.recovery_marker.is_some() {
+            return Err("remount recovery was prepared more than once".to_string());
+        }
+        let marker = WorkspaceRemountRecoveryMarker::create(
+            &self.state_root,
+            &self.mount,
+            &self.intended_mount,
+            self.preserved_directory.as_deref(),
+        )?;
+        let recovery_id = marker.recovery_id.clone();
+        self.recovery_marker = Some(marker);
+        store
+            .begin_workspace_remount_recovery(&recovery_id, &self.mount.mount_id)
+            .map_err(|error| format!("could not prepare remount recovery outcome: {error}"))?;
+        Ok(recovery_id)
+    }
+
     fn rollback(&mut self) -> Result<(), String> {
         let mut errors = Vec::new();
         for path in self.staged_paths.iter().rev() {
@@ -11332,7 +11512,6 @@ impl WorkspaceProjectionCleanupTransaction {
             errors.push(error);
         }
         if errors.is_empty() {
-            self.finish_recovery_marker()?;
             self.staged_paths.clear();
             self.staging_directories.clear();
             Ok(())
@@ -11349,7 +11528,6 @@ impl WorkspaceProjectionCleanupTransaction {
             }
         }
         if errors.is_empty() {
-            self.finish_recovery_marker()?;
             self.staged_paths.clear();
             self.staging_directories.clear();
             Ok(())
@@ -11372,6 +11550,7 @@ impl WorkspaceProjectionCleanupTransaction {
 enum WorkspaceRemountRecoveryRecord {
     Header {
         version: u32,
+        recovery_id: String,
         previous_mount: Box<MountConfig>,
         intended_mount: Box<MountConfig>,
         preserved_directory: Option<PathBuf>,
@@ -11387,6 +11566,7 @@ enum WorkspaceRemountRecoveryRecord {
 
 #[derive(Debug)]
 struct WorkspaceRemountRecoveryMarker {
+    recovery_id: String,
     path: PathBuf,
     file: File,
 }
@@ -11405,10 +11585,8 @@ impl WorkspaceRemountRecoveryMarker {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = recovery_root.join(format!(
-            "remount-{}-{timestamp}-{sequence}.jsonl",
-            std::process::id()
-        ));
+        let recovery_id = format!("remount-{}-{timestamp}-{sequence}", std::process::id());
+        let path = recovery_root.join(format!("{recovery_id}.jsonl"));
         let file = OpenOptions::new()
             .create_new(true)
             .append(true)
@@ -11419,9 +11597,14 @@ impl WorkspaceRemountRecoveryMarker {
                     path.display()
                 )
             })?;
-        let mut marker = Self { path, file };
+        let mut marker = Self {
+            recovery_id: recovery_id.clone(),
+            path,
+            file,
+        };
         marker.append(&WorkspaceRemountRecoveryRecord::Header {
             version: REMOUNT_RECOVERY_VERSION,
+            recovery_id,
             previous_mount: Box::new(previous_mount.clone()),
             intended_mount: Box::new(intended_mount.clone()),
             preserved_directory: preserved_directory.map(Path::to_path_buf),
@@ -11458,6 +11641,12 @@ impl WorkspaceRemountRecoveryMarker {
 
     fn remove(self) -> Result<(), String> {
         let path = self.path.clone();
+        validate_no_symlink_or_reparse_ancestors(&path).map_err(|error| {
+            format!(
+                "unsafe remount recovery marker `{}`: {error}",
+                path.display()
+            )
+        })?;
         let parent = path
             .parent()
             .ok_or_else(|| format!("recovery marker `{}` has no parent", path.display()))?
@@ -11480,9 +11669,9 @@ impl WorkspaceRemountRecoveryMarker {
 
 #[derive(Debug)]
 struct PersistedWorkspaceRemountRecovery {
+    recovery_id: String,
     marker_path: PathBuf,
     previous_mount: MountConfig,
-    intended_mount: MountConfig,
     preserved_directory: Option<PathBuf>,
     staged_paths: Vec<StagedProjectionPath>,
     staging_directories: Vec<PathBuf>,
@@ -11511,7 +11700,7 @@ impl PersistedWorkspaceRemountRecovery {
             errors.push(error);
         }
         if errors.is_empty() {
-            remove_persisted_recovery_marker(&self.marker_path)
+            Ok(())
         } else {
             Err(errors.join("; "))
         }
@@ -11525,10 +11714,20 @@ impl PersistedWorkspaceRemountRecovery {
             }
         }
         if errors.is_empty() {
-            remove_persisted_recovery_marker(&self.marker_path)
+            Ok(())
         } else {
             Err(errors.join("; "))
         }
+    }
+
+    fn has_staged_artifacts(&self) -> bool {
+        self.staged_paths
+            .iter()
+            .any(|path| fs::symlink_metadata(&path.staged).is_ok())
+            || self
+                .staging_directories
+                .iter()
+                .any(|path| fs::symlink_metadata(path).is_ok())
     }
 }
 
@@ -11537,23 +11736,43 @@ fn reconcile_workspace_remount_recovery(state_root: &Path) -> Result<(), String>
     if recoveries.is_empty() {
         return Ok(());
     }
-    let store = SqliteStateStore::open(state_root.to_path_buf())
+    let mut store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| format!("could not open Locality state for remount recovery: {error}"))?;
     for recovery in recoveries {
-        let current_mount = store
-            .get_mount(&recovery.previous_mount.mount_id)
-            .map_err(|error| format!("could not inspect remount recovery state: {error}"))?;
-        if current_mount.as_ref() == Some(&recovery.previous_mount) {
-            recovery.rollback()?;
-        } else if current_mount.as_ref() == Some(&recovery.intended_mount) {
-            recovery.finalize()?;
-        } else {
-            return Err(format!(
-                "recovery marker `{}` does not match either the previous or committed mount state for `{}`; staged files were preserved for review",
-                recovery.marker_path.display(),
-                recovery.previous_mount.mount_id.0
-            ));
+        let outcome = store
+            .get_workspace_remount_recovery(&recovery.recovery_id)
+            .map_err(|error| format!("could not inspect remount recovery outcome: {error}"))?;
+        match outcome {
+            Some((mount_id, WorkspaceRemountRecoveryOutcome::Prepared))
+                if mount_id == recovery.previous_mount.mount_id =>
+            {
+                recovery.rollback()?
+            }
+            Some((mount_id, WorkspaceRemountRecoveryOutcome::Committed))
+                if mount_id == recovery.previous_mount.mount_id =>
+            {
+                recovery.finalize()?
+            }
+            None if !recovery.has_staged_artifacts() => {}
+            Some((mount_id, _)) => {
+                return Err(format!(
+                    "recovery marker `{}` belongs to mount `{}`, but SQLite outcome belongs to `{}`; staged files were preserved for review",
+                    recovery.marker_path.display(),
+                    recovery.previous_mount.mount_id.0,
+                    mount_id.0
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "recovery marker `{}` has staged files but no atomic SQLite outcome; staged files were preserved for review",
+                    recovery.marker_path.display()
+                ));
+            }
         }
+        store
+            .finish_workspace_remount_recovery(&recovery.recovery_id)
+            .map_err(|error| format!("could not finish remount recovery outcome: {error}"))?;
+        remove_persisted_recovery_marker(&recovery.marker_path)?;
     }
     Ok(())
 }
@@ -11672,6 +11891,7 @@ fn load_workspace_remount_recovery(
     let header = records.remove(0);
     let WorkspaceRemountRecoveryRecord::Header {
         version,
+        recovery_id,
         previous_mount,
         intended_mount,
         preserved_directory,
@@ -11687,6 +11907,12 @@ fn load_workspace_remount_recovery(
     if version != REMOUNT_RECOVERY_VERSION {
         return Err(format!(
             "remount recovery marker `{}` uses unsupported version {version}",
+            marker_path.display()
+        ));
+    }
+    if marker_path.file_stem().and_then(|value| value.to_str()) != Some(recovery_id.as_str()) {
+        return Err(format!(
+            "remount recovery marker `{}` does not match recovery id `{recovery_id}`",
             marker_path.display()
         ));
     }
@@ -11735,9 +11961,9 @@ fn load_workspace_remount_recovery(
         }
     }
     Ok(Some(PersistedWorkspaceRemountRecovery {
+        recovery_id,
         marker_path: marker_path.to_path_buf(),
         previous_mount,
-        intended_mount,
         preserved_directory,
         staged_paths,
         staging_directories,
@@ -11813,6 +12039,8 @@ fn remount_recovery_root(state_root: &Path) -> PathBuf {
 }
 
 fn create_recovery_directory(path: &Path) -> Result<(), String> {
+    validate_no_symlink_or_reparse_ancestors(path)
+        .map_err(|error| format!("unsafe remount recovery path `{}`: {error}", path.display()))?;
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(format!(
             "remount recovery path `{}` is not a real directory",
@@ -11844,13 +12072,25 @@ fn create_recovery_directory(path: &Path) -> Result<(), String> {
 }
 
 fn restore_staged_projection_path(path: &StagedProjectionPath) -> Result<(), String> {
+    validate_no_symlink_or_reparse_ancestors(&path.original).map_err(|error| {
+        format!(
+            "unsafe original recovery path `{}`: {error}",
+            path.original.display()
+        )
+    })?;
+    validate_no_symlink_or_reparse_ancestors(&path.staged).map_err(|error| {
+        format!(
+            "unsafe staged recovery path `{}`: {error}",
+            path.staged.display()
+        )
+    })?;
     let original_exists = fs::symlink_metadata(&path.original).is_ok();
     let staged_exists = fs::symlink_metadata(&path.staged).is_ok();
     match (original_exists, staged_exists) {
         (true, false) => Ok(()),
         (false, true) => {
             if let Some(parent) = path.original.parent() {
-                fs::create_dir_all(parent).map_err(|error| {
+                create_dir_all_durable(parent).map_err(|error| {
                     format!("could not recreate `{}`: {error}", parent.display())
                 })?;
             }
@@ -11876,6 +12116,12 @@ fn restore_staged_projection_path(path: &StagedProjectionPath) -> Result<(), Str
 }
 
 fn remove_empty_staging_directory(directory: &Path) -> Result<(), String> {
+    validate_no_symlink_or_reparse_ancestors(directory).map_err(|error| {
+        format!(
+            "unsafe cleanup staging directory `{}`: {error}",
+            directory.display()
+        )
+    })?;
     match fs::remove_dir(directory) {
         Ok(()) => {
             sync_directory(directory.parent().ok_or_else(|| {
@@ -11897,6 +12143,12 @@ fn remove_empty_staging_directory(directory: &Path) -> Result<(), String> {
 }
 
 fn remove_staging_directory_tree(directory: &Path) -> Result<(), String> {
+    validate_no_symlink_or_reparse_ancestors(directory).map_err(|error| {
+        format!(
+            "unsafe cleanup staging directory `{}`: {error}",
+            directory.display()
+        )
+    })?;
     let metadata = match fs::symlink_metadata(directory) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -11913,26 +12165,21 @@ fn remove_staging_directory_tree(directory: &Path) -> Result<(), String> {
             directory.display()
         ));
     }
-    fs::remove_dir_all(directory).map_err(|error| {
+    remove_dir_all_durable(directory).map_err(|error| {
         format!(
             "could not remove committed remount staging directory `{}`: {error}",
-            directory.display()
-        )
-    })?;
-    sync_directory(
-        directory
-            .parent()
-            .ok_or_else(|| format!("staging directory `{}` has no parent", directory.display()))?,
-    )
-    .map_err(|error| {
-        format!(
-            "could not persist removal of staging directory `{}`: {error}",
             directory.display()
         )
     })
 }
 
 fn remove_persisted_recovery_marker(marker_path: &Path) -> Result<(), String> {
+    validate_no_symlink_or_reparse_ancestors(marker_path).map_err(|error| {
+        format!(
+            "unsafe remount recovery marker `{}`: {error}",
+            marker_path.display()
+        )
+    })?;
     match fs::remove_file(marker_path) {
         Ok(()) => {
             sync_directory(marker_path.parent().ok_or_else(|| {
@@ -11954,43 +12201,19 @@ fn remove_persisted_recovery_marker(marker_path: &Path) -> Result<(), String> {
 }
 
 fn rename_and_sync(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(source, destination)?;
-    let source_parent = source.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("source `{}` has no parent", source.display()),
-        )
-    })?;
-    let destination_parent = destination.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("destination `{}` has no parent", destination.display()),
-        )
-    })?;
-    sync_directory(destination_parent)?;
-    if source_parent != destination_parent {
-        sync_directory(source_parent)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(windows)]
-fn sync_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+    validate_no_symlink_or_reparse_ancestors(source)?;
+    validate_no_symlink_or_reparse_ancestors(destination)?;
+    rename_noreplace_durable(source, destination)
 }
 
 fn discard_failed_remount_recovery(preserved: &PreservedLocalChanges) -> Result<(), String> {
-    match fs::remove_dir_all(&preserved.directory) {
+    validate_no_symlink_or_reparse_ancestors(&preserved.directory).map_err(|error| {
+        format!(
+            "unsafe failed-remount recovery path `{}`: {error}",
+            preserved.directory.display()
+        )
+    })?;
+    match remove_dir_all_durable(&preserved.directory) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
@@ -12051,7 +12274,7 @@ fn preserve_mount_pending_local_changes(
         .join("recovered")
         .join(&mount_id.0)
         .join(preserved_at.replace(':', "-"));
-    fs::create_dir_all(&directory).map_err(|error| {
+    create_dir_all_durable(&directory).map_err(|error| {
         format!(
             "Could not create local change recovery folder at `{}`: {error}",
             directory.display()
@@ -12078,16 +12301,16 @@ fn preserve_mount_pending_local_changes(
     let manifest_path = directory.join("manifest.json");
     let manifest_json = serde_json::to_string_pretty(&manifest)
         .map_err(|error| format!("Could not serialize local change manifest: {error}"))?;
-    fs::write(&manifest_path, manifest_json).map_err(|error| {
+    write_new_file_durable(&manifest_path, manifest_json.as_bytes()).map_err(|error| {
         format!(
             "Could not write local change manifest at `{}`: {error}",
             manifest_path.display()
         )
     })?;
     let readme_path = directory.join("README.md");
-    fs::write(
+    write_new_file_durable(
         &readme_path,
-        "Locality preserved these local Notion edits before refreshing the active mount for a changed Notion access scope.\n\nThe active mount was cleared so old pages outside the current Notion access do not keep appearing as pending changes. Review these files manually if you need to copy edits into the newly mounted workspace.\n",
+        b"Locality preserved these local Notion edits before refreshing the active mount for a changed Notion access scope.\n\nThe active mount was cleared so old pages outside the current Notion access do not keep appearing as pending changes. Review these files manually if you need to copy edits into the newly mounted workspace.\n",
     )
     .map_err(|error| {
         format!(
@@ -12172,14 +12395,14 @@ fn copy_preserved_file(
     };
     let destination = safe_recovery_path(recovery_dir, relative_path)?;
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
+        create_dir_all_durable(parent).map_err(|error| {
             format!(
                 "Could not create local change recovery folder at `{}`: {error}",
                 parent.display()
             )
         })?;
     }
-    fs::copy(source_path, &destination).map_err(|error| {
+    copy_new_file_durable(source_path, &destination).map_err(|error| {
         format!(
             "Could not preserve local change from `{}` to `{}`: {error}",
             source_path.display(),
@@ -13123,7 +13346,7 @@ mod tests {
         LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig, MountLiveModeRecord,
         MountLiveModeRepository, MountLiveModeState, MountRepository, ProjectionMode,
         RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
-        StoreResult, WorkspaceBindingRepository,
+        StoreResult, WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
     };
     use localityd::ipc::DaemonBuildInfo;
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
@@ -13444,6 +13667,30 @@ mod tests {
         entered_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("worker entered after lock release");
+        thread.join().expect("worker joined");
+    }
+
+    #[test]
+    fn remount_activity_fence_drains_live_mode_readers() {
+        let live_mode_guard = super::desktop_mount_activity_fence()
+            .read()
+            .expect("live mode fence reader");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _remount_guard = super::desktop_mount_activity_fence()
+                .write()
+                .expect("remount fence writer");
+            entered_tx.send(()).expect("report remount entered");
+        });
+
+        assert!(
+            entered_rx.recv_timeout(Duration::from_millis(30)).is_err(),
+            "remount entered while a Live Mode operation was still active"
+        );
+        drop(live_mode_guard);
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("remount entered after Live Mode drained");
         thread.join().expect("worker joined");
     }
 
@@ -17063,7 +17310,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovers_crash_after_remount_files_are_staged_before_sqlite_commit() {
+    fn startup_recovers_identical_config_crash_before_sqlite_commit() {
         let temp = TestTempDir::new("desktop-remount-staging-crash");
         let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
         let mount_id = MountId::new("notion-main");
@@ -17124,11 +17371,22 @@ mod tests {
                 "--nocapture",
             ])
             .env("LOCALITY_REMOUNT_CRASH_STATE_ROOT", temp.path())
+            .env("LOCALITY_REMOUNT_CRASH_PHASE", "pre_commit")
             .status()
             .expect("run remount crash subprocess");
         assert!(!status.success(), "crash helper must terminate abruptly");
 
         assert_eq!(remount_recovery_marker_count(temp.path()), 1);
+        let recoveries =
+            super::load_workspace_remount_recoveries(temp.path()).expect("load prepared recovery");
+        assert_eq!(recoveries.len(), 1);
+        let reopened = SqliteStateStore::open(temp.path().to_path_buf()).expect("reopen store");
+        assert_eq!(
+            reopened
+                .get_workspace_remount_recovery(&recoveries[0].recovery_id)
+                .expect("prepared recovery outcome"),
+            Some((mount_id.clone(), WorkspaceRemountRecoveryOutcome::Prepared))
+        );
         let preserved_root = temp.path().join("recovered").join(&mount_id.0);
         assert_eq!(
             fs::read_dir(&preserved_root)
@@ -17211,20 +17469,116 @@ mod tests {
                 mount_id,
                 connector: "notion".to_string(),
                 root: mount_root,
-                remote_root_id: Some(RemoteId::new("new-source")),
+                remote_root_id: Some(RemoteId::new("old-source")),
                 connection_id: None,
                 read_only: false,
                 projection: ProjectionMode::LinuxFuse,
                 settings_json: "{}".to_string(),
             },
             Some(preparation),
-            || std::process::abort(),
+            || {
+                if std::env::var("LOCALITY_REMOUNT_CRASH_PHASE").as_deref() == Ok("pre_commit") {
+                    std::process::abort();
+                }
+                Ok(())
+            },
         );
         unreachable!("crash probe must abort the subprocess");
     }
 
     #[test]
-    fn startup_finishes_cleanup_when_sqlite_commit_won_the_crash_race() {
+    fn startup_recovers_identical_config_crash_after_sqlite_commit() {
+        let temp = TestTempDir::new("desktop-remount-post-commit-crash");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let workspace_root = temp.path().join("Locality");
+        let mount_root = workspace_root.join("notion-main");
+        fs::create_dir_all(&workspace_root).expect("create workspace root");
+        super::run_mount(
+            &mut store,
+            super::MountOptions {
+                mount_id: mount_id.clone(),
+                connector: "notion".to_string(),
+                root: mount_root,
+                remote_root_id: Some(RemoteId::new("old-source")),
+                connection_id: None,
+                read_only: false,
+                projection: ProjectionMode::LinuxFuse,
+                settings_json: "{}".to_string(),
+            },
+        )
+        .expect("initial mount");
+        let old_mount = store
+            .get_mount(&mount_id)
+            .expect("mount")
+            .expect("mount exists");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-post-commit"),
+                EntityKind::Page,
+                "Post Commit",
+                "Team/Post Commit/page.md",
+            ))
+            .expect("save cached entity");
+        let content_root = localityd::virtual_fs::virtual_fs_content_root(temp.path(), &mount_id);
+        fs::create_dir_all(&content_root).expect("create content root");
+        fs::write(content_root.join("cached"), "old cache\n").expect("write cache");
+        let staging_parents = super::remount_staging_parents(temp.path(), &old_mount);
+
+        let status = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "tests::remount_staging_crash_subprocess_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("LOCALITY_REMOUNT_CRASH_STATE_ROOT", temp.path())
+            .env("LOCALITY_REMOUNT_CRASH_PHASE", "post_commit")
+            .status()
+            .expect("run post-commit crash subprocess");
+        assert!(!status.success(), "crash helper must terminate abruptly");
+
+        let recoveries =
+            super::load_workspace_remount_recoveries(temp.path()).expect("load committed recovery");
+        assert_eq!(recoveries.len(), 1);
+        let reopened = SqliteStateStore::open(temp.path().to_path_buf()).expect("reopen store");
+        assert_eq!(
+            reopened
+                .get_workspace_remount_recovery(&recoveries[0].recovery_id)
+                .expect("committed recovery outcome"),
+            Some((mount_id.clone(), WorkspaceRemountRecoveryOutcome::Committed))
+        );
+        assert_eq!(
+            reopened.get_mount(&mount_id).expect("committed mount"),
+            Some(old_mount),
+            "identical config must not be used to infer whether commit won"
+        );
+        assert!(
+            reopened
+                .list_entities(&mount_id)
+                .expect("committed source state")
+                .is_empty()
+        );
+        assert!(!content_root.exists(), "old content must remain staged");
+        assert!(
+            staging_parents
+                .iter()
+                .map(|parent| remount_staging_directory_count(parent))
+                .sum::<usize>()
+                > 0
+        );
+        drop(reopened);
+
+        super::reconcile_workspace_remount_recovery(temp.path())
+            .expect("startup committed reconciliation");
+        assert!(!content_root.exists());
+        assert_no_remount_staging_directories(&staging_parents);
+        assert_eq!(remount_recovery_marker_count(temp.path()), 0);
+    }
+
+    #[test]
+    fn startup_finishes_identical_config_cleanup_after_sqlite_commit() {
         let temp = TestTempDir::new("desktop-remount-committed-cleanup-retry");
         let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
         let mount_id = MountId::new("notion-main");
@@ -17267,13 +17621,14 @@ mod tests {
             mount_id: mount_id.clone(),
             connector: "notion".to_string(),
             root: mount_root,
-            remote_root_id: Some(RemoteId::new("new-source")),
+            remote_root_id: Some(RemoteId::new("old-source")),
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::LinuxFuse,
             settings_json: "{}".to_string(),
         };
         let intended_mount = super::mount_config_for_options(&options);
+        assert_eq!(intended_mount, old_mount);
         let preparation =
             super::plan_existing_workspace_mount_for_remount(&mut store, temp.path(), &mount_id)
                 .expect("plan remount")
@@ -17317,6 +17672,16 @@ mod tests {
             blocked_staging_directory.expect("cleanup blocker path captured");
 
         assert_eq!(remount_recovery_marker_count(temp.path()), 1);
+        let recoveries =
+            super::load_workspace_remount_recoveries(temp.path()).expect("load committed recovery");
+        assert_eq!(recoveries.len(), 1);
+        let reopened = SqliteStateStore::open(temp.path().to_path_buf()).expect("reopen store");
+        assert_eq!(
+            reopened
+                .get_workspace_remount_recovery(&recoveries[0].recovery_id)
+                .expect("committed recovery outcome"),
+            Some((mount_id.clone(), WorkspaceRemountRecoveryOutcome::Committed))
+        );
         assert!(!content_root.exists());
         assert_eq!(
             store.get_mount(&mount_id).expect("committed mount"),
@@ -17333,6 +17698,115 @@ mod tests {
         );
         assert_no_remount_staging_directories(&staging_parents);
         assert_eq!(remount_recovery_marker_count(temp.path()), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remount_cleanup_rejects_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        assert_remount_cleanup_rejects_ancestor_alias("symlink", |alias, target| {
+            symlink(target, alias).expect("create ancestor symlink");
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remount_cleanup_rejects_junction_reparse_ancestor() {
+        assert_remount_cleanup_rejects_ancestor_alias("junction", |alias, target| {
+            let status = Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(alias)
+                .arg(target)
+                .status()
+                .expect("create ancestor junction");
+            assert!(status.success(), "mklink /J failed with {status}");
+        });
+    }
+
+    #[cfg(any(unix, windows))]
+    fn assert_remount_cleanup_rejects_ancestor_alias(
+        label: &str,
+        create_alias: impl FnOnce(&Path, &Path),
+    ) {
+        let temp = TestTempDir::new(&format!("desktop-remount-{label}-ancestor"));
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let workspace_root = temp.path().join("Locality");
+        let mount_root = workspace_root.join("notion-main");
+        #[cfg(unix)]
+        let projection = ProjectionMode::LinuxFuse;
+        #[cfg(windows)]
+        let projection = ProjectionMode::WindowsCloudFiles;
+        fs::create_dir_all(&workspace_root).expect("create workspace root");
+        super::run_mount(
+            &mut store,
+            super::MountOptions {
+                mount_id: mount_id.clone(),
+                connector: "notion".to_string(),
+                root: mount_root,
+                remote_root_id: Some(RemoteId::new("same-source")),
+                connection_id: None,
+                read_only: false,
+                projection,
+                settings_json: "{}".to_string(),
+            },
+        )
+        .expect("initial mount");
+        let relative_path = Path::new("Team/Alias/page.md");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-alias"),
+                EntityKind::Page,
+                "Alias",
+                relative_path,
+            ))
+            .expect("save entity");
+        let old_mount = store
+            .get_mount(&mount_id)
+            .expect("mount")
+            .expect("mount exists");
+        let visible_path = old_mount.root.join(relative_path);
+        fs::create_dir_all(visible_path.parent().expect("visible parent"))
+            .expect("create visible parent");
+        fs::write(&visible_path, "must remain outside alias\n").expect("write visible file");
+        let preparation =
+            super::plan_existing_workspace_mount_for_remount(&mut store, temp.path(), &mount_id)
+                .expect("plan remount")
+                .expect("existing remount");
+        let mut cleanup = super::WorkspaceProjectionCleanupTransaction::new(
+            temp.path(),
+            &preparation,
+            old_mount.clone(),
+        );
+        let recovery_id = cleanup.begin(&mut store).expect("prepare recovery");
+
+        let real_workspace_root = temp.path().join("Locality-real");
+        fs::rename(&workspace_root, &real_workspace_root).expect("move real workspace root");
+        create_alias(&workspace_root, &real_workspace_root);
+
+        let error = cleanup
+            .stage()
+            .expect_err("ancestor alias must prevent staging");
+        assert!(
+            error.contains("symlink") || error.contains("reparse"),
+            "unexpected path-safety error: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(real_workspace_root.join("notion-main").join(relative_path))
+                .expect("outside file remains"),
+            "must remain outside alias\n"
+        );
+        cleanup.rollback().expect("rollback empty staging");
+        store
+            .finish_workspace_remount_recovery(&recovery_id)
+            .expect("finish prepared outcome");
+        cleanup
+            .finish_recovery_marker()
+            .expect("remove recovery marker");
     }
 
     #[test]
@@ -18872,10 +19346,13 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("time after epoch")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "locality-desktop-{label}-{}-{nanos}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .canonicalize()
+                .expect("canonical temp directory")
+                .join(format!(
+                    "locality-desktop-{label}-{}-{nanos}",
+                    std::process::id()
+                ));
             fs::create_dir_all(&path).expect("create test temp dir");
             Self { path }
         }

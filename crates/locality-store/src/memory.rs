@@ -32,8 +32,8 @@ use crate::repository::{
     EntityRepository, EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository,
     JournalRepository, MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
     RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
-    VirtualMutationRepository, WorkspaceBindingRepository, validate_virtual_move_transition,
-    virtual_move_content_changed, virtual_move_missing,
+    VirtualMutationRepository, WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
+    validate_virtual_move_transition, virtual_move_content_changed, virtual_move_missing,
 };
 use crate::workspace_binding::{
     WorkspaceBinding, WorkspaceBindingRecord, WorkspaceHostBinding, WorkspaceHostBindingResolver,
@@ -70,6 +70,7 @@ pub struct InMemoryStateStore {
     mounts: BTreeMap<MountId, MountConfig>,
     workspace_bindings: BTreeMap<MountId, WorkspaceBinding>,
     workspace_host_bindings: BTreeMap<WorkspaceId, WorkspaceHostBinding>,
+    workspace_remount_recoveries: BTreeMap<String, (MountId, WorkspaceRemountRecoveryOutcome)>,
     mount_live_modes: BTreeMap<MountId, MountLiveModeRecord>,
     connections: BTreeMap<ConnectionId, ConnectionRecord>,
     connector_profiles: BTreeMap<ConnectorProfileId, ConnectorProfileRecord>,
@@ -380,6 +381,21 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
     ) -> StoreResult<()> {
         let previous = self.clone();
         let mount_id = mount.mount_id.clone();
+        let prepared = self
+            .workspace_remount_recoveries
+            .iter()
+            .filter(|(_, (recovery_mount_id, outcome))| {
+                recovery_mount_id == &mount_id
+                    && *outcome == WorkspaceRemountRecoveryOutcome::Prepared
+            })
+            .map(|(recovery_id, _)| recovery_id.clone())
+            .collect::<Vec<_>>();
+        let [recovery_id] = prepared.as_slice() else {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` must have exactly one prepared workspace remount recovery",
+                mount_id.as_str()
+            )));
+        };
         self.save_mount(mount)?;
         if let Err(error) = self.commit_workspace_binding(host_binding, record) {
             *self = previous;
@@ -390,6 +406,56 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
             *self = previous;
             return Err(error);
         }
+        self.workspace_remount_recoveries.insert(
+            recovery_id.clone(),
+            (mount_id, WorkspaceRemountRecoveryOutcome::Committed),
+        );
+        Ok(())
+    }
+
+    fn begin_workspace_remount_recovery(
+        &mut self,
+        recovery_id: &str,
+        mount_id: &MountId,
+    ) -> StoreResult<()> {
+        match self.workspace_remount_recoveries.get(recovery_id) {
+            Some((existing_mount_id, WorkspaceRemountRecoveryOutcome::Prepared))
+                if existing_mount_id == mount_id =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(StoreError::InvalidState(format!(
+                "workspace remount recovery `{recovery_id}` already exists with different state"
+            ))),
+            None => {
+                if self
+                    .workspace_remount_recoveries
+                    .values()
+                    .any(|(existing_mount_id, _)| existing_mount_id == mount_id)
+                {
+                    return Err(StoreError::InvalidState(format!(
+                        "mount `{}` already has a workspace remount recovery",
+                        mount_id.as_str()
+                    )));
+                }
+                self.workspace_remount_recoveries.insert(
+                    recovery_id.to_string(),
+                    (mount_id.clone(), WorkspaceRemountRecoveryOutcome::Prepared),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn get_workspace_remount_recovery(
+        &self,
+        recovery_id: &str,
+    ) -> StoreResult<Option<(MountId, WorkspaceRemountRecoveryOutcome)>> {
+        Ok(self.workspace_remount_recoveries.get(recovery_id).cloned())
+    }
+
+    fn finish_workspace_remount_recovery(&mut self, recovery_id: &str) -> StoreResult<()> {
+        self.workspace_remount_recoveries.remove(recovery_id);
         Ok(())
     }
 
