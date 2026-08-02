@@ -6,8 +6,8 @@ usage() {
 Usage: run-agent-comparison.sh [--out-dir <path>] [--remote-worktree <path>] [benchmark args...]
 
 Runs the launch-readiness benchmark concurrently on two remote sandboxes or instances:
-  - Locality strategy on LOCALITY_SANDBOX
-  - MCP strategy on MCP_SANDBOX
+  - Locality strategy in a new LOCALITY_SANDBOX
+  - MCP strategy in a new MCP_SANDBOX
 
 Defaults:
   LOCALITY_SANDBOX=launch-readiness-<UTC_RUN_ID>-locality
@@ -23,10 +23,10 @@ Defaults:
 
 Environment:
   RUN_ID                         Run id shared by both sandboxes.
-  LOCALITY_SANDBOX               Label or Amika sandbox for Locality runs.
-  MCP_SANDBOX                    Label or Amika sandbox for MCP runs.
-  LOCALITY_SNAPSHOT              Amika snapshot for Locality runs.
-  MCP_SNAPSHOT                   Amika snapshot for MCP runs.
+  LOCALITY_SANDBOX               Name for the new Locality Amika sandbox.
+  MCP_SANDBOX                    Name for the new MCP Amika sandbox.
+  LOCALITY_SNAPSHOT              Snapshot used to create the Locality sandbox.
+  MCP_SNAPSHOT                   Snapshot used to create the MCP sandbox.
   LOCAL_OUT_DIR or OUT_DIR       Local metadata/log output directory.
   REMOTE_SOURCE_REPO             Existing git checkout inside each sandbox.
   REMOTE_HOME                    Home directory inside each sandbox.
@@ -65,9 +65,18 @@ Environment:
   SYNC_LOCAL_EXPERIMENT          Copy this local comparison harness into each
                                   remote worktree before running. Default: 0.
   SYNC_ARTIFACTS                 Copy remote OUT_DIRs back locally. Default: 1.
+                                  Setting 0 discards remote-only outputs when
+                                  ephemeral Amika sandboxes are deleted.
 
 MCP credentials can also live in the MCP sandbox under:
   ~/.config/locality-launch-readiness/mcp/{linear-api-key,notion-token,slack-bot-token,slack-team-id,slack-channel-ids}
+
+For REMOTE_PROVIDER=amika, both named sandboxes are created from their snapshots.
+The wrapper refuses to reuse an existing sandbox with either name. Overrides set
+the names of newly created sandboxes; they do not select reusable sandboxes.
+Created Amika sandboxes are deleted automatically after artifact collection.
+They are also deleted after failures and signals. With SYNC_ARTIFACTS=0, that
+cleanup intentionally discards remote-only outputs.
 
 Any remaining arguments are passed to run-launch-readiness-benchmark.sh.
 This wrapper owns split strategy execution; --compare-mcp is accepted as a no-op

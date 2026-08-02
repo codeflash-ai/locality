@@ -18,8 +18,8 @@ write mounted report pages, run `loc diff`, or push.
 
 ## Files
 
-- `run-agent-comparison.sh` - local Amika wrapper that runs launch-readiness
-  Locality scenarios on `LOCALITY_SANDBOX` and MCP scenarios on `MCP_SANDBOX`.
+- `run-agent-comparison.sh` - local Amika wrapper that creates ephemeral,
+  snapshot-backed sandboxes for launch-readiness Locality and MCP scenarios.
 - `run-claude-locality-comparison.sh` - local wrapper that compares Claude Code
   on the hosted MCP path against Claude Code on the Locality path.
 - `run-codex-locality-comparison.sh` - local wrapper that compares Codex on the
@@ -48,53 +48,26 @@ This is workflow separation, not a hard security boundary, because the benchmark
 
 ## Setup In Amika
 
-From the local machine:
+Prepare immutable Amika snapshots before running the split wrapper. Its defaults
+are `locality-snapshot` for the Locality strategy and `mcp-snapshot` for the MCP
+strategy. The Locality snapshot must include the installed `loc` binary and the
+prehydrated Locality files; both snapshots need the source checkout used by the
+benchmark. Pass different snapshot slugs when those prerequisites live elsewhere:
 
 ```bash
-export LOCALITY_SANDBOX=aseem-locality
-export MCP_SANDBOX=aseem-mcp
+export LOCALITY_SNAPSHOT=my-locality-snapshot
+export MCP_SNAPSHOT=my-mcp-snapshot
 ```
 
-Seed the Azure key into both sandboxes without printing it:
+The wrapper creates run-specific sandboxes named
+`launch-readiness-<UTC_RUN_ID>-locality` and
+`launch-readiness-<UTC_RUN_ID>-mcp`. `LOCALITY_SANDBOX` and `MCP_SANDBOX`
+override those names for newly created sandboxes; they never select reusable
+sandboxes. A name collision is refused before either sandbox is created.
 
-```bash
-line="$(python3 - <<'PY'
-import os, shlex
-print("export AZURE_OPENAI_API_KEY=" + shlex.quote(os.environ["AZURE_OPENAI_API_KEY"]))
-PY
-)"
-
-b64="$(printf '%s\n' "$line" | base64 | tr -d '\n')"
-
-for sandbox in "$LOCALITY_SANDBOX" "$MCP_SANDBOX"; do
-  ssh_target="$(amika sandbox ssh --print "$sandbox")"
-  ssh -o StrictHostKeyChecking=accept-new "$ssh_target" "
-    mkdir -p ~/.config/locality-experiment &&
-    chmod 700 ~/.config/locality-experiment &&
-    printf '%s' '$b64' | base64 -d > ~/.config/locality-experiment/env &&
-    chmod 600 ~/.config/locality-experiment/env
-  "
-done
-```
-
-Verify `loc` is installed on the Locality sandbox. The split wrapper defaults
-`REMOTE_LOC_BIN` to `/usr/bin/loc` and intentionally does not build the CLI from
-source; if the installed binary is missing, the Locality run should fail until
-the sandbox is fixed.
-
-```bash
-export REMOTE_LOC_BIN="${REMOTE_LOC_BIN:-/usr/bin/loc}"
-ssh_target="$(amika sandbox ssh --print "$LOCALITY_SANDBOX")"
-ssh -o StrictHostKeyChecking=accept-new "$ssh_target" "
-  test -x '$REMOTE_LOC_BIN' &&
-    '$REMOTE_LOC_BIN' --version
-"
-```
-
-Prepare the Locality sandbox with the mounted files the benchmark should use.
-The launch worker no longer creates an isolated Locality state or pulls context
-URLs. It adds existing filesystem roots to the Locality agent. By default it
-uses these roots when they exist:
+The launch worker does not create an isolated Locality state or pull context
+URLs. The Locality snapshot should contain the filesystem roots it adds to the
+Locality agent. By default it uses these roots when they exist:
 
 ```text
 /home/amika/Locality/Notion
@@ -105,8 +78,8 @@ uses these roots when they exist:
 /home/amika/linear
 ```
 
-If the roots differ, pass them explicitly. Use newline separation when paths
-contain spaces:
+If the snapshot's roots differ, pass them explicitly. Use newline separation
+when paths contain spaces:
 
 ```bash
 export LOCALITY_CONTEXT_DIRS="$(cat <<'EOF'
@@ -117,16 +90,10 @@ EOF
 )"
 ```
 
-Verify the files are present on the Locality sandbox:
-
-```bash
-export REMOTE_LOC_BIN="${REMOTE_LOC_BIN:-/usr/bin/loc}"
-ssh_target="$(amika sandbox ssh --print "$LOCALITY_SANDBOX")"
-ssh -o StrictHostKeyChecking=accept-new "$ssh_target" "
-  '$REMOTE_LOC_BIN' connections --json || true
-  find ~/Locality ~/notion ~/slack ~/linear -maxdepth 3 -type f 2>/dev/null | head
-"
-```
+`REMOTE_LOC_BIN` defaults to `/usr/bin/loc`; the wrapper intentionally does not
+build the CLI from source. Set it if the Locality snapshot installs `loc`
+elsewhere. The wrapper forwards locally supplied Azure and MCP credential
+environment variables to the newly created sandboxes.
 
 ## Run Claude Comparison
 
@@ -158,11 +125,11 @@ export NOTION_API_TOKEN=<notion-api-token>
 ```
 
 The Codex comparison defaults to `gpt-5.6-luna` with low reasoning effort. It
-uses `MCP_SANDBOX=aseem-mcp` and `LOCALITY_SANDBOX=aseem-locality` by default.
-Override those variables to point at different prepared Amika sandboxes. It
-copies `AZURE_OPENAI_API_KEY` into sandbox-local secret storage when that
-environment variable is set locally; otherwise it uses the sandbox's existing
-Codex auth/config or `~/.config/locality-experiment/env`.
+is a legacy reusable-sandbox helper; use the snapshot-backed launch wrapper for
+the ephemeral split benchmark. It copies `AZURE_OPENAI_API_KEY` into
+sandbox-local secret storage when that environment variable is set locally;
+otherwise it uses the sandbox's existing Codex auth/config or
+`~/.config/locality-experiment/env`.
 
 ## Launch Runner MCP Auth
 
@@ -220,12 +187,10 @@ CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low \
   ./experiment/locality-mcp-comparison/run-agent-comparison.sh
 ```
 
-Run only the two multi-source scenarios against prehydrated Locality state:
+Run only the two multi-source scenarios against the Locality snapshot's
+prehydrated state:
 
 ```bash
-export LOCALITY_SANDBOX=aseem-locality
-export MCP_SANDBOX=aseem-mcp
-
 CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low \
   ./experiment/locality-mcp-comparison/run-agent-comparison.sh \
   --scenario scenario7,scenario8
@@ -246,19 +211,25 @@ CODEX_EXEC_TIMEOUT_SECONDS=300 ./experiment/locality-mcp-comparison/run-agent-co
 
 Use `CODEX_EXEC_TIMEOUT_SECONDS=0` to disable the timeout.
 
-The launch wrapper always runs split Amika strategies. The default sandboxes are
-`aseem-locality` for Locality and `aseem-mcp` for MCP:
+The launch wrapper always runs split Amika strategies in new sandboxes named
+`launch-readiness-<UTC_RUN_ID>-locality` and
+`launch-readiness-<UTC_RUN_ID>-mcp`. To choose distinct names for newly created
+sandboxes, override them explicitly:
 
 ```bash
 LOCALITY_SANDBOX=my-locality MCP_SANDBOX=my-mcp \
   ./experiment/locality-mcp-comparison/run-agent-comparison.sh
 ```
 
-The wrapper prepares a clean detached worktree in each sandbox from
+The wrapper refuses existing names, creates each sandbox from its configured
+snapshot, and prepares a clean detached worktree in each sandbox from
 `BENCHMARK_REF` and runs both strategy pipelines concurrently:
 `run-launch-readiness-benchmark.sh --strategy locality` in the Locality sandbox
 and `run-launch-readiness-benchmark.sh --strategy notion-mcp` in the MCP
-sandbox. Set `SYNC_ARTIFACTS=0` to leave outputs only on the remote sandboxes.
+sandbox. It collects artifacts before deleting the sandboxes and also deletes
+owned sandboxes after failures or signals. Set `SYNC_ARTIFACTS=0` only when
+remote-only outputs can be intentionally discarded: because the sandboxes are
+ephemeral, cleanup removes those outputs.
 
 Hooks are enabled by default. The runner installs a benchmark-owned `hooks.json`
 into each per-strategy `CODEX_HOME` and starts Codex with

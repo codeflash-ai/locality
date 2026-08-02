@@ -131,6 +131,12 @@ printf 'fake remote ok\n'
 SH
 chmod +x "${fake_bin}/amika"
 
+help_out="${tmp_root}/help.out"
+"$WRAPPER" --help > "$help_out"
+assert_contains "$help_out" "LOCALITY_SNAPSHOT=locality-snapshot"
+assert_contains "$help_out" "MCP_SNAPSHOT=mcp-snapshot"
+assert_contains "$help_out" "Created Amika sandboxes are deleted automatically after artifact collection."
+
 run_default_out="${tmp_root}/default-out"
 concurrency_dir="${tmp_root}/concurrency"
 PATH="${fake_bin}:$PATH" \
