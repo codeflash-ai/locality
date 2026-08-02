@@ -16,7 +16,8 @@ return only the baseline sealed for that exact completed attempt. This public
 crate defines no HTTP handler, credential flow, database query, or provider
 cursor.
 
-The public blocking client is `GenerationBaselineHttpClient` in `loc-cli`.
+The public blocking client is `GenerationBaselineHttpClient` in `localityd`;
+`loc_cli::generation_http` re-exports it source-compatibly for existing callers.
 Construction takes a verified `WorkspaceProfileSessionV2`, so its opaque
 capability cannot be separated from the session route identity. Fetching takes
 that same session plus the exact offer and namespaced inventory. The client

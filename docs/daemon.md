@@ -20,6 +20,29 @@ The boundary keeps responsibilities sharp:
 - `localityd` executes jobs and is the only layer that advances durable sync state or
   mutates the local projection.
 
+## Generation HTTP Runtime
+
+`localityd::generation_http::GenerationHttpRuntime` composes the bounded
+generation-baseline GET client with generation delivery poll, body-window, and
+terminal-acknowledgment transport for one validated generation-2 session. The
+implementation owns fixed route construction, bearer-header authentication,
+TLS/base-URL restrictions, bounded response allocation, retries, redaction,
+and capability negotiation. `loc_cli::generation_http` is an exact compatibility
+re-export; the CLI does not own a second implementation.
+
+`GenerationHttpRuntimeReference` is the typed integration boundary for a future
+recurrence owner. It contains only the API base URL and session credential-store
+reference. Calling `resolve` reads and validates the current generation-2
+session credential, then constructs the in-memory composition. The bearer
+capability must not be copied into durable daemon state, IPC, or persisted job
+data.
+
+No `DaemonRuntime` job or scheduler currently invokes this boundary, so
+recurring generation delivery is not live. The current pull scheduler covers
+direct-provider reconciliation only. Durable recurrence configuration, mount
+selection, session renewal/capability issuance, and retry/status policy require
+separate integration before the daemon can own this loop.
+
 ## Process Management
 
 `localityd` stays intentionally small: it runs the daemon in the foreground and owns

@@ -6,12 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use loc_cli::generation_http::{
-    GENERATION_BASELINE_CACHE_CONTROL, GENERATION_BASELINE_CONTENT_TYPE,
-    GenerationBaselineHttpClient, GenerationHttpError, GenerationHttpOperation,
-    GenerationHttpOptions, GenerationHttpRemoteCode, GenerationHttpResponseProblem,
-    GenerationHttpRetryClassification,
-};
 use locality_core::portable::{
     ContentVersionId, ExportAttemptId, LogicalPath, ProjectionFileKind, ProjectionId, SessionId,
     SourceAction, SourceConnectionId, SourceGenerationId, SourceScopeId,
@@ -37,6 +31,12 @@ use locality_protocol::{
     ExportAttemptLimits, OrderedSourceGeneration, ReplicaFreshnessState, ReplicaFreshnessStatus,
     SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SandboxSessionState, SealedExportOffer,
     StaleSessionBehavior, TarContentEncoding,
+};
+use localityd::generation_http::{
+    GENERATION_BASELINE_CACHE_CONTROL, GENERATION_BASELINE_CONTENT_TYPE,
+    GenerationBaselineHttpClient, GenerationHttpError, GenerationHttpOperation,
+    GenerationHttpOptions, GenerationHttpRemoteCode, GenerationHttpResponseProblem,
+    GenerationHttpRetryClassification, GenerationHttpRuntime, GenerationHttpTransport,
 };
 
 const SESSION_ID: &str = "session/shared ?#%ü";
@@ -417,6 +417,24 @@ fn diagnostics(error: &GenerationHttpError) -> String {
         source = error.source();
     }
     output
+}
+
+#[test]
+fn runtime_composes_baseline_and_delivery_from_one_redacted_capability() {
+    let context = export_context(
+        "018f4f6e-7b8c-7d9e-8f01-23456789abcd",
+        ATTEMPT_ID,
+        SESSION_CAPABILITY,
+    );
+    let mut runtime = GenerationHttpRuntime::new("http://127.0.0.1:9", &context.session).unwrap();
+
+    let _: &GenerationBaselineHttpClient = runtime.baseline_client();
+    let _: &GenerationHttpTransport = runtime.delivery_transport();
+    let _: &mut GenerationHttpTransport = runtime.delivery_transport_mut();
+    assert!(!format!("{runtime:?}").contains(SESSION_CAPABILITY));
+
+    let (baseline, delivery) = runtime.into_parts();
+    assert!(!format!("{baseline:?}{delivery:?}").contains(SESSION_CAPABILITY));
 }
 
 #[test]
