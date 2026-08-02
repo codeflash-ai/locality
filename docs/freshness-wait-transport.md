@@ -89,6 +89,13 @@ nondeterministic derived aggregate choice when several sources fail.
 Cancellation or disconnect is intentionally absent: it does not cancel the
 durable refresh.
 
+`loc sandbox init` consumes this contract for generation-2 sessions over the
+hosted `POST /v2/sessions/{session_id}/freshness-wait-attempts` start/resume
+route. It reuses one request idempotency key, validates every monotonic snapshot
+and authenticated HTTP `Date`, follows only the typed poll delay, and never
+schedules a poll beyond the sealed `original_deadline_at`. A server without the
+optional route retains the previous immediate `SessionNotReady` client behavior.
+
 ## Bounds and strict decoding
 
 | Value | V1 maximum |
