@@ -1367,6 +1367,83 @@ pub fn remove_dir_all_durable(trusted_root: &Path, path: &Path) -> io::Result<()
     remove_dir_all_durable_anchored(trusted_root, path)
 }
 
+/// Removes a Windows directory tree only when the descriptor opened at the
+/// cleanup boundary has the expected volume and full 128-bit file identity.
+/// The retained handle denies delete sharing, so the validated root cannot be
+/// replaced before traversal and deletion complete.
+#[cfg(windows)]
+pub fn remove_dir_all_durable_if_identity_windows(
+    trusted_root: &Path,
+    path: &Path,
+    expected_device: u64,
+    expected_inode: u64,
+    expected_inode_high: u64,
+) -> io::Result<()> {
+    remove_dir_durable_if_identity_windows_with_hook(
+        trusted_root,
+        path,
+        crate::replica_materializer::WorkspaceGenerationIdentity {
+            device: expected_device,
+            inode: expected_inode,
+            inode_high: expected_inode_high,
+        },
+        true,
+        || Ok(()),
+    )
+}
+
+/// Removes an empty Windows directory only when the cleanup handle has the
+/// expected identity. Unexpected children fail closed at `mark_delete`.
+#[cfg(windows)]
+pub fn remove_empty_dir_durable_if_identity_windows(
+    trusted_root: &Path,
+    path: &Path,
+    expected_device: u64,
+    expected_inode: u64,
+    expected_inode_high: u64,
+) -> io::Result<()> {
+    remove_dir_durable_if_identity_windows_with_hook(
+        trusted_root,
+        path,
+        crate::replica_materializer::WorkspaceGenerationIdentity {
+            device: expected_device,
+            inode: expected_inode,
+            inode_high: expected_inode_high,
+        },
+        false,
+        || Ok(()),
+    )
+}
+
+#[cfg(windows)]
+fn remove_dir_durable_if_identity_windows_with_hook(
+    trusted_root: &Path,
+    path: &Path,
+    expected: crate::replica_materializer::WorkspaceGenerationIdentity,
+    recursive: bool,
+    before_open: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
+    let (parents, name) = open_windows_parent_anchored(trusted_root, path, true)?;
+    let parent = parents.last().expect("anchored cleanup parent");
+    before_open()?;
+    let (directory, directory_sync) =
+        parent.open_directory_for_anchored_cleanup_with_sync(&name)?;
+    let actual = directory.identity()?;
+    if actual != expected {
+        return Err(io::Error::other(
+            "directory identity changed before anchored cleanup",
+        ));
+    }
+    if recursive {
+        directory.remove_contents(path, actual.device)?;
+    }
+    directory_sync.sync()?;
+    drop(directory_sync);
+    directory.mark_delete()?;
+    parent.sync()
+}
+
 pub fn remove_dir_all_durable_anchored(trusted_root: &Path, path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
@@ -1758,6 +1835,36 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_identity_bound_tree_removal_refuses_racing_replacement() {
+        let container = temp_root("windows-identity-tree-remove-race");
+        let root = container.join("trusted");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("staging");
+        let displaced = root.join("original-staging");
+        fs::create_dir(&path).expect("create original staging");
+        fs::write(path.join("old.txt"), b"original").expect("write original bytes");
+        let (device, inode, inode_high) =
+            windows_path_identity_no_follow(&path).expect("inspect original identity");
+        let expected = crate::replica_materializer::WorkspaceGenerationIdentity {
+            device,
+            inode,
+            inode_high,
+        };
+
+        remove_dir_durable_if_identity_windows_with_hook(&root, &path, expected, true, || {
+            fs::rename(&path, &displaced)?;
+            fs::create_dir(&path)?;
+            fs::write(path.join("keep.txt"), b"replacement")
+        })
+        .expect_err("cleanup handle must reject the racing replacement");
+
+        assert_eq!(fs::read(path.join("keep.txt")).unwrap(), b"replacement");
+        assert_eq!(fs::read(displaced.join("old.txt")).unwrap(), b"original");
+        fs::remove_dir_all(container).expect("remove test tree");
+    }
 
     #[cfg(unix)]
     #[test]

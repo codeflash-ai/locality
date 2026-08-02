@@ -134,6 +134,10 @@ use localityd::durable_fs::{
 use localityd::durable_fs::{
     remove_dir_all_durable_if_identity_unix, remove_empty_dir_durable_if_identity_unix,
 };
+#[cfg(windows)]
+use localityd::durable_fs::{
+    remove_dir_all_durable_if_identity_windows, remove_empty_dir_durable_if_identity_windows,
+};
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
 use localityd::google_docs::resolve_google_docs_connector_for_mount;
 use localityd::hydration::HydrationSource;
@@ -12035,13 +12039,16 @@ fn load_workspace_remount_recovery(
         let complete = line.ends_with(b"\n");
         if complete {
             line.pop();
+        } else {
+            // Recovery appends commit with their newline and sync. Even valid
+            // JSON without the newline is an uncommitted torn tail.
+            break;
         }
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
         match serde_json::from_slice::<WorkspaceRemountRecoveryRecord>(&line) {
             Ok(record) => records.push(record),
-            Err(_) if !complete => break,
             Err(error) => {
                 return Err(format!(
                     "could not decode remount recovery marker `{}`: {error}",
@@ -12371,7 +12378,20 @@ fn remove_empty_staging_directory(
     } else {
         fs::remove_dir(directory)
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let removal = if let Some(identity) = identity {
+        let (device, inode, inode_high) = identity.windows_volume_file_id();
+        remove_empty_dir_durable_if_identity_windows(
+            trusted_root,
+            directory,
+            device,
+            inode,
+            inode_high,
+        )
+    } else {
+        fs::remove_dir(directory)
+    };
+    #[cfg(not(any(unix, windows)))]
     let removal = fs::remove_dir(directory);
     match removal {
         Ok(()) => sync_directory(
@@ -12397,6 +12417,14 @@ fn remove_empty_staging_directory(
 fn remove_staging_directory_tree(
     directory: &Path,
     identity: Option<RemountFilesystemIdentity>,
+) -> Result<(), String> {
+    remove_staging_directory_tree_with_hook(directory, identity, || Ok(()))
+}
+
+fn remove_staging_directory_tree_with_hook(
+    directory: &Path,
+    identity: Option<RemountFilesystemIdentity>,
+    before_remove: impl FnOnce() -> io::Result<()>,
 ) -> Result<(), String> {
     let trusted_root = directory
         .parent()
@@ -12424,6 +12452,12 @@ fn remove_staging_directory_tree(
         ));
     }
     verify_remount_path_identity(directory, identity)?;
+    before_remove().map_err(|error| {
+        format!(
+            "could not prepare committed remount staging cleanup `{}`: {error}",
+            directory.display()
+        )
+    })?;
     #[cfg(unix)]
     let removal = if let Some(identity) = identity {
         let (device, inode) = identity.unix_device_inode();
@@ -12431,7 +12465,20 @@ fn remove_staging_directory_tree(
     } else {
         remove_dir_all_durable_anchored(trusted_root, directory)
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let removal = if let Some(identity) = identity {
+        let (device, inode, inode_high) = identity.windows_volume_file_id();
+        remove_dir_all_durable_if_identity_windows(
+            trusted_root,
+            directory,
+            device,
+            inode,
+            inode_high,
+        )
+    } else {
+        remove_dir_all_durable_anchored(trusted_root, directory)
+    };
+    #[cfg(not(any(unix, windows)))]
     let removal = remove_dir_all_durable_anchored(trusted_root, directory);
     removal.map_err(|error| {
         format!(
@@ -13703,6 +13750,7 @@ mod tests {
 
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{Mutex, OnceLock};
@@ -17836,6 +17884,78 @@ mod tests {
             fs::read_to_string(unrelated.join("keep.txt")).unwrap(),
             "unrelated",
             "prefix-matched unrelated content is never recursively deleted"
+        );
+    }
+
+    #[test]
+    fn desktop_recovery_ignores_valid_unterminated_final_record() {
+        let temp = TestTempDir::new("desktop-valid-torn-remount-record");
+        let mount_id = MountId::new("notion-main");
+        let mount = MountConfig::new(
+            mount_id.clone(),
+            "notion",
+            temp.path().join("workspace/notion-main"),
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let marker =
+            super::WorkspaceRemountRecoveryMarker::create(temp.path(), &mount, &mount, None)
+                .expect("create recovery marker");
+        let marker_path = marker.path.clone();
+        let recovery_id = marker.recovery_id.clone();
+        let staging = localityd::virtual_fs::virtual_fs_content_root(temp.path(), &mount_id)
+            .parent()
+            .expect("content parent")
+            .join(format!(".locality-remount-staging-{recovery_id}-991"));
+        fs::create_dir_all(&staging).expect("create staging identity source");
+        let identity =
+            super::RemountFilesystemIdentity::inspect(&staging).expect("inspect staging identity");
+        fs::remove_dir(&staging).expect("remove uncommitted staging directory");
+        let record = super::WorkspaceRemountRecoveryRecord::StagingDirectory {
+            path: staging,
+            identity: Some(identity),
+        };
+        let encoded = serde_json::to_vec(&record).expect("encode valid torn record");
+        drop(marker);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&marker_path)
+            .expect("open recovery marker")
+            .write_all(&encoded)
+            .expect("append valid JSON without newline");
+
+        let recovery = super::load_workspace_remount_recovery(temp.path(), &marker_path)
+            .expect("load recovery marker")
+            .expect("header remains committed");
+        assert!(
+            recovery.staging_directories.is_empty(),
+            "valid JSON without its newline is an uncommitted torn tail"
+        );
+    }
+
+    #[test]
+    fn desktop_recursive_cleanup_refuses_replacement_between_check_and_open() {
+        let temp = TestTempDir::new("desktop-remount-cleanup-race");
+        let staging = temp.path().join("staging");
+        let displaced = temp.path().join("original-staging");
+        fs::create_dir(&staging).expect("create staging directory");
+        fs::write(staging.join("old.txt"), "original").expect("write original bytes");
+        let identity =
+            super::RemountFilesystemIdentity::inspect(&staging).expect("inspect staging identity");
+
+        super::remove_staging_directory_tree_with_hook(&staging, Some(identity), || {
+            fs::rename(&staging, &displaced)?;
+            fs::create_dir(&staging)?;
+            fs::write(staging.join("keep.txt"), "replacement")
+        })
+        .expect_err("replacement at the cleanup boundary must be rejected");
+
+        assert_eq!(
+            fs::read_to_string(staging.join("keep.txt")).unwrap(),
+            "replacement"
+        );
+        assert_eq!(
+            fs::read_to_string(displaced.join("old.txt")).unwrap(),
+            "original"
         );
     }
 

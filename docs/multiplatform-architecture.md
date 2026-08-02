@@ -501,8 +501,12 @@ is named by its exact recovery ID and binds every staging directory and moved
 path to its filesystem identity. Prepared outcomes restore the exact old cache;
 committed outcomes collect it. Startup never searches by a name prefix or
 recursively removes an unrecorded directory, and an identity mismatch remains
-fenced for review. CLI JSONL recovery ignores only one unterminated final
-append; malformed newline-terminated or interior records fail closed. Restart
+fenced for review. Both JSONL readers ignore one unterminated final append,
+including valid JSON, because the newline is the commit boundary. The CLI may
+discard an outcome-less empty or torn first record because no staging action
+was authorized; malformed newline-terminated or interior records fail closed.
+On Windows, recursive cleanup compares the journal identity with the retained
+no-delete-sharing root handle before traversing it. Restart
 reconciliation restores daemon-manager supervision before durably removing the
 startup fence, so a failed restore continues to block daemon startup. CLI
 source changes additionally fail closed on dirty or

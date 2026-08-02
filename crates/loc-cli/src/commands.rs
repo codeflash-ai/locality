@@ -57,7 +57,7 @@ use locality_store::{
     host_paths_equivalent, open_credential_store, reset_locality_state_storage,
 };
 use localityd::autosave::auto_save_timestamp;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 use localityd::durable_fs::remove_dir_all_durable;
 use localityd::durable_fs::{
     create_dir_all_durable, remove_path_durable, rename_noreplace_durable, sync_directory,
@@ -65,6 +65,10 @@ use localityd::durable_fs::{
 #[cfg(unix)]
 use localityd::durable_fs::{
     remove_dir_all_durable_if_identity_unix, remove_empty_dir_durable_if_identity_unix,
+};
+#[cfg(windows)]
+use localityd::durable_fs::{
+    remove_dir_all_durable_if_identity_windows, remove_empty_dir_durable_if_identity_windows,
 };
 use localityd::execution::PushJobReport;
 use localityd::file_provider as daemon_file_provider;
@@ -3819,6 +3823,15 @@ fn remove_cli_staging_directory(
     identity: RemountFilesystemIdentity,
     recursive: bool,
 ) -> Result<(), String> {
+    remove_cli_staging_directory_with_hook(directory, identity, recursive, || Ok(()))
+}
+
+fn remove_cli_staging_directory_with_hook(
+    directory: &Path,
+    identity: RemountFilesystemIdentity,
+    recursive: bool,
+    before_remove: impl FnOnce() -> io::Result<()>,
+) -> Result<(), String> {
     if !directory.exists() {
         return Ok(());
     }
@@ -3831,13 +3844,19 @@ fn remove_cli_staging_directory(
     let parent = directory
         .parent()
         .ok_or_else(|| "CLI staging directory has no parent".to_string())?;
+    before_remove().map_err(|error| format!("could not prepare CLI remount cleanup: {error}"))?;
     let removal = if recursive {
         #[cfg(unix)]
         {
             let (device, inode) = identity.unix_device_inode();
             remove_dir_all_durable_if_identity_unix(parent, directory, device, inode)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let (device, inode, inode_high) = identity.windows_volume_file_id();
+            remove_dir_all_durable_if_identity_windows(parent, directory, device, inode, inode_high)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             remove_dir_all_durable(parent, directory)
         }
@@ -3847,7 +3866,14 @@ fn remove_cli_staging_directory(
             let (device, inode) = identity.unix_device_inode();
             remove_empty_dir_durable_if_identity_unix(parent, directory, device, inode)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let (device, inode, inode_high) = identity.windows_volume_file_id();
+            remove_empty_dir_durable_if_identity_windows(
+                parent, directory, device, inode, inode_high,
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             fs::remove_dir(directory)
         }
@@ -3866,6 +3892,11 @@ struct PersistedCliRemountJournal {
 
 impl PersistedCliRemountJournal {
     fn load(state_root: &Path, recovery_id: &str) -> Result<Self, String> {
+        Self::load_optional(state_root, recovery_id)?
+            .ok_or_else(|| "CLI remount marker has no committed header".to_string())
+    }
+
+    fn load_optional(state_root: &Path, recovery_id: &str) -> Result<Option<Self>, String> {
         if !recovery_id.starts_with("cli-remount-") {
             return Err("recovery is not owned by the CLI coordinator".to_string());
         }
@@ -3879,6 +3910,9 @@ impl PersistedCliRemountJournal {
             )
         })?;
         let records = read_cli_remount_records(file)?;
+        if records.is_empty() {
+            return Ok(None);
+        }
         let Some(WorkspaceRemountRecoveryRecord::Header {
             version,
             recovery_id: header_id,
@@ -3944,13 +3978,13 @@ impl PersistedCliRemountJournal {
                 }
             }
         }
-        Ok(Self {
+        Ok(Some(Self {
             recovery_id: recovery_id.to_string(),
             marker_path,
             content_root,
             staging_directory,
             staged_path,
-        })
+        }))
     }
 
     fn rollback(&self) -> Result<(), String> {
@@ -4094,7 +4128,17 @@ fn reconcile_cli_workspace_remount_recovery(
                         path.display()
                     ));
                 }
-                let recovery = PersistedCliRemountJournal::load(state_root, recovery_id)?;
+                let Some(recovery) =
+                    PersistedCliRemountJournal::load_optional(state_root, recovery_id)?
+                else {
+                    remove_path_durable(state_root, &path).map_err(|error| {
+                        format!(
+                            "could not discard uncommitted CLI remount marker `{}`: {error}",
+                            path.display()
+                        )
+                    })?;
+                    continue;
+                };
                 if recovery.has_artifacts() {
                     return Err(format!(
                         "CLI remount marker `{}` has staged artifacts but no atomic SQLite outcome; preserving them for review",
@@ -10816,6 +10860,66 @@ mod tests {
             let error = super::PersistedCliRemountJournal::load(&state_root, &recovery_id)
                 .expect_err("complete malformed JSONL must fail closed");
             assert!(error.contains("could not decode CLI remount marker"));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn cli_recursive_cleanup_refuses_replacement_between_check_and_open() {
+        let root = unique_temp_path("loc-cli-remount-cleanup-race");
+        let staging = root.join("staging");
+        let displaced = root.join("original-staging");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("old.txt"), "original").unwrap();
+        let identity = crate::mount::RemountFilesystemIdentity::inspect(&staging).unwrap();
+
+        super::remove_cli_staging_directory_with_hook(&staging, identity, true, || {
+            fs::rename(&staging, &displaced)?;
+            fs::create_dir(&staging)?;
+            fs::write(staging.join("keep.txt"), "replacement")
+        })
+        .expect_err("replacement at the cleanup boundary must be rejected");
+
+        assert_eq!(
+            fs::read_to_string(staging.join("keep.txt")).unwrap(),
+            "replacement"
+        );
+        assert_eq!(
+            fs::read_to_string(displaced.join("old.txt")).unwrap(),
+            "original"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_restart_discards_outcomeless_empty_and_torn_header_markers() {
+        for (label, bytes) in [
+            ("empty", b"".as_slice()),
+            (
+                "torn-header",
+                br#"{"record":"header","version":3,"recovery_id":"cli-remount-torn""#.as_slice(),
+            ),
+        ] {
+            let root = unique_temp_path(&format!("loc-cli-remount-{label}"));
+            let state_root = root.join("state");
+            let recovery_root = state_root.join(super::CLI_REMOUNT_RECOVERY_DIRECTORY);
+            fs::create_dir_all(&recovery_root).unwrap();
+            let recovery_id = format!("cli-remount-{label}");
+            let marker = recovery_root.join(format!("{recovery_id}.jsonl"));
+            fs::write(&marker, bytes).unwrap();
+            let mount_id = MountId::new("notion-main");
+            crate::mount::persist_workspace_remount_fence(&state_root, &mount_id, "1").unwrap();
+            let mut store = SqliteStateStore::open(state_root.clone()).unwrap();
+
+            super::reconcile_cli_workspace_remount_recovery(&mut store, &state_root)
+                .expect("uncommitted first record is safely discarded");
+
+            assert!(!marker.exists());
+            assert!(!locality_platform::daemon_remount_fence_path(&state_root).exists());
+            locality_platform::ensure_daemon_start_allowed(
+                &locality_platform::DaemonProcessPaths::new(state_root.clone()),
+            )
+            .expect("daemon startup is restored after orphan marker cleanup");
             let _ = fs::remove_dir_all(root);
         }
     }

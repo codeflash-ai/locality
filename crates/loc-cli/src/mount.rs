@@ -74,6 +74,11 @@ impl RemountFilesystemIdentity {
     pub fn unix_device_inode(self) -> (u64, u64) {
         (self.device, self.inode)
     }
+
+    #[cfg(windows)]
+    pub fn windows_volume_file_id(self) -> (u64, u64, u64) {
+        (self.device, self.inode, self.inode_high)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -1176,7 +1176,7 @@ fn windows_path_identity(path: &Path) -> io::Result<NativePathIdentity> {
     ))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn relative_components_overlap(
     platform: WorkspaceHostPlatform,
     left: &[OsString],
@@ -1454,6 +1454,23 @@ mod tests {
         }
 
         std::fs::remove_dir_all(root).expect("remove identity root");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn native_anchor_suffix_overlap_is_available_on_current_platform() {
+        use std::ffi::OsString;
+
+        assert!(super::relative_components_overlap(
+            WorkspaceHostPlatform::current(),
+            &[OsString::from("workspace")],
+            &[OsString::from("workspace"), OsString::from("notion-main"),],
+        ));
+        assert!(!super::relative_components_overlap(
+            WorkspaceHostPlatform::current(),
+            &[OsString::from("workspace-a")],
+            &[OsString::from("workspace-b")],
+        ));
     }
 
     #[test]
