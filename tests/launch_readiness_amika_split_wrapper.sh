@@ -49,6 +49,25 @@ assert_occurrences() {
   fi
 }
 
+assert_line_between() {
+  local path="$1"
+  local first="$2"
+  local middle="$3"
+  local last="$4"
+  local first_line
+  local middle_line
+  local last_line
+
+  first_line="$(grep -nF -- "$first" "$path" | head -n 1 | cut -d: -f1 || true)"
+  last_line="$(grep -nF -- "$last" "$path" | tail -n 1 | cut -d: -f1 || true)"
+  middle_line="$(awk -v first="$first_line" -v last="$last_line" -v middle="$middle" '
+    NR > first && NR < last && index($0, middle) { print NR; exit }
+  ' "$path")"
+  if [ -z "$first_line" ] || [ -z "$middle_line" ] || [ -z "$last_line" ]; then
+    fail "expected ${middle} between ${first} and ${last} in ${path}"
+  fi
+}
+
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-launch-readiness-amika-wrapper-test.XXXXXX")"
 cleanup() {
   rm -rf "$tmp_root"
@@ -193,9 +212,12 @@ mcp-snapshot active daytona aseem-mcp 2026-08-02T00:00:00Z}"
     exit 0
     ;;
   sandbox:create)
-    block_operation_if_requested create
     sandbox_name="$(argument_value --name "$@")"
     snapshot_name="$(argument_value --snapshot "$@")"
+    if [ "${FAKE_AMIKA_REGISTER_BEFORE_CREATE_BLOCK:-0}" = "1" ]; then
+      printf 'failed\n' > "$state_dir/$sandbox_name.state"
+    fi
+    block_operation_if_requested create
     attempt_file="$state_dir/$sandbox_name.create-count"
     create_attempt=0
     [ ! -f "$attempt_file" ] || create_attempt="$(cat "$attempt_file")"
@@ -224,7 +246,9 @@ mcp-snapshot active daytona aseem-mcp 2026-08-02T00:00:00Z}"
     exit 0
     ;;
   sandbox:ssh)
-    if [[ "$joined_args" != *" -- true"* ]] && [[ "$joined_args" != *"AMIKA_PREREQUISITE_CHECK"* ]]; then
+    if [[ "$joined_args" == *" -- true"* ]] && [ "${FAKE_AMIKA_BLOCK_READINESS:-0}" = "1" ]; then
+      block_operation_if_requested ssh
+    elif [[ "$joined_args" != *" -- true"* ]] && [[ "$joined_args" != *"AMIKA_PREREQUISITE_CHECK"* ]]; then
       block_operation_if_requested ssh
     fi
     ;;
@@ -256,6 +280,12 @@ fi
 
 if [[ "$joined_args" == *"AMIKA_PREREQUISITE_CHECK"* ]] && [ "${FAKE_AMIKA_FAIL_LOCALITY_PREREQUISITE:-0}" = "1" ] && [[ "${3:-}" == *locality* ]]; then
   exit 61
+fi
+if [[ "$joined_args" == *"AMIKA_PREREQUISITE_CHECK=notion-mcp"* ]] && [ "${FAKE_AMIKA_REQUIRE_EXPERIMENT_ENV_SOURCE:-0}" = "1" ] && [[ "$joined_args" != *".config/locality-experiment/env"* ]]; then
+  exit 62
+fi
+if [[ "$joined_args" == *"AMIKA_PREREQUISITE_CHECK=locality"* ]] && [ "${FAKE_AMIKA_REQUIRE_COLON_ROOT_SPLIT:-0}" = "1" ] && [[ "$joined_args" != *"tr"* ]]; then
+  exit 63
 fi
 
 if [ -n "${FAKE_AMIKA_CONCURRENCY_DIR:-}" ] && [[ "$joined_args" != *"AMIKA_PREREQUISITE_CHECK"* ]]; then
@@ -356,6 +386,30 @@ try:
 except ProcessLookupError:
     pass
 print(return_code)
+PY
+
+deadline_runner="${tmp_root}/run-with-deadline.py"
+cat > "$deadline_runner" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+timeout_seconds, stdout_path, stderr_path, wrapper, *wrapper_args = sys.argv[1:]
+with open(stdout_path, "wb") as stdout_file, open(stderr_path, "wb") as stderr_file:
+    process = subprocess.Popen(
+        [wrapper, *wrapper_args],
+        stdout=stdout_file,
+        stderr=stderr_file,
+        start_new_session=True,
+    )
+    try:
+        return_code = process.wait(timeout=float(timeout_seconds))
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        raise SystemExit(124)
+raise SystemExit(return_code)
 PY
 
 pty_runner="${tmp_root}/run-with-pty.py"
@@ -624,6 +678,10 @@ PATH="${fake_bin}:$PATH" \
   "$WRAPPER" --scenario scenario2 >/dev/null
 assert_occurrences "$retry_create_log" "amika sandbox create --remote --no-git --snapshot locality-snapshot --name launch-readiness-retry-create-locality" 2
 assert_contains "$retry_create_log" "amika sandbox delete --remote --force launch-readiness-retry-create-locality"
+assert_line_between "$retry_create_log" \
+  "amika sandbox delete --remote --force launch-readiness-retry-create-locality" \
+  "amika sandbox list --remote" \
+  "amika sandbox create --remote --no-git --snapshot locality-snapshot --name launch-readiness-retry-create-locality"
 assert_occurrences "$retry_create_log" "amika sandbox ssh launch-readiness-retry-create-locality -- true" 2
 assert_contains "$retry_create_out/amika-lifecycle.log" "strategy=locality sandbox=launch-readiness-retry-create-locality readiness_seconds="
 
@@ -660,8 +718,11 @@ PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_INITIALIZING_LISTS=1 \
   FAKE_AMIKA_READINESS_SSH_FAIL_SANDBOX="launch-readiness-initializing-locality" \
   FAKE_AMIKA_READINESS_SSH_FAILURES=2 \
+  FAKE_AMIKA_REQUIRE_EXPERIMENT_ENV_SOURCE=1 \
+  FAKE_AMIKA_REQUIRE_COLON_ROOT_SPLIT=1 \
   AMIKA_READINESS_TIMEOUT_SECONDS=3 \
   AMIKA_READINESS_POLL_SECONDS=1 \
+  LOCALITY_CONTEXT_DIRS="/fake/context/one:/fake/context/two" \
   RUN_ID="initializing" \
   SYNC_ARTIFACTS=0 \
   LOCAL_OUT_DIR="${tmp_root}/initializing-out" \
@@ -689,7 +750,28 @@ if [ "$prerequisite_rc" -eq 0 ]; then
 fi
 assert_contains "$prerequisite_err" "Amika prerequisite check failed for locality sandbox launch-readiness-prerequisite-locality"
 assert_contains "$prerequisite_log" "amika sandbox delete --remote --force launch-readiness-prerequisite-locality launch-readiness-prerequisite-mcp"
-assert_not_contains "$prerequisite_log" "--scenario scenario2"
+assert_not_contains "$prerequisite_log" "--scenario"
+
+delete_failure_log="${tmp_root}/retry-delete-failure-amika.log"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$delete_failure_log" \
+  FAKE_AMIKA_STATE_DIR="${tmp_root}/retry-delete-failure-state" \
+  FAKE_AMIKA_CREATE_FAIL_SNAPSHOT="locality-snapshot" \
+  FAKE_AMIKA_CREATE_FAIL_COUNT=1 \
+  FAKE_AMIKA_FAIL_DELETE=1 \
+  AMIKA_READINESS_TIMEOUT_SECONDS=3 \
+  AMIKA_READINESS_POLL_SECONDS=1 \
+  RUN_ID="retry-delete-failure" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/retry-delete-failure-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/retry-delete-failure.err"
+delete_failure_rc=$?
+set -e
+if [ "$delete_failure_rc" -ne 29 ]; then
+  fail "retry deletion failure should preserve exit 29, got ${delete_failure_rc}"
+fi
+assert_occurrences "$delete_failure_log" "amika sandbox create --remote --no-git --snapshot locality-snapshot --name launch-readiness-retry-delete-failure-locality" 1
 
 no_sync_log="${tmp_root}/no-sync-amika.log"
 no_sync_err="${tmp_root}/no-sync.err"
@@ -779,6 +861,53 @@ fi
 assert_not_contains "$int_log" "delete while remote child active"
 assert_contains "$int_log" "amika sandbox delete --remote --force launch-readiness-int-signal-locality"
 assert_not_contains "$int_log" "amika sandbox delete --remote --force launch-readiness-int-signal-locality launch-readiness-int-signal-mcp"
+
+registered_signal_log="${tmp_root}/registered-signal-amika.log"
+registered_signal_activity="${tmp_root}/registered-signal-activity"
+registered_signal_rc="$(
+  PATH="${fake_bin}:$PATH" \
+    FAKE_AMIKA_LOG="$registered_signal_log" \
+    FAKE_AMIKA_STATE_DIR="${tmp_root}/registered-signal-state" \
+    FAKE_AMIKA_REGISTER_BEFORE_CREATE_BLOCK=1 \
+    FAKE_AMIKA_BLOCK_OPERATION=create \
+    FAKE_AMIKA_BLOCK_MATCH='--snapshot locality-snapshot' \
+    FAKE_AMIKA_ACTIVITY_DIR="$registered_signal_activity" \
+    RUN_ID="registered-signal" \
+    SYNC_ARTIFACTS=0 \
+    LOCAL_OUT_DIR="${tmp_root}/registered-signal-out" \
+    python3 "$signal_runner" TERM "$registered_signal_activity" 1 \
+      "${tmp_root}/registered-signal.out" "${tmp_root}/registered-signal.err" "$WRAPPER" --scenario scenario2
+)"
+if [ "$registered_signal_rc" -ne 143 ]; then
+  fail "TERM after sandbox registration should return 143, got ${registered_signal_rc}"
+fi
+assert_contains "$registered_signal_log" "amika sandbox delete --remote --force launch-readiness-registered-signal-locality"
+
+readiness_deadline_log="${tmp_root}/readiness-deadline-amika.log"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$readiness_deadline_log" \
+  FAKE_AMIKA_STATE_DIR="${tmp_root}/readiness-deadline-state" \
+  FAKE_AMIKA_BLOCK_OPERATION=ssh \
+  FAKE_AMIKA_BLOCK_READINESS=1 \
+  FAKE_AMIKA_ACTIVITY_DIR="${tmp_root}/readiness-deadline-activity" \
+  AMIKA_CREATE_ATTEMPTS=1 \
+  AMIKA_READINESS_TIMEOUT_SECONDS=3 \
+  AMIKA_READINESS_POLL_SECONDS=1 \
+  RUN_ID="readiness-deadline" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/readiness-deadline-out" \
+  python3 "$deadline_runner" 6 "${tmp_root}/readiness-deadline.out" "${tmp_root}/readiness-deadline.err" \
+    "$WRAPPER" --scenario scenario2
+readiness_deadline_rc=$?
+set -e
+if [ "$readiness_deadline_rc" -eq 124 ]; then
+  fail "readiness polling exceeded its configured deadline"
+fi
+if [ "$readiness_deadline_rc" -eq 0 ]; then
+  fail "blocked readiness should fail provisioning"
+fi
+assert_contains "$readiness_deadline_log" "amika sandbox delete --remote --force launch-readiness-readiness-deadline-locality"
 
 forced_tty_log="${tmp_root}/forced-tty-amika.log"
 forced_tty_transport_log="${tmp_root}/forced-tty-transport.log"

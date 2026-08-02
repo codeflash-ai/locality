@@ -93,6 +93,7 @@ MCP_SANDBOX="${MCP_SANDBOX:-launch-readiness-$RUN_ID-mcp}"
 LOCALITY_SNAPSHOT="${LOCALITY_SNAPSHOT:-locality-snapshot}"
 MCP_SNAPSHOT="${MCP_SNAPSHOT:-mcp-snapshot}"
 declare -a CREATED_AMIKA_SANDBOXES=()
+PENDING_AMIKA_SANDBOX=""
 REMOTE_PROVIDER="${REMOTE_PROVIDER:-amika}"
 REMOTE_HOME="${REMOTE_HOME:-}"
 if [ -z "$REMOTE_HOME" ]; then
@@ -511,23 +512,34 @@ remove_owned_amika_sandbox() {
 wait_for_amika_sandbox_absent() {
   local name="$1"
   local started_at
-  local elapsed
+  local deadline
   local table
   local state
+  local remaining
 
   started_at="$(date +%s)"
+  deadline=$((started_at + AMIKA_READINESS_TIMEOUT_SECONDS + 1))
   while :; do
-    table="$(load_amika_sandbox_table)" || return $?
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      printf 'Timed out waiting for owned Amika sandbox to disappear: %s\n' "$name" >&2
+      return 1
+    fi
+    load_amika_sandbox_table_until "$deadline" || return $?
+    table="$AMIKA_SANDBOX_TABLE_RESULT"
     state="$(amika_table_state "$name" "$table")"
     if [ -z "$state" ]; then
       return 0
     fi
-    elapsed=$(( $(date +%s) - started_at ))
-    if [ "$elapsed" -ge "$AMIKA_READINESS_TIMEOUT_SECONDS" ]; then
+    remaining=$((deadline - $(date +%s)))
+    if [ "$remaining" -le 0 ]; then
       printf 'Timed out waiting for owned Amika sandbox to disappear: %s (state=%s)\n' "$name" "$state" >&2
       return 1
     fi
-    sleep "$AMIKA_READINESS_POLL_SECONDS"
+    if [ "$AMIKA_READINESS_POLL_SECONDS" -lt "$remaining" ]; then
+      sleep "$AMIKA_READINESS_POLL_SECONDS"
+    else
+      sleep "$remaining"
+    fi
   done
 }
 
@@ -552,18 +564,26 @@ delete_owned_amika_sandbox() {
 }
 
 AMIKA_LAST_STATE="missing"
+AMIKA_SANDBOX_TABLE_RESULT=""
 
 wait_for_amika_sandbox_ready() {
   local name="$1"
   local strategy="$2"
   local started_at
   local elapsed
+  local deadline
   local table
   local state
+  local remaining
 
   started_at="$(date +%s)"
+  deadline=$((started_at + AMIKA_READINESS_TIMEOUT_SECONDS + 1))
   while :; do
-    table="$(load_amika_sandbox_table)" || return $?
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    load_amika_sandbox_table_until "$deadline" || return $?
+    table="$AMIKA_SANDBOX_TABLE_RESULT"
     state="$(amika_table_state "$name" "$table")"
     AMIKA_LAST_STATE="${state:-missing}"
     elapsed=$(( $(date +%s) - started_at ))
@@ -573,7 +593,7 @@ wait_for_amika_sandbox_ready() {
     case "$state" in
       failed|'') return 1 ;;
       started)
-        if run_managed_command amika_sandbox_ssh "$name" -- true; then
+        if run_managed_command_until "$deadline" amika_sandbox_ssh "$name" -- true; then
           elapsed=$(( $(date +%s) - started_at ))
           printf 'strategy=%s sandbox=%s readiness_seconds=%s\n' \
             "$strategy" "$name" "$elapsed" >> "$AMIKA_LIFECYCLE_LOG"
@@ -582,10 +602,15 @@ wait_for_amika_sandbox_ready() {
         ;;
     esac
 
-    if [ "$elapsed" -ge "$AMIKA_READINESS_TIMEOUT_SECONDS" ]; then
+    remaining=$((deadline - $(date +%s)))
+    if [ "$remaining" -le 0 ]; then
       return 1
     fi
-    sleep "$AMIKA_READINESS_POLL_SECONDS"
+    if [ "$AMIKA_READINESS_POLL_SECONDS" -lt "$remaining" ]; then
+      sleep "$AMIKA_READINESS_POLL_SECONDS"
+    else
+      sleep "$remaining"
+    fi
   done
 }
 
@@ -595,12 +620,14 @@ provision_amika_sandbox() {
   local strategy="$3"
   local attempt
   local create_rc
+  local delete_rc
   local table
   local state
 
   for ((attempt = 1; attempt <= AMIKA_CREATE_ATTEMPTS; attempt += 1)); do
     printf 'strategy=%s sandbox=%s snapshot=%s attempt=%s phase=create\n' \
       "$strategy" "$name" "$snapshot" "$attempt" >> "$AMIKA_LIFECYCLE_LOG"
+    PENDING_AMIKA_SANDBOX="$name"
     if run_managed_command amika sandbox create --remote --no-git --snapshot "$snapshot" --name "$name"; then
       create_rc=0
     else
@@ -615,6 +642,7 @@ provision_amika_sandbox() {
     if [ -n "$state" ]; then
       add_owned_amika_sandbox "$name"
     fi
+    PENDING_AMIKA_SANDBOX=""
 
     if [ "$create_rc" -eq 0 ] && [ -n "$state" ] && [ "$state" != "failed" ]; then
       if wait_for_amika_sandbox_ready "$name" "$strategy"; then
@@ -622,10 +650,12 @@ provision_amika_sandbox() {
       fi
     fi
 
-    if ! delete_owned_amika_sandbox "$name"; then
+    delete_rc=0
+    delete_owned_amika_sandbox "$name" || delete_rc=$?
+    if [ "$delete_rc" -ne 0 ]; then
       printf 'Failed to delete owned Amika sandbox after %s provisioning attempt %s: %s\n' \
         "$strategy" "$attempt" "$name" >&2
-      return 1
+      return "$delete_rc"
     fi
   done
 
@@ -653,14 +683,24 @@ verify_amika_prerequisites() {
   locality_command="$(cat <<EOF
 set -euo pipefail
 AMIKA_PREREQUISITE_CHECK=locality
-test -d $(shell_quote "$REMOTE_SOURCE_REPO")/.git -o -f $(shell_quote "$REMOTE_SOURCE_REPO")/.git
+env_file="\${LOCALITY_EXPERIMENT_ENV:-\$HOME/.config/locality-experiment/env}"
+if [ -f "\$env_file" ]; then
+  set -a
+  source "\$env_file"
+  set +a
+fi
+if [ ! -d $(shell_quote "$REMOTE_SOURCE_REPO")/.git ] && [ ! -f $(shell_quote "$REMOTE_SOURCE_REPO")/.git ]; then
+  exit 1
+fi
 command -v codex >/dev/null 2>&1
 test -x $(shell_quote "$REMOTE_LOC_BIN") || command -v loc >/dev/null 2>&1
+configured_roots=$(shell_quote "$locality_roots")
+if [ -z "\$configured_roots" ]; then
+  configured_roots="\${LOCALITY_CONTEXT_DIRS:-\${LOCALITY_CONTEXT_ROOTS:-}}"
+fi
 while IFS= read -r root; do
   [ -z \"\$root\" ] || test -d \"\$root\"
-done <<'LOCALITY_ROOTS'
-$locality_roots
-LOCALITY_ROOTS
+done < <(printf '%s\n' "\$configured_roots" | tr ':' '\n')
 EOF
 )"
   if ! run_managed_command amika_sandbox_ssh "$LOCALITY_SANDBOX" -- bash -lc "$locality_command"; then
@@ -671,13 +711,21 @@ EOF
   mcp_command="$(cat <<EOF
 set -euo pipefail
 AMIKA_PREREQUISITE_CHECK=notion-mcp
-test -d $(shell_quote "$REMOTE_SOURCE_REPO")/.git -o -f $(shell_quote "$REMOTE_SOURCE_REPO")/.git
+env_file="\${LOCALITY_EXPERIMENT_ENV:-\$HOME/.config/locality-experiment/env}"
+if [ -f "\$env_file" ]; then
+  set -a
+  source "\$env_file"
+  set +a
+fi
+if [ ! -d $(shell_quote "$REMOTE_SOURCE_REPO")/.git ] && [ ! -f $(shell_quote "$REMOTE_SOURCE_REPO")/.git ]; then
+  exit 1
+fi
 command -v codex >/dev/null 2>&1
 secret_dir=\"\${LOCALITY_LAUNCH_READINESS_SECRET_DIR:-\$HOME/.config/locality-launch-readiness/mcp}\"
-[ $has_linear -eq 1 ] || test -s \"\$secret_dir/linear-api-key\"
-[ $has_notion -eq 1 ] || test -s \"\$secret_dir/notion-token\"
-[ $has_slack_bot -eq 1 ] || test -s \"\$secret_dir/slack-bot-token\"
-[ $has_slack_team -eq 1 ] || test -s \"\$secret_dir/slack-team-id\"
+[ $has_linear -eq 1 ] || [ -n \"\${LINEAR_API_KEY:-}\" ] || test -s \"\$secret_dir/linear-api-key\"
+[ $has_notion -eq 1 ] || [ -n \"\${NOTION_API_TOKEN:-\${NOTION_TOKEN:-\${NOTION_ACCESS_TOKEN:-}}}\" ] || test -s \"\$secret_dir/notion-token\"
+[ $has_slack_bot -eq 1 ] || [ -n \"\${SLACK_BOT_TOKEN:-}\" ] || test -s \"\$secret_dir/slack-bot-token\"
+[ $has_slack_team -eq 1 ] || [ -n \"\${SLACK_TEAM_ID:-}\" ] || test -s \"\$secret_dir/slack-team-id\"
 EOF
 )"
   if ! run_managed_command amika_sandbox_ssh "$MCP_SANDBOX" -- bash -lc "$mcp_command"; then
@@ -695,10 +743,15 @@ create_amika_sandboxes() {
 }
 
 cleanup_amika_sandboxes() {
+  local owned
+
   [ "$REMOTE_PROVIDER" = "amika" ] || return 0
   [ "${#CREATED_AMIKA_SANDBOXES[@]}" -gt 0 ] || return 0
 
   amika sandbox delete --remote --force "${CREATED_AMIKA_SANDBOXES[@]}" || return $?
+  for owned in "${CREATED_AMIKA_SANDBOXES[@]}"; do
+    wait_for_amika_sandbox_absent "$owned" || return $?
+  done
   CREATED_AMIKA_SANDBOXES=()
 }
 
@@ -713,6 +766,67 @@ run_managed_command() {
   set -e
   active_operation_pid=""
   return "$command_rc"
+}
+
+run_managed_command_until() {
+  local deadline="$1"
+  shift
+  local command_rc
+
+  "$@" &
+  active_operation_pid=$!
+  while process_is_active "$active_operation_pid"; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      terminate_process_tree "$active_operation_pid"
+      active_operation_pid=""
+      return 124
+    fi
+    sleep 0.1
+  done
+  set +e
+  wait "$active_operation_pid"
+  command_rc=$?
+  set -e
+  active_operation_pid=""
+  return "$command_rc"
+}
+
+load_amika_sandbox_table_until() {
+  local deadline="$1"
+  local output_file
+  local command_rc
+
+  output_file="$(mktemp "${TMPDIR:-/tmp}/amika-sandbox-list.XXXXXX")"
+  if run_managed_command_until "$deadline" amika sandbox list --remote > "$output_file"; then
+    AMIKA_SANDBOX_TABLE_RESULT="$(< "$output_file")"
+    rm -f "$output_file"
+    return 0
+  else
+    command_rc=$?
+  fi
+  rm -f "$output_file"
+  if [ "$command_rc" -eq 124 ]; then
+    printf 'Amika sandbox lifecycle list timed out\n' >&2
+  else
+    printf 'Amika sandbox lifecycle list failed (amika sandbox list --remote exited %s)\n' "$command_rc" >&2
+  fi
+  return "$command_rc"
+}
+
+reconcile_pending_amika_sandbox() {
+  [ "$REMOTE_PROVIDER" = "amika" ] || return 0
+  [ -n "$PENDING_AMIKA_SANDBOX" ] || return 0
+
+  local table
+  local state
+  local deadline=$(( $(date +%s) + AMIKA_READINESS_TIMEOUT_SECONDS + 1 ))
+  load_amika_sandbox_table_until "$deadline" || return $?
+  table="$AMIKA_SANDBOX_TABLE_RESULT"
+  state="$(amika_table_state "$PENDING_AMIKA_SANDBOX" "$table")"
+  if [ -n "$state" ]; then
+    add_owned_amika_sandbox "$PENDING_AMIKA_SANDBOX"
+  fi
+  PENDING_AMIKA_SANDBOX=""
 }
 
 remote_rsync_ssh_command() {
@@ -1363,21 +1477,30 @@ stop_strategy_pipelines() {
       terminate_process_tree "$pid"
     fi
   done
+  active_operation_pid=""
+  reconcile_pending_amika_sandbox || true
   exit "$signal_rc"
 }
 
 cleanup_amika_sandboxes_on_exit() {
   local original_rc=$?
-  local cleanup_rc
+  local cleanup_rc=0
+  local current_cleanup_rc
 
   trap - EXIT INT TERM
   set +e
+  reconcile_pending_amika_sandbox || cleanup_rc=$?
   cleanup_amika_sandboxes
-  cleanup_rc=$?
+  current_cleanup_rc=$?
+  if [ "$cleanup_rc" -eq 0 ]; then
+    cleanup_rc="$current_cleanup_rc"
+  fi
 
   if [ "$cleanup_rc" -ne 0 ]; then
     printf 'Amika sandbox cleanup failed with exit code %s; owned sandboxes:' "$cleanup_rc" >&2
-    printf ' %s' "${CREATED_AMIKA_SANDBOXES[@]}" >&2
+    if [ "${#CREATED_AMIKA_SANDBOXES[@]}" -gt 0 ]; then
+      printf ' %s' "${CREATED_AMIKA_SANDBOXES[@]}" >&2
+    fi
     printf '\n' >&2
   fi
 
