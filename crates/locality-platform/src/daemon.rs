@@ -981,7 +981,8 @@ mod tests {
         assert_eq!(error.code(), "remount_in_progress");
 
         drop(remount);
-        DaemonStartupCoordinatorLock::try_acquire(&paths).expect("startup resumes after remount");
+        let _startup = DaemonStartupCoordinatorLock::try_acquire(&paths)
+            .expect("startup resumes after remount");
         std::fs::remove_dir_all(root).expect("remove state root");
     }
 
