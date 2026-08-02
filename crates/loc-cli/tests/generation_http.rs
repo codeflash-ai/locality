@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::error::Error as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
@@ -355,9 +356,13 @@ fn transport(server: &ScriptedServer) -> GenerationHttpTransport {
 
 fn raw_frame(metadata: &GenerationBodyWindowMetadata, body: &[u8]) -> Vec<u8> {
     let metadata = serde_json::to_vec(metadata).expect("serialize metadata");
+    raw_json_frame(&metadata, body)
+}
+
+fn raw_json_frame(metadata: &[u8], body: &[u8]) -> Vec<u8> {
     let mut frame = Vec::new();
     frame.extend_from_slice(&(metadata.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&metadata);
+    frame.extend_from_slice(metadata);
     frame.extend_from_slice(body);
     frame
 }
@@ -380,6 +385,23 @@ fn assert_authenticated_request(request: &CapturedRequest, expected_path: &str) 
         request.headers.get("content-type").map(String::as_str),
         Some("application/json")
     );
+}
+
+fn assert_response_diagnostics_redact(error: &GenerationHttpError, sentinels: &[&str]) {
+    let mut diagnostics = format!("display: {error}\ndebug: {error:?}");
+    let mut source = error.source();
+    while let Some(error) = source {
+        diagnostics.push_str(&format!(
+            "\nsource display: {error}\nsource debug: {error:?}"
+        ));
+        source = error.source();
+    }
+    for sentinel in sentinels {
+        assert!(
+            !diagnostics.contains(sentinel),
+            "response sentinel leaked into diagnostics: {diagnostics}"
+        );
+    }
 }
 
 #[test]
@@ -428,8 +450,11 @@ fn poll_rejects_malformed_oversized_and_crossed_responses() {
         .next_delta_poll(&request)
         .expect_err("malformed JSON");
     assert!(matches!(
-        error,
-        GenerationHttpError::RequestContract(GenerationTransportContractError::InvalidJson(_))
+        &error,
+        GenerationHttpError::InvalidResponse {
+            problem: GenerationHttpResponseProblem::InvalidJson,
+            ..
+        }
     ));
     malformed.finish();
 
@@ -445,7 +470,7 @@ fn poll_rejects_malformed_oversized_and_crossed_responses() {
         .next_delta_poll(&request)
         .expect_err("oversized poll");
     assert!(matches!(
-        error,
+        &error,
         GenerationHttpError::InvalidResponse {
             problem: GenerationHttpResponseProblem::ContentLengthTooLarge,
             ..
@@ -463,10 +488,11 @@ fn poll_rejects_malformed_oversized_and_crossed_responses() {
         .next_delta_poll(&request)
         .expect_err("crossed poll");
     assert!(matches!(
-        error,
-        GenerationHttpError::RequestContract(
-            GenerationTransportContractError::PollResponseMismatch
-        )
+        &error,
+        GenerationHttpError::InvalidResponse {
+            problem: GenerationHttpResponseProblem::CorrelationMismatch,
+            ..
+        }
     ));
     crossed_server.finish();
 
@@ -486,6 +512,30 @@ fn poll_rejects_malformed_oversized_and_crossed_responses() {
         }
     ));
     legacy_server.finish();
+}
+
+#[test]
+fn malformed_poll_response_sentinel_is_absent_from_full_error_chain() {
+    const SENTINEL: &str = "poll-response-body-SENTINEL";
+    let mut payload = serde_json::to_value(poll_fixtures().no_delivery).unwrap();
+    payload["format_version"] = serde_json::Value::String(SENTINEL.to_string());
+    let server = ScriptedServer::start(vec![ResponseSpec::json(
+        200,
+        serde_json::to_vec(&payload).unwrap(),
+    )]);
+    let error = transport(&server)
+        .next_delta_poll(&delivery_request())
+        .expect_err("malformed poll response");
+    assert!(matches!(
+        &error,
+        GenerationHttpError::InvalidResponse {
+            problem: GenerationHttpResponseProblem::InvalidJson,
+            retry: GenerationHttpRetryClassification::Never,
+            ..
+        }
+    ));
+    assert_response_diagnostics_redact(&error, &[SENTINEL]);
+    assert_eq!(server.finish().len(), 1);
 }
 
 #[test]
@@ -544,7 +594,7 @@ fn body_window_accepts_valid_frame_and_rejects_truncation_extra_media_digest_and
     assert_window_contract_error(
         &request,
         ResponseSpec::window(truncated),
-        GenerationTransportContractError::BodyIntegrityMismatch,
+        GenerationHttpResponseProblem::IntegrityMismatch,
     );
 
     let mut extra = valid.clone();
@@ -552,7 +602,7 @@ fn body_window_accepts_valid_frame_and_rejects_truncation_extra_media_digest_and
     assert_window_contract_error(
         &request,
         ResponseSpec::window(extra),
-        GenerationTransportContractError::BodyIntegrityMismatch,
+        GenerationHttpResponseProblem::IntegrityMismatch,
     );
 
     let mut wrong_media = ResponseSpec::window(valid.clone());
@@ -582,7 +632,7 @@ fn body_window_accepts_valid_frame_and_rejects_truncation_extra_media_digest_and
     assert_window_contract_error(
         &request,
         ResponseSpec::window(corrupt),
-        GenerationTransportContractError::BodyIntegrityMismatch,
+        GenerationHttpResponseProblem::IntegrityMismatch,
     );
 
     let mut crossed_range = body_metadata();
@@ -591,18 +641,41 @@ fn body_window_accepts_valid_frame_and_rejects_truncation_extra_media_digest_and
     assert_window_contract_error(
         &request,
         ResponseSpec::window(crossed_range),
-        GenerationTransportContractError::BodyWindowMismatch,
+        GenerationHttpResponseProblem::CorrelationMismatch,
     );
+}
+
+#[test]
+fn malformed_window_path_sentinel_is_absent_from_full_error_chain() {
+    const TENANT_PATH_SENTINEL: &str = "tenant-private-e\u{301}.md";
+    let request = body_request();
+    let mut metadata = serde_json::to_value(body_metadata()).unwrap();
+    metadata["content"]["logical_path"] =
+        serde_json::Value::String(TENANT_PATH_SENTINEL.to_string());
+    let metadata = serde_json::to_vec(&metadata).unwrap();
+    let response = ResponseSpec::window(raw_json_frame(&metadata, b"hello wo"));
+    let error = window_error(&request, response);
+    assert!(matches!(
+        &error,
+        GenerationHttpError::InvalidResponse {
+            problem: GenerationHttpResponseProblem::InvalidJson,
+            retry: GenerationHttpRetryClassification::Never,
+            ..
+        }
+    ));
+    assert_response_diagnostics_redact(&error, &[TENANT_PATH_SENTINEL]);
 }
 
 fn assert_window_contract_error(
     request: &GenerationBodyWindowRequest,
     response: ResponseSpec,
-    expected: GenerationTransportContractError,
+    expected: GenerationHttpResponseProblem,
 ) {
     let error = window_error(request, response);
     match error {
-        GenerationHttpError::RequestContract(actual) => assert_eq!(actual, expected),
+        GenerationHttpError::InvalidResponse {
+            problem: actual, ..
+        } => assert_eq!(actual, expected),
         other => panic!("unexpected window error: {other:?}"),
     }
 }
@@ -723,9 +796,10 @@ fn acknowledgment_rejects_malformed_crossed_and_oversized_responses() {
         .expect_err("crossed acknowledgment");
     assert!(matches!(
         error,
-        GenerationHttpError::RequestContract(
-            GenerationTransportContractError::AcknowledgmentMismatch
-        )
+        GenerationHttpError::InvalidResponse {
+            problem: GenerationHttpResponseProblem::CorrelationMismatch,
+            ..
+        }
     ));
     assert_eq!(crossed_server.finish().len(), 1);
 
@@ -751,6 +825,31 @@ fn acknowledgment_rejects_malformed_crossed_and_oversized_responses() {
 }
 
 #[test]
+fn malformed_acknowledgment_sentinel_is_absent_from_full_error_chain() {
+    const SENTINEL: &str = "ack-response-body-SENTINEL";
+    let fixture = acknowledgment_fixture();
+    let mut payload = serde_json::to_value(&fixture.response).unwrap();
+    payload["format_version"] = serde_json::Value::String(SENTINEL.to_string());
+    let server = ScriptedServer::start(vec![ResponseSpec::json(
+        200,
+        serde_json::to_vec(&payload).unwrap(),
+    )]);
+    let error = transport(&server)
+        .acknowledge_terminal_receipt(&fixture.request)
+        .expect_err("malformed acknowledgment response");
+    assert!(matches!(
+        &error,
+        GenerationHttpError::InvalidResponse {
+            problem: GenerationHttpResponseProblem::InvalidJson,
+            retry: GenerationHttpRetryClassification::Never,
+            ..
+        }
+    ));
+    assert_response_diagnostics_redact(&error, &[SENTINEL]);
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
 fn contradictory_small_content_length_cannot_bypass_chunked_response_bound() {
     let fixture = acknowledgment_fixture();
     let payload = vec![b' '; MAX_GENERATION_TRANSPORT_REQUEST_BYTES + 1];
@@ -768,7 +867,33 @@ fn contradictory_small_content_length_cannot_bypass_chunked_response_bound() {
     assert!(matches!(
         error,
         GenerationHttpError::InvalidResponse {
-            problem: GenerationHttpResponseProblem::ContentLengthTooLarge,
+            problem: GenerationHttpResponseProblem::TransferEncodingNotAllowed,
+            ..
+        }
+    ));
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn matching_content_length_cannot_make_transfer_encoding_acceptable() {
+    let fixture = acknowledgment_fixture();
+    let payload = serde_json::to_vec(&fixture.response).unwrap();
+    let server = ScriptedServer::start(vec![ResponseSpec {
+        status: 200,
+        content_type: Some("application/json"),
+        content_length: Some(payload.len()),
+        headers: vec![("Transfer-Encoding", "chunked")],
+        body: chunked_body(&payload),
+        delay: Duration::ZERO,
+    }]);
+    let error = transport(&server)
+        .acknowledge_terminal_receipt(&fixture.request)
+        .expect_err("transfer encoding conflicts with exact framing");
+    assert!(matches!(
+        error,
+        GenerationHttpError::InvalidResponse {
+            problem: GenerationHttpResponseProblem::TransferEncodingNotAllowed,
+            retry: GenerationHttpRetryClassification::Never,
             ..
         }
     ));

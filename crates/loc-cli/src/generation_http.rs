@@ -31,7 +31,7 @@ use localityd::generation_sync::{
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use reqwest::header::{
-    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue,
+    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, TRANSFER_ENCODING,
 };
 use serde::Deserialize;
 
@@ -102,6 +102,7 @@ pub enum GenerationHttpTransportFailure {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GenerationHttpResponseProblem {
+    TransferEncodingNotAllowed,
     MissingContentLength,
     MultipleContentLengths,
     InvalidContentLength,
@@ -109,6 +110,10 @@ pub enum GenerationHttpResponseProblem {
     ContentLengthMismatch,
     InvalidContentType,
     InvalidJson,
+    UnsupportedVersion,
+    CorrelationMismatch,
+    IntegrityMismatch,
+    ProtocolViolation,
     MissingRequiredCapability,
 }
 
@@ -497,7 +502,7 @@ impl GenerationDeliveryTransport for GenerationHttpTransport {
         )?;
         let response = self.require_success(GenerationHttpOperation::Poll, response)?;
         let poll = GenerationDeliveryPollResponse::decode_json(&response, request)
-            .map_err(GenerationHttpError::RequestContract)?;
+            .map_err(|error| response_contract_error(GenerationHttpOperation::Poll, error))?;
         match poll.status {
             GenerationDeliveryPollStatus::Delivery => {
                 if poll.selected_capabilities.body_windows.is_none()
@@ -581,13 +586,14 @@ impl GenerationDeliveryTransport for GenerationHttpTransport {
             request,
             GENERATION_BODY_WINDOW_CONTENT_TYPE,
             u64::try_from(response.len()).map_err(|_| {
-                GenerationHttpError::RequestContract(
+                response_contract_error(
+                    GenerationHttpOperation::BodyWindow,
                     GenerationTransportContractError::InvalidBodyFrame,
                 )
             })?,
             &response,
         )
-        .map_err(GenerationHttpError::RequestContract)?;
+        .map_err(|error| response_contract_error(GenerationHttpOperation::BodyWindow, error))?;
         Ok(Some(AuthorizedGenerationBodyWindow {
             metadata: frame.metadata,
             body: Box::new(Cursor::new(frame.body)),
@@ -622,9 +628,9 @@ impl GenerationDeliveryTransport for GenerationHttpTransport {
                 problem: GenerationHttpResponseProblem::InvalidJson,
                 retry: GenerationHttpRetryClassification::Never,
             })?;
-        acknowledgment
-            .validate_against(request)
-            .map_err(GenerationHttpError::RequestContract)?;
+        acknowledgment.validate_against(request).map_err(|error| {
+            response_contract_error(GenerationHttpOperation::Acknowledgment, error)
+        })?;
         Ok(Some(acknowledgment))
     }
 }
@@ -638,6 +644,48 @@ struct RemoteErrorBody {
 struct WireResponse {
     status: StatusCode,
     body: Vec<u8>,
+}
+
+fn response_contract_error(
+    operation: GenerationHttpOperation,
+    error: GenerationTransportContractError,
+) -> GenerationHttpError {
+    let problem = match error {
+        GenerationTransportContractError::InvalidJson(_) => {
+            GenerationHttpResponseProblem::InvalidJson
+        }
+        GenerationTransportContractError::EncodingTooLarge { .. } => {
+            GenerationHttpResponseProblem::ContentLengthTooLarge
+        }
+        GenerationTransportContractError::UpdateRequired { .. }
+        | GenerationTransportContractError::InvalidVersionEnvelope => {
+            GenerationHttpResponseProblem::UnsupportedVersion
+        }
+        GenerationTransportContractError::InvalidBodyWindowContentType => {
+            GenerationHttpResponseProblem::InvalidContentType
+        }
+        GenerationTransportContractError::BodyContentLengthMismatch => {
+            GenerationHttpResponseProblem::ContentLengthMismatch
+        }
+        GenerationTransportContractError::BodyWindowMismatch
+        | GenerationTransportContractError::PollResponseMismatch
+        | GenerationTransportContractError::AcknowledgmentMismatch => {
+            GenerationHttpResponseProblem::CorrelationMismatch
+        }
+        GenerationTransportContractError::BodyIntegrityMismatch => {
+            GenerationHttpResponseProblem::IntegrityMismatch
+        }
+        GenerationTransportContractError::CapabilityNotOffered => {
+            GenerationHttpResponseProblem::MissingRequiredCapability
+        }
+        _ => GenerationHttpResponseProblem::ProtocolViolation,
+    };
+    GenerationHttpError::InvalidResponse {
+        operation,
+        status: Some(StatusCode::OK.as_u16()),
+        problem,
+        retry: GenerationHttpRetryClassification::Never,
+    }
 }
 
 fn validate_options(options: GenerationHttpOptions) -> Result<(), GenerationHttpError> {
@@ -897,6 +945,9 @@ fn require_content_length(
     headers: &HeaderMap,
     maximum: usize,
 ) -> Result<usize, GenerationHttpResponseProblem> {
+    if headers.contains_key(TRANSFER_ENCODING) {
+        return Err(GenerationHttpResponseProblem::TransferEncodingNotAllowed);
+    }
     let mut values = headers.get_all(CONTENT_LENGTH).iter();
     let value = values
         .next()
