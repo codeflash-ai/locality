@@ -7,11 +7,6 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use loc_cli::generation_http::{
-    GenerationHttpError, GenerationHttpOperation, GenerationHttpOptions, GenerationHttpRemoteCode,
-    GenerationHttpResponseProblem, GenerationHttpRetryClassification, GenerationHttpTransport,
-    GenerationHttpTransportFailure,
-};
 use locality_core::model::MountId;
 use locality_core::portable::{SourceConnectionId, SourceGenerationId};
 use locality_protocol::freshness_delivery::{FreshnessReasonCode, FreshnessRetryClass};
@@ -25,6 +20,11 @@ use locality_protocol::freshness_delivery_transport::{
     GenerationDeliveryPollResponse, GenerationDeliveryRequest, GenerationTransportContractError,
     MAX_GENERATION_BODY_WINDOW_BYTES, MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES,
     MAX_GENERATION_TRANSPORT_REQUEST_BYTES,
+};
+use localityd::generation_http::{
+    GenerationHttpError, GenerationHttpOperation, GenerationHttpOptions, GenerationHttpRemoteCode,
+    GenerationHttpResponseProblem, GenerationHttpRetryClassification, GenerationHttpTransport,
+    GenerationHttpTransportFailure,
 };
 use localityd::generation_sync::{
     GenerationDeliveryRequest as LegacyGenerationDeliveryRequest, GenerationDeliveryTransport,

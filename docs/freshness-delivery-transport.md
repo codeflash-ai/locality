@@ -5,10 +5,12 @@ generation delivery. The Rust values live in
 `locality_protocol::freshness_delivery_transport`; the local adapter trait is
 `localityd::generation_sync::GenerationTransport`.
 
-The public repository does not define a hosted route, base URL, bearer token,
-tenant identifier, private lease repository, or cloud resource. A
-private authenticated adapter maps its API to these values and must authenticate
-and authorize each response before returning it to local delivery code.
+The public repository does not define a hosted handler, bearer-token issuance,
+tenant identifier, private lease repository, or cloud resource. The bounded
+blocking client adapter in `localityd::generation_http` maps the fixed v2 HTTP
+routes to these values and validates each complete response before returning it
+to local delivery code. The hosted service remains responsible for
+authentication and authorization.
 
 ## Negotiation and compatibility
 
