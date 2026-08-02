@@ -66,8 +66,8 @@ use crate::repository::{
 };
 use crate::workspace_binding::{
     LegacyWorkspaceMount, WorkspaceBinding, WorkspaceBindingRecord, WorkspaceHostBinding,
-    WorkspaceHostBindingResolver, WorkspaceId, WorkspaceRebindBlocker, legacy_mount_collision_key,
-    legacy_mount_collision_key_for_host,
+    WorkspaceHostBindingResolver, WorkspaceId, WorkspaceRebindBlocker, host_paths_equivalent,
+    legacy_mount_collision_key, legacy_mount_collision_key_for_host,
 };
 use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
 
@@ -6053,7 +6053,11 @@ fn validate_workspace_binding_commit(
         ));
     }
     let resolved_root = host_binding.mount_root(record.binding.mount_target());
-    if resolved_root != mount.root {
+    if !host_paths_equivalent(
+        crate::WorkspaceHostPlatform::current(),
+        &resolved_root,
+        &mount.root,
+    ) {
         return Err(StoreError::InvalidState(format!(
             "workspace binding for mount `{}` resolves to `{}` instead of its preserved root `{}`",
             record.mount_id.as_str(),
@@ -6062,7 +6066,7 @@ fn validate_workspace_binding_commit(
         )));
     }
     WorkspaceHostBindingResolver::current()
-        .validate_persistent_mount_root(host_binding, &mount.root, record.binding.mount_target())
+        .validate_persistent_mount_root(host_binding, &resolved_root, record.binding.mount_target())
         .map_err(|error| StoreError::InvalidState(error.to_string()))
 }
 
@@ -6119,8 +6123,11 @@ fn commit_workspace_binding_in_transaction(
         .map(|json| workspace_host_binding_from_row(&json))
         .transpose()?;
     if let Some(existing_host) = &existing_host {
-        if existing_host.trusted_workspace_root() != host_binding.trusted_workspace_root()
-            || existing_host.projection_identity() != host_binding.projection_identity()
+        if !host_paths_equivalent(
+            crate::WorkspaceHostPlatform::current(),
+            existing_host.trusted_workspace_root(),
+            host_binding.trusted_workspace_root(),
+        ) || existing_host.projection_identity() != host_binding.projection_identity()
         {
             return Err(StoreError::InvalidState(format!(
                 "workspace `{}` host root or projection identity is immutable outside an owning coordinator",
@@ -6147,6 +6154,18 @@ fn commit_workspace_binding_in_transaction(
             workspace_id.as_str()
         )));
     }
+    let persisted_host = if let Some(existing_host) = &existing_host {
+        WorkspaceHostBinding::new(
+            crate::WorkspaceHostPlatform::current(),
+            workspace_id.clone(),
+            existing_host.trusted_workspace_root().to_path_buf(),
+            host_binding.projection_identity().clone(),
+            host_binding.layout_sequence(),
+        )
+        .map_err(|error| StoreError::InvalidState(error.to_string()))?
+    } else {
+        host_binding.clone()
+    };
 
     if !exact_replay {
         let collision_key = record.binding.collision_key();
@@ -6180,10 +6199,10 @@ fn commit_workspace_binding_in_transaction(
                             Some(binding.collision_key())
                         }
                         Some(_) => None,
-                        None => legacy_mount_collision_key_for_host(host_binding, &root),
+                        None => legacy_mount_collision_key_for_host(&persisted_host, &root),
                     }
                 }
-                (None, None) => legacy_mount_collision_key_for_host(host_binding, &root),
+                (None, None) => legacy_mount_collision_key_for_host(&persisted_host, &root),
                 _ => {
                     return Err(StoreError::InvalidState(
                         "workspace binding row is partially present".to_string(),
@@ -6203,7 +6222,7 @@ fn commit_workspace_binding_in_transaction(
         "INSERT INTO workspace_host_bindings (workspace_id, binding_json)
          VALUES (?1, ?2)
          ON CONFLICT(workspace_id) DO UPDATE SET binding_json = excluded.binding_json",
-        params![workspace_id.as_str(), to_json(host_binding)?],
+        params![workspace_id.as_str(), to_json(&persisted_host)?],
     )?;
     if !exact_replay {
         connection.execute(

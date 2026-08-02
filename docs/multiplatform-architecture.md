@@ -493,6 +493,25 @@ reconciles cleanup recovery, restores supervision, and only then removes the
 fence and restarts the daemon. A drain or restore failure therefore cannot
 briefly expose a cleared fence while supervision is still disabled.
 
+Both surfaces use the same version-3 append-only recovery records. Each marker
+is named by its exact recovery ID and binds every staging directory and moved
+path to its filesystem identity. Prepared outcomes restore the exact old cache;
+committed outcomes collect it. Startup never searches by a name prefix or
+recursively removes an unrecorded directory, and an identity mismatch remains
+fenced for review. CLI source changes additionally fail closed on dirty or
+conflicted entities and pending virtual creates or renames. A virtual-to-plain
+change is rejected until a dedicated migration can atomically retire its
+layout-1 binding.
+
+On Unix, identity-bound deletion first performs a no-replace rename into a
+random mode-0700 sibling quarantine with a durable device/inode manifest. Its
+name and manifest also bind the trusted root's device/inode, so concurrent
+roots sharing a parent cannot collect or block one another. Only that private,
+descriptor-held namespace is recursively collected. A bounded startup scan
+completes quarantines left between rename and unlink; malformed, replaced, or
+excessive entries fail closed instead of accumulating unchecked sensitive
+payloads.
+
 Sandbox overlap inspection opens the mount database read-only and supports old
 `mounts(mount_id, root)` schemas without initializing, migrating, or repairing
 state. CLI and Desktop inspect once before network work and again after staging,

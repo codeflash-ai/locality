@@ -13,11 +13,88 @@ use locality_store::{
     ConnectionId, LegacyLayout0Reason, LegacyWorkspaceMount, MountConfig, MountRepository,
     ProjectionMode, StoreError, WorkspaceBindingRepository, WorkspaceHostBinding,
     WorkspaceHostBindingError, WorkspaceHostBindingResolver, WorkspaceHostPlatform, WorkspaceId,
-    WorkspaceProjectionIdentity,
+    WorkspaceProjectionIdentity, host_paths_equivalent,
 };
 use localityd::durable_fs::{remove_path_durable, write_new_file_durable};
 use localityd::source::source_descriptor;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+pub const WORKSPACE_REMOUNT_RECOVERY_VERSION: u32 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemountFilesystemIdentity {
+    device: u64,
+    inode: u64,
+    #[serde(default)]
+    inode_high: u64,
+}
+
+impl RemountFilesystemIdentity {
+    pub fn inspect(path: &Path) -> io::Result<Self> {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("remount path `{}` is a symlink", path.display()),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            return Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                inode_high: 0,
+            });
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            return Ok(Self {
+                device: metadata.volume_serial_number().unwrap_or_default() as u64,
+                inode: metadata.file_index().unwrap_or_default(),
+                inode_high: 0,
+            });
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = metadata;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remount filesystem identity is unsupported on this platform",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn unix_device_inode(self) -> (u64, u64) {
+        (self.device, self.inode)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "record", rename_all = "snake_case")]
+pub enum WorkspaceRemountRecoveryRecord {
+    Header {
+        version: u32,
+        recovery_id: String,
+        previous_mount: Box<MountConfig>,
+        intended_mount: Box<MountConfig>,
+        preserved_directory: Option<PathBuf>,
+    },
+    StagingDirectory {
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<RemountFilesystemIdentity>,
+    },
+    StagedPath {
+        original: PathBuf,
+        staged: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<RemountFilesystemIdentity>,
+    },
+}
 
 const AGENTS_FILE: &str = "AGENTS.md";
 const CLAUDE_FILE: &str = "CLAUDE.md";
@@ -242,7 +319,24 @@ fn run_mount_inner<S>(
 where
     S: MountRepository + WorkspaceBindingRepository,
 {
-    let root = absolute_path(&options.root)?;
+    let mut root = absolute_path(&options.root)?;
+    let existing_mount = store
+        .get_mount(&options.mount_id)
+        .map_err(MountError::Store)?;
+    if let Some(existing) = &existing_mount
+        && host_paths_equivalent(WorkspaceHostPlatform::current(), &existing.root, &root)
+    {
+        root = existing.root.clone();
+    }
+    if existing_mount
+        .as_ref()
+        .is_some_and(|mount| mount.projection.uses_virtual_filesystem())
+        && !options.projection.uses_virtual_filesystem()
+    {
+        return Err(MountError::ProjectionMigrationRequired {
+            mount_id: options.mount_id.clone(),
+        });
+    }
     if options.projection.uses_virtual_filesystem() {
         let proposed = MountConfig::new(options.mount_id.clone(), "pending", &root)
             .projection(options.projection.clone());
@@ -406,6 +500,9 @@ pub enum MountError {
         mount_point: String,
         existing_mount_id: MountId,
     },
+    ProjectionMigrationRequired {
+        mount_id: MountId,
+    },
     UnsafeVirtualProjectionRoot {
         root: PathBuf,
         projection_root: PathBuf,
@@ -430,6 +527,7 @@ impl MountError {
             Self::HostBinding(_) => "invalid_mount_binding",
             Self::WorkspaceBindingUnavailable { .. } => "invalid_mount_binding",
             Self::MountPointConflict { .. } => "mount_point_conflict",
+            Self::ProjectionMigrationRequired { .. } => "projection_migration_required",
             Self::UnsafeVirtualProjectionRoot { .. } => "unsafe_virtual_projection_root",
             Self::ReadGuidance { .. } => "read_mount_guidance_failed",
             Self::Store(_) => "store_error",
@@ -460,6 +558,10 @@ impl MountError {
                 "mount `{}` already uses mount point `{mount_point}` under `{}`",
                 existing_mount_id.0,
                 root.display()
+            ),
+            Self::ProjectionMigrationRequired { mount_id } => format!(
+                "mount `{}` uses a virtual layout-1 workspace binding; changing it to plain files requires an explicit projection migration",
+                mount_id.as_str()
             ),
             Self::UnsafeVirtualProjectionRoot {
                 root,

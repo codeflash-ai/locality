@@ -73,5 +73,5 @@ pub use workspace_binding::{
     WORKSPACE_HOST_BINDING_VERSION, WorkspaceBinding, WorkspaceBindingError,
     WorkspaceBindingMigrationPlan, WorkspaceBindingRecord, WorkspaceHostBinding,
     WorkspaceHostBindingError, WorkspaceHostBindingResolver, WorkspaceHostPlatform, WorkspaceId,
-    WorkspaceProjectionIdentity, WorkspaceRebindBlocker,
+    WorkspaceProjectionIdentity, WorkspaceRebindBlocker, host_paths_equivalent,
 };

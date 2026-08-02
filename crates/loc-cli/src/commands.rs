@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::fs;
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command as ProcessCommand;
@@ -52,10 +52,18 @@ use locality_store::{
     JournalRepository, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, SqliteStateStore, StoreError,
     VirtualMutationKind, VirtualMutationRepository, WorkspaceBindingRepository,
-    open_credential_store, reset_locality_state_storage,
+    host_paths_equivalent, open_credential_store, reset_locality_state_storage,
 };
 use localityd::autosave::auto_save_timestamp;
-use localityd::durable_fs::{remove_dir_all_durable, rename_noreplace_durable};
+#[cfg(not(unix))]
+use localityd::durable_fs::remove_dir_all_durable;
+use localityd::durable_fs::{
+    create_dir_all_durable, remove_path_durable, rename_noreplace_durable, sync_directory,
+};
+#[cfg(unix)]
+use localityd::durable_fs::{
+    remove_dir_all_durable_if_identity_unix, remove_empty_dir_durable_if_identity_unix,
+};
 use localityd::execution::PushJobReport;
 use localityd::file_provider as daemon_file_provider;
 use localityd::google_docs::resolve_google_docs_connector_for_mount;
@@ -108,6 +116,7 @@ use crate::local_oauth::{
 };
 use crate::mount::{
     MountError, MountOptions, MountReport, QuiescedWorkspaceRemountRuntime,
+    RemountFilesystemIdentity, WORKSPACE_REMOUNT_RECOVERY_VERSION, WorkspaceRemountRecoveryRecord,
     clear_workspace_remount_fence, persist_workspace_remount_fence, resolve_workspace_mount_root,
     run_mount, run_mount_with_workspace_cleanup, run_quiesced_workspace_remount,
 };
@@ -3629,14 +3638,442 @@ fn slack_mount_missing_path_error() -> CommandError {
     )
 }
 
+const CLI_REMOUNT_RECOVERY_DIRECTORY: &str = ".locality-remount-recovery";
+
+struct CliWorkspaceRemountJournal {
+    recovery_id: String,
+    marker_path: PathBuf,
+    marker: File,
+    content_root: PathBuf,
+    staging_directory: Option<(PathBuf, RemountFilesystemIdentity)>,
+    staged_path: Option<(PathBuf, RemountFilesystemIdentity)>,
+}
+
+impl CliWorkspaceRemountJournal {
+    fn create(
+        state_root: &Path,
+        previous_mount: &MountConfig,
+        intended_mount: &MountConfig,
+    ) -> Result<Self, String> {
+        let recovery_id = format!(
+            "cli-remount-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let recovery_root = state_root.join(CLI_REMOUNT_RECOVERY_DIRECTORY);
+        create_dir_all_durable(state_root, &recovery_root).map_err(|error| {
+            format!(
+                "could not create CLI remount recovery root `{}`: {error}",
+                recovery_root.display()
+            )
+        })?;
+        let marker_path = recovery_root.join(format!("{recovery_id}.jsonl"));
+        let marker = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&marker_path)
+            .map_err(|error| {
+                format!(
+                    "could not create CLI remount recovery marker `{}`: {error}",
+                    marker_path.display()
+                )
+            })?;
+        let content_root = virtual_fs_content_root(state_root, &previous_mount.mount_id);
+        let mut journal = Self {
+            recovery_id,
+            marker_path,
+            marker,
+            content_root,
+            staging_directory: None,
+            staged_path: None,
+        };
+        journal.append(&WorkspaceRemountRecoveryRecord::Header {
+            version: WORKSPACE_REMOUNT_RECOVERY_VERSION,
+            recovery_id: journal.recovery_id.clone(),
+            previous_mount: Box::new(previous_mount.clone()),
+            intended_mount: Box::new(intended_mount.clone()),
+            preserved_directory: None,
+        })?;
+        Ok(journal)
+    }
+
+    fn append(&mut self, record: &WorkspaceRemountRecoveryRecord) -> Result<(), String> {
+        serde_json::to_writer(&mut self.marker, record)
+            .map_err(|error| format!("could not encode CLI remount recovery: {error}"))?;
+        self.marker
+            .write_all(b"\n")
+            .and_then(|()| self.marker.sync_all())
+            .map_err(|error| format!("could not persist CLI remount recovery: {error}"))?;
+        sync_directory(
+            self.marker_path
+                .parent()
+                .expect("CLI recovery marker has parent"),
+            self.marker_path
+                .parent()
+                .expect("CLI recovery marker has parent"),
+        )
+        .map_err(|error| format!("could not persist CLI remount marker directory: {error}"))
+    }
+
+    fn stage(&mut self) -> Result<(), String> {
+        let metadata = match fs::symlink_metadata(&self.content_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("could not inspect CLI content cache: {error}")),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "CLI content cache `{}` is not a real directory",
+                self.content_root.display()
+            ));
+        }
+        let parent = self
+            .content_root
+            .parent()
+            .ok_or_else(|| "CLI content root has no parent".to_string())?;
+        let parent = parent.to_path_buf();
+        let staging = parent.join(format!(".locality-remount-staging-{}-0", self.recovery_id));
+        create_dir_all_durable(&parent, &staging)
+            .map_err(|error| format!("could not create CLI remount staging: {error}"))?;
+        let staging_identity = RemountFilesystemIdentity::inspect(&staging)
+            .map_err(|error| format!("could not bind CLI remount staging: {error}"))?;
+        self.append(&WorkspaceRemountRecoveryRecord::StagingDirectory {
+            path: staging.clone(),
+            identity: Some(staging_identity),
+        })?;
+        self.staging_directory = Some((staging.clone(), staging_identity));
+
+        let source_identity = RemountFilesystemIdentity::inspect(&self.content_root)
+            .map_err(|error| format!("could not bind CLI content cache: {error}"))?;
+        let staged = staging.join("0");
+        self.append(&WorkspaceRemountRecoveryRecord::StagedPath {
+            original: self.content_root.clone(),
+            staged: staged.clone(),
+            identity: Some(source_identity),
+        })?;
+        rename_noreplace_durable(&parent, &self.content_root, &parent, &staged)
+            .map_err(|error| format!("could not stage CLI content cache: {error}"))?;
+        if RemountFilesystemIdentity::inspect(&staged).ok() != Some(source_identity) {
+            return Err("CLI content cache changed at the staging boundary".to_string());
+        }
+        self.staged_path = Some((staged, source_identity));
+        Ok(())
+    }
+
+    fn rollback(&self) -> Result<(), String> {
+        if let Some((staged, identity)) = &self.staged_path {
+            restore_cli_staged_path(&self.content_root, staged, *identity)?;
+        }
+        if let Some((directory, identity)) = &self.staging_directory {
+            remove_cli_staging_directory(directory, *identity, false)?;
+        }
+        Ok(())
+    }
+
+    fn finalize(&self) -> Result<(), String> {
+        if let Some((directory, identity)) = &self.staging_directory {
+            remove_cli_staging_directory(directory, *identity, true)?;
+        }
+        Ok(())
+    }
+
+    fn remove_marker(self, state_root: &Path) -> Result<(), String> {
+        let marker_path = self.marker_path.clone();
+        drop(self.marker);
+        remove_path_durable(state_root, &marker_path)
+            .map_err(|error| format!("could not remove CLI remount marker: {error}"))
+    }
+}
+
+fn restore_cli_staged_path(
+    original: &Path,
+    staged: &Path,
+    identity: RemountFilesystemIdentity,
+) -> Result<(), String> {
+    if original.exists() {
+        return Err(format!(
+            "refusing CLI remount rollback because `{}` was replaced",
+            original.display()
+        ));
+    }
+    if RemountFilesystemIdentity::inspect(staged).ok() != Some(identity) {
+        return Err(format!(
+            "refusing CLI remount rollback because staged path `{}` was replaced",
+            staged.display()
+        ));
+    }
+    let trusted_root = original
+        .parent()
+        .ok_or_else(|| "CLI remount original has no parent".to_string())?;
+    rename_noreplace_durable(trusted_root, staged, trusted_root, original)
+        .map_err(|error| format!("could not roll back CLI remount staging: {error}"))
+}
+
+fn remove_cli_staging_directory(
+    directory: &Path,
+    identity: RemountFilesystemIdentity,
+    recursive: bool,
+) -> Result<(), String> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    if RemountFilesystemIdentity::inspect(directory).ok() != Some(identity) {
+        return Err(format!(
+            "refusing CLI remount cleanup because staging directory `{}` was replaced",
+            directory.display()
+        ));
+    }
+    let parent = directory
+        .parent()
+        .ok_or_else(|| "CLI staging directory has no parent".to_string())?;
+    let removal = if recursive {
+        #[cfg(unix)]
+        {
+            let (device, inode) = identity.unix_device_inode();
+            remove_dir_all_durable_if_identity_unix(parent, directory, device, inode)
+        }
+        #[cfg(not(unix))]
+        {
+            remove_dir_all_durable(parent, directory)
+        }
+    } else {
+        #[cfg(unix)]
+        {
+            let (device, inode) = identity.unix_device_inode();
+            remove_empty_dir_durable_if_identity_unix(parent, directory, device, inode)
+        }
+        #[cfg(not(unix))]
+        {
+            fs::remove_dir(directory)
+        }
+    };
+    removal.map_err(|error| format!("could not remove CLI remount staging: {error}"))
+}
+
+struct PersistedCliRemountJournal {
+    recovery_id: String,
+    marker_path: PathBuf,
+    content_root: PathBuf,
+    staging_directory: Option<(PathBuf, RemountFilesystemIdentity)>,
+    staged_path: Option<(PathBuf, RemountFilesystemIdentity)>,
+}
+
+impl PersistedCliRemountJournal {
+    fn load(state_root: &Path, recovery_id: &str) -> Result<Self, String> {
+        if !recovery_id.starts_with("cli-remount-") {
+            return Err("recovery is not owned by the CLI coordinator".to_string());
+        }
+        let marker_path = state_root
+            .join(CLI_REMOUNT_RECOVERY_DIRECTORY)
+            .join(format!("{recovery_id}.jsonl"));
+        let file = File::open(&marker_path).map_err(|error| {
+            format!(
+                "CLI remount recovery `{recovery_id}` has no exact marker `{}`: {error}",
+                marker_path.display()
+            )
+        })?;
+        let mut records = Vec::new();
+        for line in BufReader::new(file).split(b'\n') {
+            let line =
+                line.map_err(|error| format!("could not read CLI remount marker: {error}"))?;
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            records.push(
+                serde_json::from_slice::<WorkspaceRemountRecoveryRecord>(&line)
+                    .map_err(|error| format!("could not decode CLI remount marker: {error}"))?,
+            );
+        }
+        let Some(WorkspaceRemountRecoveryRecord::Header {
+            version,
+            recovery_id: header_id,
+            previous_mount,
+            intended_mount,
+            preserved_directory,
+        }) = records.first()
+        else {
+            return Err("CLI remount marker has no header".to_string());
+        };
+        if *version != WORKSPACE_REMOUNT_RECOVERY_VERSION
+            || header_id != recovery_id
+            || previous_mount.mount_id != intended_mount.mount_id
+            || preserved_directory.is_some()
+        {
+            return Err("CLI remount marker header has invalid bindings".to_string());
+        }
+        let content_root = virtual_fs_content_root(state_root, &previous_mount.mount_id);
+        let content_parent = content_root
+            .parent()
+            .ok_or_else(|| "CLI content root has no parent".to_string())?;
+        let expected_staging_name = format!(".locality-remount-staging-{recovery_id}-0");
+        let mut staging_directory = None;
+        let mut staged_path = None;
+        for record in records.into_iter().skip(1) {
+            match record {
+                WorkspaceRemountRecoveryRecord::Header { .. } => {
+                    return Err("CLI remount marker has duplicate headers".to_string());
+                }
+                WorkspaceRemountRecoveryRecord::StagingDirectory { path, identity } => {
+                    let identity = identity.ok_or_else(|| {
+                        "CLI remount staging directory has no identity".to_string()
+                    })?;
+                    if staging_directory.is_some()
+                        || path.parent() != Some(content_parent)
+                        || path.file_name().and_then(|name| name.to_str())
+                            != Some(expected_staging_name.as_str())
+                    {
+                        return Err(
+                            "CLI remount staging directory is not exactly bound".to_string()
+                        );
+                    }
+                    staging_directory = Some((path, identity));
+                }
+                WorkspaceRemountRecoveryRecord::StagedPath {
+                    original,
+                    staged,
+                    identity,
+                } => {
+                    let identity = identity
+                        .ok_or_else(|| "CLI remount staged path has no identity".to_string())?;
+                    let Some((directory, _)) = &staging_directory else {
+                        return Err("CLI remount staged path precedes its directory".to_string());
+                    };
+                    if staged_path.is_some()
+                        || original != content_root
+                        || staged.parent() != Some(directory.as_path())
+                        || staged.file_name().and_then(|name| name.to_str()) != Some("0")
+                    {
+                        return Err("CLI remount staged path is not exactly bound".to_string());
+                    }
+                    staged_path = Some((staged, identity));
+                }
+            }
+        }
+        Ok(Self {
+            recovery_id: recovery_id.to_string(),
+            marker_path,
+            content_root,
+            staging_directory,
+            staged_path,
+        })
+    }
+
+    fn rollback(&self) -> Result<(), String> {
+        if let Some((staged, identity)) = &self.staged_path
+            && staged.exists()
+        {
+            restore_cli_staged_path(&self.content_root, staged, *identity)?;
+        }
+        if let Some((directory, identity)) = &self.staging_directory {
+            remove_cli_staging_directory(directory, *identity, false)?;
+        }
+        Ok(())
+    }
+
+    fn finalize(&self) -> Result<(), String> {
+        if let Some((directory, identity)) = &self.staging_directory {
+            remove_cli_staging_directory(directory, *identity, true)?;
+        }
+        Ok(())
+    }
+
+    fn has_artifacts(&self) -> bool {
+        self.staging_directory
+            .as_ref()
+            .is_some_and(|(path, _)| path.exists())
+            || self
+                .staged_path
+                .as_ref()
+                .is_some_and(|(path, _)| path.exists())
+    }
+
+    fn remove_marker(&self, state_root: &Path) -> Result<(), String> {
+        match remove_path_durable(state_root, &self.marker_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "could not remove completed CLI remount marker `{}`: {error}",
+                self.marker_path.display()
+            )),
+        }
+    }
+}
+
+fn reconcile_cli_workspace_remount_recovery(
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+) -> Result<(), String> {
+    let outcomes = store
+        .list_workspace_remount_recoveries()
+        .map_err(|error| format!("could not list CLI remount recoveries: {error}"))?;
+    for (recovery_id, _, outcome) in outcomes {
+        if !recovery_id.starts_with("cli-remount-") {
+            continue;
+        }
+        let recovery = PersistedCliRemountJournal::load(state_root, &recovery_id)?;
+        match outcome {
+            locality_store::WorkspaceRemountRecoveryOutcome::Prepared => recovery.rollback()?,
+            locality_store::WorkspaceRemountRecoveryOutcome::Committed => recovery.finalize()?,
+        }
+        store
+            .finish_workspace_remount_recovery(&recovery_id)
+            .map_err(|error| format!("could not finish CLI remount recovery: {error}"))?;
+        recovery.remove_marker(state_root)?;
+    }
+    let recovery_root = state_root.join(CLI_REMOUNT_RECOVERY_DIRECTORY);
+    let entries = match fs::read_dir(&recovery_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("could not scan CLI remount markers: {error}")),
+    };
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("could not scan CLI remount marker: {error}"))?
+            .path();
+        let Some(recovery_id) = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| value.starts_with("cli-remount-"))
+        else {
+            continue;
+        };
+        let recovery = PersistedCliRemountJournal::load(state_root, recovery_id)?;
+        if recovery.has_artifacts() {
+            return Err(format!(
+                "CLI remount marker `{}` has staged artifacts but no atomic SQLite outcome; preserving them for review",
+                recovery.recovery_id
+            ));
+        }
+        recovery.remove_marker(state_root)?;
+    }
+    Ok(())
+}
+
 fn run_cli_coordinated_mount(
     store: &mut SqliteStateStore,
     state_root: &Path,
-    options: MountOptions,
+    mut options: MountOptions,
 ) -> Result<MountReport, MountError> {
+    reconcile_cli_workspace_remount_recovery(store, state_root)
+        .map_err(|error| MountError::Store(StoreError::InvalidState(error)))?;
     let existing = store
         .get_mount(&options.mount_id)
         .map_err(MountError::Store)?;
+    if let Some(existing) = &existing
+        && host_paths_equivalent(
+            locality_store::WorkspaceHostPlatform::current(),
+            &existing.root,
+            &options.root,
+        )
+    {
+        // Equivalent case, symlink, and physical aliases are not remounts.
+        // Keep the established host spelling so a replay cannot churn binding
+        // metadata or clear source-scoped state.
+        options.root = existing.root.clone();
+    }
     let source_changed = existing.as_ref().is_some_and(|existing| {
         existing.connector != options.connector
             || existing.remote_root_id != options.remote_root_id
@@ -3649,6 +4086,43 @@ fn run_cli_coordinated_mount(
         return run_mount(store, options);
     }
 
+    if existing
+        .as_ref()
+        .is_some_and(|mount| mount.projection.uses_virtual_filesystem())
+        && !options.projection.uses_virtual_filesystem()
+    {
+        return Err(MountError::Store(StoreError::InvalidState(
+            "changing an existing virtual workspace mount to plain files requires an explicit projection migration"
+                .to_string(),
+        )));
+    }
+    let dirty = store
+        .list_entities(&options.mount_id)
+        .map_err(MountError::Store)?
+        .into_iter()
+        .any(|entity| {
+            matches!(
+                entity.hydration,
+                HydrationState::Dirty | HydrationState::Conflicted
+            )
+        });
+    let pending_virtual = !store
+        .list_virtual_mutations(&options.mount_id)
+        .map_err(MountError::Store)?
+        .is_empty();
+    if dirty || pending_virtual {
+        let reason = match (dirty, pending_virtual) {
+            (true, true) => "dirty or conflicted entities and pending virtual mutations",
+            (true, false) => "dirty or conflicted entities",
+            (false, true) => "pending virtual mutations",
+            (false, false) => unreachable!(),
+        };
+        return Err(MountError::Store(StoreError::InvalidState(format!(
+            "refusing CLI source remount for `{}` because it has {reason}; preserve or resolve local work first",
+            options.mount_id.as_str()
+        ))));
+    }
+
     let mount_id = options.mount_id.clone();
     let uses_virtual_filesystem = options.projection.uses_virtual_filesystem();
     let mut runtime = CliQuiescedRemountRuntime::new(state_root, &mount_id);
@@ -3657,45 +4131,43 @@ fn run_cli_coordinated_mount(
         if !uses_virtual_filesystem {
             return run_mount(store, options).map_err(|error| error.message());
         }
-        let recovery_id = format!(
-            "cli-remount-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let previous_mount = existing
+            .as_ref()
+            .expect("source remount has an existing mount");
+        let intended_root = if options.root.is_absolute() {
+            options.root.clone()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| error.to_string())?
+                .join(&options.root)
+        };
+        let mut intended_mount = MountConfig::new(
+            options.mount_id.clone(),
+            options.connector.clone(),
+            intended_root,
+        )
+        .read_only(options.read_only)
+        .projection(options.projection.clone())
+        .with_settings_json(options.settings_json.clone());
+        if let Some(remote_root_id) = options.remote_root_id.clone() {
+            intended_mount = intended_mount.with_remote_root_id(remote_root_id);
+        }
+        if let Some(connection_id) = options.connection_id.clone() {
+            intended_mount = intended_mount.with_connection_id(connection_id);
+        }
+        let mut journal =
+            CliWorkspaceRemountJournal::create(state_root, previous_mount, &intended_mount)?;
+        let recovery_id = journal.recovery_id.clone();
         store
             .begin_workspace_remount_recovery(&recovery_id, &mount_id)
             .map_err(|error| error.to_string())?;
-        let content_root = virtual_fs_content_root(state_root, &mount_id);
-        let content_parent = content_root
-            .parent()
-            .ok_or_else(|| "virtual content root has no parent".to_string())?
-            .to_path_buf();
-        let staging = content_parent.join(format!(".locality-remount-staging-{recovery_id}"));
-        let mut staged = false;
         let result = run_mount_with_workspace_cleanup(store, options, || {
-            if fs::symlink_metadata(&content_root).is_ok() {
-                rename_noreplace_durable(
-                    &content_parent,
-                    &content_root,
-                    &content_parent,
-                    &staging,
-                )?;
-                staged = true;
-            }
-            Ok(())
+            journal.stage().map_err(StoreError::InvalidState)
         })
         .map_err(|error| error.message());
         let cleanup = match &result {
-            Ok(_) if staged => remove_dir_all_durable(&content_parent, &staging)
-                .map_err(|error| format!("could not finalize CLI projection cleanup: {error}")),
-            Err(_) if staged => {
-                rename_noreplace_durable(&content_parent, &staging, &content_parent, &content_root)
-                    .map_err(|error| format!("could not roll back CLI projection cleanup: {error}"))
-            }
-            _ => Ok(()),
+            Ok(_) => journal.finalize(),
+            Err(_) => journal.rollback(),
         };
         if let Err(error) = cleanup {
             *cleanup_failure.borrow_mut() = Some(error.clone());
@@ -3704,6 +4176,10 @@ fn run_cli_coordinated_mount(
         let finish = store.finish_workspace_remount_recovery(&recovery_id);
         if let Err(error) = finish {
             let error = format!("could not clear CLI remount recovery outcome: {error}");
+            *cleanup_failure.borrow_mut() = Some(error.clone());
+            return Err(error);
+        }
+        if let Err(error) = journal.remove_marker(state_root) {
             *cleanup_failure.borrow_mut() = Some(error.clone());
             return Err(error);
         }
@@ -9971,7 +10447,8 @@ mod tests {
     use locality_store::{
         ConnectionId, EntityRecord, EntityRepository, InMemoryStateStore, MountConfig,
         MountRepository, ProjectionMode, RemoteObservationRecord, RemoteObservationRepository,
-        ShadowRepository, SqliteStateStore,
+        ShadowRepository, SqliteStateStore, StoreError, VirtualMutationKind, VirtualMutationRecord,
+        VirtualMutationRepository, WorkspaceBindingRepository,
     };
 
     use crate::diff::{DiffReport, GuardrailOutput, PlanSummaryOutput};
@@ -10001,7 +10478,8 @@ mod tests {
         print_push_confirmation_preview, projection_mode_for_target,
         projection_usage_options_for_target, prompt_for_push_confirmation,
         pull_direct_fallback_error, push_confirmation_preview_matches_displayed,
-        push_preview_plan_matches, run_cli_coordinated_mount, should_prompt_for_push_confirmation,
+        push_preview_plan_matches, reconcile_cli_workspace_remount_recovery,
+        run_cli_coordinated_mount, should_prompt_for_push_confirmation,
         should_refresh_notion_url_search, slack_mount_missing_path_error,
         slack_oauth_broker_config, spinner_config_for_command, spinner_enabled,
         status as run_status_command, validate_virtual_projection_registration,
@@ -10060,6 +10538,280 @@ mod tests {
         assert!(
             !old_content_root.exists(),
             "old account content cache is removed by the coordinated cleanup"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_remount_fails_closed_on_dirty_and_pending_virtual_work() {
+        for pending_kind in [
+            None,
+            Some(VirtualMutationKind::Create),
+            Some(VirtualMutationKind::Rename),
+        ] {
+            let root = unique_temp_path("loc-cli-remount-local-work");
+            let state_root = root.join("state");
+            let mount_root = root.join("workspace/notion-main");
+            fs::create_dir_all(&state_root).unwrap();
+            let mut store = SqliteStateStore::open(state_root.clone()).unwrap();
+            let mount_id = MountId::new("notion-main");
+            let options = |connection: &str| crate::mount::MountOptions {
+                mount_id: mount_id.clone(),
+                connector: "notion".to_string(),
+                root: mount_root.clone(),
+                remote_root_id: None,
+                connection_id: Some(ConnectionId::new(connection)),
+                read_only: false,
+                projection: ProjectionMode::LinuxFuse,
+                settings_json: "{}".to_string(),
+            };
+            run_cli_coordinated_mount(&mut store, &state_root, options("account-a")).unwrap();
+            if let Some(kind) = pending_kind {
+                store
+                    .save_virtual_mutation(VirtualMutationRecord {
+                        mount_id: mount_id.clone(),
+                        local_id: "local:pending".to_string(),
+                        mutation_kind: kind,
+                        target_remote_id: Some(RemoteId::new("page-1")),
+                        parent_remote_id: None,
+                        original_path: Some(PathBuf::from("old.md")),
+                        projected_path: PathBuf::from("new.md"),
+                        title: "New".to_string(),
+                        content_path: None,
+                        created_at: "1".to_string(),
+                        updated_at: "1".to_string(),
+                    })
+                    .unwrap();
+            } else {
+                store
+                    .save_entity(
+                        EntityRecord::new(
+                            mount_id.clone(),
+                            RemoteId::new("page-1"),
+                            EntityKind::Page,
+                            "Dirty",
+                            "dirty.md",
+                        )
+                        .with_hydration(HydrationState::Dirty),
+                    )
+                    .unwrap();
+            }
+
+            let error = run_cli_coordinated_mount(&mut store, &state_root, options("account-b"))
+                .expect_err("local work blocks CLI remount");
+            assert!(error.message().contains("preserve or resolve local work"));
+            assert_eq!(
+                store.get_mount(&mount_id).unwrap().unwrap().connection_id,
+                Some(ConnectionId::new("account-a"))
+            );
+            assert!(!locality_platform::daemon_remount_fence_path(&state_root).exists());
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_equivalent_root_alias_is_not_a_destructive_remount() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_path("loc-cli-equivalent-root");
+        let state_root = root.join("state");
+        let workspace = root.join("workspace");
+        let mount_root = workspace.join("notion-main");
+        fs::create_dir_all(&state_root).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let alias = root.join("workspace-alias");
+        symlink(&workspace, &alias).unwrap();
+        let mut store = SqliteStateStore::open(state_root.clone()).unwrap();
+        let mount_id = MountId::new("notion-main");
+        let options = |path: PathBuf| crate::mount::MountOptions {
+            mount_id: mount_id.clone(),
+            connector: "notion".to_string(),
+            root: path,
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("account-a")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
+        };
+        run_cli_coordinated_mount(&mut store, &state_root, options(mount_root.clone())).unwrap();
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Keep",
+                "keep.md",
+            ))
+            .unwrap();
+
+        run_cli_coordinated_mount(&mut store, &state_root, options(alias.join("notion-main")))
+            .expect("equivalent root replay");
+
+        assert_eq!(
+            store.get_mount(&mount_id).unwrap().unwrap().root,
+            mount_root
+        );
+        assert!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("page-1"))
+                .unwrap()
+                .is_some()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_rejects_virtual_to_plain_without_staling_layout_binding() {
+        let root = unique_temp_path("loc-cli-virtual-to-plain");
+        let state_root = root.join("state");
+        let mount_root = root.join("workspace/notion-main");
+        fs::create_dir_all(&state_root).unwrap();
+        let mut store = SqliteStateStore::open(state_root.clone()).unwrap();
+        let mount_id = MountId::new("notion-main");
+        let mut options = crate::mount::MountOptions {
+            mount_id: mount_id.clone(),
+            connector: "notion".to_string(),
+            root: mount_root,
+            remote_root_id: None,
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
+        };
+        run_cli_coordinated_mount(&mut store, &state_root, options.clone()).unwrap();
+        let binding = store.get_workspace_binding(&mount_id).unwrap();
+        options.projection = ProjectionMode::PlainFiles;
+
+        let error = run_cli_coordinated_mount(&mut store, &state_root, options)
+            .expect_err("virtual-to-plain requires migration");
+        assert!(error.message().contains("explicit projection migration"));
+        assert_eq!(
+            store.get_mount(&mount_id).unwrap().unwrap().projection,
+            ProjectionMode::LinuxFuse
+        );
+        assert_eq!(store.get_workspace_binding(&mount_id).unwrap(), binding);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_precommit_crash_journal_restores_exact_cache_on_restart() {
+        let root = unique_temp_path("loc-cli-remount-restart-recovery");
+        let state_root = root.join("state");
+        let mount_root = root.join("workspace/notion-main");
+        fs::create_dir_all(&state_root).unwrap();
+        let mut store = SqliteStateStore::open(state_root.clone()).unwrap();
+        let mount_id = MountId::new("notion-main");
+        let options = crate::mount::MountOptions {
+            mount_id: mount_id.clone(),
+            connector: "notion".to_string(),
+            root: mount_root,
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("account-a")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
+        };
+        run_cli_coordinated_mount(&mut store, &state_root, options).unwrap();
+        let previous = store.get_mount(&mount_id).unwrap().unwrap();
+        let mut intended = previous.clone();
+        intended.connection_id = Some(ConnectionId::new("account-b"));
+        let content_root = localityd::virtual_fs::virtual_fs_content_root(&state_root, &mount_id);
+        fs::create_dir_all(&content_root).unwrap();
+        fs::write(content_root.join("keep.md"), "restart-safe bytes").unwrap();
+        let mut journal =
+            super::CliWorkspaceRemountJournal::create(&state_root, &previous, &intended).unwrap();
+        store
+            .begin_workspace_remount_recovery(&journal.recovery_id, &mount_id)
+            .unwrap();
+        journal.stage().unwrap();
+        drop(journal);
+        assert!(!content_root.exists());
+
+        reconcile_cli_workspace_remount_recovery(&mut store, &state_root)
+            .expect("restart reconciliation");
+
+        assert_eq!(
+            fs::read_to_string(content_root.join("keep.md")).unwrap(),
+            "restart-safe bytes"
+        );
+        assert!(
+            store
+                .list_workspace_remount_recoveries()
+                .unwrap()
+                .is_empty()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_postcommit_crash_journal_discards_exact_old_cache_on_restart() {
+        let root = unique_temp_path("loc-cli-remount-postcommit-recovery");
+        let state_root = root.join("state");
+        let mount_root = root.join("workspace/notion-main");
+        fs::create_dir_all(&state_root).unwrap();
+        let mut store = SqliteStateStore::open(state_root.clone()).unwrap();
+        let mount_id = MountId::new("notion-main");
+        let previous_options = crate::mount::MountOptions {
+            mount_id: mount_id.clone(),
+            connector: "notion".to_string(),
+            root: mount_root.clone(),
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("account-a")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
+        };
+        run_cli_coordinated_mount(&mut store, &state_root, previous_options).unwrap();
+        let previous = store.get_mount(&mount_id).unwrap().unwrap();
+        let mut intended = previous.clone();
+        intended.connection_id = Some(ConnectionId::new("account-b"));
+        let intended_options = crate::mount::MountOptions {
+            mount_id: mount_id.clone(),
+            connector: intended.connector.clone(),
+            root: intended.root.clone(),
+            remote_root_id: intended.remote_root_id.clone(),
+            connection_id: intended.connection_id.clone(),
+            read_only: intended.read_only,
+            projection: intended.projection.clone(),
+            settings_json: intended.settings_json.clone(),
+        };
+        let content_root = localityd::virtual_fs::virtual_fs_content_root(&state_root, &mount_id);
+        fs::create_dir_all(&content_root).unwrap();
+        fs::write(content_root.join("old.md"), "obsolete cache bytes").unwrap();
+        let mut journal =
+            super::CliWorkspaceRemountJournal::create(&state_root, &previous, &intended).unwrap();
+        let recovery_id = journal.recovery_id.clone();
+        store
+            .begin_workspace_remount_recovery(&recovery_id, &mount_id)
+            .unwrap();
+        crate::mount::run_mount_with_workspace_cleanup(&mut store, intended_options, || {
+            journal.stage().map_err(StoreError::InvalidState)
+        })
+        .expect("atomically commit intended mount and recovery outcome");
+        let staged = journal
+            .staged_path
+            .as_ref()
+            .expect("old cache was staged")
+            .0
+            .clone();
+        drop(journal);
+        assert!(staged.exists());
+        assert!(!content_root.exists());
+
+        reconcile_cli_workspace_remount_recovery(&mut store, &state_root)
+            .expect("restart reconciliation finalizes committed cache removal");
+
+        assert!(!staged.exists());
+        assert_eq!(
+            store.get_mount(&mount_id).unwrap().unwrap().connection_id,
+            Some(ConnectionId::new("account-b"))
+        );
+        assert!(
+            store
+                .list_workspace_remount_recoveries()
+                .unwrap()
+                .is_empty()
         );
         let _ = fs::remove_dir_all(root);
     }

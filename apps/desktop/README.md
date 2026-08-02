@@ -116,5 +116,11 @@ same binding resolver as CLI. Missing and released v1 bindings still resolve
 through exact `MountConfig.root`. Existing-source account or source changes from
 either surface enter the shared quiesced remount coordinator, which persists a
 daemon fence, drains supervision, commits source-state cleanup, and restores
-supervision before clearing the fence. Target rename/removal, root relocation,
-and projection change-anchor lifecycle remain future coordinator work.
+supervision before clearing the fence. Its version-3 recovery journal records
+the exact recovery ID, original and staged paths, and filesystem identities, so
+either Desktop startup or a later CLI invocation can reconcile the same crash.
+CLI remounts fail closed while dirty/conflicted entities or pending virtual
+creates/renames exist, retain an equivalent existing host-root spelling, and
+reject virtual-to-plain conversion until an explicit projection migration owns
+the layout-1 binding transition. Target rename/removal and root-relocation
+lifecycle remain future coordinator work.

@@ -37,7 +37,7 @@ use crate::repository::{
 };
 use crate::workspace_binding::{
     WorkspaceBinding, WorkspaceBindingRecord, WorkspaceHostBinding, WorkspaceHostBindingResolver,
-    WorkspaceId, WorkspaceRebindBlocker, legacy_mount_collision_key,
+    WorkspaceId, WorkspaceRebindBlocker, host_paths_equivalent, legacy_mount_collision_key,
     legacy_mount_collision_key_for_host,
 };
 
@@ -243,7 +243,7 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
 
     fn commit_workspace_binding(
         &mut self,
-        host_binding: WorkspaceHostBinding,
+        mut host_binding: WorkspaceHostBinding,
         record: WorkspaceBindingRecord,
     ) -> StoreResult<()> {
         let workspace_id = record.binding.workspace_id().ok_or_else(|| {
@@ -261,7 +261,11 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
             .get(&record.mount_id)
             .ok_or_else(|| StoreError::MountMissing(record.mount_id.clone()))?;
         let resolved_root = host_binding.mount_root(record.binding.mount_target());
-        if resolved_root != mount.root {
+        if !host_paths_equivalent(
+            crate::WorkspaceHostPlatform::current(),
+            &resolved_root,
+            &mount.root,
+        ) {
             return Err(StoreError::InvalidState(format!(
                 "workspace binding for mount `{}` resolves to `{}` instead of its preserved root `{}`",
                 record.mount_id.as_str(),
@@ -272,7 +276,7 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
         WorkspaceHostBindingResolver::current()
             .validate_persistent_mount_root(
                 &host_binding,
-                &mount.root,
+                &resolved_root,
                 record.binding.mount_target(),
             )
             .map_err(|error| StoreError::InvalidState(error.to_string()))?;
@@ -295,8 +299,11 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
         }
 
         if let Some(existing_host) = self.workspace_host_bindings.get(workspace_id) {
-            if existing_host.trusted_workspace_root() != host_binding.trusted_workspace_root()
-                || existing_host.projection_identity() != host_binding.projection_identity()
+            if !host_paths_equivalent(
+                crate::WorkspaceHostPlatform::current(),
+                existing_host.trusted_workspace_root(),
+                host_binding.trusted_workspace_root(),
+            ) || existing_host.projection_identity() != host_binding.projection_identity()
             {
                 return Err(StoreError::InvalidState(format!(
                     "workspace `{}` host root or projection identity is immutable outside an owning coordinator",
@@ -317,6 +324,14 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
                     host_binding.layout_sequence()
                 )));
             }
+            host_binding = WorkspaceHostBinding::new(
+                crate::WorkspaceHostPlatform::current(),
+                workspace_id.clone(),
+                existing_host.trusted_workspace_root().to_path_buf(),
+                host_binding.projection_identity().clone(),
+                host_binding.layout_sequence(),
+            )
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
         } else if host_binding.layout_sequence() != 1 {
             return Err(StoreError::InvalidState(format!(
                 "new workspace `{}` must start at layout sequence 1",

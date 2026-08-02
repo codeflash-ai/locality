@@ -1002,6 +1002,75 @@ impl HostFilesystemAliases {
     }
 }
 
+/// Returns whether two host spellings identify the same filesystem path under
+/// the selected platform's path rules. Existing objects use canonical and,
+/// on Unix, device/inode anchors; missing tails use normalized canonical
+/// components. This is intentionally equality, not ancestor overlap.
+pub fn host_paths_equivalent(platform: WorkspaceHostPlatform, left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+
+    // Preserve the selected platform's lexical equivalence even when the
+    // paths cannot be inspected on this host (for example Windows spellings
+    // while validating a portable binding on Unix).
+    if let (Some(left), Some(right)) = (
+        ParsedHostPath::parse(platform, left),
+        ParsedHostPath::parse(platform, right),
+    ) && path_token_eq(platform, &left.prefix, &right.prefix)
+        && left.components.len() == right.components.len()
+        && left
+            .components
+            .iter()
+            .zip(&right.components)
+            .all(|(left, right)| path_token_eq(platform, left, right))
+    {
+        return true;
+    }
+
+    let (Ok(left), Ok(right)) = (
+        HostFilesystemAliases::inspect(left),
+        HostFilesystemAliases::inspect(right),
+    ) else {
+        return false;
+    };
+    let canonical_equal = match (
+        ParsedHostPath::parse(platform, &left.canonical),
+        ParsedHostPath::parse(platform, &right.canonical),
+    ) {
+        (Some(left), Some(right)) => {
+            left.components.len() == right.components.len()
+                && left
+                    .components
+                    .iter()
+                    .zip(&right.components)
+                    .all(|(left, right)| path_token_eq(platform, left, right))
+        }
+        _ => false,
+    };
+    if canonical_equal {
+        return true;
+    }
+    #[cfg(unix)]
+    if platform == WorkspaceHostPlatform::current()
+        && left.native_anchors.iter().any(|left| {
+            right.native_anchors.iter().any(|right| {
+                left.identity == right.identity
+                    && left.suffix.len() == right.suffix.len()
+                    && left.suffix.iter().zip(&right.suffix).all(|(left, right)| {
+                        match (left.to_str(), right.to_str()) {
+                            (Some(left), Some(right)) => path_token_eq(platform, left, right),
+                            _ => left == right,
+                        }
+                    })
+            })
+        })
+    {
+        return true;
+    }
+    false
+}
+
 fn canonicalize_with_missing_tail(path: &Path) -> io::Result<PathBuf> {
     let mut missing = Vec::<OsString>::new();
     let mut candidate = path;
@@ -1286,6 +1355,20 @@ mod tests {
             ),
             Err(super::WorkspaceHostBindingError::InvalidBoundMountRoot)
         );
+    }
+
+    #[test]
+    fn host_path_equivalence_uses_selected_platform_case_rules() {
+        assert!(super::host_paths_equivalent(
+            WorkspaceHostPlatform::Windows,
+            Path::new(r"C:\Locality\Notion-Main"),
+            Path::new(r"c:/LOCALITY/notion-main"),
+        ));
+        assert!(!super::host_paths_equivalent(
+            WorkspaceHostPlatform::Linux,
+            Path::new("/srv/Locality/notion-main"),
+            Path::new("/srv/locality/notion-main"),
+        ));
     }
 
     #[test]

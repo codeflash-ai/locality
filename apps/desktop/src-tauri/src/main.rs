@@ -41,9 +41,10 @@ use loc_cli::file_provider::{
 };
 use loc_cli::local_oauth::run_local_oauth_authorization;
 use loc_cli::mount::{
-    MountOptions, MountReport, QuiescedWorkspaceRemountRuntime, clear_workspace_remount_fence,
-    persist_workspace_remount_fence, resolve_workspace_mount_root, run_mount,
-    run_mount_with_workspace_cleanup, run_quiesced_workspace_remount,
+    MountOptions, MountReport, QuiescedWorkspaceRemountRuntime, RemountFilesystemIdentity,
+    WORKSPACE_REMOUNT_RECOVERY_VERSION, WorkspaceRemountRecoveryRecord,
+    clear_workspace_remount_fence, persist_workspace_remount_fence, resolve_workspace_mount_root,
+    run_mount, run_mount_with_workspace_cleanup, run_quiesced_workspace_remount,
 };
 use loc_cli::pull::{PullReport, run_pull_with_state_root};
 use loc_cli::push::{
@@ -128,6 +129,10 @@ use localityd::durable_fs::{
     remove_dir_all_durable_anchored, rename_noreplace_durable_anchored, sync_directory,
     validate_no_symlink_or_reparse_ancestors, validate_no_symlink_or_reparse_ancestors_allow_final,
     write_new_file_durable,
+};
+#[cfg(unix)]
+use localityd::durable_fs::{
+    remove_dir_all_durable_if_identity_unix, remove_empty_dir_durable_if_identity_unix,
 };
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
 use localityd::google_docs::resolve_google_docs_connector_for_mount;
@@ -11385,12 +11390,19 @@ struct WorkspaceRemountPreparation {
 
 static REMOUNT_CLEANUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const REMOUNT_RECOVERY_DIRECTORY: &str = ".locality-remount-recovery";
-const REMOUNT_RECOVERY_VERSION: u32 = 2;
+const REMOUNT_RECOVERY_VERSION: u32 = WORKSPACE_REMOUNT_RECOVERY_VERSION;
 
 #[derive(Debug)]
 struct StagedProjectionPath {
     original: PathBuf,
     staged: PathBuf,
+    identity: Option<RemountFilesystemIdentity>,
+}
+
+#[derive(Debug)]
+struct RemountStagingDirectory {
+    path: PathBuf,
+    identity: Option<RemountFilesystemIdentity>,
 }
 
 #[derive(Debug)]
@@ -11401,7 +11413,7 @@ struct WorkspaceProjectionCleanupTransaction {
     cached_entities: Vec<EntityRecord>,
     preserved_directory: Option<PathBuf>,
     staged_paths: Vec<StagedProjectionPath>,
-    staging_directories: Vec<PathBuf>,
+    staging_directories: Vec<RemountStagingDirectory>,
     recovery_marker: Option<WorkspaceRemountRecoveryMarker>,
     started: bool,
 }
@@ -11485,20 +11497,34 @@ impl WorkspaceProjectionCleanupTransaction {
             )
         })?;
         let sequence = REMOUNT_CLEANUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let recovery_id = &self
+            .recovery_marker
+            .as_ref()
+            .ok_or_else(|| "remount recovery was not prepared before staging".to_string())?
+            .recovery_id;
         let directory = parent.join(format!(
-            ".locality-remount-staging-{}-{sequence}",
-            std::process::id()
+            ".locality-remount-staging-{recovery_id}-{sequence}"
         ));
-        self.append_recovery_record(&WorkspaceRemountRecoveryRecord::StagingDirectory {
-            path: directory.clone(),
-        })?;
-        self.staging_directories.push(directory.clone());
         create_dir_all_durable(parent, &directory).map_err(|error| {
             format!(
                 "could not create cleanup staging directory `{}`: {error}",
                 directory.display()
             )
         })?;
+        let identity = RemountFilesystemIdentity::inspect(&directory).map_err(|error| {
+            format!(
+                "could not bind cleanup staging directory `{}`: {error}",
+                directory.display()
+            )
+        })?;
+        self.append_recovery_record(&WorkspaceRemountRecoveryRecord::StagingDirectory {
+            path: directory.clone(),
+            identity: Some(identity),
+        })?;
+        self.staging_directories.push(RemountStagingDirectory {
+            path: directory.clone(),
+            identity: Some(identity),
+        });
         Ok(directory)
     }
 
@@ -11549,13 +11575,18 @@ impl WorkspaceProjectionCleanupTransaction {
             return Ok(false);
         }
         let staged = staging_directory.join(self.staged_paths.len().to_string());
+        let identity = RemountFilesystemIdentity::inspect(path).map_err(|error| {
+            format!("could not bind cleanup path `{}`: {error}", path.display())
+        })?;
         self.append_recovery_record(&WorkspaceRemountRecoveryRecord::StagedPath {
             original: path.to_path_buf(),
             staged: staged.clone(),
+            identity: Some(identity),
         })?;
         self.staged_paths.push(StagedProjectionPath {
             original: path.to_path_buf(),
             staged: staged.clone(),
+            identity: Some(identity),
         });
         rename_and_sync(trusted_root, path, &staged).map_err(|error| {
             format!(
@@ -11621,7 +11652,8 @@ impl WorkspaceProjectionCleanupTransaction {
             }
         }
         for directory in self.staging_directories.iter().rev() {
-            if let Err(error) = remove_empty_staging_directory(directory) {
+            if let Err(error) = remove_empty_staging_directory(&directory.path, directory.identity)
+            {
                 errors.push(error);
             }
         }
@@ -11649,7 +11681,7 @@ impl WorkspaceProjectionCleanupTransaction {
     fn finalize(&mut self) -> Result<(), String> {
         let mut errors = Vec::new();
         for directory in self.staging_directories.iter().rev() {
-            if let Err(error) = remove_staging_directory_tree(directory) {
+            if let Err(error) = remove_staging_directory_tree(&directory.path, directory.identity) {
                 errors.push(error);
             }
         }
@@ -11669,25 +11701,6 @@ impl WorkspaceProjectionCleanupTransaction {
             Ok(())
         }
     }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "record", rename_all = "snake_case")]
-enum WorkspaceRemountRecoveryRecord {
-    Header {
-        version: u32,
-        recovery_id: String,
-        previous_mount: Box<MountConfig>,
-        intended_mount: Box<MountConfig>,
-        preserved_directory: Option<PathBuf>,
-    },
-    StagingDirectory {
-        path: PathBuf,
-    },
-    StagedPath {
-        original: PathBuf,
-        staged: PathBuf,
-    },
 }
 
 #[derive(Debug)]
@@ -11803,7 +11816,7 @@ struct PersistedWorkspaceRemountRecovery {
     previous_mount: MountConfig,
     preserved_directory: Option<PathBuf>,
     staged_paths: Vec<StagedProjectionPath>,
-    staging_directories: Vec<PathBuf>,
+    staging_directories: Vec<RemountStagingDirectory>,
 }
 
 impl PersistedWorkspaceRemountRecovery {
@@ -11815,7 +11828,8 @@ impl PersistedWorkspaceRemountRecovery {
             }
         }
         for directory in self.staging_directories.iter().rev() {
-            if let Err(error) = remove_empty_staging_directory(directory) {
+            if let Err(error) = remove_empty_staging_directory(&directory.path, directory.identity)
+            {
                 errors.push(error);
             }
         }
@@ -11841,7 +11855,7 @@ impl PersistedWorkspaceRemountRecovery {
     fn finalize(&self) -> Result<(), String> {
         let mut errors = Vec::new();
         for directory in self.staging_directories.iter().rev() {
-            if let Err(error) = remove_staging_directory_tree(directory) {
+            if let Err(error) = remove_staging_directory_tree(&directory.path, directory.identity) {
                 errors.push(error);
             }
         }
@@ -11859,7 +11873,7 @@ impl PersistedWorkspaceRemountRecovery {
             || self
                 .staging_directories
                 .iter()
-                .any(|path| fs::symlink_metadata(path).is_ok())
+                .any(|directory| fs::symlink_metadata(&directory.path).is_ok())
     }
 }
 
@@ -11914,82 +11928,12 @@ fn reconcile_workspace_remount_recovery(state_root: &Path) -> Result<(), String>
         if marker_ids.contains(&recovery_id) {
             continue;
         }
-        let mount = store
-            .get_mount(&mount_id)
-            .map_err(|error| format!("could not inspect orphan remount mount: {error}"))?;
-        let staging = mount
-            .as_ref()
-            .map(|mount| orphan_remount_staging_directories(state_root, mount))
-            .transpose()?
-            .unwrap_or_default();
-        if outcome == WorkspaceRemountRecoveryOutcome::Committed {
-            for directory in &staging {
-                remove_staging_directory_tree(directory)?;
-            }
-        }
-        store
-            .finish_workspace_remount_recovery(&recovery_id)
-            .map_err(|error| format!("could not clear orphan remount outcome: {error}"))?;
-        desktop_log(
-            "warn",
-            "remount.orphan_outcome_reconciled",
-            format!(
-                "cleared orphan {outcome:?} remount outcome `{recovery_id}` for mount `{}`{}",
-                mount_id.0,
-                if staging.is_empty() {
-                    "".to_string()
-                } else {
-                    format!("; found {} staging directories", staging.len())
-                }
-            ),
-        );
-        if outcome == WorkspaceRemountRecoveryOutcome::Prepared && !staging.is_empty() {
-            return Err(format!(
-                "orphan prepared remount outcome `{recovery_id}` had {} staging directories; its blocking SQLite token was cleared, but staged files were preserved for review",
-                staging.len()
-            ));
-        }
+        return Err(format!(
+            "workspace remount {outcome:?} outcome `{recovery_id}` for mount `{}` has no exact durable recovery marker; no prefix-matched staging directory was removed and supervision remains fenced",
+            mount_id.0
+        ));
     }
     Ok(())
-}
-
-fn orphan_remount_staging_directories(
-    state_root: &Path,
-    mount: &MountConfig,
-) -> Result<Vec<PathBuf>, String> {
-    let mut staging = Vec::new();
-    for parent in remount_staging_parents(state_root, mount) {
-        let entries = match fs::read_dir(&parent) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(format!(
-                    "could not inspect orphan remount staging parent `{}`: {error}",
-                    parent.display()
-                ));
-            }
-        };
-        for entry in entries {
-            let path = entry
-                .map_err(|error| {
-                    format!(
-                        "could not inspect orphan remount staging parent `{}`: {error}",
-                        parent.display()
-                    )
-                })?
-                .path();
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".locality-remount-staging-"))
-            {
-                staging.push(path);
-            }
-        }
-    }
-    staging.sort();
-    staging.dedup();
-    Ok(staging)
 }
 
 fn load_workspace_remount_recoveries(
@@ -12131,7 +12075,7 @@ fn load_workspace_remount_recovery(
     };
     let previous_mount = *previous_mount;
     let intended_mount = *intended_mount;
-    if version != REMOUNT_RECOVERY_VERSION {
+    if !matches!(version, 2 | REMOUNT_RECOVERY_VERSION) {
         return Err(format!(
             "remount recovery marker `{}` uses unsupported version {version}",
             marker_path.display()
@@ -12159,11 +12103,32 @@ fn load_workspace_remount_recovery(
                     marker_path.display()
                 ));
             }
-            WorkspaceRemountRecoveryRecord::StagingDirectory { path } => {
-                validate_recovery_staging_directory(state_root, &previous_mount, &path)?;
-                staging_directories.push(path);
+            WorkspaceRemountRecoveryRecord::StagingDirectory { path, identity } => {
+                if version == REMOUNT_RECOVERY_VERSION && identity.is_none() {
+                    return Err(format!(
+                        "remount recovery marker `{}` has an unbound staging directory",
+                        marker_path.display()
+                    ));
+                }
+                validate_recovery_staging_directory(
+                    state_root,
+                    &previous_mount,
+                    &recovery_id,
+                    &path,
+                )?;
+                staging_directories.push(RemountStagingDirectory { path, identity });
             }
-            WorkspaceRemountRecoveryRecord::StagedPath { original, staged } => {
+            WorkspaceRemountRecoveryRecord::StagedPath {
+                original,
+                staged,
+                identity,
+            } => {
+                if version == REMOUNT_RECOVERY_VERSION && identity.is_none() {
+                    return Err(format!(
+                        "remount recovery marker `{}` has an unbound staged path",
+                        marker_path.display()
+                    ));
+                }
                 validate_recovery_staged_path(
                     state_root,
                     &previous_mount,
@@ -12171,7 +12136,11 @@ fn load_workspace_remount_recovery(
                     &original,
                     &staged,
                 )?;
-                staged_paths.push(StagedProjectionPath { original, staged });
+                staged_paths.push(StagedProjectionPath {
+                    original,
+                    staged,
+                    identity,
+                });
             }
         }
     }
@@ -12201,13 +12170,15 @@ fn load_workspace_remount_recovery(
 fn validate_recovery_staging_directory(
     state_root: &Path,
     mount: &MountConfig,
+    recovery_id: &str,
     directory: &Path,
 ) -> Result<(), String> {
     let allowed_parents = remount_staging_parents(state_root, mount);
     let has_safe_name = directory
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with(".locality-remount-staging-"));
+        .and_then(|name| name.strip_prefix(&format!(".locality-remount-staging-{recovery_id}-")))
+        .is_some_and(|sequence| !sequence.is_empty() && sequence.parse::<usize>().is_ok());
     if !directory.is_absolute()
         || !has_safe_name
         || !directory
@@ -12225,7 +12196,7 @@ fn validate_recovery_staging_directory(
 fn validate_recovery_staged_path(
     state_root: &Path,
     mount: &MountConfig,
-    staging_directories: &[PathBuf],
+    staging_directories: &[RemountStagingDirectory],
     original: &Path,
     staged: &Path,
 ) -> Result<(), String> {
@@ -12234,13 +12205,14 @@ fn validate_recovery_staged_path(
         || daemon_file_provider::mount_access_roots(mount)
             .iter()
             .any(|root| original.starts_with(root));
-    let staged_is_safe = staged
-        .parent()
-        .is_some_and(|parent| staging_directories.iter().any(|dir| dir == parent))
-        && staged
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.parse::<usize>().is_ok());
+    let staged_is_safe = staged.parent().is_some_and(|parent| {
+        staging_directories
+            .iter()
+            .any(|directory| directory.path == parent)
+    }) && staged
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.parse::<usize>().is_ok());
     if !original.is_absolute() || !original_is_safe || !staged_is_safe {
         return Err(format!(
             "remount recovery contains unsafe staged path `{}` -> `{}`",
@@ -12320,6 +12292,11 @@ fn restore_staged_projection_path(path: &StagedProjectionPath) -> Result<(), Str
     })?;
     let original_exists = fs::symlink_metadata(&path.original).is_ok();
     let staged_exists = fs::symlink_metadata(&path.staged).is_ok();
+    if staged_exists {
+        verify_remount_path_identity(&path.staged, path.identity)?;
+    } else if original_exists {
+        verify_remount_path_identity(&path.original, path.identity)?;
+    }
     match (original_exists, staged_exists) {
         (true, false) => Ok(()),
         (false, true) => {
@@ -12349,7 +12326,32 @@ fn restore_staged_projection_path(path: &StagedProjectionPath) -> Result<(), Str
     }
 }
 
-fn remove_empty_staging_directory(directory: &Path) -> Result<(), String> {
+fn verify_remount_path_identity(
+    path: &Path,
+    expected: Option<RemountFilesystemIdentity>,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = RemountFilesystemIdentity::inspect(path).map_err(|error| {
+        format!(
+            "could not inspect remount path `{}`: {error}",
+            path.display()
+        )
+    })?;
+    if actual != expected {
+        return Err(format!(
+            "remount path `{}` was replaced; refusing recovery mutation",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn remove_empty_staging_directory(
+    directory: &Path,
+    identity: Option<RemountFilesystemIdentity>,
+) -> Result<(), String> {
     let trusted_root = directory
         .parent()
         .ok_or_else(|| format!("staging directory `{}` has no parent", directory.display()))?;
@@ -12359,7 +12361,19 @@ fn remove_empty_staging_directory(directory: &Path) -> Result<(), String> {
             directory.display()
         )
     })?;
-    match fs::remove_dir(directory) {
+    if directory.exists() {
+        verify_remount_path_identity(directory, identity)?;
+    }
+    #[cfg(unix)]
+    let removal = if let Some(identity) = identity {
+        let (device, inode) = identity.unix_device_inode();
+        remove_empty_dir_durable_if_identity_unix(trusted_root, directory, device, inode)
+    } else {
+        fs::remove_dir(directory)
+    };
+    #[cfg(not(unix))]
+    let removal = fs::remove_dir(directory);
+    match removal {
         Ok(()) => sync_directory(
             trusted_root,
             directory.parent().ok_or_else(|| {
@@ -12380,7 +12394,10 @@ fn remove_empty_staging_directory(directory: &Path) -> Result<(), String> {
     }
 }
 
-fn remove_staging_directory_tree(directory: &Path) -> Result<(), String> {
+fn remove_staging_directory_tree(
+    directory: &Path,
+    identity: Option<RemountFilesystemIdentity>,
+) -> Result<(), String> {
     let trusted_root = directory
         .parent()
         .ok_or_else(|| format!("staging directory `{}` has no parent", directory.display()))?;
@@ -12406,7 +12423,17 @@ fn remove_staging_directory_tree(directory: &Path) -> Result<(), String> {
             directory.display()
         ));
     }
-    remove_dir_all_durable_anchored(trusted_root, directory).map_err(|error| {
+    verify_remount_path_identity(directory, identity)?;
+    #[cfg(unix)]
+    let removal = if let Some(identity) = identity {
+        let (device, inode) = identity.unix_device_inode();
+        remove_dir_all_durable_if_identity_unix(trusted_root, directory, device, inode)
+    } else {
+        remove_dir_all_durable_anchored(trusted_root, directory)
+    };
+    #[cfg(not(unix))]
+    let removal = remove_dir_all_durable_anchored(trusted_root, directory);
+    removal.map_err(|error| {
         format!(
             "could not remove committed remount staging directory `{}`: {error}",
             directory.display()
@@ -17774,7 +17801,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_clears_orphan_prepared_outcome_without_marker() {
+    fn startup_preserves_orphan_outcome_and_unrelated_prefix_directory() {
         let temp = TestTempDir::new("desktop-orphan-remount-outcome");
         let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
         let mount_id = MountId::new("notion-main");
@@ -17788,15 +17815,155 @@ mod tests {
         store
             .begin_workspace_remount_recovery("orphan-prepared", &mount_id)
             .expect("create orphan outcome");
+        let unrelated = localityd::virtual_fs::virtual_fs_content_root(temp.path(), &mount_id)
+            .parent()
+            .expect("content parent")
+            .join(".locality-remount-staging-unrelated");
+        fs::create_dir_all(&unrelated).expect("create unrelated prefix directory");
+        fs::write(unrelated.join("keep.txt"), "unrelated").expect("write unrelated bytes");
 
-        super::reconcile_workspace_remount_recovery(temp.path()).expect("reconcile orphan outcome");
+        super::reconcile_workspace_remount_recovery(temp.path())
+            .expect_err("orphan outcome without exact marker remains fenced");
 
         assert!(
-            store
+            !store
                 .list_workspace_remount_recoveries()
                 .expect("list outcomes")
                 .is_empty(),
-            "orphan outcome must not permanently block the mount"
+            "orphan outcome remains durable until an exact marker authorizes recovery"
+        );
+        assert_eq!(
+            fs::read_to_string(unrelated.join("keep.txt")).unwrap(),
+            "unrelated",
+            "prefix-matched unrelated content is never recursively deleted"
+        );
+    }
+
+    #[test]
+    fn startup_recovery_refuses_replaced_exact_staging_directory() {
+        let temp = TestTempDir::new("desktop-replaced-remount-staging");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let mount = MountConfig::new(
+            mount_id.clone(),
+            "notion",
+            temp.path().join("workspace/notion-main"),
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        store.save_mount(mount.clone()).expect("save mount");
+        let mut marker =
+            super::WorkspaceRemountRecoveryMarker::create(temp.path(), &mount, &mount, None)
+                .expect("create exact recovery marker");
+        let recovery_id = marker.recovery_id.clone();
+        store
+            .begin_workspace_remount_recovery(&recovery_id, &mount_id)
+            .expect("prepare recovery outcome");
+        let staging = localityd::virtual_fs::virtual_fs_content_root(temp.path(), &mount_id)
+            .parent()
+            .expect("content parent")
+            .join(format!(".locality-remount-staging-{recovery_id}-777"));
+        fs::create_dir_all(&staging).expect("create original staging directory");
+        let identity =
+            super::RemountFilesystemIdentity::inspect(&staging).expect("bind original staging");
+        marker
+            .append(&super::WorkspaceRemountRecoveryRecord::StagingDirectory {
+                path: staging.clone(),
+                identity: Some(identity),
+            })
+            .expect("persist staging identity");
+        drop(marker);
+        fs::remove_dir(&staging).expect("remove original staging directory");
+        fs::create_dir(&staging).expect("create replacement staging directory");
+        fs::write(staging.join("keep.txt"), "replacement").expect("write replacement");
+
+        super::reconcile_workspace_remount_recovery(temp.path())
+            .expect_err("replacement identity blocks cleanup");
+
+        assert_eq!(
+            fs::read_to_string(staging.join("keep.txt")).unwrap(),
+            "replacement"
+        );
+        assert_eq!(
+            store.get_workspace_remount_recovery(&recovery_id).unwrap(),
+            Some((mount_id, WorkspaceRemountRecoveryOutcome::Prepared))
+        );
+    }
+
+    #[test]
+    fn desktop_startup_reconciles_cli_remount_journal_with_shared_semantics() {
+        let temp = TestTempDir::new("desktop-cli-remount-recovery");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let previous = MountConfig::new(
+            mount_id.clone(),
+            "notion",
+            temp.path().join("workspace/notion-main"),
+        )
+        .projection(ProjectionMode::LinuxFuse)
+        .with_connection_id(ConnectionId::new("account-a"));
+        let intended = previous
+            .clone()
+            .with_connection_id(ConnectionId::new("account-b"));
+        store.save_mount(previous.clone()).expect("save mount");
+        let recovery_id = "cli-remount-cross-surface-test";
+        let content_root = localityd::virtual_fs::virtual_fs_content_root(temp.path(), &mount_id);
+        fs::create_dir_all(&content_root).expect("create content root");
+        fs::write(content_root.join("keep.md"), "cross-surface bytes").expect("write cached bytes");
+        let content_parent = content_root.parent().expect("content parent");
+        let staging = content_parent.join(format!(".locality-remount-staging-{recovery_id}-0"));
+        fs::create_dir(&staging).expect("create CLI staging directory");
+        let staging_identity =
+            super::RemountFilesystemIdentity::inspect(&staging).expect("bind staging directory");
+        let source_identity =
+            super::RemountFilesystemIdentity::inspect(&content_root).expect("bind content root");
+        let staged = staging.join("0");
+        fs::rename(&content_root, &staged).expect("simulate CLI staging before crash");
+        let recovery_root = temp.path().join(super::REMOUNT_RECOVERY_DIRECTORY);
+        fs::create_dir(&recovery_root).expect("create recovery root");
+        let marker = recovery_root.join(format!("{recovery_id}.jsonl"));
+        let records = [
+            super::WorkspaceRemountRecoveryRecord::Header {
+                version: super::REMOUNT_RECOVERY_VERSION,
+                recovery_id: recovery_id.to_string(),
+                previous_mount: Box::new(previous),
+                intended_mount: Box::new(intended),
+                preserved_directory: None,
+            },
+            super::WorkspaceRemountRecoveryRecord::StagingDirectory {
+                path: staging.clone(),
+                identity: Some(staging_identity),
+            },
+            super::WorkspaceRemountRecoveryRecord::StagedPath {
+                original: content_root.clone(),
+                staged,
+                identity: Some(source_identity),
+            },
+        ];
+        let encoded = records
+            .iter()
+            .map(|record| serde_json::to_string(record).expect("encode shared record"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&marker, encoded).expect("write CLI recovery marker");
+        store
+            .begin_workspace_remount_recovery(recovery_id, &mount_id)
+            .expect("prepare shared recovery outcome");
+
+        super::reconcile_workspace_remount_recovery(temp.path())
+            .expect("Desktop reconciles CLI prepared recovery");
+
+        assert_eq!(
+            fs::read_to_string(content_root.join("keep.md")).unwrap(),
+            "cross-surface bytes"
+        );
+        assert!(!staging.exists());
+        assert!(!marker.exists());
+        assert!(
+            store
+                .list_workspace_remount_recoveries()
+                .unwrap()
+                .is_empty()
         );
     }
 

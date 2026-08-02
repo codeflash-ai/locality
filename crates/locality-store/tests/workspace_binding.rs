@@ -23,6 +23,52 @@ use locality_store::{
 };
 use rusqlite::{Connection, params};
 
+#[cfg(unix)]
+#[test]
+fn host_binding_equivalent_alias_replay_retains_existing_spelling_in_both_stores() {
+    let fixture = Fixture::new();
+    assert_equivalent_host_replay_retains_spelling(InMemoryStateStore::new(), &fixture);
+    assert_equivalent_host_replay_retains_spelling(fixture.open(), &fixture);
+}
+
+#[cfg(unix)]
+fn assert_equivalent_host_replay_retains_spelling<S>(mut store: S, fixture: &Fixture)
+where
+    S: MountRepository + WorkspaceBindingRepository,
+{
+    let mount = fixture.mount_config(ProjectionMode::LinuxFuse);
+    store.save_mount(mount).expect("save mount");
+    let (host, record) = fixture_atomic_workspace_binding(fixture);
+    store
+        .commit_workspace_binding(host.clone(), record.clone())
+        .expect("commit canonical host spelling");
+    let alias = fixture.root.join("workspace-alias");
+    symlink(host.trusted_workspace_root(), &alias).expect("create equivalent host alias");
+    let alias_host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        host.workspace_id().clone(),
+        alias.clone(),
+        host.projection_identity().clone(),
+        host.layout_sequence(),
+    )
+    .expect("alias host binding");
+
+    store
+        .commit_workspace_binding(alias_host, record)
+        .expect("equivalent host replay");
+
+    assert_eq!(
+        store
+            .get_workspace_host_binding(host.workspace_id())
+            .expect("read host")
+            .expect("host exists")
+            .trusted_workspace_root(),
+        host.trusted_workspace_root(),
+        "equivalent replay keeps the established host spelling"
+    );
+    fs::remove_file(alias).expect("remove equivalent host alias");
+}
+
 #[test]
 fn legacy_v20_upgrade_preserves_dirty_shadow_apply_journal_and_mount_identity() {
     let fixture = Fixture::new();
