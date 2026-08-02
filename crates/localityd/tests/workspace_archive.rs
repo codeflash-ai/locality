@@ -16,10 +16,11 @@ use locality_protocol::workspace_api_v2::{
     WorkspaceExportOfferV2, WorkspaceProfileSessionV2,
 };
 use locality_protocol::workspace_export_v2::{
-    WorkspaceAuthorizedExportEntryV2, WorkspaceExportCompletionReceiptV2,
+    WORKSPACE_EXPORT_TERMINAL_CONTROL_V2_GOLDEN_JSON, WorkspaceArchiveEntryKindV2,
+    WorkspaceArchiveMemberV2, WorkspaceAuthorizedExportEntryV2, WorkspaceExportCompletionReceiptV2,
     WorkspaceExportControlMetadataV2, WorkspaceExportTerminalControlV2,
-    WorkspaceNamespacedExportRecordV2, WorkspaceNamespacedInventoryV2,
-    WorkspaceScopeSourceAuthorityV2,
+    WorkspaceMaterializationPlanWithInventoryV2, WorkspaceNamespacedExportRecordV2,
+    WorkspaceNamespacedInventoryV2, WorkspaceScopeSourceAuthorityV2,
 };
 use locality_protocol::{
     DeliveredBodyDigestV2, ExportCompletionReceipt, ExportV2FilePaxMetadata,
@@ -678,6 +679,157 @@ fn archive_limits_bound_the_inventory_that_can_be_returned() {
             "case {label}: {error}"
         );
     }
+}
+
+#[test]
+fn combined_planner_is_deterministic_at_the_default_archive_entry_ceiling() {
+    const EXPECTED_INVENTORY_SHA256: &str =
+        "sha256:d8c65c8ff5ece28960b3f6cbabbcd7033caea04e7f53b58de6d48ea3d2e10e99";
+
+    let archive_limits = WorkspaceArchiveLimits::default();
+    assert_eq!(archive_limits.max_entries, 100_000);
+    let archive_entry_count = usize::try_from(archive_limits.max_entries).unwrap();
+
+    let session: WorkspaceProfileSessionV2 =
+        serde_json::from_slice(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON).expect("session fixture");
+    let target_roots = session
+        .session_layout()
+        .entries()
+        .iter()
+        .map(|entry| entry.target().as_str().to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(target_roots.len(), 2);
+    let file_count = archive_entry_count - target_roots.len() - 1;
+
+    let mount_id = session
+        .session_layout()
+        .entries()
+        .iter()
+        .find(|entry| entry.scope_ordinal() == 0)
+        .expect("scope zero")
+        .mount_id()
+        .clone();
+    let effective_actions = BTreeSet::from([SourceAction::Read]);
+    let empty_sha256 = sha256_label(b"");
+    let authorized_entries = (0..file_count)
+        .map(|index| {
+            let logical_path = format!("f{index:05}.md");
+            WorkspaceAuthorizedExportEntryV2::File {
+                winning_scope_ordinal: 0,
+                mount_id: mount_id.clone(),
+                logical_path,
+                projection_id: ProjectionId::new(format!("p{index:05}")),
+                source_connection_id: SourceConnectionId::new("source-notion"),
+                file_kind: ProjectionFileKind::Markdown,
+                effective_actions: effective_actions.clone(),
+                content_sha256: empty_sha256.clone(),
+                byte_length: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut offer_json: Value =
+        serde_json::from_slice(WORKSPACE_EXPORT_OFFER_V2_GOLDEN_JSON).expect("offer JSON");
+    offer_json["offer"]["limits"]["max_files"] = Value::from(archive_limits.max_entries);
+    offer_json["offer"]["limits"]["max_directories"] = Value::from(archive_limits.max_entries);
+    offer_json["offer"]["file_count"] = Value::from(file_count as u64);
+    offer_json["offer"]["directory_count"] = Value::from(target_roots.len() as u64);
+    offer_json["offer"]["archive_entry_count"] = Value::from(archive_limits.max_entries);
+    offer_json["offer"]["selected_content_bytes"] = Value::from(0);
+    offer_json["offer"]["inventory_sha256"] = Value::String(EXPECTED_INVENTORY_SHA256.to_string());
+    let placeholder_offer: WorkspaceExportOfferV2 =
+        serde_json::from_value(offer_json.clone()).expect("placeholder offer");
+    let writable_metadata = ScopeAuthorizedWritableExportMetadata {
+        versions: placeholder_offer.offer().versions,
+        session_id: placeholder_offer.offer().session_id.clone(),
+        export_attempt_id: placeholder_offer.offer().export_attempt_id.clone(),
+        source_generations: placeholder_offer.offer().source_generations.clone(),
+        writable_entries: Vec::new(),
+    };
+    let writable_metadata_sha256 =
+        canonical_writable_metadata_sha256(&writable_metadata).expect("writable digest");
+    offer_json["offer"]["writable_metadata_sha256"] =
+        Value::String(writable_metadata_sha256.clone());
+    let offer: WorkspaceExportOfferV2 =
+        serde_json::from_value(offer_json).expect("maximum-scale offer");
+
+    let mut control_json: Value =
+        serde_json::from_slice(WORKSPACE_EXPORT_TERMINAL_CONTROL_V2_GOLDEN_JSON)
+            .expect("control JSON");
+    control_json["metadata"]["inventory_sha256"] =
+        Value::String(EXPECTED_INVENTORY_SHA256.to_string());
+    control_json["metadata"]["target_directories"][1]["directory_count"] = Value::from(1);
+    control_json["metadata"]["target_directories"][1]["file_count"] =
+        Value::from(file_count as u64);
+    control_json["metadata"]["target_directories"][1]["content_bytes"] = Value::from(0);
+    control_json["metadata"]["declared_file_count"] = Value::from(file_count as u64);
+    control_json["metadata"]["declared_directory_count"] = Value::from(target_roots.len() as u64);
+    control_json["metadata"]["declared_archive_entry_count"] =
+        Value::from(archive_limits.max_entries);
+    control_json["metadata"]["declared_content_bytes"] = Value::from(0);
+    control_json["writable_metadata"] =
+        serde_json::to_value(writable_metadata).expect("writable metadata JSON");
+    control_json["completion_receipt"]["metadata"] = control_json["metadata"].clone();
+    control_json["completion_receipt"]["receipt"]["inventory_sha256"] =
+        Value::String(EXPECTED_INVENTORY_SHA256.to_string());
+    control_json["completion_receipt"]["receipt"]["writable_metadata_sha256"] =
+        Value::String(writable_metadata_sha256);
+    control_json["completion_receipt"]["receipt"]["delivered_file_count"] =
+        Value::from(file_count as u64);
+    control_json["completion_receipt"]["receipt"]["delivered_directory_count"] =
+        Value::from(target_roots.len() as u64);
+    control_json["completion_receipt"]["receipt"]["delivered_archive_entry_count"] =
+        Value::from(archive_limits.max_entries);
+    control_json["completion_receipt"]["receipt"]["delivered_content_bytes"] = Value::from(0);
+    let control: WorkspaceExportTerminalControlV2 =
+        serde_json::from_value(control_json).expect("maximum-scale control");
+
+    let mut members = Vec::with_capacity(archive_entry_count);
+    members.extend(
+        target_roots
+            .into_iter()
+            .map(|target| WorkspaceArchiveMemberV2 {
+                kind: WorkspaceArchiveEntryKindV2::Directory,
+                member_path: target,
+                authorized_entry: None,
+            }),
+    );
+    members.extend(authorized_entries.into_iter().map(|authorized_entry| {
+        let WorkspaceAuthorizedExportEntryV2::File { logical_path, .. } = &authorized_entry else {
+            unreachable!("maximum-scale fixture contains only files");
+        };
+        let member_path = format!("Sales/{logical_path}");
+        WorkspaceArchiveMemberV2 {
+            kind: WorkspaceArchiveEntryKindV2::File,
+            member_path,
+            authorized_entry: Some(authorized_entry),
+        }
+    }));
+    members.push(WorkspaceArchiveMemberV2 {
+        kind: WorkspaceArchiveEntryKindV2::Control,
+        member_path: locality_protocol::RESERVED_EXPORT_METADATA_PATH.to_string(),
+        authorized_entry: None,
+    });
+    assert_eq!(members.len(), archive_entry_count);
+
+    let planned =
+        WorkspaceMaterializationPlanWithInventoryV2::plan(&session, &offer, &control, &members)
+            .expect("combined planner accepts the default archive ceiling");
+    assert_eq!(planned.inventory().records().len(), archive_entry_count);
+    assert_eq!(planned.inventory().file_count(), file_count as u64);
+    assert_eq!(planned.inventory().directory_count(), 2);
+    assert_eq!(
+        planned.inventory().archive_entry_count(),
+        archive_limits.max_entries
+    );
+    assert_eq!(
+        planned.materialization_plan().entries().len(),
+        archive_entry_count - 1
+    );
+    assert_eq!(
+        planned.inventory().inventory_sha256(),
+        EXPECTED_INVENTORY_SHA256
+    );
 }
 
 #[test]
