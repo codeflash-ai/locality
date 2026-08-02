@@ -7835,22 +7835,16 @@ fn create_desktop_remount_quiesced(
         });
     }
 
-    let restart_result = remove_daemon_remount_fence(state_root)
-        .and_then(|()| {
-            manager_fence.restore().map_err(|error| {
-                let refence_error = repersist_resolved_daemon_remount_fence(state_root).err();
-                manager_fence.remain_suspended();
-                format!(
-                    "Could not restore localityd's process manager after remount: {}{}",
-                    error.message(),
-                    refence_error
-                        .map(|error| format!(
-                            "; re-persisting the retry fence also failed: {error}"
-                        ))
-                        .unwrap_or_default()
-                )
-            })
+    let restart_result = manager_fence
+        .restore()
+        .map_err(|error| {
+            manager_fence.remain_suspended();
+            format!(
+                "Could not restore localityd's process manager after remount: {}",
+                error.message()
+            )
         })
+        .and_then(|()| remove_daemon_remount_fence(state_root))
         .and_then(|()| ensure_daemon_running_locked(state_root));
     let (store, mount_report, preserved) = match (commit_result, restart_result) {
         (Ok(result), Ok(())) => result,
@@ -7921,17 +7915,13 @@ fn reconcile_daemon_remount_fence_with(
         return Ok(());
     }
     let paths = DaemonProcessPaths::new(state_root.to_path_buf());
-    remove_daemon_remount_fence(state_root)?;
     restore(&paths).map_err(|error| {
-        let refence_error = repersist_resolved_daemon_remount_fence(state_root).err();
         format!(
-            "Could not restore daemon supervision after remount recovery: {}{}",
-            error.message(),
-            refence_error
-                .map(|error| format!("; re-persisting the retry fence also failed: {error}"))
-                .unwrap_or_default()
+            "Could not restore daemon supervision after remount recovery: {}",
+            error.message()
         )
-    })
+    })?;
+    remove_daemon_remount_fence(state_root)
 }
 
 fn drain_daemon_for_remount(state_root: &Path) -> Result<(), String> {
@@ -17288,7 +17278,7 @@ mod tests {
 
         super::reconcile_workspace_remount_recovery(temp.path()).expect("resolve remount recovery");
         super::reconcile_daemon_remount_fence_with(temp.path(), |_| {
-            assert!(!locality_platform::daemon_remount_fence_path(temp.path()).exists());
+            assert!(locality_platform::daemon_remount_fence_path(temp.path()).exists());
             restored.set(true);
             Ok(())
         })
@@ -17296,6 +17286,26 @@ mod tests {
 
         assert!(restored.get());
         assert!(!locality_platform::daemon_remount_fence_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn startup_crash_during_supervision_restore_keeps_persisted_daemon_fence() {
+        let temp = TestTempDir::new("startup-daemon-remount-fence-crash");
+        let mount_id = MountId::new("notion-main");
+        super::persist_daemon_remount_fence(temp.path(), &mount_id).expect("persist fence");
+
+        let crashed = std::panic::catch_unwind(|| {
+            let _ = super::reconcile_daemon_remount_fence_with(temp.path(), |_| {
+                assert!(locality_platform::daemon_remount_fence_path(temp.path()).exists());
+                panic!("injected crash while restoring supervision")
+            });
+        });
+
+        assert!(crashed.is_err());
+        assert!(
+            locality_platform::daemon_remount_fence_path(temp.path()).exists(),
+            "startup retry marker survives the restore/remove crash gap"
+        );
     }
 
     #[test]

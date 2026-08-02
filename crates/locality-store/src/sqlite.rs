@@ -75,6 +75,7 @@ const DB_FILE: &str = "state.sqlite3";
 const SCHEMA_VERSION: i64 = 27;
 const ENTITY_SEARCH_COMPONENT_VERSION: i64 = 2;
 const JOURNALS_COMPONENT_VERSION: i64 = 3;
+const VIRTUAL_MUTATIONS_COMPONENT_VERSION: i64 = 4;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const RETIRED_NOTION_WORKSPACE_ROOTS_COMPONENT_ID: &str = "projection:notion_workspace_roots";
@@ -161,8 +162,8 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "durable:virtual_mutations",
         component_kind: "durable_json",
-        current_version: 3,
-        min_reader_version: 3,
+        current_version: VIRTUAL_MUTATIONS_COMPONENT_VERSION,
+        min_reader_version: VIRTUAL_MUTATIONS_COMPONENT_VERSION,
         required: true,
         rebuildable: false,
         data_json: "{}",
@@ -3949,7 +3950,7 @@ impl VirtualMutationRepository for SqliteStateStore {
                 mutation
                     .content_path
                     .as_ref()
-                    .map(|path| path_to_text(path)),
+                    .map(|path| native_path_to_text(path)),
                 mutation.created_at,
                 mutation.updated_at,
             ],
@@ -4130,7 +4131,7 @@ impl VirtualMoveRepository for SqliteStateStore {
                 mutation
                     .content_path
                     .as_ref()
-                    .map(|path| path_to_text(path)),
+                    .map(|path| native_path_to_text(path)),
                 mutation.created_at,
                 mutation.updated_at,
             ],
@@ -4172,7 +4173,7 @@ impl VirtualMoveRepository for SqliteStateStore {
             params![
                 mount_id.0,
                 local_id,
-                path_to_text(&content_path),
+                native_path_to_text(&content_path),
                 updated_at
             ],
         )?;
@@ -4934,7 +4935,7 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
         migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
         migrate_journals_component_to_v3(connection)?;
-        migrate_virtual_mutations_component_to_v3(connection)?;
+        migrate_virtual_mutations_component_to_v4(connection)?;
         migrate_entity_search_component_to_v2(connection)?;
         migrate_generation_delivery_to_v6(connection, None, true)?;
         return Ok(());
@@ -5695,8 +5696,8 @@ fn state_component_issue_allows_schema_migration(
         StateCompatibilityIssue::OlderComponent {
             component_id,
             found,
-            current: 3,
-        } if component_id == "durable:virtual_mutations" && matches!(*found, 1 | 2)
+            current: VIRTUAL_MUTATIONS_COMPONENT_VERSION,
+        } if component_id == "durable:virtual_mutations" && matches!(*found, 1 | 2 | 3)
     ) || matches!(
         issue,
         StateCompatibilityIssue::OlderComponent {
@@ -6427,7 +6428,7 @@ fn virtual_mutation_from_row(row: VirtualMutationRow) -> StoreResult<VirtualMuta
         original_path: row.5.map(PathBuf::from),
         projected_path: PathBuf::from(row.6),
         title: row.7,
-        content_path: row.8.map(PathBuf::from),
+        content_path: row.8.map(|path| native_path_from_text(&path)).transpose()?,
         created_at: row.9,
         updated_at: row.10,
     })
@@ -7120,7 +7121,7 @@ fn migrate_windows_cloud_files_projection_layout_to_v2(
     )
 }
 
-fn migrate_virtual_mutations_component_to_v3(connection: &Connection) -> StoreResult<()> {
+fn migrate_virtual_mutations_component_to_v4(connection: &Connection) -> StoreResult<()> {
     migrate_state_component_to_current(connection, "durable:virtual_mutations")
 }
 
@@ -8825,6 +8826,112 @@ fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
 
 fn path_to_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+const NATIVE_PATH_ENCODING_PREFIX: &str = "locality-native-path-v1:";
+
+fn native_path_to_text(path: &Path) -> String {
+    if let Some(path) = path.to_str() {
+        return format!(
+            "{NATIVE_PATH_ENCODING_PREFIX}utf8:{}",
+            encode_hex(path.as_bytes())
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        return format!(
+            "{NATIVE_PATH_ENCODING_PREFIX}unix:{}",
+            encode_hex(path.as_os_str().as_bytes())
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let bytes = path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        return format!(
+            "{NATIVE_PATH_ENCODING_PREFIX}windows:{}",
+            encode_hex(&bytes)
+        );
+    }
+    #[cfg(not(any(unix, windows)))]
+    unreachable!("non-UTF-8 native paths are unsupported on this platform")
+}
+
+fn native_path_from_text(encoded: &str) -> StoreResult<PathBuf> {
+    let Some(encoded) = encoded.strip_prefix(NATIVE_PATH_ENCODING_PREFIX) else {
+        return Ok(PathBuf::from(encoded));
+    };
+    let (kind, bytes) = encoded.split_once(':').ok_or_else(|| {
+        StoreError::InvalidState("invalid durable native path encoding".to_string())
+    })?;
+    let bytes = decode_hex(bytes)?;
+    match kind {
+        "utf8" => String::from_utf8(bytes).map(PathBuf::from).map_err(|_| {
+            StoreError::InvalidState("durable native UTF-8 path is invalid".to_string())
+        }),
+        #[cfg(unix)]
+        "unix" => {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            Ok(PathBuf::from(OsString::from_vec(bytes)))
+        }
+        #[cfg(windows)]
+        "windows" => {
+            use std::ffi::OsString;
+            use std::os::windows::ffi::OsStringExt;
+            if bytes.len() % 2 != 0 {
+                return Err(StoreError::InvalidState(
+                    "durable native Windows path has an odd byte count".to_string(),
+                ));
+            }
+            let wide = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>();
+            Ok(PathBuf::from(OsString::from_wide(&wide)))
+        }
+        _ => Err(StoreError::InvalidState(format!(
+            "durable native path encoding `{kind}` is unsupported on this host"
+        ))),
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex(encoded: &str) -> StoreResult<Vec<u8>> {
+    if encoded.len() % 2 != 0 {
+        return Err(StoreError::InvalidState(
+            "durable native path has an odd hex length".to_string(),
+        ));
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16);
+            let low = (pair[1] as char).to_digit(16);
+            match (high, low) {
+                (Some(high), Some(low)) => Ok(((high << 4) | low) as u8),
+                _ => Err(StoreError::InvalidState(
+                    "durable native path contains invalid hex".to_string(),
+                )),
+            }
+        })
+        .collect()
 }
 
 fn logical_path_to_text(path: &Path) -> String {

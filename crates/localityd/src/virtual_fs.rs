@@ -2672,13 +2672,6 @@ where
         .begin_virtual_move(transition)
         .map_err(LocalityError::from)?;
 
-    if old_path != new_content_path
-        && !destination_exists
-        && let Some(source) = source.as_ref()
-    {
-        publish_virtual_move_cache(content_root, new_content_path, &source.contents)?;
-    }
-
     let cleanup = source
         .as_ref()
         .map(|source| {
@@ -2698,6 +2691,16 @@ where
             cleanup,
             &source.as_ref().expect("cleanup has source").file,
         )?;
+    }
+
+    // Publication is authorized only after the durable anchor and cleanup
+    // intent bind the exact source object. A crash from this point onward can
+    // retry without adopting or deleting a replacement at the old path.
+    if old_path != new_content_path
+        && !destination_exists
+        && let Some(source) = source.as_ref()
+    {
+        publish_virtual_move_cache(content_root, new_content_path, &source.contents)?;
     }
     // The durable hard-link anchor now pins the source object across retries;
     // release the read handle before Windows opens the same object for delete.
@@ -3258,89 +3261,9 @@ fn remove_trusted_regular_file_if_identity(
 ) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use rustix::fs::{AtFlags, FileType, Mode, OFlags};
-
-        if !trusted_root.is_absolute() || !path.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "trusted root and file path must be absolute",
-            ));
-        }
-        let relative = path.strip_prefix(trusted_root).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "path `{}` is outside trusted root `{}`",
-                    path.display(),
-                    trusted_root.display()
-                ),
-            )
-        })?;
-        let components = relative
-            .components()
-            .map(|component| match component {
-                std::path::Component::Normal(component) => Ok(component),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("path `{}` contains unsafe components", path.display()),
-                )),
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        let Some((name, parent_components)) = components.split_last() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "trusted file path must name a child",
-            ));
-        };
-        let root = rustix::fs::open(
-            trusted_root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(io::Error::from)?;
-        let mut directories = vec![root];
-        for component in parent_components {
-            let parent = directories.last().expect("retained cleanup parent");
-            directories.push(
-                rustix::fs::openat(
-                    parent,
-                    *component,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(io::Error::from)?,
-            );
-        }
-        let parent = directories.last().expect("retained cleanup parent");
-        let descriptor = rustix::fs::openat(
-            parent,
-            *name,
-            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(io::Error::from)?;
-        let opened = rustix::fs::fstat(&descriptor).map_err(io::Error::from)?;
-        if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
-            || opened.st_dev as u64 != expected.device
-            || opened.st_ino as u64 != expected.inode
-            || expected.inode_high != 0
-        {
-            return Err(io::Error::other(
-                "file identity changed before descriptor-relative cleanup",
-            ));
-        }
-        let named = rustix::fs::statat(parent, *name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(io::Error::from)?;
-        if FileType::from_raw_mode(named.st_mode) != FileType::RegularFile
-            || named.st_dev as u64 != expected.device
-            || named.st_ino as u64 != expected.inode
-        {
-            return Err(io::Error::other(
-                "named file identity changed at the unlink boundary",
-            ));
-        }
-        rustix::fs::unlinkat(parent, *name, AtFlags::empty()).map_err(io::Error::from)?;
-        rustix::fs::fsync(parent).map_err(io::Error::from)
+        remove_trusted_regular_file_if_identity_unix_with_hook(trusted_root, path, expected, || {
+            Ok(())
+        })
     }
     #[cfg(windows)]
     {
@@ -3407,6 +3330,117 @@ fn remove_trusted_regular_file_if_identity(
             "identity-bound cleanup is unavailable on this platform",
         ))
     }
+}
+
+#[cfg(unix)]
+fn remove_trusted_regular_file_if_identity_unix_with_hook(
+    trusted_root: &Path,
+    path: &Path,
+    expected: VirtualMoveSourceIdentity,
+    before_quarantine: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
+
+    if !trusted_root.is_absolute() || !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "trusted root and file path must be absolute",
+        ));
+    }
+    let relative = path.strip_prefix(trusted_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "path `{}` is outside trusted root `{}`",
+                path.display(),
+                trusted_root.display()
+            ),
+        )
+    })?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(component) => Ok(component),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path `{}` contains unsafe components", path.display()),
+            )),
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let Some((name, parent_components)) = components.split_last() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "trusted file path must name a child",
+        ));
+    };
+    let root = rustix::fs::open(
+        trusted_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let mut directories = vec![root];
+    for component in parent_components {
+        let parent = directories.last().expect("retained cleanup parent");
+        directories.push(
+            rustix::fs::openat(
+                parent,
+                *component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?,
+        );
+    }
+    let parent = directories.last().expect("retained cleanup parent");
+    let descriptor = rustix::fs::openat(
+        parent,
+        *name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let opened = rustix::fs::fstat(&descriptor).map_err(io::Error::from)?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+        || opened.st_dev as u64 != expected.device
+        || opened.st_ino as u64 != expected.inode
+        || expected.inode_high != 0
+    {
+        return Err(io::Error::other(
+            "file identity changed before descriptor-relative cleanup",
+        ));
+    }
+
+    before_quarantine()?;
+    let quarantine_name = format!(
+        ".locality-identity-delete-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    );
+    rustix::fs::renameat_with(
+        parent,
+        *name,
+        parent,
+        quarantine_name.as_str(),
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(io::Error::from)?;
+    rustix::fs::fsync(parent).map_err(io::Error::from)?;
+
+    let quarantined =
+        rustix::fs::statat(parent, quarantine_name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(io::Error::from)?;
+    if FileType::from_raw_mode(quarantined.st_mode) != FileType::RegularFile
+        || quarantined.st_dev as u64 != expected.device
+        || quarantined.st_ino as u64 != expected.inode
+    {
+        return Err(io::Error::other(format!(
+            "file identity changed at the quarantine boundary; replacement preserved as `{quarantine_name}`"
+        )));
+    }
+    rustix::fs::unlinkat(parent, quarantine_name.as_str(), AtFlags::empty())
+        .map_err(io::Error::from)?;
+    rustix::fs::fsync(parent).map_err(io::Error::from)
 }
 
 fn remove_pending_virtual_move_cleanup_record(
@@ -9484,6 +9518,68 @@ mod tests {
     }
 
     #[test]
+    fn virtual_move_never_publishes_before_source_anchor_is_durable() {
+        let mount_id = MountId::new("anchor-before-publication");
+        let state_root = temp_root("loc-virtual-move-anchor-before-publication");
+        let content_root = state_root.join("content/anchor-before-publication/files");
+        let old_path = content_root.join("old.md");
+        let new_path = content_root.join("new.md");
+        fs::create_dir_all(content_root.join(".loc")).expect("create cleanup parent");
+        fs::write(&old_path, "source bytes").expect("write source");
+        fs::write(
+            content_root.join(super::VIRTUAL_MOVE_CLEANUP_ANCHOR_DIRECTORY),
+            "blocks anchor directory",
+        )
+        .expect("block anchor persistence");
+
+        let mutation = VirtualMutationRecord {
+            mount_id: mount_id.clone(),
+            local_id: "local:anchor-before-publication".to_string(),
+            mutation_kind: VirtualMutationKind::Create,
+            target_remote_id: None,
+            parent_remote_id: None,
+            original_path: Some(PathBuf::from("old.md")),
+            projected_path: PathBuf::from("new.md"),
+            title: "New".to_string(),
+            content_path: Some(old_path.clone()),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_virtual_mutation(mutation.clone())
+            .expect("save source pointer");
+
+        persist_and_publish_virtual_move(
+            &mut store,
+            VirtualMoveTransition {
+                mutation,
+                entity: None,
+                freshness: None,
+                superseded_local_ids: Vec::new(),
+            },
+            &content_root,
+            &old_path,
+            &new_path,
+            None,
+            false,
+        )
+        .expect_err("anchor failure must precede publication");
+
+        assert_eq!(fs::read_to_string(&old_path).unwrap(), "source bytes");
+        assert!(!new_path.exists(), "destination was never published");
+        assert_eq!(
+            store
+                .get_virtual_mutation(&mount_id, "local:anchor-before-publication")
+                .unwrap()
+                .unwrap()
+                .content_path,
+            Some(old_path)
+        );
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
     fn virtual_move_cleanup_refuses_replacement_file_or_tree() {
         let mount_id = MountId::new("cleanup-replacement");
         let state_root = temp_root("loc-virtual-move-cleanup-replacement");
@@ -9605,6 +9701,46 @@ mod tests {
         super::remove_trusted_regular_file_if_identity(&content_root, &path, wrong)
             .expect_err("unlink boundary must reject the wrong expected identity");
         assert_eq!(fs::read_to_string(&path).unwrap(), "preserve me");
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn virtual_move_cleanup_quarantines_racing_replacement_without_unlinking_it() {
+        let state_root = temp_root("loc-virtual-move-cleanup-unlink-race");
+        let content_root = state_root.join("content/files");
+        let path = content_root.join("obsolete.md");
+        fs::create_dir_all(&content_root).expect("create content root");
+        fs::write(&path, "original").expect("write original candidate");
+        let expected = super::trusted_regular_file_identity(&content_root, &path)
+            .expect("inspect original candidate")
+            .expect("candidate identity");
+
+        super::remove_trusted_regular_file_if_identity_unix_with_hook(
+            &content_root,
+            &path,
+            expected,
+            || {
+                fs::remove_file(&path)?;
+                fs::write(&path, "racing replacement")
+            },
+        )
+        .expect_err("racing replacement must never cross the identity boundary");
+
+        let preserved = fs::read_dir(&content_root)
+            .expect("read quarantine parent")
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".locality-identity-delete-")
+            })
+            .expect("replacement is preserved in quarantine");
+        assert_eq!(
+            fs::read_to_string(preserved.path()).expect("read preserved replacement"),
+            "racing replacement"
+        );
         let _ = fs::remove_dir_all(state_root);
     }
 

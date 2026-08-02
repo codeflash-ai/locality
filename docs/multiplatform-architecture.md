@@ -452,7 +452,7 @@ entry points are:
 
 ```rust
 let resolver = WorkspaceHostBindingResolver::new(platform);
-let plan = resolver.plan_legacy_migration(&trusted_workspace_root, &mounts)?;
+let plan = resolver.plan_workspace_migration(host_binding, &mounts)?;
 let root = resolver.resolve_ephemeral_publication_root(&requested_root, &active_mounts)?;
 ```
 

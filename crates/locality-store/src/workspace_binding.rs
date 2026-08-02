@@ -1099,10 +1099,23 @@ pub(crate) fn legacy_mount_collision_key_for_host(
     host_binding: &WorkspaceHostBinding,
     root: &Path,
 ) -> Option<String> {
+    let resolver = WorkspaceHostBindingResolver::current();
+    if resolver.platform == WorkspaceHostPlatform::current() {
+        let trusted = HostFilesystemAliases::inspect(host_binding.trusted_workspace_root()).ok()?;
+        let mount = HostFilesystemAliases::inspect(root).ok()?;
+        let trusted = ParsedHostPath::parse(resolver.platform, &trusted.canonical)?;
+        let mount = ParsedHostPath::parse(resolver.platform, &mount.canonical)?;
+        let component = mount.direct_child_of(resolver.platform, &trusted)?;
+        let normalized = component.chars().nfc().collect::<String>();
+        return MountTarget::new(normalized)
+            .ok()
+            .map(|target| target.collision_key());
+    }
+
     let target = root.file_name()?.to_str()?;
     let normalized = target.chars().nfc().collect::<String>();
     let target = MountTarget::new(normalized).ok()?;
-    WorkspaceHostBindingResolver::current()
+    resolver
         .validate_persistent_mount_root(host_binding, root, &target)
         .ok()?;
     Some(target.collision_key())

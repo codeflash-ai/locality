@@ -234,13 +234,15 @@ impl WindowsDirectory {
         name: &OsStr,
     ) -> io::Result<(Self, Self)> {
         let cleanup = self.open_directory_for_cleanup(name)?;
-        cleanup.clear_read_only()?;
-        let sync = self.open_directory_for_sync(name)?;
-        if cleanup.identity()? != sync.identity()? {
-            return Err(io::Error::other(
-                "workspace cleanup directory changed while opening durability handle",
-            ));
-        }
+        let sync = cleanup.with_read_only_cleared_for_cleanup(|| {
+            let sync = self.open_directory_for_sync(name)?;
+            if cleanup.identity()? != sync.identity()? {
+                return Err(io::Error::other(
+                    "workspace cleanup directory changed while opening durability handle",
+                ));
+            }
+            Ok(sync)
+        })?;
         Ok((cleanup, sync))
     }
 
@@ -262,13 +264,15 @@ impl WindowsDirectory {
         name: &OsStr,
     ) -> io::Result<(Self, Self)> {
         let cleanup = self.open_directory_for_anchored_cleanup(name)?;
-        cleanup.clear_read_only()?;
-        let sync = self.open_directory_for_sync(name)?;
-        if cleanup.identity()? != sync.identity()? {
-            return Err(io::Error::other(
-                "anchored cleanup directory changed while opening durability handle",
-            ));
-        }
+        let sync = cleanup.with_read_only_cleared_for_cleanup(|| {
+            let sync = self.open_directory_for_sync(name)?;
+            if cleanup.identity()? != sync.identity()? {
+                return Err(io::Error::other(
+                    "anchored cleanup directory changed while opening durability handle",
+                ));
+            }
+            Ok(sync)
+        })?;
         Ok((cleanup, sync))
     }
 
@@ -500,9 +504,9 @@ impl WindowsDirectory {
                     }
                     child.preflight_contents(&entry.path(), expected_device)?;
                 }
-                Err(directory_error) => match self.open_file_read_handle(&name) {
+                Err(directory_error) => match self.open_file_for_identity(&name) {
                     Ok(file) => {
-                        if handle_identity(&file)?.device != expected_device {
+                        if handle_identity(&OwnedHandle::from(file))?.device != expected_device {
                             return Err(io::Error::other(
                                 "workspace cleanup refuses to cross a volume boundary",
                             ));
@@ -523,7 +527,16 @@ impl WindowsDirectory {
         named_path: &Path,
         expected_device: u64,
     ) -> io::Result<()> {
-        self.clear_read_only()?;
+        self.with_read_only_cleared_for_cleanup(|| {
+            self.remove_contents_after_read_only_clear(named_path, expected_device)
+        })
+    }
+
+    fn remove_contents_after_read_only_clear(
+        &self,
+        named_path: &Path,
+        expected_device: u64,
+    ) -> io::Result<()> {
         for entry in std::fs::read_dir(named_path)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -615,6 +628,25 @@ impl WindowsDirectory {
 
     pub(crate) fn clear_read_only(&self) -> io::Result<()> {
         set_handle_read_only(&self.handle, false)
+    }
+
+    fn with_read_only_cleared_for_cleanup<T>(
+        &self,
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.clear_read_only()?;
+        match operation() {
+            Ok(value) => Ok(value),
+            Err(operation) => match self.set_read_only() {
+                Ok(()) => Err(operation),
+                Err(restore) => Err(io::Error::new(
+                    restore.kind(),
+                    format!(
+                        "failed to restore directory read-only state: {restore}; preceding cleanup preparation also failed: {operation}"
+                    ),
+                )),
+            },
+        }
     }
 
     pub(crate) fn rename_no_replace(
@@ -1262,6 +1294,32 @@ mod lock_tests {
         drop(parent);
         assert!(!tree_path.exists());
         std::fs::remove_dir_all(path).expect("remove cleanup test directory");
+    }
+
+    #[test]
+    fn cleanup_preparation_error_restores_directory_read_only_attribute() {
+        let path = temporary_test_directory("cleanup-restore");
+        std::fs::create_dir(&path).expect("create cleanup restore directory");
+        let root = WindowsDirectory::open_absolute(&path).expect("open cleanup restore directory");
+        root.set_read_only()
+            .expect("seal cleanup restore directory");
+
+        root.with_read_only_cleared_for_cleanup(|| {
+            Err::<(), _>(io::Error::other("injected post-clear failure"))
+        })
+        .expect_err("injected cleanup preparation must fail");
+
+        assert!(
+            std::fs::metadata(&path)
+                .expect("read restored directory metadata")
+                .permissions()
+                .readonly(),
+            "every post-clear error restores the read-only attribute"
+        );
+        root.clear_read_only()
+            .expect("clear test directory attribute");
+        drop(root);
+        std::fs::remove_dir(path).expect("remove cleanup restore directory");
     }
 
     fn temporary_test_directory(label: &str) -> std::path::PathBuf {

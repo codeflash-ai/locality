@@ -149,8 +149,8 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "durable:virtual_mutations".to_string(),
                 "durable_json".to_string(),
-                3,
-                3,
+                4,
+                4,
                 1,
                 0,
             ),
@@ -861,8 +861,8 @@ fn sqlite_store_does_not_rewrite_v2_linux_fuse_mount_point_roots() {
 }
 
 #[test]
-fn sqlite_store_migrates_virtual_mutations_v1_and_v2_to_v3_without_rewriting_rows() {
-    for old_version in [1, 2] {
+fn sqlite_store_migrates_virtual_mutations_v1_through_v3_to_v4_without_rewriting_rows() {
+    for old_version in [1, 2, 3] {
         let fixture = SqliteFixture::new();
         let mut store = fixture.open();
         store
@@ -895,7 +895,7 @@ fn sqlite_store_migrates_virtual_mutations_v1_and_v2_to_v3_without_rewriting_row
             vec![StateCompatibilityIssue::OlderComponent {
                 component_id: "durable:virtual_mutations".to_string(),
                 found: old_version,
-                current: 3,
+                current: 4,
             }]
         );
 
@@ -913,14 +913,14 @@ fn sqlite_store_migrates_virtual_mutations_v1_and_v2_to_v3_without_rewriting_row
         let after_user_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user version");
-        assert_eq!(component, (3, 3));
+        assert_eq!(component, (4, 4));
         assert_eq!(virtual_mutation_raw_row(&connection), before_row);
         assert_eq!(after_user_version, before_user_version);
     }
 }
 
 #[test]
-fn sqlite_store_reports_virtual_mutations_v4_without_mutating_state() {
+fn sqlite_store_reports_virtual_mutations_v5_without_mutating_state() {
     let fixture = SqliteFixture::new();
     let mut store = fixture.open();
     store
@@ -934,7 +934,7 @@ fn sqlite_store_reports_virtual_mutations_v4_without_mutating_state() {
     connection
         .execute(
             "UPDATE state_components
-             SET version = 4, min_reader_version = 4
+             SET version = 5, min_reader_version = 5
              WHERE component_id = 'durable:virtual_mutations'",
             [],
         )
@@ -944,14 +944,14 @@ fn sqlite_store_reports_virtual_mutations_v4_without_mutating_state() {
     drop(store);
 
     let report =
-        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v4");
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v5");
     assert_eq!(report.status, StateCompatibilityStatus::NeedsUpdate);
     assert_eq!(
         report.issues,
         vec![StateCompatibilityIssue::NewerComponent {
             component_id: "durable:virtual_mutations".to_string(),
-            found: 4,
-            supported: 3,
+            found: 5,
+            supported: 4,
         }]
     );
     assert!(matches!(
@@ -968,7 +968,7 @@ fn sqlite_store_reports_virtual_mutations_v4_without_mutating_state() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("component metadata");
-    assert_eq!(component, (4, 4));
+    assert_eq!(component, (5, 5));
 }
 
 #[test]

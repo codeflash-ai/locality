@@ -72,7 +72,8 @@
   discards every prerelease binding and leaves every legacy mount in layout 0;
   it never edits `mounts.root` or user files. `save_mount` also leaves every new
   mount in layout 0: only an owning coordinator may plan against its explicitly
-  trusted workspace root and save an accepted binding. Explicit binding inserts
+  trusted workspace root with `plan_workspace_migration` and save an accepted
+  binding. Explicit binding inserts
   check every configured mount, including unbound layout 0 roots, so an unbound
   basename cannot later collide with a portable target.
 - Workspace-binding component v4 adds stable local workspace identity plus a
@@ -80,8 +81,13 @@
   remount-recovery outcome without a schema-version bump. Opening released
   component-v2/v3 state creates or completes these tables transactionally and
   preserves all v1 mount bindings; they keep resolving through their exact
-  legacy roots. New layout-1 bindings require an atomic host/mount commit whose
-  derived root matches the preserved mount root.
+  legacy roots until the persistent coordinator accepts
+  `plan_workspace_migration`. New layout-1 bindings require an atomic host/mount
+  commit whose derived root matches the preserved mount root.
+- Virtual-mutations component v4 stores native content pointers with reversible
+  platform path encoding. It continues reading released plain UTF-8 rows while
+  preventing older readers from treating an encoded non-UTF-8 pointer as a
+  literal filesystem path.
 - Generation-delivery component v6 marks whether that selection is fully bound.
   Ambiguous active v25 journals fail migration atomically; completed pre-binding
   journals permit only exact terminal replay and preserve only their recorded

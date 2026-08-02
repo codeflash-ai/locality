@@ -1115,6 +1115,85 @@ fn sqlite_stale_v1_target_still_reserves_authoritative_legacy_root() {
     assert_stale_v1_target_reserves_authoritative_legacy_root(fixture.open(), &fixture.root);
 }
 
+#[cfg(unix)]
+#[test]
+fn in_memory_legacy_root_alias_reserves_canonical_workspace_target() {
+    let fixture = Fixture::new();
+    assert_legacy_root_alias_reserves_canonical_workspace_target(
+        InMemoryStateStore::default(),
+        &fixture.root,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sqlite_legacy_root_alias_reserves_canonical_workspace_target() {
+    let fixture = Fixture::new();
+    assert_legacy_root_alias_reserves_canonical_workspace_target(fixture.open(), &fixture.root);
+}
+
+#[cfg(unix)]
+fn assert_legacy_root_alias_reserves_canonical_workspace_target<S>(mut store: S, root: &Path)
+where
+    S: MountRepository + WorkspaceBindingRepository,
+{
+    let workspace_root = root.join("AliasWorkspace");
+    let alias_root = root.join("AliasParent");
+    let target = MountTarget::new("canonical-target").expect("target");
+    fs::create_dir_all(workspace_root.join(target.as_str())).expect("canonical mount root");
+    symlink(&workspace_root, &alias_root).expect("workspace-root alias");
+
+    let legacy_mount_id = MountId::new("legacy-alias");
+    store
+        .save_mount(MountConfig::new(
+            legacy_mount_id.clone(),
+            "notion",
+            alias_root.join(target.as_str()),
+        ))
+        .expect("save aliased legacy mount");
+    store
+        .save_workspace_binding(WorkspaceBindingRecord::new(
+            legacy_mount_id.clone(),
+            WorkspaceBinding::new(MountTarget::new("stale-alias-target").expect("stale target")),
+        ))
+        .expect("save stale v1 binding");
+
+    let candidate_mount_id = MountId::new("candidate-canonical");
+    store
+        .save_mount(MountConfig::new(
+            candidate_mount_id.clone(),
+            "google-docs",
+            workspace_root.join(target.as_str()),
+        ))
+        .expect("save candidate mount");
+    let workspace_id = WorkspaceId::new("locality.workspace.alias-collision").expect("workspace");
+    let error = store
+        .commit_workspace_binding(
+            WorkspaceHostBinding::new(
+                WorkspaceHostPlatform::current(),
+                workspace_id.clone(),
+                &workspace_root,
+                WorkspaceProjectionIdentity::new("test:alias-collision")
+                    .expect("projection identity"),
+                1,
+            )
+            .expect("host binding"),
+            WorkspaceBindingRecord::new(
+                candidate_mount_id,
+                WorkspaceBinding::for_workspace(workspace_id, target.clone()),
+            ),
+        )
+        .expect_err("canonical alias must reserve the actual legacy target");
+
+    assert_eq!(
+        error,
+        StoreError::WorkspaceMountTargetCollision {
+            target: target.as_str().to_string(),
+            existing_mount_id: legacy_mount_id,
+        }
+    );
+}
+
 #[test]
 fn exact_replay_skips_workspace_collision_scan() {
     let memory_fixture = Fixture::new();
