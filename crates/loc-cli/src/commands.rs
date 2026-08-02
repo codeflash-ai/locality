@@ -41,7 +41,8 @@ use locality_notion::oauth::{
 };
 use locality_platform::{
     DaemonManager, DaemonManagerRestartFence, DaemonProcessPaths,
-    daemon_manager_supervision_enabled, restore_daemon_manager_supervision,
+    daemon_manager_supervision_enabled, reset_locality_state_storage_coordinated,
+    restore_daemon_manager_supervision,
 };
 use locality_slack::{
     DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
@@ -55,7 +56,7 @@ use locality_store::{
     JournalRepository, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, SqliteStateStore, StoreError,
     VirtualMutationKind, VirtualMutationRepository, WorkspaceBindingRepository,
-    host_paths_equivalent, open_credential_store, reset_locality_state_storage,
+    host_paths_equivalent, open_credential_store,
 };
 use localityd::autosave::auto_save_timestamp;
 #[cfg(not(any(unix, windows)))]
@@ -2018,12 +2019,12 @@ fn reset(args: &[String], json: bool) -> i32 {
         );
     }
 
-    let storage = match reset_locality_state_storage(&state_root) {
+    let storage = match reset_locality_state_storage_coordinated(&state_root) {
         Ok(report) => report,
         Err(error) => {
             return command_error(
                 json,
-                CommandError::new("reset", "reset_failed", error.to_string()),
+                CommandError::new("reset", "reset_failed", error.message()),
                 EXIT_INTERNAL,
             );
         }
