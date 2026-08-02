@@ -1,15 +1,38 @@
 //! Strict filesystem durability primitives shared by recovery paths.
 
-use std::fs::{self, File, OpenOptions};
+#[cfg(any(test, not(unix), windows))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
 
-pub fn create_dir_all_durable(trusted_root: &Path, path: &Path) -> io::Result<()> {
-    create_dir_all_durable_with_sync(trusted_root, path, |directory| {
-        sync_directory(trusted_root, directory)
-    })
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_vendor = "apple",
+    target_os = "redox"
+)))]
+fn unsupported_descriptor_relative_operation<T>() -> io::Result<T> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "descriptor-relative durable filesystem operations are unavailable on this platform",
+    ))
 }
 
+pub fn create_dir_all_durable(trusted_root: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        return create_dir_all_durable_unix(trusted_root, path);
+    }
+    #[cfg(windows)]
+    return create_dir_all_durable_with_sync(trusted_root, path, |directory| {
+        sync_directory(trusted_root, directory)
+    });
+    #[cfg(not(any(unix, windows)))]
+    unsupported_descriptor_relative_operation()
+}
+
+#[cfg(any(test, not(unix)))]
 pub(crate) fn create_dir_all_durable_with_sync(
     trusted_root: &Path,
     path: &Path,
@@ -57,13 +80,20 @@ pub(crate) fn create_dir_all_durable_with_sync(
 }
 
 pub fn write_new_file_durable(trusted_root: &Path, path: &Path, contents: &[u8]) -> io::Result<()> {
-    write_new_file_durable_with_sync(
+    #[cfg(unix)]
+    {
+        return write_new_file_durable_unix(trusted_root, path, contents);
+    }
+    #[cfg(windows)]
+    return write_new_file_durable_with_sync(
         trusted_root,
         path,
         contents,
         |file| file.sync_all(),
         |directory| sync_directory(trusted_root, directory),
-    )
+    );
+    #[cfg(not(any(unix, windows)))]
+    unsupported_descriptor_relative_operation()
 }
 
 pub fn copy_new_file_durable(
@@ -82,15 +112,12 @@ pub fn copy_new_file_durable(
             false,
         );
     }
-    #[cfg(not(windows))]
-    copy_new_file_durable_with_sync(
-        source_root,
-        source,
-        destination_root,
-        destination,
-        |file| file.sync_all(),
-        |directory| sync_directory(destination_root, directory),
-    )
+    #[cfg(unix)]
+    {
+        return copy_new_file_durable_unix(source_root, source, destination_root, destination);
+    }
+    #[cfg(not(any(unix, windows)))]
+    unsupported_descriptor_relative_operation()
 }
 
 pub fn copy_new_file_durable_allow_cloud_placeholder(
@@ -113,6 +140,7 @@ pub fn copy_new_file_durable_allow_cloud_placeholder(
     copy_new_file_durable(source_root, source, destination_root, destination)
 }
 
+#[cfg(any(test, not(any(unix, windows))))]
 pub(crate) fn copy_new_file_durable_with_sync(
     source_root: &Path,
     source: &Path,
@@ -140,6 +168,7 @@ pub(crate) fn copy_new_file_durable_with_sync(
     Ok(copied)
 }
 
+#[cfg(any(test, not(unix)))]
 pub(crate) fn write_new_file_durable_with_sync(
     trusted_root: &Path,
     path: &Path,
@@ -168,8 +197,7 @@ pub fn rename_noreplace_durable(
 ) -> io::Result<()> {
     #[cfg(windows)]
     validate_no_symlink_or_reparse_ancestors_allow_final(source_root, source)?;
-    #[cfg(not(windows))]
-    validate_no_symlink_or_reparse_ancestors(source_root, source)?;
+    #[cfg(windows)]
     validate_no_symlink_or_reparse_ancestors(destination_root, destination)?;
     #[cfg(all(
         unix,
@@ -191,19 +219,7 @@ pub fn rename_noreplace_durable(
             destination,
         );
         #[cfg(not(windows))]
-        rename_noreplace_durable_with_sync(
-            source_root,
-            source,
-            destination_root,
-            destination,
-            |directory| {
-                if directory.starts_with(destination_root) {
-                    sync_directory(destination_root, directory)
-                } else {
-                    sync_directory(source_root, directory)
-                }
-            },
-        )
+        return unsupported_descriptor_relative_operation();
     }
 }
 
@@ -390,17 +406,294 @@ fn rename_noreplace_durable_unix(
     Ok(())
 }
 
-#[cfg(all(
-    unix,
-    any(target_os = "linux", target_vendor = "apple", target_os = "redox")
-))]
+#[cfg(unix)]
+fn validate_root_relative_path(trusted_root: &Path, path: &Path) -> io::Result<()> {
+    if !trusted_root.is_absolute() || !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "trusted root and durable path must be absolute",
+        ));
+    }
+    let relative = path.strip_prefix(trusted_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "path `{}` is outside trusted root `{}`",
+                path.display(),
+                trusted_root.display()
+            ),
+        )
+    })?;
+    if relative.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path `{}` contains unsafe components", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_unix_root(trusted_root: &Path) -> io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+
+    if !trusted_root.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("trusted root `{}` must be absolute", trusted_root.display()),
+        ));
+    }
+    rustix::fs::open(
+        trusted_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)
+}
+
+#[cfg(unix)]
+fn open_unix_child_directory(
+    parent: &std::os::fd::OwnedFd,
+    component: &std::ffi::OsStr,
+) -> io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+
+    rustix::fs::openat(
+        parent,
+        component,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "trusted path component `{}` is a symlink or not a directory",
+                    component.to_string_lossy()
+                ),
+            )
+        } else {
+            error.into()
+        }
+    })
+}
+
+#[cfg(unix)]
+fn open_unix_directory_without_symlinks(
+    trusted_root: &Path,
+    path: &Path,
+) -> io::Result<std::os::fd::OwnedFd> {
+    validate_root_relative_path(trusted_root, path)?;
+    let mut directory = open_unix_root(trusted_root)?;
+    for component in path
+        .strip_prefix(trusted_root)
+        .expect("validated root-relative path")
+        .components()
+    {
+        let std::path::Component::Normal(component) = component else {
+            continue;
+        };
+        directory = open_unix_child_directory(&directory, component)?;
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn create_dir_all_durable_unix(trusted_root: &Path, path: &Path) -> io::Result<()> {
+    use rustix::fs::Mode;
+
+    validate_root_relative_path(trusted_root, path)?;
+    let mut directory = open_unix_root(trusted_root)?;
+    for component in path
+        .strip_prefix(trusted_root)
+        .expect("validated root-relative path")
+        .components()
+    {
+        let std::path::Component::Normal(component) = component else {
+            continue;
+        };
+        match open_unix_child_directory(&directory, component) {
+            Ok(child) => directory = child,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                rustix::fs::mkdirat(&directory, component, Mode::from_raw_mode(0o777))
+                    .map_err(io::Error::from)?;
+                rustix::fs::fsync(&directory).map_err(io::Error::from)?;
+                directory = open_unix_child_directory(&directory, component)?;
+                rustix::fs::fsync(&directory).map_err(io::Error::from)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_new_file_durable_unix(
+    trusted_root: &Path,
+    path: &Path,
+    contents: &[u8],
+) -> io::Result<()> {
+    use rustix::fs::{Mode, OFlags};
+
+    let (parent, name) = open_unix_parent_without_symlinks(trusted_root, path)?;
+    let descriptor = rustix::fs::openat(
+        &parent,
+        &name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o666),
+    )
+    .map_err(io::Error::from)?;
+    let mut file = File::from(descriptor);
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    rustix::fs::fsync(&parent).map_err(io::Error::from)
+}
+
+#[cfg(unix)]
+fn copy_new_file_durable_unix(
+    source_root: &Path,
+    source: &Path,
+    destination_root: &Path,
+    destination: &Path,
+) -> io::Result<u64> {
+    use rustix::fs::{Mode, OFlags};
+
+    let (source_parent, source_name) = open_unix_parent_without_symlinks(source_root, source)?;
+    let source_descriptor = rustix::fs::openat(
+        &source_parent,
+        &source_name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let (destination_parent, destination_name) =
+        open_unix_parent_without_symlinks(destination_root, destination)?;
+    let destination_descriptor = rustix::fs::openat(
+        &destination_parent,
+        &destination_name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o666),
+    )
+    .map_err(io::Error::from)?;
+    let mut source_file = File::from(source_descriptor);
+    let mut destination_file = File::from(destination_descriptor);
+    let copied = io::copy(&mut source_file, &mut destination_file)?;
+    destination_file.sync_all()?;
+    drop(destination_file);
+    rustix::fs::fsync(&destination_parent).map_err(io::Error::from)?;
+    Ok(copied)
+}
+
+#[cfg(unix)]
+fn remove_directory_contents_unix(directory: &std::os::fd::OwnedFd) -> io::Result<()> {
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
+
+    for entry in Dir::read_from(directory).map_err(io::Error::from)? {
+        let entry = entry.map_err(io::Error::from)?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let metadata = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(metadata) => metadata,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
+            let child = rustix::fs::openat(
+                directory,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?;
+            remove_directory_contents_unix(&child)?;
+            rustix::fs::unlinkat(directory, name, AtFlags::REMOVEDIR).map_err(io::Error::from)?;
+        } else {
+            rustix::fs::unlinkat(directory, name, AtFlags::empty()).map_err(io::Error::from)?;
+        }
+    }
+    rustix::fs::fsync(directory).map_err(io::Error::from)
+}
+
+#[cfg(unix)]
+fn remove_dir_all_durable_unix(trusted_root: &Path, path: &Path) -> io::Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+
+    let (parent, name) = open_unix_parent_without_symlinks(trusted_root, path)?;
+    let directory = rustix::fs::openat(
+        &parent,
+        &name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    remove_directory_contents_unix(&directory)?;
+    rustix::fs::unlinkat(&parent, &name, AtFlags::REMOVEDIR).map_err(io::Error::from)?;
+    rustix::fs::fsync(&parent).map_err(io::Error::from)
+}
+
+#[cfg(unix)]
+fn remove_path_durable_unix(trusted_root: &Path, path: &Path) -> io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+
+    let (parent, name) = open_unix_parent_without_symlinks(trusted_root, path)?;
+    let metadata =
+        rustix::fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+    match FileType::from_raw_mode(metadata.st_mode) {
+        FileType::Directory => {
+            let directory = rustix::fs::openat(
+                &parent,
+                &name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?;
+            remove_directory_contents_unix(&directory)?;
+            rustix::fs::unlinkat(&parent, &name, AtFlags::REMOVEDIR).map_err(io::Error::from)?;
+        }
+        FileType::RegularFile => {
+            let descriptor = rustix::fs::openat(
+                &parent,
+                &name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?;
+            let opened = rustix::fs::fstat(&descriptor).map_err(io::Error::from)?;
+            let observed = rustix::fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(io::Error::from)?;
+            if opened.st_dev != observed.st_dev || opened.st_ino != observed.st_ino {
+                return Err(io::Error::other("path changed during durable removal"));
+            }
+            rustix::fs::unlinkat(&parent, &name, AtFlags::empty()).map_err(io::Error::from)?;
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "path `{}` is not an ordinary file or directory",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    rustix::fs::fsync(&parent).map_err(io::Error::from)
+}
+
+#[cfg(unix)]
 fn open_unix_parent_without_symlinks(
     trusted_root: &Path,
     path: &Path,
 ) -> io::Result<(std::os::fd::OwnedFd, std::ffi::OsString)> {
-    use rustix::fs::{Mode, OFlags};
-
-    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
+    validate_root_relative_path(trusted_root, path)?;
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -413,9 +706,7 @@ fn open_unix_parent_without_symlinks(
             format!("path `{}` has no filename", path.display()),
         )
     })?;
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let mut directory =
-        rustix::fs::open(trusted_root, flags, Mode::empty()).map_err(io::Error::from)?;
+    let mut directory = open_unix_root(trusted_root)?;
     let relative_parent = parent.strip_prefix(trusted_root).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -433,8 +724,7 @@ fn open_unix_parent_without_symlinks(
                 format!("path `{}` contains unsafe components", path.display()),
             ));
         };
-        directory = rustix::fs::openat(&directory, component, flags, Mode::empty())
-            .map_err(io::Error::from)?;
+        directory = open_unix_child_directory(&directory, component)?;
     }
     Ok((directory, name.to_os_string()))
 }
@@ -480,9 +770,9 @@ pub fn remove_dir_all_durable(trusted_root: &Path, path: &Path) -> io::Result<()
 }
 
 pub fn remove_dir_all_durable_anchored(trusted_root: &Path, path: &Path) -> io::Result<()> {
-    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
     #[cfg(windows)]
     {
+        validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
         let (parents, name) = open_windows_parent_anchored(trusted_root, path, true)?;
         let parent = parents.last().expect("anchored cleanup parent");
         let directory = parent.open_directory_for_anchored_cleanup(&name)?;
@@ -492,31 +782,15 @@ pub fn remove_dir_all_durable_anchored(trusted_root: &Path, path: &Path) -> io::
         parent.sync()?;
         return Ok(());
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        remove_dir_all_durable_with_sync(trusted_root, path, |directory| {
-            sync_directory(trusted_root, directory)
-        })
+        remove_dir_all_durable_unix(trusted_root, path)
     }
+    #[cfg(not(any(unix, windows)))]
+    unsupported_descriptor_relative_operation()
 }
 
-pub(crate) fn remove_dir_all_durable_with_sync(
-    trusted_root: &Path,
-    path: &Path,
-    mut sync_parent: impl FnMut(&Path) -> io::Result<()>,
-) -> io::Result<()> {
-    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("directory `{}` has no parent", path.display()),
-        )
-    })?;
-    fs::remove_dir_all(path)?;
-    sync_parent(parent)
-}
-
-pub(crate) fn remove_path_durable(trusted_root: &Path, path: &Path) -> io::Result<()> {
+pub fn remove_path_durable(trusted_root: &Path, path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
@@ -536,12 +810,15 @@ pub(crate) fn remove_path_durable(trusted_root: &Path, path: &Path) -> io::Resul
         parent.sync()?;
         return Ok(());
     }
-    #[cfg(not(windows))]
-    remove_path_durable_with_sync(trusted_root, path, |directory| {
-        sync_directory(trusted_root, directory)
-    })
+    #[cfg(unix)]
+    {
+        remove_path_durable_unix(trusted_root, path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    unsupported_descriptor_relative_operation()
 }
 
+#[cfg(any(test, not(any(unix, windows))))]
 pub(crate) fn remove_path_durable_with_sync(
     trusted_root: &Path,
     path: &Path,
@@ -751,8 +1028,8 @@ fn metadata_is_windows_reparse_point(_metadata: &fs::Metadata) -> bool {
 
 #[cfg(unix)]
 pub fn sync_directory(trusted_root: &Path, path: &Path) -> io::Result<()> {
-    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
-    File::open(path)?.sync_all()
+    let directory = open_unix_directory_without_symlinks(trusted_root, path)?;
+    rustix::fs::fsync(&directory).map_err(io::Error::from)
 }
 
 #[cfg(windows)]
@@ -791,8 +1068,11 @@ fn windows_directory_sync_access() -> u32 {
 
 #[cfg(not(any(unix, windows)))]
 pub fn sync_directory(trusted_root: &Path, path: &Path) -> io::Result<()> {
-    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
-    File::open(path)?.sync_all()
+    let _ = (trusted_root, path);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "descriptor-relative durable filesystem operations are unavailable on this platform",
+    ))
 }
 
 #[cfg(all(
@@ -978,6 +1258,37 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("symlink"));
         assert!(!real.join("record").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_root_descriptor_cannot_be_redirected_after_open() {
+        use rustix::fs::{Mode, OFlags};
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("retained-root-descriptor");
+        let owned = root.join("owned");
+        let moved = root.join("moved-owned");
+        let outside = root.join("outside");
+        fs::create_dir_all(&owned).expect("create owned root");
+        fs::create_dir_all(&outside).expect("create outside root");
+        let anchor = open_unix_root(&owned).expect("open retained root descriptor");
+
+        fs::rename(&owned, &moved).expect("move owned root after open");
+        symlink(&outside, &owned).expect("replace pathname with symlink");
+        let descriptor = rustix::fs::openat(
+            &anchor,
+            "record",
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
+            Mode::from_raw_mode(0o600),
+        )
+        .expect("descriptor-relative create remains anchored");
+        let mut file = File::from(descriptor);
+        file.write_all(b"anchored").expect("write anchored file");
+
+        assert_eq!(fs::read(moved.join("record")).unwrap(), b"anchored");
+        assert!(!outside.join("record").exists());
         let _ = fs::remove_dir_all(root);
     }
 

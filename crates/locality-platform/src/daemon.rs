@@ -15,6 +15,7 @@ pub const DAEMON_PID_FILENAME: &str = "localityd.pid";
 pub const DAEMON_METADATA_FILENAME: &str = "localityd.manager.json";
 pub const DAEMON_STDOUT_LOG_FILENAME: &str = "localityd.out.log";
 pub const DAEMON_STDERR_LOG_FILENAME: &str = "localityd.err.log";
+pub const DAEMON_REMOUNT_FENCE_FILENAME: &str = "localityd.remount.fence";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -121,6 +122,34 @@ pub fn daemon_socket_path(state_root: &Path) -> PathBuf {
     state_root.join(DAEMON_SOCKET_FILENAME)
 }
 
+pub fn daemon_remount_fence_path(state_root: &Path) -> PathBuf {
+    state_root.join(DAEMON_REMOUNT_FENCE_FILENAME)
+}
+
+pub fn ensure_daemon_start_allowed(paths: &DaemonProcessPaths) -> Result<(), DaemonProcessError> {
+    let fence = daemon_remount_fence_path(&paths.state_root);
+    match fs::symlink_metadata(&fence) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DaemonProcessError::new("io_error", error.to_string())),
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            Err(DaemonProcessError::new(
+                "remount_in_progress",
+                format!(
+                    "daemon start is fenced while interrupted remount recovery is pending at `{}`",
+                    fence.display()
+                ),
+            ))
+        }
+        Ok(_) => Err(DaemonProcessError::new(
+            "remount_in_progress",
+            format!(
+                "unsafe daemon remount fence exists at `{}`",
+                fence.display()
+            ),
+        )),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DaemonProcessError {
     code: &'static str,
@@ -205,6 +234,32 @@ impl DaemonManagerRestartFence {
         }
         Ok(())
     }
+
+    /// Transfers responsibility for restoring supervision to persisted-fence
+    /// startup reconciliation.
+    pub fn remain_suspended(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.launchd_target = None;
+        }
+    }
+}
+
+pub fn restore_daemon_manager_supervision(
+    paths: &DaemonProcessPaths,
+) -> Result<(), DaemonProcessError> {
+    #[cfg(target_os = "macos")]
+    if paths
+        .launch_agent
+        .as_ref()
+        .is_some_and(|path| path.exists())
+    {
+        let target = launchd_service_target(&launchd_domain()?);
+        set_launchd_service_enabled(&target, true)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = paths;
+    Ok(())
 }
 
 impl Drop for DaemonManagerRestartFence {
@@ -253,6 +308,7 @@ impl DaemonProcessManager for DefaultDaemonProcessManager {
         &self,
         config: &DaemonProcessStartConfig<'_>,
     ) -> Result<DaemonProcessStartReport, DaemonProcessError> {
+        ensure_daemon_start_allowed(config.paths)?;
         match self.resolve_start_manager(config.mode)? {
             DaemonManager::Launchd => start_launchd(config),
             DaemonManager::Session => start_session(config),
@@ -587,8 +643,8 @@ fn xml_escape(value: &str) -> String {
 mod tests {
     use super::{
         DaemonManager, DaemonProcessPaths, DaemonProcessStartConfig, DaemonStartMode,
-        daemon_socket_path, launch_agent_plist, launchd_restart_fence_action,
-        launchd_service_target, xml_escape,
+        daemon_remount_fence_path, daemon_socket_path, ensure_daemon_start_allowed,
+        launch_agent_plist, launchd_restart_fence_action, launchd_service_target, xml_escape,
     };
     use std::path::PathBuf;
 
@@ -640,6 +696,23 @@ mod tests {
             daemon_socket_path(&PathBuf::from("/tmp/loc-state")),
             PathBuf::from("/tmp/loc-state/localityd.sock")
         );
+    }
+
+    #[test]
+    fn persisted_remount_fence_blocks_all_manager_start_modes() {
+        let root = std::env::temp_dir().join(format!(
+            "locality-daemon-fence-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create state root");
+        std::fs::write(daemon_remount_fence_path(&root), "version=1\n").expect("write fence");
+        for target in ["linux", "windows", "macos"] {
+            let paths = DaemonProcessPaths::for_target(root.clone(), target, None);
+            let error = ensure_daemon_start_allowed(&paths).expect_err("fence blocks start");
+            assert_eq!(error.code(), "remount_in_progress");
+        }
+        std::fs::remove_dir_all(root).expect("remove state root");
     }
 
     #[test]

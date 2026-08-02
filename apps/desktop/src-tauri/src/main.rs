@@ -98,8 +98,10 @@ use locality_notion::oauth::{
 };
 use locality_platform::{
     DAEMON_PID_FILENAME, DaemonManagerRestartFence, DaemonProcessPaths, append_service_log,
-    bundled_binary_next_to_current_exe, default_state_root as platform_default_state_root,
-    logs_dir as platform_logs_dir, user_home as platform_user_home,
+    bundled_binary_next_to_current_exe, daemon_remount_fence_path,
+    default_state_root as platform_default_state_root, ensure_daemon_start_allowed,
+    logs_dir as platform_logs_dir, restore_daemon_manager_supervision,
+    user_home as platform_user_home,
 };
 use locality_slack::{
     DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
@@ -122,9 +124,9 @@ use locality_store::{ConnectorProfileId, ConnectorProfileRecord, ConnectorProfil
 use localityd::autosave::auto_save_timestamp;
 use localityd::durable_fs::{
     copy_new_file_durable, copy_new_file_durable_allow_cloud_placeholder, create_dir_all_durable,
-    remove_dir_all_durable_anchored, rename_noreplace_durable_anchored, sync_directory,
-    validate_no_symlink_or_reparse_ancestors, validate_no_symlink_or_reparse_ancestors_allow_final,
-    write_new_file_durable,
+    remove_dir_all_durable_anchored, remove_path_durable, rename_noreplace_durable_anchored,
+    sync_directory, validate_no_symlink_or_reparse_ancestors,
+    validate_no_symlink_or_reparse_ancestors_allow_final, write_new_file_durable,
 };
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
 use localityd::google_docs::resolve_google_docs_connector_for_mount;
@@ -145,8 +147,9 @@ use localityd::virtual_fs::materialize_virtual_fs_item_with_content_root;
 #[cfg(target_os = "macos")]
 use localityd::virtual_fs::mount_point_directory_name;
 use localityd::virtual_fs::{
-    VirtualFsChildrenReport, commit_virtual_fs_write, mount_point_identifier,
-    virtual_fs_content_base, virtual_fs_content_path, virtual_fs_content_root,
+    VirtualFsChildrenReport, commit_virtual_fs_write, content_path_for_relative,
+    mount_point_identifier, virtual_content_trusted_root_for_path, virtual_fs_content_base,
+    virtual_fs_content_path, virtual_fs_content_root, virtual_mutation_content_path_for_read,
 };
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -7764,21 +7767,37 @@ fn create_desktop_remount_quiesced(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _remount_guard = RemountInProgressGuard::begin();
 
-    stop_windows_cloud_files_provider_supervisor(state_root)?;
     let daemon_paths = DaemonProcessPaths::new(state_root.to_path_buf());
-    let mut manager_fence = DaemonManagerRestartFence::suspend(&daemon_paths).map_err(|error| {
-        format!(
-            "Could not suspend localityd's process manager before remount: {}",
-            error.message()
-        )
-    })?;
+    persist_daemon_remount_fence(state_root, &mount_id)?;
+    if let Err(error) = stop_windows_cloud_files_provider_supervisor(state_root) {
+        let _ = remove_daemon_remount_fence(state_root);
+        return Err(error);
+    }
+    let mut manager_fence = match DaemonManagerRestartFence::suspend(&daemon_paths) {
+        Ok(fence) => fence,
+        Err(error) => {
+            let cleanup = remove_daemon_remount_fence(state_root);
+            return Err(match cleanup {
+                Ok(()) => format!(
+                    "Could not suspend localityd's process manager before remount: {}",
+                    error.message()
+                ),
+                Err(cleanup_error) => format!(
+                    "Could not suspend localityd's process manager before remount: {}; removing the durable daemon fence also failed: {cleanup_error}",
+                    error.message()
+                ),
+            });
+        }
+    };
     if let Err(error) = drain_daemon_for_remount(state_root) {
         if let Err(restore_error) = manager_fence.restore() {
+            manager_fence.remain_suspended();
             return Err(format!(
                 "{error}; restoring localityd's process manager also failed: {}",
                 restore_error.message()
             ));
         }
+        remove_daemon_remount_fence(state_root)?;
         return match ensure_daemon_running_locked(state_root) {
             Ok(()) => Err(error),
             Err(restart_error) => Err(format!(
@@ -7800,6 +7819,18 @@ fn create_desktop_remount_quiesced(
         Ok::<_, String>((store, report, preserved))
     })();
 
+    if let Err(recovery_error) = reconcile_workspace_remount_recovery(state_root) {
+        manager_fence.remain_suspended();
+        return Err(match commit_result {
+            Ok(_) => format!(
+                "The remount completed, but durable recovery did not resolve; daemon supervision remains fenced: {recovery_error}"
+            ),
+            Err(error) => format!(
+                "{error}; durable remount recovery also failed and daemon supervision remains fenced: {recovery_error}"
+            ),
+        });
+    }
+
     let restart_result = manager_fence
         .restore()
         .map_err(|error| {
@@ -7808,6 +7839,11 @@ fn create_desktop_remount_quiesced(
                 error.message()
             )
         })
+        .map_err(|error| {
+            manager_fence.remain_suspended();
+            error
+        })
+        .and_then(|()| remove_daemon_remount_fence(state_root))
         .and_then(|()| ensure_daemon_running_locked(state_root));
     let (store, mount_report, preserved) = match (commit_result, restart_result) {
         (Ok(result), Ok(())) => result,
@@ -7830,6 +7866,55 @@ fn create_desktop_remount_quiesced(
     };
     reload_daemon_mounts(state_root)?;
     finish_desktop_mount_setup(&store, state_root, mount_report, preserved)
+}
+
+fn persist_daemon_remount_fence(state_root: &Path, mount_id: &MountId) -> Result<(), String> {
+    let path = daemon_remount_fence_path(state_root);
+    let contents = format!(
+        "version=1\nmount_id={}\ncreated_at={}\n",
+        mount_id.0,
+        activity_timestamp()
+    );
+    write_new_file_durable(state_root, &path, contents.as_bytes()).map_err(|error| {
+        format!(
+            "Could not persist daemon remount fence `{}`: {error}",
+            path.display()
+        )
+    })
+}
+
+fn remove_daemon_remount_fence(state_root: &Path) -> Result<(), String> {
+    let path = daemon_remount_fence_path(state_root);
+    match remove_path_durable(state_root, &path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Could not durably remove daemon remount fence `{}`: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn reconcile_daemon_remount_fence(state_root: &Path) -> Result<(), String> {
+    reconcile_daemon_remount_fence_with(state_root, restore_daemon_manager_supervision)
+}
+
+fn reconcile_daemon_remount_fence_with(
+    state_root: &Path,
+    restore: impl FnOnce(&DaemonProcessPaths) -> Result<(), locality_platform::DaemonProcessError>,
+) -> Result<(), String> {
+    let path = daemon_remount_fence_path(state_root);
+    if fs::symlink_metadata(&path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound) {
+        return Ok(());
+    }
+    let paths = DaemonProcessPaths::new(state_root.to_path_buf());
+    restore(&paths).map_err(|error| {
+        format!(
+            "Could not restore daemon supervision after remount recovery: {}",
+            error.message()
+        )
+    })?;
+    remove_daemon_remount_fence(state_root)
 }
 
 fn drain_daemon_for_remount(state_root: &Path) -> Result<(), String> {
@@ -8183,6 +8268,8 @@ fn desktop_mount_activity_fence() -> &'static RwLock<()> {
 }
 
 fn ensure_daemon_running_locked(state_root: &Path) -> Result<(), String> {
+    let paths = DaemonProcessPaths::new(state_root.to_path_buf());
+    ensure_daemon_start_allowed(&paths).map_err(|error| error.message().to_string())?;
     let current_build = expected_daemon_build_info();
     match running_daemon_build(state_root) {
         Some(build)
@@ -12462,6 +12549,7 @@ fn preserve_mount_pending_local_changes(
     let pending_mutations = store
         .list_virtual_mutations(mount_id)
         .map_err(|error| format!("Could not inspect pending virtual changes: {error}"))?;
+    let content_root = virtual_fs_content_root(state_root, mount_id);
 
     if pending_entities.is_empty() && pending_mutations.is_empty() {
         return Ok(None);
@@ -12488,12 +12576,20 @@ fn preserve_mount_pending_local_changes(
     let mut items = Vec::new();
     for entity in pending_entities {
         items.push(preserve_entity_local_change(
-            state_root, &mount, &directory, entity,
+            state_root,
+            &content_root,
+            &mount,
+            &directory,
+            entity,
         )?);
     }
     for mutation in pending_mutations {
         items.push(preserve_virtual_mutation_local_change(
-            state_root, &mount, &directory, mutation,
+            state_root,
+            &content_root,
+            &mount,
+            &directory,
+            mutation,
         )?);
     }
 
@@ -12546,13 +12642,15 @@ fn preserve_mount_pending_local_changes(
 
 fn preserve_entity_local_change(
     state_root: &Path,
+    content_root: &Path,
     mount: &MountConfig,
     recovery_dir: &Path,
     entity: EntityRecord,
 ) -> Result<PreservedLocalChangeItem, String> {
-    let source_path = preserved_local_change_source_path(state_root, mount, &entity.path);
+    let source_path = preserved_local_change_source_path(content_root, mount, &entity.path);
     let preserved_path = copy_preserved_file(
         state_root,
+        content_root,
         mount,
         source_path.as_deref(),
         recovery_dir,
@@ -12571,19 +12669,22 @@ fn preserve_entity_local_change(
 
 fn preserve_virtual_mutation_local_change(
     state_root: &Path,
+    content_root: &Path,
     mount: &MountConfig,
     recovery_dir: &Path,
     mutation: VirtualMutationRecord,
 ) -> Result<PreservedLocalChangeItem, String> {
     let fallback_path =
-        preserved_local_change_source_path(state_root, mount, &mutation.projected_path);
-    let source_path = mutation
-        .content_path
-        .clone()
-        .filter(|path| path.exists())
-        .or(fallback_path);
+        preserved_local_change_source_path(content_root, mount, &mutation.projected_path);
+    let source_path =
+        virtual_mutation_content_path_for_read(Some(state_root), &mount.mount_id, &mutation)
+            .map_err(|error| format!("Could not resolve pending local content: {error}"))?
+            .filter(|path| path.exists())
+            .or_else(|| mutation.content_path.clone().filter(|path| path.exists()))
+            .or(fallback_path);
     let preserved_path = copy_preserved_file(
         state_root,
+        content_root,
         mount,
         source_path.as_deref(),
         recovery_dir,
@@ -12601,12 +12702,12 @@ fn preserve_virtual_mutation_local_change(
 }
 
 fn preserved_local_change_source_path(
-    state_root: &Path,
+    content_root: &Path,
     mount: &MountConfig,
     relative_path: &Path,
 ) -> Option<PathBuf> {
     if mount.projection.uses_virtual_filesystem() {
-        virtual_fs_content_path(state_root, &mount.mount_id, relative_path).ok()
+        content_path_for_relative(content_root, relative_path).ok()
     } else {
         Some(mount.root.join(relative_path))
     }
@@ -12614,6 +12715,7 @@ fn preserved_local_change_source_path(
 
 fn copy_preserved_file(
     state_root: &Path,
+    content_root: &Path,
     mount: &MountConfig,
     source_path: Option<&Path>,
     recovery_dir: &Path,
@@ -12622,10 +12724,15 @@ fn copy_preserved_file(
     let Some(source_path) = source_path.filter(|path| path.is_file()) else {
         return Ok(None);
     };
-    let source_root = if source_path.starts_with(state_root) {
-        state_root
+    let source_root = if source_path.starts_with(content_root) {
+        content_root.to_path_buf()
+    } else if mount.projection.uses_virtual_filesystem() {
+        virtual_content_trusted_root_for_path(state_root, &mount.mount_id, source_path)
+            .map_err(|error| format!("Could not resolve trusted virtual content root: {error}"))?
+    } else if source_path.starts_with(state_root) {
+        state_root.to_path_buf()
     } else if source_path.starts_with(&mount.root) {
-        mount.root.as_path()
+        mount.root.clone()
     } else {
         return Err(format!(
             "Could not preserve local change from path outside owned roots `{}`",
@@ -12634,9 +12741,9 @@ fn copy_preserved_file(
     };
     let source_validation =
         if cfg!(windows) && mount.projection == ProjectionMode::WindowsCloudFiles {
-            validate_no_symlink_or_reparse_ancestors_allow_final(source_root, source_path)
+            validate_no_symlink_or_reparse_ancestors_allow_final(&source_root, source_path)
         } else {
-            validate_no_symlink_or_reparse_ancestors(source_root, source_path)
+            validate_no_symlink_or_reparse_ancestors(&source_root, source_path)
         };
     source_validation.map_err(|error| {
         format!(
@@ -12661,13 +12768,13 @@ fn copy_preserved_file(
     }
     let copy_result = if cfg!(windows) && mount.projection == ProjectionMode::WindowsCloudFiles {
         copy_new_file_durable_allow_cloud_placeholder(
-            source_root,
+            &source_root,
             source_path,
             state_root,
             &destination,
         )
     } else {
-        copy_new_file_durable(source_root, source_path, state_root, &destination)
+        copy_new_file_durable(&source_root, source_path, state_root, &destination)
     };
     copy_result.map_err(|error| {
         format!(
@@ -13147,6 +13254,7 @@ fn keep_target_as_local_draft_direct(target: &Path) -> Result<PathBuf, String> {
     })?;
     let draft_path = copy_preserved_file(
         &state_root,
+        &virtual_fs_content_root(&state_root, &mount.mount_id),
         &mount,
         Some(&source_path),
         &recovery_dir,
@@ -17100,6 +17208,80 @@ mod tests {
     }
 
     #[test]
+    fn preservation_accepts_resolved_virtual_content_root_outside_state_and_mount_roots() {
+        let temp = TestTempDir::new("preserve-resolved-content-root");
+        let state_root = temp.path().join("state");
+        let projection_root = temp.path().join("projection");
+        let content_root = temp.path().join("resolved-content/notion-main/files");
+        let recovery_dir = state_root.join("recovered/item");
+        fs::create_dir_all(&content_root).expect("create content root");
+        fs::create_dir_all(&recovery_dir).expect("create recovery root");
+        let relative = Path::new("Team/Edit.md");
+        let source = content_root.join(relative);
+        fs::create_dir_all(source.parent().unwrap()).expect("create source parent");
+        fs::write(&source, "local edit").expect("write source");
+        let mut mount = MountConfig::new(MountId::new("notion-main"), "notion", projection_root);
+        mount.projection = ProjectionMode::LinuxFuse;
+
+        let preserved = super::copy_preserved_file(
+            &state_root,
+            &content_root,
+            &mount,
+            Some(&source),
+            &recovery_dir,
+            relative,
+        )
+        .expect("preserve from resolved content root")
+        .expect("preserved path");
+
+        assert_eq!(fs::read_to_string(preserved).unwrap(), "local edit");
+
+        #[cfg(target_os = "macos")]
+        {
+            let legacy_root = temp
+                .path()
+                .join("Library/Group Containers/C484HB7Q6S.group.ai.codeflash.locality")
+                .join("content/notion-main/files");
+            let legacy_source = legacy_root.join(relative);
+            fs::create_dir_all(legacy_source.parent().unwrap()).expect("create legacy parent");
+            fs::write(&legacy_source, "legacy local edit").expect("write legacy source");
+            let legacy_state_root = temp.path().join(".loc");
+            let legacy_recovery = legacy_state_root.join("recovered/item");
+            fs::create_dir_all(&legacy_recovery).expect("create legacy recovery root");
+            let preserved = super::copy_preserved_file(
+                &legacy_state_root,
+                &content_root,
+                &mount,
+                Some(&legacy_source),
+                &legacy_recovery,
+                relative,
+            )
+            .expect("preserve from legacy normalized content root")
+            .expect("legacy preserved path");
+            assert_eq!(fs::read_to_string(preserved).unwrap(), "legacy local edit");
+        }
+    }
+
+    #[test]
+    fn startup_restores_supervision_before_clearing_persisted_daemon_fence() {
+        let temp = TestTempDir::new("startup-daemon-remount-fence");
+        let mount_id = MountId::new("notion-main");
+        super::persist_daemon_remount_fence(temp.path(), &mount_id).expect("persist fence");
+        let restored = std::cell::Cell::new(false);
+
+        super::reconcile_workspace_remount_recovery(temp.path()).expect("resolve remount recovery");
+        super::reconcile_daemon_remount_fence_with(temp.path(), |_| {
+            assert!(locality_platform::daemon_remount_fence_path(temp.path()).exists());
+            restored.set(true);
+            Ok(())
+        })
+        .expect("reconcile daemon fence");
+
+        assert!(restored.get());
+        assert!(!locality_platform::daemon_remount_fence_path(temp.path()).exists());
+    }
+
+    #[test]
     fn failed_journal_audit_alone_does_not_block_access_refresh() {
         let temp = TestTempDir::new("failed-journal-access-refresh");
         let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
@@ -20659,6 +20841,17 @@ fn main() {
                 );
                 return Err(io::Error::other(format!(
                     "Locality could not recover an interrupted source remount: {error}"
+                ))
+                .into());
+            }
+            if let Err(error) = reconcile_daemon_remount_fence(&state_root) {
+                desktop_log(
+                    "error",
+                    "remount.daemon_fence_recovery_failed",
+                    format!("could not reconcile interrupted daemon remount fence: {error}"),
+                );
+                return Err(io::Error::other(format!(
+                    "Locality could not restore daemon supervision after remount recovery: {error}"
                 ))
                 .into());
             }

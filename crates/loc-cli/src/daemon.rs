@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use locality_platform::{
     DaemonManager, DaemonProcessError, DaemonProcessManager, DaemonProcessPaths,
     DaemonProcessStartConfig, DaemonProcessStartReport, DaemonStartMode,
-    DefaultDaemonProcessManager,
+    DefaultDaemonProcessManager, ensure_daemon_start_allowed,
 };
 use localityd::ipc::{
     DaemonClientError, DaemonEndpoint, DaemonReloadReport, DaemonRequest, DaemonResponse,
@@ -200,6 +200,7 @@ fn start_daemon(
     options: &DaemonOptions,
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
+    ensure_daemon_start_allowed(paths).map_err(daemon_process_error)?;
     if is_running(options, paths) {
         repair_linux_fuse_units_for_daemon_start(&options.state_root);
         return Ok(report(
@@ -880,6 +881,31 @@ mod tests {
             .expect_err("parse should fail");
 
         assert_eq!(error.code(), "usage");
+    }
+
+    #[test]
+    fn competing_cli_start_is_rejected_by_persisted_remount_fence() {
+        let root = temp_root("loc-daemon-remount-fence");
+        fs::create_dir_all(&root).expect("create state root");
+        fs::write(
+            locality_platform::daemon_remount_fence_path(&root),
+            "version=1\n",
+        )
+        .expect("write fence");
+        let options = DaemonOptions {
+            action: DaemonAction::Start,
+            mode: StartMode::Session,
+            state_root: root.clone(),
+            localityd_bin: Some(root.join("unused-localityd")),
+            tcp_addr: None,
+            include_env: Vec::new(),
+        };
+        let paths = DaemonPaths::new(root.clone());
+
+        let error = start_daemon(&options, &paths).expect_err("fenced start must fail closed");
+
+        assert_eq!(error.code(), "remount_in_progress");
+        fs::remove_dir_all(root).expect("remove state root");
     }
 
     #[test]

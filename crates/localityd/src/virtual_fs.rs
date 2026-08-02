@@ -2066,7 +2066,7 @@ pub fn virtual_fs_content_path(
     )
 }
 
-pub(crate) fn virtual_mutation_content_path_for_read(
+pub fn virtual_mutation_content_path_for_read(
     state_root: Option<&Path>,
     mount_id: &MountId,
     mutation: &VirtualMutationRecord,
@@ -2086,6 +2086,28 @@ pub(crate) fn virtual_mutation_content_path_for_read(
     }
 
     Ok(current_path)
+}
+
+pub fn virtual_content_trusted_root_for_path(
+    state_root: &Path,
+    mount_id: &MountId,
+    path: &Path,
+) -> LocalityResult<PathBuf> {
+    let current = virtual_fs_content_root(state_root, mount_id);
+    if path.starts_with(&current) {
+        return Ok(current);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(legacy) = macos_app_group_container_for_state_root(state_root)
+        .map(|container| container.join("content").join(&mount_id.0).join("files"))
+        && path.starts_with(&legacy)
+    {
+        return Ok(legacy);
+    }
+    Err(LocalityError::InvalidState(format!(
+        "virtual content path `{}` is outside the current and legacy trusted roots",
+        path.display()
+    )))
 }
 
 #[cfg(target_os = "macos")]
@@ -2625,6 +2647,19 @@ where
         retitle_cached_page_if_present(new_content_path, title)?;
     }
 
+    // Keep the transition pending until obsolete source cleanup is durable.
+    // A cleanup error is therefore surfaced and retried by the next move
+    // reconciliation instead of being forgotten after SQLite finalization.
+    if old_path != new_content_path && old_path.exists() {
+        let source_root = virtual_move_source_trusted_root(content_root, &mount_id, old_path)?;
+        remove_path_durable(&source_root, old_path).map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to durably remove obsolete virtual content `{}`: {error}",
+                old_path.display()
+            ))
+        })?;
+    }
+
     let finalized = store
         .finalize_virtual_move_content(
             &mount_id,
@@ -2635,10 +2670,46 @@ where
         )
         .map_err(LocalityError::from)?;
 
-    if old_path != new_content_path && old_path.exists() {
-        let _ = remove_path_durable(content_root, old_path);
-    }
     Ok(finalized)
+}
+
+fn virtual_move_source_trusted_root(
+    content_root: &Path,
+    mount_id: &MountId,
+    source: &Path,
+) -> LocalityResult<PathBuf> {
+    if source.starts_with(content_root) {
+        return Ok(content_root.to_path_buf());
+    }
+    #[cfg(target_os = "macos")]
+    for candidate in source.ancestors() {
+        if candidate.file_name().and_then(OsStr::to_str) == Some("files")
+            && candidate
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(OsStr::to_str)
+                == Some(mount_id.0.as_str())
+            && candidate
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .and_then(OsStr::to_str)
+                == Some("content")
+            && candidate
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .and_then(OsStr::to_str)
+                == Some("C484HB7Q6S.group.ai.codeflash.locality")
+        {
+            return Ok(candidate.to_path_buf());
+        }
+    }
+    Err(LocalityError::InvalidState(format!(
+        "virtual move source `{}` is outside its trusted current and legacy content roots",
+        source.display()
+    )))
 }
 
 fn publish_virtual_move_cache(
@@ -3950,7 +4021,10 @@ fn path_string(path: &Path) -> String {
     locality_platform::logical_path_display(path)
 }
 
-fn content_path_for_relative(content_root: &Path, relative_path: &Path) -> LocalityResult<PathBuf> {
+pub fn content_path_for_relative(
+    content_root: &Path,
+    relative_path: &Path,
+) -> LocalityResult<PathBuf> {
     validate_relative_path(relative_path)?;
     Ok(content_root.join(relative_path))
 }
@@ -4071,8 +4145,8 @@ mod tests {
     };
     use locality_store::{
         EntityRecord, EntityRepository, FreshnessStateRepository, InMemoryStateStore, MountConfig,
-        MountRepository, ProjectionMode, ShadowRepository, VirtualMutationKind,
-        VirtualMutationRecord, VirtualMutationRepository,
+        MountRepository, ProjectionMode, ShadowRepository, VirtualMoveTransition,
+        VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
     };
 
     use crate::hydration::{HydratedEntity, HydrationSource};
@@ -4083,12 +4157,12 @@ mod tests {
         create_virtual_fs_directory, create_virtual_fs_file,
         materialize_virtual_fs_guidance_with_content_root,
         materialize_virtual_fs_item_with_content_root, mount_point_identifier,
-        refresh_virtual_fs_children, refresh_virtual_fs_children_with_content_root,
-        rename_virtual_fs_item, repair_legacy_macos_content_root, trash_virtual_fs_item,
-        validate_virtual_projection_root, virtual_fs_ancestor_container_identifiers,
-        virtual_fs_children, virtual_fs_children_with_content_root, virtual_fs_content_path,
-        virtual_fs_content_root, virtual_fs_item, virtual_fs_item_with_content_root,
-        virtual_projection_root,
+        persist_and_publish_virtual_move, refresh_virtual_fs_children,
+        refresh_virtual_fs_children_with_content_root, rename_virtual_fs_item,
+        repair_legacy_macos_content_root, trash_virtual_fs_item, validate_virtual_projection_root,
+        virtual_fs_ancestor_container_identifiers, virtual_fs_children,
+        virtual_fs_children_with_content_root, virtual_fs_content_path, virtual_fs_content_root,
+        virtual_fs_item, virtual_fs_item_with_content_root, virtual_projection_root,
     };
 
     #[test]
@@ -6294,6 +6368,24 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn legacy_move_cleanup_selects_the_actual_legacy_content_root() {
+        let home = temp_root("loc-legacy-cleanup-root");
+        let mount_id = MountId::new("notion-main");
+        let current_root = home.join("override/content/notion-main/files");
+        let legacy_root = home
+            .join("Library/Group Containers/C484HB7Q6S.group.ai.codeflash.locality")
+            .join("content/notion-main/files");
+        let legacy_file = legacy_root.join("Team/Edit.md");
+
+        assert_eq!(
+            super::virtual_move_source_trusted_root(&current_root, &mount_id, &legacy_file)
+                .expect("legacy trusted root"),
+            legacy_root
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn pending_create_listing_does_not_expose_legacy_app_group_content_path_outside_sandbox() {
         let home = std::env::temp_dir().join(format!(
             "loc-virtual-fs-legacy-pending-home-{}",
@@ -8027,6 +8119,98 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(state_root);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn virtual_move_cleanup_failure_is_surfaced_and_remains_retryable() {
+        use std::os::unix::fs::symlink;
+
+        let mount_id = MountId::new("cleanup-retry");
+        let state_root = temp_root("loc-virtual-move-cleanup-retry");
+        let content_root = state_root.join("content/cleanup-retry/files");
+        let old_path = content_root.join("old.md");
+        let new_path = content_root.join("new.md");
+        let outside = state_root.join("outside.md");
+        fs::create_dir_all(&content_root).expect("create content root");
+        fs::write(&outside, "preserved bytes").expect("write outside source");
+        symlink(&outside, &old_path).expect("create unsafe final source link");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        let mutation = VirtualMutationRecord {
+            mount_id: mount_id.clone(),
+            local_id: "local:cleanup-retry".to_string(),
+            mutation_kind: VirtualMutationKind::Create,
+            target_remote_id: None,
+            parent_remote_id: None,
+            original_path: Some(PathBuf::from("old.md")),
+            projected_path: PathBuf::from("new.md"),
+            title: "New".to_string(),
+            content_path: Some(old_path.clone()),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        let transition = VirtualMoveTransition {
+            mutation: mutation.clone(),
+            entity: None,
+            freshness: None,
+            superseded_local_ids: Vec::new(),
+        };
+
+        let error = persist_and_publish_virtual_move(
+            &mut store,
+            transition,
+            &content_root,
+            &old_path,
+            &new_path,
+            None,
+            false,
+        )
+        .expect_err("unsafe source cleanup must be surfaced");
+        assert!(matches!(error, LocalityError::Io(_)));
+        assert_eq!(fs::read_to_string(&new_path).unwrap(), "preserved bytes");
+        assert_eq!(
+            store
+                .get_virtual_mutation(&mount_id, &mutation.local_id)
+                .unwrap()
+                .unwrap()
+                .content_path,
+            Some(old_path.clone())
+        );
+
+        fs::remove_file(&old_path).expect("remove unsafe link");
+        fs::write(&old_path, "preserved bytes").expect("restore ordinary source");
+        let pending = store
+            .get_virtual_mutation(&mount_id, &mutation.local_id)
+            .unwrap()
+            .unwrap();
+        persist_and_publish_virtual_move(
+            &mut store,
+            VirtualMoveTransition {
+                mutation: pending,
+                entity: None,
+                freshness: None,
+                superseded_local_ids: Vec::new(),
+            },
+            &content_root,
+            &old_path,
+            &new_path,
+            None,
+            true,
+        )
+        .expect("retry cleanup and finalize");
+        assert!(!old_path.exists());
+        assert_eq!(
+            store
+                .get_virtual_mutation(&mount_id, &mutation.local_id)
+                .unwrap()
+                .unwrap()
+                .content_path,
+            Some(new_path)
+        );
+        let _ = fs::remove_dir_all(state_root);
     }
 
     #[test]
