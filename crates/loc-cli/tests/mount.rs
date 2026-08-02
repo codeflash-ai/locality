@@ -344,8 +344,10 @@ fn failed_cli_virtual_remount_keeps_the_persisted_mount_unchanged() {
     );
 }
 
+// This test intentionally runs on Windows CI too: Windows host-path comparison
+// trims trailing dots, but the portable mount target must reject the raw leaf.
 #[test]
-fn cli_rejects_layout_zero_plan_without_retaining_success() {
+fn cli_rejects_raw_trailing_dot_target_without_retaining_success() {
     let fixture = MountFixture::new("loc-cli-layout-zero-plan");
     let workspace_root = fixture.root.join("Locality");
     let mount_id = MountId::new("notion-main");

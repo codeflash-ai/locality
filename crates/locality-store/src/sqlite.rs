@@ -5948,7 +5948,7 @@ fn commit_workspace_binding_in_transaction(
         )));
     }
 
-    if !exact_replay && !safe_v1_upgrade {
+    if !exact_replay {
         let collision_key = record.binding.collision_key();
         let mut statement = connection.prepare(
             "SELECT m.mount_id, m.root, b.workspace_id, b.binding_json, b.target_collision_key

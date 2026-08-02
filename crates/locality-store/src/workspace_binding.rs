@@ -701,12 +701,14 @@ impl WorkspaceHostBindingResolver {
         let mut candidates = Vec::with_capacity(mounts.len());
         let mut collision_groups = BTreeMap::<String, Vec<usize>>::new();
         for mount in mounts {
-            let outcome = match ParsedHostPath::parse(self.platform, &mount.root) {
-                None => Err(LegacyLayout0Reason::InvalidHostPath),
-                Some(root) => match root.direct_child_of(self.platform, &trusted) {
-                    None => Err(LegacyLayout0Reason::OutsideTrustedWorkspaceRoot),
-                    Some(component) => MountTarget::new(component.to_string())
-                        .map_err(|_| LegacyLayout0Reason::InvalidMountTarget),
+            let outcome = match raw_mount_target(self.platform, &mount.root) {
+                Err(reason) => Err(reason),
+                Ok(target) => match ParsedHostPath::parse(self.platform, &mount.root) {
+                    None => Err(LegacyLayout0Reason::InvalidHostPath),
+                    Some(root) => match root.direct_child_of(self.platform, &trusted) {
+                        None => Err(LegacyLayout0Reason::OutsideTrustedWorkspaceRoot),
+                        Some(_) => Ok(target),
+                    },
                 },
             };
             let index = candidates.len();
@@ -818,6 +820,26 @@ impl WorkspaceHostBindingResolver {
         }
         Ok(resolved)
     }
+}
+
+fn raw_mount_target(
+    platform: WorkspaceHostPlatform,
+    root: &Path,
+) -> Result<MountTarget, LegacyLayout0Reason> {
+    let value = root.to_str().ok_or(LegacyLayout0Reason::InvalidHostPath)?;
+    let leaf = match platform {
+        WorkspaceHostPlatform::Macos | WorkspaceHostPlatform::Linux => root
+            .file_name()
+            .and_then(|leaf| leaf.to_str())
+            .ok_or(LegacyLayout0Reason::InvalidHostPath)?,
+        WorkspaceHostPlatform::Windows => value
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|leaf| !leaf.is_empty())
+            .ok_or(LegacyLayout0Reason::InvalidHostPath)?,
+    };
+    MountTarget::new(leaf.to_string()).map_err(|_| LegacyLayout0Reason::InvalidMountTarget)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1224,6 +1246,22 @@ mod tests {
         let plan = WorkspaceHostBindingResolver::new(WorkspaceHostPlatform::Linux)
             .plan_legacy_migration(Path::new("/tmp/Locality"), std::slice::from_ref(&mount))
             .expect("migration plan");
+
+        assert!(plan.layout1_bindings().is_empty());
+        assert_eq!(plan.layout0_mounts()[0].root, mount.root);
+        assert_eq!(
+            plan.layout0_mounts()[0].reason,
+            LegacyLayout0Reason::InvalidMountTarget
+        );
+    }
+
+    #[test]
+    fn windows_plan_validates_raw_leaf_before_alias_normalization() {
+        let mount =
+            LegacyWorkspaceMount::new(MountId::new("notion-production"), r"C:\Locality\trailing.");
+        let plan = WorkspaceHostBindingResolver::new(WorkspaceHostPlatform::Windows)
+            .plan_legacy_migration(Path::new(r"C:\Locality"), std::slice::from_ref(&mount))
+            .expect("Windows migration plan");
 
         assert!(plan.layout1_bindings().is_empty());
         assert_eq!(plan.layout0_mounts()[0].root, mount.root);

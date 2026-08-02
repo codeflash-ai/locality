@@ -964,6 +964,120 @@ fn workspace_binding_collision_includes_unbound_layout_zero_mounts() {
     assert_layout_zero_collision_is_reserved(fixture.open());
 }
 
+#[test]
+fn in_memory_v1_upgrade_still_scans_workspace_collisions() {
+    let fixture = Fixture::new();
+    assert_v1_upgrade_scans_workspace_collisions(InMemoryStateStore::default(), &fixture.root);
+}
+
+#[test]
+fn sqlite_v1_upgrade_still_scans_workspace_collisions() {
+    let fixture = Fixture::new();
+    assert_v1_upgrade_scans_workspace_collisions(fixture.open(), &fixture.root);
+}
+
+fn assert_v1_upgrade_scans_workspace_collisions<S>(mut store: S, root: &Path)
+where
+    S: MountRepository + WorkspaceBindingRepository,
+{
+    let legacy_mount_id = MountId::new("legacy-v1");
+    let existing_mount_id = MountId::new("existing-v2");
+    let legacy_workspace_root = root.join("LegacyWorkspace");
+    let target_workspace_root = root.join("TargetWorkspace");
+    fs::create_dir_all(&legacy_workspace_root).expect("legacy workspace root");
+    fs::create_dir_all(&target_workspace_root).expect("target workspace root");
+    let target = MountTarget::new("shared-target").expect("shared target");
+
+    store
+        .save_mount(MountConfig::new(
+            legacy_mount_id.clone(),
+            "notion",
+            legacy_workspace_root.join(target.as_str()),
+        ))
+        .expect("save legacy mount");
+    store
+        .save_workspace_binding(WorkspaceBindingRecord::new(
+            legacy_mount_id.clone(),
+            WorkspaceBinding::new(target.clone()),
+        ))
+        .expect("save v1 binding");
+
+    store
+        .save_mount(MountConfig::new(
+            existing_mount_id.clone(),
+            "google-docs",
+            target_workspace_root.join(target.as_str()),
+        ))
+        .expect("save existing v2 mount");
+    let workspace_id = WorkspaceId::new("locality.workspace.v1-upgrade").expect("workspace");
+    let projection_identity =
+        WorkspaceProjectionIdentity::new("test:v1-upgrade-collision").expect("projection identity");
+    store
+        .commit_workspace_binding(
+            WorkspaceHostBinding::new(
+                WorkspaceHostPlatform::current(),
+                workspace_id.clone(),
+                &target_workspace_root,
+                projection_identity.clone(),
+                1,
+            )
+            .expect("initial host binding"),
+            WorkspaceBindingRecord::new(
+                existing_mount_id.clone(),
+                WorkspaceBinding::for_workspace(workspace_id.clone(), target.clone()),
+            ),
+        )
+        .expect("save existing v2 binding");
+
+    store
+        .save_mount(MountConfig::new(
+            legacy_mount_id.clone(),
+            "notion",
+            target_workspace_root.join(target.as_str()),
+        ))
+        .expect("move legacy mount under target workspace");
+    let error = store
+        .commit_workspace_binding(
+            WorkspaceHostBinding::new(
+                WorkspaceHostPlatform::current(),
+                workspace_id.clone(),
+                &target_workspace_root,
+                projection_identity,
+                2,
+            )
+            .expect("next host binding"),
+            WorkspaceBindingRecord::new(
+                legacy_mount_id.clone(),
+                WorkspaceBinding::for_workspace(workspace_id.clone(), target.clone()),
+            ),
+        )
+        .expect_err("v1 upgrade must scan the target workspace");
+
+    assert_eq!(
+        error,
+        StoreError::WorkspaceMountTargetCollision {
+            target: target.as_str().to_string(),
+            existing_mount_id,
+        }
+    );
+    assert_eq!(
+        store
+            .get_workspace_binding(&legacy_mount_id)
+            .expect("legacy binding after collision")
+            .expect("legacy binding remains")
+            .workspace_id(),
+        None
+    );
+    assert_eq!(
+        store
+            .get_workspace_host_binding(&workspace_id)
+            .expect("host after collision")
+            .expect("host remains")
+            .layout_sequence(),
+        1
+    );
+}
+
 fn assert_layout_zero_collision_is_reserved<S>(mut store: S)
 where
     S: MountRepository + WorkspaceBindingRepository,

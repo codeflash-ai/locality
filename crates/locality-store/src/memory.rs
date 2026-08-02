@@ -323,7 +323,7 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
             )));
         }
 
-        if !exact_replay && !safe_v1_upgrade {
+        if !exact_replay {
             let requested_collision_key = record.binding.collision_key();
             if let Some(existing_mount_id) = self.mounts.iter().find_map(|(mount_id, mount)| {
                 if *mount_id == record.mount_id {
