@@ -86,10 +86,11 @@ case "${1:-}" in
     if grep -F -q '[mcp_servers' "$codex_home/config.toml"; then
       has_mcp=1
     fi
+    git_data_file="${GIT_DATA_FILE:-<unset>}"
 
     if [[ "$output_last_message" == *locality-agent-final.md ]]; then
       printf 'exec locality home=%s has_mcp=%s out_dir=%s report_file=%s trace_file=%s git_data_file=%s\n' \
-        "$codex_home" "$has_mcp" "$OUT_DIR" "${REPORT_FILE:-}" "${TRACE_FILE:-}" "${GIT_DATA_FILE:-}" >> "$log"
+        "$codex_home" "$has_mcp" "$OUT_DIR" "${REPORT_FILE:-}" "${TRACE_FILE:-}" "$git_data_file" >> "$log"
       if [ "$has_mcp" -ne 0 ]; then
         printf 'Locality Codex home contains MCP config\n' >&2
         exit 31
@@ -101,7 +102,7 @@ case "${1:-}" in
       printf 'locality trace\n' > "$trace_path"
     else
       printf 'exec notion-mcp home=%s has_mcp=%s out_dir=%s report_file=%s trace_file=%s git_data_file=%s\n' \
-        "$codex_home" "$has_mcp" "$OUT_DIR" "${REPORT_FILE:-}" "${TRACE_FILE:-}" "${GIT_DATA_FILE:-}" >> "$log"
+        "$codex_home" "$has_mcp" "$OUT_DIR" "${REPORT_FILE:-}" "${TRACE_FILE:-}" "$git_data_file" >> "$log"
       if [ "$has_mcp" -ne 1 ]; then
         printf 'MCP Codex home is missing MCP config\n' >&2
         exit 32
@@ -309,9 +310,23 @@ PATH="${fake_bin}:$PATH" \
 assert_contains "$fake_log" "exec locality home=${scenario1_out_dir}/codex/locality has_mcp=0 out_dir=${scenario1_out_dir}/scenarios/scenario1"
 assert_contains "$fake_log" "report_file=${scenario1_agent_report_path}"
 assert_contains "$fake_log" "trace_file=${scenario1_out_dir}/scenarios/scenario1/locality-agent-trace.md"
+assert_contains "$fake_log" "git_data_file=<unset>"
 assert_contains "${scenario1_out_dir}/scenarios/scenario1/locality-codex-command.txt" "context_paths_file=${scenario1_out_dir}/scenarios/scenario1/locality-context-paths.txt"
 assert_contains "${scenario1_out_dir}/scenarios/scenario1/locality-codex-command.txt" "report_file=${scenario1_out_dir}/scenarios/scenario1/report-body.md"
 assert_contains "${scenario1_out_dir}/scenarios/scenario1/report-body.md" "locality report"
+
+unsupported_hooks_out="${tmp_root}/unsupported-hooks-out"
+set +e
+PATH="${fake_bin}:$PATH" \
+  OUT_DIR="$unsupported_hooks_out" \
+  "$RUNNER" --compare-hooks --scenario scenario2 >/dev/null 2>"${tmp_root}/unsupported-hooks.err"
+unsupported_hooks_rc=$?
+set -e
+if [ "$unsupported_hooks_rc" -ne 2 ]; then
+  fail "--compare-hooks should be rejected by the artifact-only runner"
+fi
+assert_contains "${tmp_root}/unsupported-hooks.err" "--compare-hooks is no longer supported by the simplified artifact-only runner"
+test ! -e "$unsupported_hooks_out" || fail "unsupported --compare-hooks should not create artifacts"
 
 converter_events="${tmp_root}/converter-events.jsonl"
 cat > "$converter_events" <<'JSONL'
