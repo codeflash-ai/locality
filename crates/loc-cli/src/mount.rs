@@ -86,6 +86,40 @@ pub fn run_mount<S>(store: &mut S, options: MountOptions) -> Result<MountReport,
 where
     S: MountRepository + WorkspaceBindingRepository,
 {
+    run_mount_inner(store, options, WorkspaceMountCommit::Standard)
+}
+
+/// Run a virtual mount while retaining the durable mount/binding transaction
+/// through one coordinator-owned cleanup step.
+pub fn run_mount_with_workspace_cleanup<S, F>(
+    store: &mut S,
+    options: MountOptions,
+    mut cleanup: F,
+) -> Result<MountReport, MountError>
+where
+    S: MountRepository + WorkspaceBindingRepository,
+    F: FnMut() -> Result<(), StoreError>,
+{
+    run_mount_inner(
+        store,
+        options,
+        WorkspaceMountCommit::WithCleanup(&mut cleanup),
+    )
+}
+
+enum WorkspaceMountCommit<'a> {
+    Standard,
+    WithCleanup(&'a mut dyn FnMut() -> Result<(), StoreError>),
+}
+
+fn run_mount_inner<S>(
+    store: &mut S,
+    options: MountOptions,
+    workspace_commit: WorkspaceMountCommit<'_>,
+) -> Result<MountReport, MountError>
+where
+    S: MountRepository + WorkspaceBindingRepository,
+{
     let root = absolute_path(&options.root)?;
     if options.projection.uses_virtual_filesystem() {
         let proposed = MountConfig::new(options.mount_id.clone(), "pending", &root)
@@ -168,13 +202,21 @@ where
         if let (Some(host_binding), Some(binding)) =
             (plan.host_binding(), plan.layout1_bindings().first())
         {
-            store
-                .save_mount_with_workspace_binding(
+            let result = match workspace_commit {
+                WorkspaceMountCommit::Standard => store.save_mount_with_workspace_binding(
                     mount.clone(),
                     host_binding.clone(),
                     binding.clone(),
-                )
-                .map_err(MountError::Store)?;
+                ),
+                WorkspaceMountCommit::WithCleanup(cleanup) => store
+                    .save_mount_with_workspace_binding_and_cleanup(
+                        mount.clone(),
+                        host_binding.clone(),
+                        binding.clone(),
+                        cleanup,
+                    ),
+            };
+            result.map_err(MountError::Store)?;
         }
     } else {
         store.save_mount(mount.clone()).map_err(MountError::Store)?;

@@ -70,6 +70,24 @@ pub trait WorkspaceBindingRepository {
         ))
     }
 
+    /// Save a mount and binding while keeping the durable transaction open
+    /// through a coordinator-owned cleanup step. A cleanup error rolls back
+    /// mount, binding, host, and source-state mutations together.
+    fn save_mount_with_workspace_binding_and_cleanup(
+        &mut self,
+        _mount: MountConfig,
+        _host_binding: WorkspaceHostBinding,
+        _record: WorkspaceBindingRecord,
+        _cleanup: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<()>
+    where
+        Self: MountRepository,
+    {
+        Err(StoreError::NotImplemented(
+            "transactional portable workspace mount cleanup",
+        ))
+    }
+
     fn get_workspace_host_binding(
         &self,
         _workspace_id: &WorkspaceId,

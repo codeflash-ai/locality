@@ -2202,6 +2202,29 @@ impl WorkspaceBindingRepository for SqliteStateStore {
         Ok(())
     }
 
+    fn save_mount_with_workspace_binding_and_cleanup(
+        &mut self,
+        mount: MountConfig,
+        host_binding: WorkspaceHostBinding,
+        record: WorkspaceBindingRecord,
+        cleanup: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<()> {
+        if mount.mount_id != record.mount_id {
+            return Err(StoreError::InvalidState(
+                "mount and workspace binding identities do not match".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_workspace_binding_commit(&mount, &host_binding, &record)?;
+        clear_mount_source_state(&transaction, &mount.mount_id)?;
+        save_mount_row(&transaction, &mount)?;
+        commit_workspace_binding_in_transaction(&transaction, &mount, &host_binding, &record)?;
+        cleanup()?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn get_workspace_host_binding(
         &self,
         workspace_id: &WorkspaceId,

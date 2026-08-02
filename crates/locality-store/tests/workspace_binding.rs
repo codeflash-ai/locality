@@ -976,6 +976,63 @@ fn sqlite_v1_upgrade_still_scans_workspace_collisions() {
     assert_v1_upgrade_scans_workspace_collisions(fixture.open(), &fixture.root);
 }
 
+#[test]
+fn exact_replay_skips_workspace_collision_scan() {
+    let memory_fixture = Fixture::new();
+    assert_exact_replay_skips_workspace_collision_scan(
+        InMemoryStateStore::default(),
+        &memory_fixture.root,
+    );
+    let sqlite_fixture = Fixture::new();
+    assert_exact_replay_skips_workspace_collision_scan(sqlite_fixture.open(), &sqlite_fixture.root);
+}
+
+fn assert_exact_replay_skips_workspace_collision_scan<S>(mut store: S, root: &Path)
+where
+    S: MountRepository + WorkspaceBindingRepository,
+{
+    let workspace_root = root.join("ExactReplayWorkspace");
+    fs::create_dir_all(&workspace_root).expect("workspace root");
+    let mount_id = MountId::new("exact-replay");
+    let collision_mount_id = MountId::new("later-layout-zero-collision");
+    let target = MountTarget::new("shared-target").expect("target");
+    let workspace_id = WorkspaceId::new("locality.workspace.exact-replay").expect("workspace");
+    let host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        workspace_id.clone(),
+        &workspace_root,
+        WorkspaceProjectionIdentity::new("test:exact-replay").expect("projection identity"),
+        1,
+    )
+    .expect("host binding");
+    let record = WorkspaceBindingRecord::new(
+        mount_id.clone(),
+        WorkspaceBinding::for_workspace(workspace_id, target.clone()),
+    );
+
+    store
+        .save_mount(MountConfig::new(
+            mount_id,
+            "notion",
+            workspace_root.join(target.as_str()),
+        ))
+        .expect("save bound mount");
+    store
+        .commit_workspace_binding(host.clone(), record.clone())
+        .expect("initial binding commit");
+    store
+        .save_mount(MountConfig::new(
+            collision_mount_id,
+            "google-docs",
+            workspace_root.join(target.as_str()),
+        ))
+        .expect("introduce later layout-zero collision");
+
+    store
+        .commit_workspace_binding(host, record)
+        .expect("exact replay must not rescan later collisions");
+}
+
 fn assert_v1_upgrade_scans_workspace_collisions<S>(mut store: S, root: &Path)
 where
     S: MountRepository + WorkspaceBindingRepository,

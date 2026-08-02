@@ -371,6 +371,28 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
         Ok(())
     }
 
+    fn save_mount_with_workspace_binding_and_cleanup(
+        &mut self,
+        mount: MountConfig,
+        host_binding: WorkspaceHostBinding,
+        record: WorkspaceBindingRecord,
+        cleanup: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<()> {
+        let previous = self.clone();
+        let mount_id = mount.mount_id.clone();
+        self.save_mount(mount)?;
+        if let Err(error) = self.commit_workspace_binding(host_binding, record) {
+            *self = previous;
+            return Err(error);
+        }
+        self.clear_mount_source_state(&mount_id);
+        if let Err(error) = cleanup() {
+            *self = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn get_workspace_host_binding(
         &self,
         workspace_id: &WorkspaceId,
