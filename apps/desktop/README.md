@@ -113,5 +113,8 @@ Desktop-created virtual mounts persist a stable workspace identity, trusted
 workspace root, projection/domain identity, and layout sequence through the
 shared CLI coordinator. Creation reporting and Desktop path matching use the
 same binding resolver as CLI. Missing and released v1 bindings still resolve
-through exact `MountConfig.root`; target rename/removal, root relocation, and
-projection change-anchor lifecycle remain future coordinator work.
+through exact `MountConfig.root`. Existing-source account or source changes from
+either surface enter the shared quiesced remount coordinator, which persists a
+daemon fence, drains supervision, commits source-state cleanup, and restores
+supervision before clearing the fence. Target rename/removal, root relocation,
+and projection change-anchor lifecycle remain future coordinator work.

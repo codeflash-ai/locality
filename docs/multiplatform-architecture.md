@@ -486,6 +486,13 @@ advances the layout sequence for each new mount. CLI and Desktop then use the
 same repository resolver: layout-1 rows derive `<trusted root>/<target>`, while
 missing and v1 rows retain the legacy root.
 
+CLI and Desktop account/source remounts also use one quiesced lifecycle
+coordinator. It durably fences daemon startup before supervision is suspended,
+drains the active daemon, runs the surface's atomic projection/source cleanup,
+reconciles cleanup recovery, restores supervision, and only then removes the
+fence and restarts the daemon. A drain or restore failure therefore cannot
+briefly expose a cleared fence while supervision is still disabled.
+
 Sandbox overlap inspection opens the mount database read-only and supports old
 `mounts(mount_id, root)` schemas without initializing, migrating, or repairing
 state. CLI and Desktop inspect once before network work and again after staging,

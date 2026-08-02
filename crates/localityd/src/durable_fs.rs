@@ -599,42 +599,11 @@ fn copy_new_file_durable_unix(
 }
 
 #[cfg(unix)]
-fn remove_directory_contents_unix(directory: &std::os::fd::OwnedFd) -> io::Result<()> {
-    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
-
-    for entry in Dir::read_from(directory).map_err(io::Error::from)? {
-        let entry = entry.map_err(io::Error::from)?;
-        let name = entry.file_name();
-        if name.to_bytes() == b"." || name.to_bytes() == b".." {
-            continue;
-        }
-        let metadata = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(metadata) => metadata,
-            Err(rustix::io::Errno::NOENT) => continue,
-            Err(error) => return Err(error.into()),
-        };
-        if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
-            let child = rustix::fs::openat(
-                directory,
-                name,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(io::Error::from)?;
-            remove_directory_contents_unix(&child)?;
-            rustix::fs::unlinkat(directory, name, AtFlags::REMOVEDIR).map_err(io::Error::from)?;
-        } else {
-            rustix::fs::unlinkat(directory, name, AtFlags::empty()).map_err(io::Error::from)?;
-        }
-    }
-    rustix::fs::fsync(directory).map_err(io::Error::from)
-}
-
-#[cfg(unix)]
 fn remove_dir_all_durable_unix(trusted_root: &Path, path: &Path) -> io::Result<()> {
-    use rustix::fs::{AtFlags, Mode, OFlags};
+    use rustix::fs::{Mode, OFlags};
 
-    let (parent, name) = open_unix_parent_without_symlinks(trusted_root, path)?;
+    let root = open_unix_root(trusted_root)?;
+    let (parent, name) = open_unix_parent_from_root(&root, trusted_root, path)?;
     let directory = rustix::fs::openat(
         &parent,
         &name,
@@ -642,16 +611,24 @@ fn remove_dir_all_durable_unix(trusted_root: &Path, path: &Path) -> io::Result<(
         Mode::empty(),
     )
     .map_err(io::Error::from)?;
-    remove_directory_contents_unix(&directory)?;
-    rustix::fs::unlinkat(&parent, &name, AtFlags::REMOVEDIR).map_err(io::Error::from)?;
-    rustix::fs::fsync(&parent).map_err(io::Error::from)
+    let opened = rustix::fs::fstat(&directory).map_err(io::Error::from)?;
+    drop(directory);
+    quarantine_directory_if_identity_unix(
+        &root,
+        &parent,
+        &name,
+        opened.st_dev as u64,
+        opened.st_ino as u64,
+        || Ok(()),
+    )
 }
 
 #[cfg(unix)]
 fn remove_path_durable_unix(trusted_root: &Path, path: &Path) -> io::Result<()> {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 
-    let (parent, name) = open_unix_parent_without_symlinks(trusted_root, path)?;
+    let root = open_unix_root(trusted_root)?;
+    let (parent, name) = open_unix_parent_from_root(&root, trusted_root, path)?;
     let metadata =
         rustix::fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
     match FileType::from_raw_mode(metadata.st_mode) {
@@ -663,8 +640,16 @@ fn remove_path_durable_unix(trusted_root: &Path, path: &Path) -> io::Result<()> 
                 Mode::empty(),
             )
             .map_err(io::Error::from)?;
-            remove_directory_contents_unix(&directory)?;
-            rustix::fs::unlinkat(&parent, &name, AtFlags::REMOVEDIR).map_err(io::Error::from)?;
+            let opened = rustix::fs::fstat(&directory).map_err(io::Error::from)?;
+            drop(directory);
+            quarantine_directory_if_identity_unix(
+                &root,
+                &parent,
+                &name,
+                opened.st_dev as u64,
+                opened.st_ino as u64,
+                || Ok(()),
+            )?;
         }
         FileType::RegularFile => {
             let descriptor = rustix::fs::openat(
@@ -675,12 +660,15 @@ fn remove_path_durable_unix(trusted_root: &Path, path: &Path) -> io::Result<()> 
             )
             .map_err(io::Error::from)?;
             let opened = rustix::fs::fstat(&descriptor).map_err(io::Error::from)?;
-            let observed = rustix::fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(io::Error::from)?;
-            if opened.st_dev != observed.st_dev || opened.st_ino != observed.st_ino {
-                return Err(io::Error::other("path changed during durable removal"));
-            }
-            rustix::fs::unlinkat(&parent, &name, AtFlags::empty()).map_err(io::Error::from)?;
+            drop(descriptor);
+            quarantine_regular_file_if_identity_unix(
+                &root,
+                &parent,
+                &name,
+                opened.st_dev as u64,
+                opened.st_ino as u64,
+                || Ok(()),
+            )?;
         }
         _ => {
             return Err(io::Error::new(
@@ -693,6 +681,191 @@ fn remove_path_durable_unix(trusted_root: &Path, path: &Path) -> io::Result<()> 
         }
     }
     rustix::fs::fsync(&parent).map_err(io::Error::from)
+}
+
+/// Atomically removes a regular file from its public pathname only while that
+/// pathname still names the expected Unix object.
+///
+/// POSIX has no conditional-unlink primitive. The checked object is therefore
+/// renamed without replacement into an unpredictable private quarantine next
+/// to the trusted root and retained there. Retaining the quarantined inode is
+/// intentional: a later unlink would introduce the same check/unlink race
+/// under a different name. Keeping the quarantine outside the trusted tree
+/// also prevents internal tombstones from becoming projected or recovery
+/// content.
+#[cfg(unix)]
+pub(crate) fn remove_regular_file_durable_if_identity_unix(
+    trusted_root: &Path,
+    path: &Path,
+    expected_device: u64,
+    expected_inode: u64,
+) -> io::Result<()> {
+    remove_regular_file_durable_if_identity_unix_with_hook(
+        trusted_root,
+        path,
+        expected_device,
+        expected_inode,
+        || Ok(()),
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn remove_regular_file_durable_if_identity_unix_with_hook(
+    trusted_root: &Path,
+    path: &Path,
+    expected_device: u64,
+    expected_inode: u64,
+    before_remove: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let root = open_unix_root(trusted_root)?;
+    let (parent, name) = open_unix_parent_from_root(&root, trusted_root, path)?;
+    quarantine_regular_file_if_identity_unix(
+        &root,
+        &parent,
+        &name,
+        expected_device,
+        expected_inode,
+        before_remove,
+    )
+}
+
+#[cfg(unix)]
+fn quarantine_regular_file_if_identity_unix(
+    trusted_root: &std::os::fd::OwnedFd,
+    parent: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    expected_device: u64,
+    expected_inode: u64,
+    before_remove: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
+
+    let descriptor = rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let opened = rustix::fs::fstat(&descriptor).map_err(io::Error::from)?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+        || opened.st_dev as u64 != expected_device
+        || opened.st_ino as u64 != expected_inode
+    {
+        return Err(io::Error::other(
+            "file identity changed before descriptor-relative removal",
+        ));
+    }
+
+    before_remove()?;
+    let (quarantine_parent, quarantine, quarantine_name) =
+        create_unix_identity_quarantine(trusted_root)?;
+    rustix::fs::renameat_with(parent, name, &quarantine, "object", RenameFlags::NOREPLACE)
+        .map_err(io::Error::from)?;
+    rustix::fs::fsync(parent).map_err(io::Error::from)?;
+    rustix::fs::fsync(&quarantine).map_err(io::Error::from)?;
+    rustix::fs::fsync(&quarantine_parent).map_err(io::Error::from)?;
+
+    let quarantined = rustix::fs::statat(&quarantine, "object", AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(io::Error::from)?;
+    if FileType::from_raw_mode(quarantined.st_mode) != FileType::RegularFile
+        || quarantined.st_dev as u64 != expected_device
+        || quarantined.st_ino as u64 != expected_inode
+    {
+        return Err(io::Error::other(format!(
+            "file identity changed at the atomic removal boundary; replacement preserved in `{quarantine_name}`"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn quarantine_directory_if_identity_unix(
+    trusted_root: &std::os::fd::OwnedFd,
+    parent: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    expected_device: u64,
+    expected_inode: u64,
+    before_remove: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
+
+    let descriptor = rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let opened = rustix::fs::fstat(&descriptor).map_err(io::Error::from)?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::Directory
+        || opened.st_dev as u64 != expected_device
+        || opened.st_ino as u64 != expected_inode
+    {
+        return Err(io::Error::other(
+            "directory identity changed before descriptor-relative removal",
+        ));
+    }
+    before_remove()?;
+    let (quarantine_parent, quarantine, quarantine_name) =
+        create_unix_identity_quarantine(trusted_root)?;
+    rustix::fs::renameat_with(parent, name, &quarantine, "object", RenameFlags::NOREPLACE)
+        .map_err(io::Error::from)?;
+    rustix::fs::fsync(parent).map_err(io::Error::from)?;
+    rustix::fs::fsync(&quarantine).map_err(io::Error::from)?;
+    rustix::fs::fsync(&quarantine_parent).map_err(io::Error::from)?;
+    let quarantined = rustix::fs::statat(&quarantine, "object", AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(io::Error::from)?;
+    if FileType::from_raw_mode(quarantined.st_mode) != FileType::Directory
+        || quarantined.st_dev as u64 != expected_device
+        || quarantined.st_ino as u64 != expected_inode
+    {
+        return Err(io::Error::other(format!(
+            "directory identity changed at the atomic removal boundary; replacement preserved in `{quarantine_name}`"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_unix_identity_quarantine(
+    trusted_root: &std::os::fd::OwnedFd,
+) -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd, String)> {
+    use rustix::fs::{Mode, OFlags};
+
+    let quarantine_parent = rustix::fs::openat(
+        trusted_root,
+        "..",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let quarantine_name = unix_quarantine_name()?;
+    rustix::fs::mkdirat(
+        &quarantine_parent,
+        quarantine_name.as_str(),
+        Mode::from_raw_mode(0o700),
+    )
+    .map_err(io::Error::from)?;
+    rustix::fs::fsync(&quarantine_parent).map_err(io::Error::from)?;
+    let quarantine = open_unix_child_directory(&quarantine_parent, quarantine_name.as_ref())?;
+    Ok((quarantine_parent, quarantine, quarantine_name))
+}
+
+#[cfg(unix)]
+fn unix_quarantine_name() -> io::Result<String> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(|error| {
+        io::Error::other(format!("could not allocate quarantine name: {error}"))
+    })?;
+    let random = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!(
+        ".locality-identity-delete-{}-{random}",
+        std::process::id()
+    ))
 }
 
 #[cfg(unix)]
@@ -1177,6 +1350,95 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_stable_removal_never_unlinks_a_racing_replacement() {
+        let root = temp_root("identity-stable-remove-race");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("record");
+        fs::write(&path, b"original").expect("write original");
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(&path).expect("inspect original");
+
+        remove_regular_file_durable_if_identity_unix_with_hook(
+            &root,
+            &path,
+            metadata.dev(),
+            metadata.ino(),
+            || {
+                fs::remove_file(&path)?;
+                fs::write(&path, b"replacement")
+            },
+        )
+        .expect_err("atomic removal boundary rejects a replacement");
+
+        let quarantined = fs::read_dir(root.parent().expect("root parent"))
+            .expect("read quarantine parent")
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".locality-identity-delete-")
+                    && matches!(
+                        fs::read(entry.path().join("object")),
+                        Ok(contents) if contents == b"replacement"
+                    )
+            })
+            .expect("replacement remains quarantined");
+        assert_eq!(
+            fs::read(quarantined.path().join("object")).unwrap(),
+            b"replacement"
+        );
+        fs::remove_dir_all(quarantined.path()).expect("remove test quarantine");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_stable_tree_removal_never_unlinks_a_racing_replacement() {
+        let root = temp_root("identity-stable-tree-remove-race");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("tree");
+        fs::create_dir(&path).expect("create original tree");
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(&path).expect("inspect original tree");
+        let root_descriptor = open_unix_root(&root).unwrap();
+        let (parent, name) = open_unix_parent_from_root(&root_descriptor, &root, &path).unwrap();
+
+        quarantine_directory_if_identity_unix(
+            &root_descriptor,
+            &parent,
+            &name,
+            metadata.dev(),
+            metadata.ino(),
+            || {
+                fs::remove_dir(&path)?;
+                fs::create_dir(&path)?;
+                fs::write(path.join("keep.txt"), b"replacement tree")
+            },
+        )
+        .expect_err("atomic tree removal boundary rejects a replacement");
+
+        let quarantined = fs::read_dir(root.parent().expect("root parent"))
+            .expect("read quarantine parent")
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".locality-identity-delete-")
+                    && entry.path().join("object/keep.txt").is_file()
+            })
+            .expect("replacement tree remains quarantined");
+        assert_eq!(
+            fs::read(quarantined.path().join("object/keep.txt")).unwrap(),
+            b"replacement tree"
+        );
+        fs::remove_dir_all(quarantined.path()).expect("remove test quarantine");
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn write_sync_failure_stops_before_parent_sync_and_preserves_written_file() {

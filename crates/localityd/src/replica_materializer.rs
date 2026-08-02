@@ -2253,20 +2253,7 @@ fn with_windows_directory_read_only_restored<T>(
     root: &WindowsDirectory,
     operation: impl FnOnce() -> io::Result<T>,
 ) -> io::Result<T> {
-    root.clear_read_only()?;
-    let operation_result = operation();
-    let restore_result = root.set_read_only();
-    match (operation_result, restore_result) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(restore)) => Err(restore),
-        (Err(operation), Err(restore)) => Err(io::Error::new(
-            restore.kind(),
-            format!(
-                "failed to restore workspace generation read-only state: {restore}; preceding operation also failed: {operation}"
-            ),
-        )),
-    }
+    root.with_read_only_cleared_for_cleanup(operation)
 }
 
 pub(crate) struct StagingDirectory {
@@ -3244,54 +3231,66 @@ mod windows_mode_repair_tests {
     }
 
     #[test]
-    fn post_clear_sync_handle_error_restores_read_only() {
-        let (parent_path, root_path, parent, root) = test_directory("sync-open-error");
+    fn post_clear_sync_handle_error_restores_original_attribute_state() {
+        for original_read_only in [false, true] {
+            let (parent_path, root_path, parent, root) = test_directory("sync-open-error");
+            if !original_read_only {
+                root.clear_read_only().expect("make generation writable");
+            }
 
-        with_windows_directory_read_only_restored(&root, || {
-            parent
-                .open_directory_for_sync(OsStr::new("missing-generation"))
-                .map(drop)
-        })
-        .expect_err("missing durability handle must fail");
+            with_windows_directory_read_only_restored(&root, || {
+                parent
+                    .open_directory_for_sync(OsStr::new("missing-generation"))
+                    .map(drop)
+            })
+            .expect_err("missing durability handle must fail");
 
-        assert!(
-            fs::metadata(&root_path)
-                .expect("read restored metadata")
-                .permissions()
-                .readonly(),
-            "read-only state is restored after handle-open errors"
-        );
-        cleanup_test_directory(parent_path, &root_path, parent, root);
+            assert_eq!(
+                fs::metadata(&root_path)
+                    .expect("read restored metadata")
+                    .permissions()
+                    .readonly(),
+                original_read_only,
+                "the original attribute state is restored after handle-open errors"
+            );
+            cleanup_test_directory(parent_path, &root_path, parent, root);
+        }
     }
 
     #[test]
-    fn post_clear_identity_mismatch_restores_read_only() {
-        let (parent_path, root_path, parent, root) = test_directory("identity-mismatch");
-        fs::create_dir(parent_path.join("replacement-generation"))
-            .expect("create mismatched generation");
-        let expected = root.identity().expect("read expected identity");
-
-        with_windows_directory_read_only_restored(&root, || {
-            let replacement =
-                parent.open_directory_for_sync(OsStr::new("replacement-generation"))?;
-            if replacement.identity()? != expected {
-                return Err(io::Error::other(
-                    "workspace generation changed while opening durability handle",
-                ));
+    fn post_clear_identity_mismatch_restores_original_attribute_state() {
+        for original_read_only in [false, true] {
+            let (parent_path, root_path, parent, root) = test_directory("identity-mismatch");
+            if !original_read_only {
+                root.clear_read_only().expect("make generation writable");
             }
-            drop(replacement);
-            Ok(())
-        })
-        .expect_err("mismatched identity must fail");
+            fs::create_dir(parent_path.join("replacement-generation"))
+                .expect("create mismatched generation");
+            let expected = root.identity().expect("read expected identity");
 
-        assert!(
-            fs::metadata(&root_path)
-                .expect("read restored metadata")
-                .permissions()
-                .readonly(),
-            "read-only state is restored after identity mismatches"
-        );
-        cleanup_test_directory(parent_path, &root_path, parent, root);
+            with_windows_directory_read_only_restored(&root, || {
+                let replacement =
+                    parent.open_directory_for_sync(OsStr::new("replacement-generation"))?;
+                if replacement.identity()? != expected {
+                    return Err(io::Error::other(
+                        "workspace generation changed while opening durability handle",
+                    ));
+                }
+                drop(replacement);
+                Ok(())
+            })
+            .expect_err("mismatched identity must fail");
+
+            assert_eq!(
+                fs::metadata(&root_path)
+                    .expect("read restored metadata")
+                    .permissions()
+                    .readonly(),
+                original_read_only,
+                "the original attribute state is restored after identity mismatches"
+            );
+            cleanup_test_directory(parent_path, &root_path, parent, root);
+        }
     }
 }
 

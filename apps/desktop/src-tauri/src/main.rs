@@ -41,8 +41,9 @@ use loc_cli::file_provider::{
 };
 use loc_cli::local_oauth::run_local_oauth_authorization;
 use loc_cli::mount::{
-    MountOptions, MountReport, resolve_workspace_mount_root, run_mount,
-    run_mount_with_workspace_cleanup,
+    MountOptions, MountReport, QuiescedWorkspaceRemountRuntime, clear_workspace_remount_fence,
+    persist_workspace_remount_fence, resolve_workspace_mount_root, run_mount,
+    run_mount_with_workspace_cleanup, run_quiesced_workspace_remount,
 };
 use loc_cli::pull::{PullReport, run_pull_with_state_root};
 use loc_cli::push::{
@@ -124,9 +125,9 @@ use locality_store::{ConnectorProfileId, ConnectorProfileRecord, ConnectorProfil
 use localityd::autosave::auto_save_timestamp;
 use localityd::durable_fs::{
     copy_new_file_durable, copy_new_file_durable_allow_cloud_placeholder, create_dir_all_durable,
-    remove_dir_all_durable_anchored, remove_path_durable, rename_noreplace_durable_anchored,
-    sync_directory, validate_no_symlink_or_reparse_ancestors,
-    validate_no_symlink_or_reparse_ancestors_allow_final, write_new_file_durable,
+    remove_dir_all_durable_anchored, rename_noreplace_durable_anchored, sync_directory,
+    validate_no_symlink_or_reparse_ancestors, validate_no_symlink_or_reparse_ancestors_allow_final,
+    write_new_file_durable,
 };
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
 use localityd::google_docs::resolve_google_docs_connector_for_mount;
@@ -7767,50 +7768,11 @@ fn create_desktop_remount_quiesced(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _remount_guard = RemountInProgressGuard::begin();
 
-    let daemon_paths = DaemonProcessPaths::new(state_root.to_path_buf());
-    persist_daemon_remount_fence(state_root, &mount_id)?;
-    if let Err(error) = stop_windows_cloud_files_provider_supervisor(state_root) {
-        let _ = remove_daemon_remount_fence(state_root);
-        return Err(error);
-    }
-    let mut manager_fence = match DaemonManagerRestartFence::suspend(&daemon_paths) {
-        Ok(fence) => fence,
-        Err(error) => {
-            let cleanup = remove_daemon_remount_fence(state_root);
-            return Err(match cleanup {
-                Ok(()) => format!(
-                    "Could not suspend localityd's process manager before remount: {}",
-                    error.message()
-                ),
-                Err(cleanup_error) => format!(
-                    "Could not suspend localityd's process manager before remount: {}; removing the durable daemon fence also failed: {cleanup_error}",
-                    error.message()
-                ),
-            });
-        }
+    let mut runtime = DesktopQuiescedRemountRuntime {
+        state_root,
+        mount_id: &mount_id,
     };
-    if let Err(error) = drain_daemon_for_remount(state_root) {
-        remove_daemon_remount_fence(state_root)?;
-        if let Err(restore_error) = manager_fence.restore() {
-            let refence_error = repersist_resolved_daemon_remount_fence(state_root).err();
-            manager_fence.remain_suspended();
-            return Err(format!(
-                "{error}; restoring localityd's process manager also failed: {}{}",
-                restore_error.message(),
-                refence_error
-                    .map(|error| format!("; re-persisting the retry fence also failed: {error}"))
-                    .unwrap_or_default()
-            ));
-        }
-        return match ensure_daemon_running_locked(state_root) {
-            Ok(()) => Err(error),
-            Err(restart_error) => Err(format!(
-                "{error}; localityd restart after the cancelled remount also failed: {restart_error}"
-            )),
-        };
-    }
-
-    let commit_result = (|| {
+    let (store, mount_report, preserved) = run_quiesced_workspace_remount(&mut runtime, || {
         let mut store = SqliteStateStore::open(state_root.to_path_buf())
             .map_err(|error| format!("Could not reopen Locality state for remount: {error}"))?;
         let preparation =
@@ -7821,85 +7783,78 @@ fn create_desktop_remount_quiesced(
         let (report, preserved) =
             commit_desktop_mount(&mut store, state_root, options, Some(preparation))?;
         Ok::<_, String>((store, report, preserved))
-    })();
+    })?;
+    reload_daemon_mounts(state_root)?;
+    finish_desktop_mount_setup(&store, state_root, mount_report, preserved)
+}
 
-    if let Err(recovery_error) = reconcile_workspace_remount_recovery(state_root) {
-        manager_fence.remain_suspended();
-        return Err(match commit_result {
-            Ok(_) => format!(
-                "The remount completed, but durable recovery did not resolve; daemon supervision remains fenced: {recovery_error}"
-            ),
-            Err(error) => format!(
-                "{error}; durable remount recovery also failed and daemon supervision remains fenced: {recovery_error}"
-            ),
-        });
+struct DesktopQuiescedRemountRuntime<'a> {
+    state_root: &'a Path,
+    mount_id: &'a MountId,
+}
+
+impl QuiescedWorkspaceRemountRuntime for DesktopQuiescedRemountRuntime<'_> {
+    type SupervisionFence = DaemonManagerRestartFence;
+
+    fn persist_fence(&mut self) -> Result<(), String> {
+        persist_daemon_remount_fence(self.state_root, self.mount_id)?;
+        if let Err(error) = stop_windows_cloud_files_provider_supervisor(self.state_root) {
+            let _ = remove_daemon_remount_fence(self.state_root);
+            return Err(error);
+        }
+        Ok(())
     }
 
-    let restart_result = manager_fence
-        .restore()
-        .map_err(|error| {
-            manager_fence.remain_suspended();
+    fn clear_fence(&mut self) -> Result<(), String> {
+        remove_daemon_remount_fence(self.state_root)
+    }
+
+    fn suspend_supervision(&mut self) -> Result<Self::SupervisionFence, String> {
+        DaemonManagerRestartFence::suspend(&DaemonProcessPaths::new(self.state_root.to_path_buf()))
+            .map_err(|error| {
+                format!(
+                    "Could not suspend localityd's process manager before remount: {}",
+                    error.message()
+                )
+            })
+    }
+
+    fn restore_supervision(&mut self, fence: &mut Self::SupervisionFence) -> Result<(), String> {
+        fence.restore().map_err(|error| {
             format!(
                 "Could not restore localityd's process manager after remount: {}",
                 error.message()
             )
         })
-        .and_then(|()| remove_daemon_remount_fence(state_root))
-        .and_then(|()| ensure_daemon_running_locked(state_root));
-    let (store, mount_report, preserved) = match (commit_result, restart_result) {
-        (Ok(result), Ok(())) => result,
-        (Err(error), Ok(())) => {
-            return Err(
-                match reactivate_mount_after_failed_remount(state_root, &mount_id) {
-                    Ok(()) => error,
-                    Err(reactivation_error) => format!(
-                        "{error}; restoring the previous projection runtime also failed: {reactivation_error}"
-                    ),
-                },
-            );
-        }
-        (Ok(_), Err(restart_error)) => return Err(restart_error),
-        (Err(error), Err(restart_error)) => {
-            return Err(format!(
-                "{error}; localityd restart after remount failure also failed: {restart_error}"
-            ));
-        }
-    };
-    reload_daemon_mounts(state_root)?;
-    finish_desktop_mount_setup(&store, state_root, mount_report, preserved)
-}
+    }
 
-fn persist_daemon_remount_fence(state_root: &Path, mount_id: &MountId) -> Result<(), String> {
-    let path = daemon_remount_fence_path(state_root);
-    let contents = format!(
-        "version=1\nmount_id={}\ncreated_at={}\n",
-        mount_id.0,
-        activity_timestamp()
-    );
-    write_new_file_durable(state_root, &path, contents.as_bytes()).map_err(|error| {
-        format!(
-            "Could not persist daemon remount fence `{}`: {error}",
-            path.display()
-        )
-    })
-}
+    fn remain_suspended(&mut self, fence: &mut Self::SupervisionFence) {
+        fence.remain_suspended();
+    }
 
-fn remove_daemon_remount_fence(state_root: &Path) -> Result<(), String> {
-    let path = daemon_remount_fence_path(state_root);
-    match remove_path_durable(state_root, &path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "Could not durably remove daemon remount fence `{}`: {error}",
-            path.display()
-        )),
+    fn drain(&mut self) -> Result<(), String> {
+        drain_daemon_for_remount(self.state_root)
+    }
+
+    fn reconcile_cleanup(&mut self) -> Result<(), String> {
+        reconcile_workspace_remount_recovery(self.state_root)
+    }
+
+    fn ensure_running(&mut self) -> Result<(), String> {
+        ensure_daemon_running_locked(self.state_root)
+    }
+
+    fn reactivate_after_failed_commit(&mut self) -> Result<(), String> {
+        reactivate_mount_after_failed_remount(self.state_root, self.mount_id)
     }
 }
 
-fn repersist_resolved_daemon_remount_fence(state_root: &Path) -> Result<(), String> {
-    let path = daemon_remount_fence_path(state_root);
-    write_new_file_durable(state_root, &path, b"version=1\nrecovery_resolved=true\n")
-        .map_err(|error| format!("Could not re-persist daemon remount retry fence: {error}"))
+fn persist_daemon_remount_fence(state_root: &Path, mount_id: &MountId) -> Result<(), String> {
+    persist_workspace_remount_fence(state_root, mount_id, &activity_timestamp())
+}
+
+fn remove_daemon_remount_fence(state_root: &Path) -> Result<(), String> {
+    clear_workspace_remount_fence(state_root)
 }
 
 fn reconcile_daemon_remount_fence(state_root: &Path) -> Result<(), String> {
@@ -7915,12 +7870,21 @@ fn reconcile_daemon_remount_fence_with(
         return Ok(());
     }
     let paths = DaemonProcessPaths::new(state_root.to_path_buf());
-    restore(&paths).map_err(|error| {
-        format!(
-            "Could not restore daemon supervision after remount recovery: {}",
-            error.message()
-        )
-    })?;
+    restore_supervision_before_clearing_remount_fence(state_root, || {
+        restore(&paths).map_err(|error| {
+            format!(
+                "Could not restore daemon supervision after remount recovery: {}",
+                error.message()
+            )
+        })
+    })
+}
+
+fn restore_supervision_before_clearing_remount_fence(
+    state_root: &Path,
+    restore: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    restore()?;
     remove_daemon_remount_fence(state_root)
 }
 
@@ -17306,6 +17270,23 @@ mod tests {
             locality_platform::daemon_remount_fence_path(temp.path()).exists(),
             "startup retry marker survives the restore/remove crash gap"
         );
+    }
+
+    #[test]
+    fn drain_failure_crash_before_supervision_restore_keeps_persisted_fence() {
+        let temp = TestTempDir::new("drain-failure-supervision-crash");
+        let mount_id = MountId::new("notion-main");
+        super::persist_daemon_remount_fence(temp.path(), &mount_id).expect("persist fence");
+
+        let crashed = std::panic::catch_unwind(|| {
+            let _ = super::restore_supervision_before_clearing_remount_fence(temp.path(), || {
+                assert!(locality_platform::daemon_remount_fence_path(temp.path()).exists());
+                panic!("injected crash restoring supervision after drain failure")
+            });
+        });
+
+        assert!(crashed.is_err());
+        assert!(locality_platform::daemon_remount_fence_path(temp.path()).exists());
     }
 
     #[test]

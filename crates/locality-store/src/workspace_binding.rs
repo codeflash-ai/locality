@@ -1074,6 +1074,32 @@ fn relative_components_overlap(
     is_prefix(left, right) || is_prefix(right, left)
 }
 
+#[cfg(unix)]
+fn native_direct_child_component(
+    platform: WorkspaceHostPlatform,
+    trusted: &HostFilesystemAliases,
+    mount: &HostFilesystemAliases,
+) -> Option<String> {
+    mount.native_anchors.iter().find_map(|mount_anchor| {
+        trusted.native_anchors.iter().find_map(|trusted_anchor| {
+            if mount_anchor.identity != trusted_anchor.identity
+                || mount_anchor.suffix.len() != trusted_anchor.suffix.len() + 1
+            {
+                return None;
+            }
+            let same_prefix = trusted_anchor.suffix.iter().zip(&mount_anchor.suffix).all(
+                |(trusted, mount)| match (trusted.to_str(), mount.to_str()) {
+                    (Some(trusted), Some(mount)) => path_token_eq(platform, trusted, mount),
+                    _ => trusted == mount,
+                },
+            );
+            same_prefix
+                .then(|| mount_anchor.suffix.last()?.to_str().map(str::to_string))
+                .flatten()
+        })
+    })
+}
+
 fn path_token_eq(platform: WorkspaceHostPlatform, left: &str, right: &str) -> bool {
     match platform {
         WorkspaceHostPlatform::Macos | WorkspaceHostPlatform::Windows => {
@@ -1103,9 +1129,19 @@ pub(crate) fn legacy_mount_collision_key_for_host(
     if resolver.platform == WorkspaceHostPlatform::current() {
         let trusted = HostFilesystemAliases::inspect(host_binding.trusted_workspace_root()).ok()?;
         let mount = HostFilesystemAliases::inspect(root).ok()?;
-        let trusted = ParsedHostPath::parse(resolver.platform, &trusted.canonical)?;
-        let mount = ParsedHostPath::parse(resolver.platform, &mount.canonical)?;
-        let component = mount.direct_child_of(resolver.platform, &trusted)?;
+        let canonical_component = ParsedHostPath::parse(resolver.platform, &trusted.canonical)
+            .and_then(|trusted| {
+                ParsedHostPath::parse(resolver.platform, &mount.canonical).and_then(|mount| {
+                    mount
+                        .direct_child_of(resolver.platform, &trusted)
+                        .map(str::to_string)
+                })
+            });
+        #[cfg(unix)]
+        let component = canonical_component
+            .or_else(|| native_direct_child_component(resolver.platform, &trusted, &mount))?;
+        #[cfg(not(unix))]
+        let component = canonical_component?;
         let normalized = component.chars().nfc().collect::<String>();
         return MountTarget::new(normalized)
             .ok()
@@ -1300,5 +1336,40 @@ mod tests {
             mount.reason == LegacyLayout0Reason::MountTargetCollision
                 && (mount.root.ends_with("Straße") || mount.root.ends_with("STRASSE"))
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_identity_anchor_reserves_direct_child_when_canonical_paths_differ() {
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+
+        let trusted = super::HostFilesystemAliases {
+            canonical: PathBuf::from("/canonical/workspace"),
+            native_anchors: vec![super::NativePathAnchor {
+                identity: (41, 73),
+                suffix: Vec::new(),
+            }],
+        };
+        let mount = super::HostFilesystemAliases {
+            canonical: PathBuf::from("/bind-alias/not-canonicalized"),
+            native_anchors: vec![super::NativePathAnchor {
+                identity: (41, 73),
+                suffix: vec![OsString::from("canonical-target")],
+            }],
+        };
+
+        let component = super::native_direct_child_component(
+            WorkspaceHostPlatform::current(),
+            &trusted,
+            &mount,
+        )
+        .expect("same physical workspace anchor reserves its direct child");
+        assert_eq!(
+            MountTarget::new(component).expect("target").collision_key(),
+            MountTarget::new("canonical-target")
+                .expect("expected target")
+                .collision_key()
+        );
     }
 }

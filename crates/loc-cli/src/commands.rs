@@ -1,11 +1,14 @@
+use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command as ProcessCommand;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use locality_connector::ConnectorUndoApplier;
@@ -36,6 +39,7 @@ use locality_notion::oauth::{
     DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, DEFAULT_NOTION_OAUTH_AUTHORIZE_URL,
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
 };
+use locality_platform::{DaemonManagerRestartFence, DaemonProcessPaths};
 use locality_slack::{
     DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
     SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE, SLACK_CONNECTOR_ID, SlackConversationType,
@@ -46,10 +50,12 @@ use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, EntityRecord,
     EntityRepository, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
     JournalRepository, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
-    VirtualMutationRepository, open_credential_store, reset_locality_state_storage,
+    RemoteObservationRepository, ShadowRepository, SqliteStateStore, StoreError,
+    VirtualMutationKind, VirtualMutationRepository, WorkspaceBindingRepository,
+    open_credential_store, reset_locality_state_storage,
 };
 use localityd::autosave::auto_save_timestamp;
+use localityd::durable_fs::{remove_dir_all_durable, rename_noreplace_durable};
 use localityd::execution::PushJobReport;
 use localityd::file_provider as daemon_file_provider;
 use localityd::google_docs::resolve_google_docs_connector_for_mount;
@@ -101,7 +107,9 @@ use crate::local_oauth::{
     run_local_oauth_authorization,
 };
 use crate::mount::{
-    MountError, MountOptions, MountReport, resolve_workspace_mount_root, run_mount,
+    MountError, MountOptions, MountReport, QuiescedWorkspaceRemountRuntime,
+    clear_workspace_remount_fence, persist_workspace_remount_fence, resolve_workspace_mount_root,
+    run_mount, run_mount_with_workspace_cleanup, run_quiesced_workspace_remount,
 };
 use crate::mv::{MvError, MvOptions, MvReport, run_mv_with_daemon_at_state_root};
 use crate::okf::{OkfExportError, OkfExportOptions, OkfExportReport, run_okf_export};
@@ -3490,7 +3498,7 @@ fn mount(args: &[String], json: bool) -> i32 {
     };
     let mount_id = options.mount_id.clone();
 
-    match run_mount(&mut store, options) {
+    match run_cli_coordinated_mount(&mut store, &state_root, options) {
         Ok(report) => {
             notify_daemon_mounts_changed(&state_root);
             if let Err(error) = auto_register_mounted_projection(&state_root, &store, &mount_id) {
@@ -3596,7 +3604,7 @@ fn mount_slack(args: &[String], json: bool) -> i32 {
     };
     let mount_id = options.mount_id.clone();
 
-    match run_mount(&mut store, options) {
+    match run_cli_coordinated_mount(&mut store, &state_root, options) {
         Ok(report) => {
             notify_daemon_mounts_changed(&state_root);
             if let Err(error) = auto_register_mounted_projection(&state_root, &store, &mount_id) {
@@ -3619,6 +3627,200 @@ fn slack_mount_missing_path_error() -> CommandError {
         "usage",
         "usage: loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection <mode>] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim]",
     )
+}
+
+fn run_cli_coordinated_mount(
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    options: MountOptions,
+) -> Result<MountReport, MountError> {
+    let existing = store
+        .get_mount(&options.mount_id)
+        .map_err(MountError::Store)?;
+    let source_changed = existing.as_ref().is_some_and(|existing| {
+        existing.connector != options.connector
+            || existing.remote_root_id != options.remote_root_id
+            || existing.connection_id != options.connection_id
+            || existing.settings_json != options.settings_json
+            || existing.root != options.root
+            || existing.projection != options.projection
+    });
+    if !source_changed {
+        return run_mount(store, options);
+    }
+
+    let mount_id = options.mount_id.clone();
+    let uses_virtual_filesystem = options.projection.uses_virtual_filesystem();
+    let mut runtime = CliQuiescedRemountRuntime::new(state_root, &mount_id);
+    let cleanup_failure = Rc::clone(&runtime.cleanup_failure);
+    run_quiesced_workspace_remount(&mut runtime, || {
+        if !uses_virtual_filesystem {
+            return run_mount(store, options).map_err(|error| error.message());
+        }
+        let recovery_id = format!(
+            "cli-remount-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        store
+            .begin_workspace_remount_recovery(&recovery_id, &mount_id)
+            .map_err(|error| error.to_string())?;
+        let content_root = virtual_fs_content_root(state_root, &mount_id);
+        let content_parent = content_root
+            .parent()
+            .ok_or_else(|| "virtual content root has no parent".to_string())?
+            .to_path_buf();
+        let staging = content_parent.join(format!(".locality-remount-staging-{recovery_id}"));
+        let mut staged = false;
+        let result = run_mount_with_workspace_cleanup(store, options, || {
+            if fs::symlink_metadata(&content_root).is_ok() {
+                rename_noreplace_durable(
+                    &content_parent,
+                    &content_root,
+                    &content_parent,
+                    &staging,
+                )?;
+                staged = true;
+            }
+            Ok(())
+        })
+        .map_err(|error| error.message());
+        let cleanup = match &result {
+            Ok(_) if staged => remove_dir_all_durable(&content_parent, &staging)
+                .map_err(|error| format!("could not finalize CLI projection cleanup: {error}")),
+            Err(_) if staged => {
+                rename_noreplace_durable(&content_parent, &staging, &content_parent, &content_root)
+                    .map_err(|error| format!("could not roll back CLI projection cleanup: {error}"))
+            }
+            _ => Ok(()),
+        };
+        if let Err(error) = cleanup {
+            *cleanup_failure.borrow_mut() = Some(error.clone());
+            return Err(error);
+        }
+        let finish = store.finish_workspace_remount_recovery(&recovery_id);
+        if let Err(error) = finish {
+            let error = format!("could not clear CLI remount recovery outcome: {error}");
+            *cleanup_failure.borrow_mut() = Some(error.clone());
+            return Err(error);
+        }
+        result
+    })
+    .map_err(|error| MountError::Store(StoreError::InvalidState(error)))
+}
+
+struct CliQuiescedRemountRuntime<'a> {
+    state_root: &'a Path,
+    mount_id: &'a MountId,
+    daemon_was_ready: bool,
+    cleanup_failure: Rc<RefCell<Option<String>>>,
+}
+
+impl<'a> CliQuiescedRemountRuntime<'a> {
+    fn new(state_root: &'a Path, mount_id: &'a MountId) -> Self {
+        Self {
+            state_root,
+            mount_id,
+            daemon_was_ready: cli_daemon_is_ready(state_root),
+            cleanup_failure: Rc::new(RefCell::new(None)),
+        }
+    }
+}
+
+impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
+    type SupervisionFence = DaemonManagerRestartFence;
+
+    fn persist_fence(&mut self) -> Result<(), String> {
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_string();
+        persist_workspace_remount_fence(self.state_root, self.mount_id, &created_at)
+    }
+
+    fn clear_fence(&mut self) -> Result<(), String> {
+        clear_workspace_remount_fence(self.state_root)
+    }
+
+    fn suspend_supervision(&mut self) -> Result<Self::SupervisionFence, String> {
+        DaemonManagerRestartFence::suspend(&DaemonProcessPaths::new(self.state_root.to_path_buf()))
+            .map_err(|error| error.message().to_string())
+    }
+
+    fn restore_supervision(&mut self, fence: &mut Self::SupervisionFence) -> Result<(), String> {
+        fence.restore().map_err(|error| error.message().to_string())
+    }
+
+    fn remain_suspended(&mut self, fence: &mut Self::SupervisionFence) {
+        fence.remain_suspended();
+    }
+
+    fn drain(&mut self) -> Result<(), String> {
+        if !self.daemon_was_ready {
+            return Ok(());
+        }
+        let response = send_request_with_timeout(
+            self.state_root,
+            &DaemonRequest::Shutdown,
+            Duration::from_secs(5),
+        )
+        .map_err(|error| {
+            format!(
+                "could not obtain localityd's remount drain acknowledgement: {}",
+                error.message()
+            )
+        })?;
+        if !response.ok {
+            return Err(response
+                .error
+                .map(|error| error.message)
+                .unwrap_or_else(|| "localityd rejected the remount drain request".to_string()));
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while cli_daemon_is_ready(self.state_root) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if cli_daemon_is_ready(self.state_root) {
+            return Err("localityd acknowledged drain but remained available".to_string());
+        }
+        Ok(())
+    }
+
+    fn reconcile_cleanup(&mut self) -> Result<(), String> {
+        self.cleanup_failure.borrow().clone().map_or(Ok(()), Err)
+    }
+
+    fn ensure_running(&mut self) -> Result<(), String> {
+        if !self.daemon_was_ready || cli_daemon_is_ready(self.state_root) {
+            return Ok(());
+        }
+        let args = vec![
+            "start".to_string(),
+            "--state-dir".to_string(),
+            self.state_root.display().to_string(),
+        ];
+        crate::daemon::run_daemon_control(&args)
+            .map(|_| ())
+            .map_err(|error| error.message())
+    }
+
+    fn reactivate_after_failed_commit(&mut self) -> Result<(), String> {
+        notify_daemon_mounts_changed(self.state_root);
+        Ok(())
+    }
+}
+
+fn cli_daemon_is_ready(state_root: &Path) -> bool {
+    let paths = DaemonProcessPaths::new(state_root.to_path_buf());
+    if !paths.socket.exists() && !paths.pid_file.exists() && !paths.metadata_file.exists() {
+        return false;
+    }
+    send_request_with_timeout(state_root, &DaemonRequest::Ping, Duration::from_millis(250))
+        .is_ok_and(|response| response.ok)
 }
 
 fn slack_settings_from_mount_args(args: &[String]) -> Result<String, CommandError> {
@@ -9799,12 +10001,68 @@ mod tests {
         print_push_confirmation_preview, projection_mode_for_target,
         projection_usage_options_for_target, prompt_for_push_confirmation,
         pull_direct_fallback_error, push_confirmation_preview_matches_displayed,
-        push_preview_plan_matches, should_prompt_for_push_confirmation,
+        push_preview_plan_matches, run_cli_coordinated_mount, should_prompt_for_push_confirmation,
         should_refresh_notion_url_search, slack_mount_missing_path_error,
         slack_oauth_broker_config, spinner_config_for_command, spinner_enabled,
         status as run_status_command, validate_virtual_projection_registration,
         write_connect_report, write_log_report,
     };
+
+    #[test]
+    fn cli_account_change_uses_quiesced_coordinator_and_atomic_source_cleanup() {
+        let root = unique_temp_path("loc-cli-quiesced-account-remount");
+        let state_root = root.join("state");
+        let mount_root = root.join("workspace/notion-main");
+        fs::create_dir_all(&state_root).expect("create state root");
+        let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let options = |connection: &str| crate::mount::MountOptions {
+            mount_id: mount_id.clone(),
+            connector: "notion".to_string(),
+            root: mount_root.clone(),
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new(connection)),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
+        };
+        run_cli_coordinated_mount(&mut store, &state_root, options("account-a"))
+            .expect("create initial mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Old account page",
+                "old.md",
+            ))
+            .expect("save old account state");
+        let old_content_root =
+            localityd::virtual_fs::virtual_fs_content_root(&state_root, &mount_id);
+        fs::create_dir_all(&old_content_root).expect("create old content root");
+        fs::write(old_content_root.join("old.md"), "old account cache")
+            .expect("write old content cache");
+
+        run_cli_coordinated_mount(&mut store, &state_root, options("account-b"))
+            .expect("quiesced account remount");
+
+        assert!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("page-1"))
+                .expect("read source state")
+                .is_none(),
+            "source cleanup commits with the account change"
+        );
+        assert!(
+            !locality_platform::daemon_remount_fence_path(&state_root).exists(),
+            "supervision is restored before the durable fence is cleared"
+        );
+        assert!(
+            !old_content_root.exists(),
+            "old account content cache is removed by the coordinated cleanup"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn update_required_has_stable_command_error_code() {

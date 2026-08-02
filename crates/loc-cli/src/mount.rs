@@ -15,6 +15,7 @@ use locality_store::{
     WorkspaceHostBindingError, WorkspaceHostBindingResolver, WorkspaceHostPlatform, WorkspaceId,
     WorkspaceProjectionIdentity,
 };
+use localityd::durable_fs::{remove_path_durable, write_new_file_durable};
 use localityd::source::source_descriptor;
 use serde::Serialize;
 
@@ -105,6 +106,127 @@ where
         options,
         WorkspaceMountCommit::WithCleanup(&mut cleanup),
     )
+}
+
+/// Surface-independent lifecycle used whenever an existing workspace source
+/// is rebound. Desktop and the CLI provide their platform-specific drain,
+/// projection cleanup, and restart operations, while this coordinator owns the
+/// crash-sensitive ordering between them.
+pub trait QuiescedWorkspaceRemountRuntime {
+    type SupervisionFence;
+
+    fn persist_fence(&mut self) -> Result<(), String>;
+    fn clear_fence(&mut self) -> Result<(), String>;
+    fn suspend_supervision(&mut self) -> Result<Self::SupervisionFence, String>;
+    fn restore_supervision(&mut self, fence: &mut Self::SupervisionFence) -> Result<(), String>;
+    fn remain_suspended(&mut self, fence: &mut Self::SupervisionFence);
+    fn drain(&mut self) -> Result<(), String>;
+    fn reconcile_cleanup(&mut self) -> Result<(), String>;
+    fn ensure_running(&mut self) -> Result<(), String>;
+
+    fn reactivate_after_failed_commit(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+pub fn run_quiesced_workspace_remount<R, T>(
+    runtime: &mut R,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String>
+where
+    R: QuiescedWorkspaceRemountRuntime,
+{
+    runtime.persist_fence()?;
+    let mut supervision = match runtime.suspend_supervision() {
+        Ok(supervision) => supervision,
+        Err(error) => {
+            let cleanup = runtime.clear_fence();
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => {
+                    format!("{error}; clearing the durable remount fence also failed: {cleanup}")
+                }
+            });
+        }
+    };
+
+    if let Err(drain_error) = runtime.drain() {
+        if let Err(restore_error) = runtime
+            .restore_supervision(&mut supervision)
+            .and_then(|()| runtime.clear_fence())
+        {
+            runtime.remain_suspended(&mut supervision);
+            return Err(format!(
+                "{drain_error}; restoring supervision before clearing the durable remount fence also failed: {restore_error}"
+            ));
+        }
+        return match runtime.ensure_running() {
+            Ok(()) => Err(drain_error),
+            Err(restart_error) => Err(format!(
+                "{drain_error}; restarting after the cancelled remount also failed: {restart_error}"
+            )),
+        };
+    }
+
+    let operation_result = operation();
+    if let Err(recovery_error) = runtime.reconcile_cleanup() {
+        runtime.remain_suspended(&mut supervision);
+        return Err(match operation_result {
+            Ok(_) => format!(
+                "the remount committed, but durable cleanup recovery did not resolve; supervision remains fenced: {recovery_error}"
+            ),
+            Err(error) => format!(
+                "{error}; durable cleanup recovery also failed and supervision remains fenced: {recovery_error}"
+            ),
+        });
+    }
+
+    if let Err(error) = runtime.restore_supervision(&mut supervision) {
+        runtime.remain_suspended(&mut supervision);
+        return Err(error);
+    }
+    runtime.clear_fence()?;
+    runtime.ensure_running()?;
+
+    match operation_result {
+        Ok(value) => Ok(value),
+        Err(error) => match runtime.reactivate_after_failed_commit() {
+            Ok(()) => Err(error),
+            Err(reactivation) => Err(format!(
+                "{error}; restoring the previous projection runtime also failed: {reactivation}"
+            )),
+        },
+    }
+}
+
+pub fn persist_workspace_remount_fence(
+    state_root: &Path,
+    mount_id: &MountId,
+    created_at: &str,
+) -> Result<(), String> {
+    let path = locality_platform::daemon_remount_fence_path(state_root);
+    let contents = format!(
+        "version=1\nmount_id={}\ncreated_at={created_at}\n",
+        mount_id.0
+    );
+    write_new_file_durable(state_root, &path, contents.as_bytes()).map_err(|error| {
+        format!(
+            "Could not persist daemon remount fence `{}`: {error}",
+            path.display()
+        )
+    })
+}
+
+pub fn clear_workspace_remount_fence(state_root: &Path) -> Result<(), String> {
+    let path = locality_platform::daemon_remount_fence_path(state_root);
+    match remove_path_durable(state_root, &path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Could not durably remove daemon remount fence `{}`: {error}",
+            path.display()
+        )),
+    }
 }
 
 enum WorkspaceMountCommit<'a> {
@@ -524,5 +646,135 @@ fn absolute_path(path: &Path) -> Result<PathBuf, MountError> {
         std::env::current_dir()
             .map(|cwd| cwd.join(path))
             .map_err(|error| MountError::CurrentDir(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod remount_coordinator_tests {
+    use super::{QuiescedWorkspaceRemountRuntime, run_quiesced_workspace_remount};
+
+    struct Runtime {
+        surface: &'static str,
+        events: Vec<String>,
+        drain_error: bool,
+        panic_while_restoring: bool,
+    }
+
+    impl Runtime {
+        fn record(&mut self, event: &str) {
+            self.events.push(format!("{}:{event}", self.surface));
+        }
+    }
+
+    impl QuiescedWorkspaceRemountRuntime for Runtime {
+        type SupervisionFence = ();
+
+        fn persist_fence(&mut self) -> Result<(), String> {
+            self.record("persist_fence");
+            Ok(())
+        }
+        fn clear_fence(&mut self) -> Result<(), String> {
+            self.record("clear_fence");
+            Ok(())
+        }
+        fn suspend_supervision(&mut self) -> Result<(), String> {
+            self.record("suspend");
+            Ok(())
+        }
+        fn restore_supervision(&mut self, _: &mut ()) -> Result<(), String> {
+            self.record("restore");
+            if self.panic_while_restoring {
+                panic!("injected crash while restoring supervision");
+            }
+            Ok(())
+        }
+        fn remain_suspended(&mut self, _: &mut ()) {
+            self.record("remain_suspended");
+        }
+        fn drain(&mut self) -> Result<(), String> {
+            self.record("drain");
+            if self.drain_error {
+                Err("injected drain failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        fn reconcile_cleanup(&mut self) -> Result<(), String> {
+            self.record("reconcile_cleanup");
+            Ok(())
+        }
+        fn ensure_running(&mut self) -> Result<(), String> {
+            self.record("ensure_running");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cli_and_desktop_use_the_same_quiesced_remount_ordering() {
+        for surface in ["cli", "desktop"] {
+            let mut runtime = Runtime {
+                surface,
+                events: Vec::new(),
+                drain_error: false,
+                panic_while_restoring: false,
+            };
+            run_quiesced_workspace_remount(&mut runtime, || Ok::<_, String>(()))
+                .expect("coordinated remount");
+            assert_eq!(
+                runtime.events,
+                [
+                    "persist_fence",
+                    "suspend",
+                    "drain",
+                    "reconcile_cleanup",
+                    "restore",
+                    "clear_fence",
+                    "ensure_running",
+                ]
+                .map(|event| format!("{surface}:{event}"))
+            );
+        }
+    }
+
+    #[test]
+    fn drain_failure_restores_supervision_before_clearing_fence() {
+        let mut runtime = Runtime {
+            surface: "shared",
+            events: Vec::new(),
+            drain_error: true,
+            panic_while_restoring: false,
+        };
+        run_quiesced_workspace_remount(&mut runtime, || Ok::<_, String>(()))
+            .expect_err("drain failure cancels remount");
+        assert_eq!(
+            runtime.events,
+            [
+                "persist_fence",
+                "suspend",
+                "drain",
+                "restore",
+                "clear_fence",
+                "ensure_running",
+            ]
+            .map(|event| format!("shared:{event}"))
+        );
+    }
+
+    #[test]
+    fn drain_failure_crash_during_restore_never_reaches_fence_removal() {
+        let mut runtime = Runtime {
+            surface: "shared",
+            events: Vec::new(),
+            drain_error: true,
+            panic_while_restoring: true,
+        };
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = run_quiesced_workspace_remount(&mut runtime, || Ok::<_, String>(()));
+        }));
+        assert!(crashed.is_err());
+        assert_eq!(
+            runtime.events,
+            ["persist_fence", "suspend", "drain", "restore"].map(|event| format!("shared:{event}"))
+        );
     }
 }

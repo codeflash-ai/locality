@@ -2652,25 +2652,23 @@ where
     } else {
         None
     };
-    let destination_exists = old_path != new_content_path
-        && trusted_regular_file_identity(content_root, new_content_path)
-            .map_err(|error| {
-                LocalityError::Io(format!(
-                    "failed to inspect virtual move destination `{}`: {error}",
-                    new_content_path.display()
-                ))
-            })?
-            .is_some();
+    let destination_identity = if old_path != new_content_path {
+        trusted_regular_file_identity(content_root, new_content_path).map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to inspect virtual move destination `{}`: {error}",
+                new_content_path.display()
+            ))
+        })?
+    } else {
+        None
+    };
+    let destination_exists = destination_identity.is_some();
     if destination_exists && !retrying_published_move {
         return Err(LocalityError::InvalidState(format!(
             "virtual filesystem content `{}` already exists",
             new_content_path.display()
         )));
     }
-
-    store
-        .begin_virtual_move(transition)
-        .map_err(LocalityError::from)?;
 
     let cleanup = source
         .as_ref()
@@ -2693,6 +2691,63 @@ where
         )?;
     }
 
+    let persisted_destination_binding =
+        read_pending_virtual_move_destination_binding(content_root, &mount_id, &local_id)?;
+    let mut destination_binding = if destination_exists {
+        let binding = persisted_destination_binding.ok_or_else(|| {
+            LocalityError::InvalidState(format!(
+                "virtual move destination `{}` exists without a durable publication binding; refusing to adopt it",
+                new_content_path.display()
+            ))
+        })?;
+        verify_pending_virtual_move_destination_binding(
+            content_root,
+            &mount_id,
+            &local_id,
+            new_content_path,
+            &binding,
+            source.as_ref().map(|source| source.contents.as_slice()),
+        )?;
+        Some(binding)
+    } else if let Some(binding) = persisted_destination_binding {
+        if !retrying_published_move {
+            return Err(LocalityError::InvalidState(
+                "a durable virtual move publication is pending for a different move".to_string(),
+            ));
+        }
+        let source = source.as_ref().ok_or_else(|| {
+            LocalityError::InvalidState(
+                "pending virtual move publication has no authorized source".to_string(),
+            )
+        })?;
+        verify_pending_virtual_move_staging_binding(
+            content_root,
+            &mount_id,
+            &local_id,
+            new_content_path,
+            &binding,
+            &source.contents,
+        )?;
+        Some(binding)
+    } else {
+        None
+    };
+
+    if let Err(error) = store
+        .begin_virtual_move(transition)
+        .map_err(LocalityError::from)
+    {
+        if let Some(cleanup) = cleanup.as_ref() {
+            let _ = remove_pending_virtual_move_cleanup_state(
+                content_root,
+                &mount_id,
+                &local_id,
+                cleanup,
+            );
+        }
+        return Err(error);
+    }
+
     // Publication is authorized only after the durable anchor and cleanup
     // intent bind the exact source object. A crash from this point onward can
     // retry without adopting or deleting a replacement at the old path.
@@ -2700,7 +2755,31 @@ where
         && !destination_exists
         && let Some(source) = source.as_ref()
     {
-        publish_virtual_move_cache(content_root, new_content_path, &source.contents)?;
+        let binding = match destination_binding.take() {
+            Some(binding) => binding,
+            None => prepare_pending_virtual_move_destination(
+                content_root,
+                &mount_id,
+                &local_id,
+                new_content_path,
+                &source.contents,
+            )?,
+        };
+        publish_bound_virtual_move_destination(
+            content_root,
+            &mount_id,
+            &local_id,
+            new_content_path,
+            &binding,
+            &source.contents,
+        )?;
+        destination_binding = Some(binding);
+    }
+
+    if cleanup.is_some() && destination_binding.is_none() {
+        return Err(LocalityError::InvalidState(
+            "virtual move destination was not durably bound before finalization".to_string(),
+        ));
     }
     // The durable hard-link anchor now pins the source object across retries;
     // release the read handle before Windows opens the same object for delete.
@@ -2717,17 +2796,7 @@ where
         .map_err(LocalityError::from)
     {
         Ok(finalized) => finalized,
-        Err(error) => {
-            if let Some(cleanup) = cleanup.as_ref() {
-                let _ = remove_pending_virtual_move_cleanup_state(
-                    content_root,
-                    &mount_id,
-                    &local_id,
-                    cleanup,
-                );
-            }
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
 
     // The cleanup record is durable before SQLite points at the destination.
@@ -2856,6 +2925,19 @@ struct PendingVirtualMoveCleanup {
     source_identity: VirtualMoveSourceIdentity,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingVirtualMoveDestinationBinding {
+    version: u32,
+    mount_id: String,
+    local_id: String,
+    destination_path: EncodedNativePath,
+    staging_path: EncodedNativePath,
+    destination_identity: VirtualMoveSourceIdentity,
+    content_len: u64,
+    content_sha256: String,
+}
+
 impl PendingVirtualMoveCleanup {
     fn new(
         mount_id: &MountId,
@@ -2888,6 +2970,391 @@ fn pending_virtual_move_cleanup_path(
             "{}.json",
             virtual_move_cleanup_key(mount_id, local_id)
         ))
+}
+
+fn pending_virtual_move_destination_binding_path(
+    content_root: &Path,
+    mount_id: &MountId,
+    local_id: &str,
+) -> PathBuf {
+    content_root
+        .join(VIRTUAL_MOVE_CLEANUP_DIRECTORY)
+        .join(format!(
+            "{}.destination.json",
+            virtual_move_cleanup_key(mount_id, local_id)
+        ))
+}
+
+fn pending_virtual_move_destination_anchor_path(
+    content_root: &Path,
+    mount_id: &MountId,
+    local_id: &str,
+) -> PathBuf {
+    content_root
+        .join(VIRTUAL_MOVE_CLEANUP_ANCHOR_DIRECTORY)
+        .join(format!(
+            "{}.destination",
+            virtual_move_cleanup_key(mount_id, local_id)
+        ))
+}
+
+fn virtual_move_content_sha256(contents: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(contents))
+}
+
+fn prepare_pending_virtual_move_destination(
+    content_root: &Path,
+    mount_id: &MountId,
+    local_id: &str,
+    destination_path: &Path,
+    expected_contents: &[u8],
+) -> LocalityResult<PendingVirtualMoveDestinationBinding> {
+    let parent = destination_path.parent().ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "virtual filesystem content `{}` has no parent",
+            destination_path.display()
+        ))
+    })?;
+    create_dir_all_durable(content_root, parent).map_err(|error| {
+        LocalityError::Io(format!(
+            "failed to create virtual filesystem content directory `{}`: {error}",
+            parent.display()
+        ))
+    })?;
+    let staging_path = virtual_move_temp_path(destination_path);
+    write_new_file_durable(content_root, &staging_path, expected_contents).map_err(|error| {
+        LocalityError::Io(format!(
+            "failed to write virtual filesystem staging file `{}`: {error}",
+            staging_path.display()
+        ))
+    })?;
+    let opened =
+        read_trusted_regular_file(content_root, &staging_path, Some(expected_contents.len()))
+            .map_err(|error| {
+                LocalityError::Io(format!(
+                    "failed to bind virtual move staging file `{}`: {error}",
+                    staging_path.display()
+                ))
+            })?
+            .ok_or_else(|| {
+                LocalityError::InvalidState(format!(
+                    "virtual move staging file `{}` disappeared before binding",
+                    staging_path.display()
+                ))
+            })?;
+    if opened.contents != expected_contents {
+        return Err(LocalityError::InvalidState(format!(
+            "virtual move staging file `{}` changed before binding",
+            staging_path.display()
+        )));
+    }
+    let binding = PendingVirtualMoveDestinationBinding {
+        version: VIRTUAL_MOVE_CLEANUP_VERSION,
+        mount_id: mount_id.0.clone(),
+        local_id: local_id.to_string(),
+        destination_path: EncodedNativePath::from_path(destination_path)?,
+        staging_path: EncodedNativePath::from_path(&staging_path)?,
+        destination_identity: opened.identity,
+        content_len: expected_contents.len() as u64,
+        content_sha256: virtual_move_content_sha256(expected_contents),
+    };
+    persist_pending_virtual_move_destination_binding(content_root, mount_id, local_id, &binding)?;
+    persist_pending_virtual_move_destination_anchor(
+        content_root,
+        mount_id,
+        local_id,
+        &staging_path,
+        opened.identity,
+    )?;
+    Ok(binding)
+}
+
+fn persist_pending_virtual_move_destination_anchor(
+    content_root: &Path,
+    mount_id: &MountId,
+    local_id: &str,
+    staged_path: &Path,
+    expected: VirtualMoveSourceIdentity,
+) -> LocalityResult<()> {
+    let anchor = pending_virtual_move_destination_anchor_path(content_root, mount_id, local_id);
+    let parent = anchor.parent().expect("destination anchor has parent");
+    create_dir_all_durable(content_root, parent).map_err(|error| {
+        LocalityError::Io(format!(
+            "failed to create virtual move destination anchor directory `{}`: {error}",
+            parent.display()
+        ))
+    })?;
+    match trusted_regular_file_identity(content_root, &anchor).map_err(|error| {
+        LocalityError::Io(format!(
+            "failed to inspect virtual move destination anchor `{}`: {error}",
+            anchor.display()
+        ))
+    })? {
+        Some(identity) if identity != expected => {
+            return Err(LocalityError::InvalidState(format!(
+                "virtual move destination anchor `{}` belongs to a different publication",
+                anchor.display()
+            )));
+        }
+        Some(_) => {}
+        None => std::fs::hard_link(staged_path, &anchor).map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to anchor virtual move destination `{}` at `{}`: {error}",
+                staged_path.display(),
+                anchor.display()
+            ))
+        })?,
+    }
+    let staged = trusted_regular_file_identity(content_root, staged_path).map_err(|error| {
+        LocalityError::Io(format!(
+            "failed to revalidate staged virtual move destination `{}`: {error}",
+            staged_path.display()
+        ))
+    })?;
+    let anchored = trusted_regular_file_identity(content_root, &anchor).map_err(|error| {
+        LocalityError::Io(format!(
+            "failed to validate virtual move destination anchor `{}`: {error}",
+            anchor.display()
+        ))
+    })?;
+    if staged != Some(expected) || anchored != Some(expected) {
+        return Err(LocalityError::InvalidState(
+            "virtual move destination changed while its durable identity anchor was created"
+                .to_string(),
+        ));
+    }
+    sync_directory(content_root, parent).map_err(|error| {
+        LocalityError::Io(format!(
+            "failed to persist virtual move destination anchor `{}`: {error}",
+            anchor.display()
+        ))
+    })
+}
+
+fn persist_pending_virtual_move_destination_binding(
+    content_root: &Path,
+    mount_id: &MountId,
+    local_id: &str,
+    binding: &PendingVirtualMoveDestinationBinding,
+) -> LocalityResult<()> {
+    let path = pending_virtual_move_destination_binding_path(content_root, mount_id, local_id);
+    if let Some(existing) =
+        read_pending_virtual_move_destination_binding(content_root, mount_id, local_id)?
+    {
+        if existing == *binding {
+            return Ok(());
+        }
+        return Err(LocalityError::InvalidState(format!(
+            "virtual move destination binding `{}` belongs to a different publication",
+            path.display()
+        )));
+    }
+    let bytes = serde_json::to_vec(binding).map_err(|error| {
+        LocalityError::InvalidState(format!(
+            "failed to serialize virtual move destination binding: {error}"
+        ))
+    })?;
+    let temporary = path.with_extension(format!("tmp-{}", unique_suffix()));
+    write_new_file_durable(content_root, &temporary, &bytes).map_err(|error| {
+        LocalityError::Io(format!(
+            "failed to write virtual move destination binding `{}`: {error}",
+            temporary.display()
+        ))
+    })?;
+    rename_noreplace_durable(content_root, &temporary, content_root, &path).map_err(|error| {
+        let _ = remove_path_durable(content_root, &temporary);
+        LocalityError::Io(format!(
+            "failed to publish virtual move destination binding `{}`: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn read_pending_virtual_move_destination_binding(
+    content_root: &Path,
+    mount_id: &MountId,
+    local_id: &str,
+) -> LocalityResult<Option<PendingVirtualMoveDestinationBinding>> {
+    let path = pending_virtual_move_destination_binding_path(content_root, mount_id, local_id);
+    let Some(opened) = read_trusted_regular_file(
+        content_root,
+        &path,
+        Some(VIRTUAL_MOVE_CLEANUP_RECORD_MAX_BYTES),
+    )
+    .map_err(|error| {
+        LocalityError::Io(format!(
+            "failed to read virtual move destination binding `{}`: {error}",
+            path.display()
+        ))
+    })?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&opened.contents)
+        .map(Some)
+        .map_err(|error| {
+            LocalityError::InvalidState(format!(
+                "invalid virtual move destination binding `{}`: {error}",
+                path.display()
+            ))
+        })
+}
+
+fn verify_pending_virtual_move_destination_binding(
+    content_root: &Path,
+    mount_id: &MountId,
+    local_id: &str,
+    destination_path: &Path,
+    binding: &PendingVirtualMoveDestinationBinding,
+    expected_contents: Option<&[u8]>,
+) -> LocalityResult<()> {
+    if binding.version != VIRTUAL_MOVE_CLEANUP_VERSION
+        || binding.mount_id != mount_id.0
+        || binding.local_id != local_id
+        || binding.destination_path.to_path_buf()? != destination_path
+    {
+        return Err(LocalityError::InvalidState(
+            "virtual move destination binding has invalid durable bindings".to_string(),
+        ));
+    }
+    if let Some(expected_contents) = expected_contents
+        && (binding.content_len != expected_contents.len() as u64
+            || binding.content_sha256 != virtual_move_content_sha256(expected_contents))
+    {
+        return Err(LocalityError::InvalidState(
+            "virtual move destination binding does not match the anchored source content"
+                .to_string(),
+        ));
+    }
+    let destination_anchor =
+        pending_virtual_move_destination_anchor_path(content_root, mount_id, local_id);
+    let anchored_identity = trusted_regular_file_identity(content_root, &destination_anchor)
+        .map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to verify virtual move destination anchor `{}`: {error}",
+                destination_anchor.display()
+            ))
+        })?;
+    if anchored_identity != Some(binding.destination_identity) {
+        return Err(LocalityError::InvalidState(
+            "virtual move destination identity anchor is missing or changed".to_string(),
+        ));
+    }
+    let max_bytes = usize::try_from(binding.content_len).map_err(|_| {
+        LocalityError::InvalidState("virtual move destination length is unsupported".to_string())
+    })?;
+    let opened = read_trusted_regular_file(content_root, destination_path, Some(max_bytes))
+        .map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to verify virtual move destination `{}`: {error}",
+                destination_path.display()
+            ))
+        })?
+        .ok_or_else(|| {
+            LocalityError::InvalidState(format!(
+                "virtual move destination `{}` is missing after publication",
+                destination_path.display()
+            ))
+        })?;
+    if opened.identity != binding.destination_identity
+        || opened.contents.len() as u64 != binding.content_len
+        || virtual_move_content_sha256(&opened.contents) != binding.content_sha256
+    {
+        return Err(LocalityError::InvalidState(format!(
+            "virtual move destination `{}` no longer matches its durable publication binding",
+            destination_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn verify_pending_virtual_move_staging_binding(
+    content_root: &Path,
+    mount_id: &MountId,
+    local_id: &str,
+    destination_path: &Path,
+    binding: &PendingVirtualMoveDestinationBinding,
+    expected_contents: &[u8],
+) -> LocalityResult<PathBuf> {
+    if binding.version != VIRTUAL_MOVE_CLEANUP_VERSION
+        || binding.mount_id != mount_id.0
+        || binding.local_id != local_id
+        || binding.destination_path.to_path_buf()? != destination_path
+        || binding.content_len != expected_contents.len() as u64
+        || binding.content_sha256 != virtual_move_content_sha256(expected_contents)
+    {
+        return Err(LocalityError::InvalidState(
+            "virtual move staging binding does not match the anchored move".to_string(),
+        ));
+    }
+    let staging_path = binding.staging_path.to_path_buf()?;
+    let max_bytes = usize::try_from(binding.content_len).map_err(|_| {
+        LocalityError::InvalidState("virtual move staging length is unsupported".to_string())
+    })?;
+    let opened = read_trusted_regular_file(content_root, &staging_path, Some(max_bytes))
+        .map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to verify virtual move staging file `{}`: {error}",
+                staging_path.display()
+            ))
+        })?
+        .ok_or_else(|| {
+            LocalityError::InvalidState(format!(
+                "virtual move staging file `{}` is missing before publication",
+                staging_path.display()
+            ))
+        })?;
+    if opened.identity != binding.destination_identity
+        || opened.contents != expected_contents
+        || virtual_move_content_sha256(&opened.contents) != binding.content_sha256
+    {
+        return Err(LocalityError::InvalidState(format!(
+            "virtual move staging file `{}` no longer matches its durable binding",
+            staging_path.display()
+        )));
+    }
+    Ok(staging_path)
+}
+
+fn publish_bound_virtual_move_destination(
+    content_root: &Path,
+    mount_id: &MountId,
+    local_id: &str,
+    destination_path: &Path,
+    binding: &PendingVirtualMoveDestinationBinding,
+    expected_contents: &[u8],
+) -> LocalityResult<()> {
+    let staging_path = verify_pending_virtual_move_staging_binding(
+        content_root,
+        mount_id,
+        local_id,
+        destination_path,
+        binding,
+        expected_contents,
+    )?;
+    persist_pending_virtual_move_destination_anchor(
+        content_root,
+        mount_id,
+        local_id,
+        &staging_path,
+        binding.destination_identity,
+    )?;
+    rename_noreplace_durable(content_root, &staging_path, content_root, destination_path).map_err(
+        |error| {
+            LocalityError::Io(format!(
+                "failed to publish bound virtual filesystem content `{}`: {error}",
+                destination_path.display()
+            ))
+        },
+    )?;
+    verify_pending_virtual_move_destination_binding(
+        content_root,
+        mount_id,
+        local_id,
+        destination_path,
+        binding,
+        Some(expected_contents),
+    )
 }
 
 fn pending_virtual_move_cleanup_anchor_path(
@@ -3130,20 +3597,22 @@ where
             path.display()
         )));
     }
-    let destination_exists = trusted_regular_file_identity(content_root, &destination_path)
-        .map_err(|error| {
-            LocalityError::Io(format!(
-                "failed to verify virtual move cleanup destination `{}`: {error}",
-                destination_path.display()
-            ))
-        })?
-        .is_some();
-    if !destination_exists {
-        return Err(LocalityError::InvalidState(format!(
-            "virtual move cleanup destination `{}` is missing after pointer finalization",
-            destination_path.display()
-        )));
-    }
+    let destination_binding =
+        read_pending_virtual_move_destination_binding(content_root, mount_id, local_id)?
+            .ok_or_else(|| {
+                LocalityError::InvalidState(format!(
+                    "virtual move cleanup destination `{}` has no durable publication binding",
+                    destination_path.display()
+                ))
+            })?;
+    verify_pending_virtual_move_destination_binding(
+        content_root,
+        mount_id,
+        local_id,
+        &destination_path,
+        &destination_binding,
+        None,
+    )?;
     let authorized_root = virtual_move_source_trusted_root(content_root, mount_id, &source_path)?;
     if authorized_root != source_root {
         return Err(LocalityError::InvalidState(format!(
@@ -3261,9 +3730,17 @@ fn remove_trusted_regular_file_if_identity(
 ) -> io::Result<()> {
     #[cfg(unix)]
     {
-        remove_trusted_regular_file_if_identity_unix_with_hook(trusted_root, path, expected, || {
-            Ok(())
-        })
+        if expected.inode_high != 0 {
+            return Err(io::Error::other(
+                "Unix cleanup identity contains an unsupported high inode component",
+            ));
+        }
+        crate::durable_fs::remove_regular_file_durable_if_identity_unix(
+            trusted_root,
+            path,
+            expected.device,
+            expected.inode,
+        )
     }
     #[cfg(windows)]
     {
@@ -3332,115 +3809,25 @@ fn remove_trusted_regular_file_if_identity(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn remove_trusted_regular_file_if_identity_unix_with_hook(
     trusted_root: &Path,
     path: &Path,
     expected: VirtualMoveSourceIdentity,
     before_quarantine: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
-    use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
-
-    if !trusted_root.is_absolute() || !path.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "trusted root and file path must be absolute",
-        ));
-    }
-    let relative = path.strip_prefix(trusted_root).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "path `{}` is outside trusted root `{}`",
-                path.display(),
-                trusted_root.display()
-            ),
-        )
-    })?;
-    let components = relative
-        .components()
-        .map(|component| match component {
-            std::path::Component::Normal(component) => Ok(component),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("path `{}` contains unsafe components", path.display()),
-            )),
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    let Some((name, parent_components)) = components.split_last() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "trusted file path must name a child",
-        ));
-    };
-    let root = rustix::fs::open(
-        trusted_root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(io::Error::from)?;
-    let mut directories = vec![root];
-    for component in parent_components {
-        let parent = directories.last().expect("retained cleanup parent");
-        directories.push(
-            rustix::fs::openat(
-                parent,
-                *component,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(io::Error::from)?,
-        );
-    }
-    let parent = directories.last().expect("retained cleanup parent");
-    let descriptor = rustix::fs::openat(
-        parent,
-        *name,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(io::Error::from)?;
-    let opened = rustix::fs::fstat(&descriptor).map_err(io::Error::from)?;
-    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
-        || opened.st_dev as u64 != expected.device
-        || opened.st_ino as u64 != expected.inode
-        || expected.inode_high != 0
-    {
+    if expected.inode_high != 0 {
         return Err(io::Error::other(
-            "file identity changed before descriptor-relative cleanup",
+            "Unix cleanup identity contains an unsupported high inode component",
         ));
     }
-
-    before_quarantine()?;
-    let quarantine_name = format!(
-        ".locality-identity-delete-{}-{}",
-        std::process::id(),
-        unique_suffix()
-    );
-    rustix::fs::renameat_with(
-        parent,
-        *name,
-        parent,
-        quarantine_name.as_str(),
-        RenameFlags::NOREPLACE,
+    crate::durable_fs::remove_regular_file_durable_if_identity_unix_with_hook(
+        trusted_root,
+        path,
+        expected.device,
+        expected.inode,
+        before_quarantine,
     )
-    .map_err(io::Error::from)?;
-    rustix::fs::fsync(parent).map_err(io::Error::from)?;
-
-    let quarantined =
-        rustix::fs::statat(parent, quarantine_name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(io::Error::from)?;
-    if FileType::from_raw_mode(quarantined.st_mode) != FileType::RegularFile
-        || quarantined.st_dev as u64 != expected.device
-        || quarantined.st_ino as u64 != expected.inode
-    {
-        return Err(io::Error::other(format!(
-            "file identity changed at the quarantine boundary; replacement preserved as `{quarantine_name}`"
-        )));
-    }
-    rustix::fs::unlinkat(parent, quarantine_name.as_str(), AtFlags::empty())
-        .map_err(io::Error::from)?;
-    rustix::fs::fsync(parent).map_err(io::Error::from)
 }
 
 fn remove_pending_virtual_move_cleanup_record(
@@ -3448,15 +3835,46 @@ fn remove_pending_virtual_move_cleanup_record(
     mount_id: &MountId,
     local_id: &str,
 ) -> LocalityResult<()> {
+    let destination_binding =
+        read_pending_virtual_move_destination_binding(content_root, mount_id, local_id)?;
     let path = pending_virtual_move_cleanup_path(content_root, mount_id, local_id);
-    match remove_path_durable(content_root, &path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(LocalityError::Io(format!(
+    if let Err(error) = remove_path_durable(content_root, &path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        return Err(LocalityError::Io(format!(
             "failed to remove completed virtual move cleanup record `{}`: {error}",
             path.display()
-        ))),
+        )));
     }
+    let binding = pending_virtual_move_destination_binding_path(content_root, mount_id, local_id);
+    match remove_path_durable(content_root, &binding) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(LocalityError::Io(format!(
+                "failed to remove completed virtual move destination binding `{}`: {error}",
+                binding.display()
+            )));
+        }
+    };
+    if let Some(destination_binding) = destination_binding {
+        let anchor = pending_virtual_move_destination_anchor_path(content_root, mount_id, local_id);
+        match remove_trusted_regular_file_if_identity(
+            content_root,
+            &anchor,
+            destination_binding.destination_identity,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(LocalityError::Io(format!(
+                    "failed to remove completed virtual move destination anchor `{}`: {error}",
+                    anchor.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn remove_pending_virtual_move_cleanup_state(
@@ -3508,41 +3926,6 @@ fn virtual_move_source_trusted_root(
         "virtual move source `{}` is outside its trusted current and legacy content roots",
         source.display()
     )))
-}
-
-fn publish_virtual_move_cache(
-    content_root: &Path,
-    new_content_path: &Path,
-    contents: &[u8],
-) -> LocalityResult<()> {
-    let parent = new_content_path.parent().ok_or_else(|| {
-        LocalityError::InvalidState(format!(
-            "virtual filesystem content `{}` has no parent",
-            new_content_path.display()
-        ))
-    })?;
-    create_dir_all_durable(content_root, parent).map_err(|error| {
-        LocalityError::Io(format!(
-            "failed to create virtual filesystem content directory `{}`: {error}",
-            parent.display()
-        ))
-    })?;
-    let temp_path = virtual_move_temp_path(new_content_path);
-    write_new_file_durable(content_root, &temp_path, contents).map_err(|error| {
-        LocalityError::Io(format!(
-            "failed to write virtual filesystem temp file `{}`: {error}",
-            temp_path.display()
-        ))
-    })?;
-    rename_noreplace_durable(content_root, &temp_path, content_root, new_content_path).map_err(
-        |error| {
-            let _ = remove_path_durable(content_root, &temp_path);
-            LocalityError::Io(format!(
-                "failed to publish virtual filesystem content `{}`: {error}",
-                new_content_path.display()
-            ))
-        },
-    )
 }
 
 fn read_virtual_move_cache(
@@ -9465,6 +9848,12 @@ mod tests {
         super::persist_pending_virtual_move_cleanup(&content_root, &cleanup, &source.file)
             .expect("persist cleanup before simulated crash");
         drop(source);
+        persist_test_virtual_move_destination_binding(
+            &content_root,
+            &mount_id,
+            &mutation.local_id,
+            &new_path,
+        );
 
         super::retry_pending_virtual_move_cleanup(
             &store,
@@ -9580,6 +9969,230 @@ mod tests {
     }
 
     #[test]
+    fn virtual_move_retry_refuses_an_unbound_preexisting_destination() {
+        let mount_id = MountId::new("unbound-retry-destination");
+        let state_root = temp_root("loc-virtual-move-unbound-retry-destination");
+        let content_root = state_root.join("content/unbound-retry-destination/files");
+        let old_path = content_root.join("old.md");
+        let new_path = content_root.join("new.md");
+        fs::create_dir_all(&content_root).expect("create content root");
+        fs::write(&old_path, "authorized source").expect("write source");
+        fs::write(&new_path, "unrelated destination").expect("write unrelated destination");
+        let mutation = VirtualMutationRecord {
+            mount_id: mount_id.clone(),
+            local_id: "local:unbound-retry-destination".to_string(),
+            mutation_kind: VirtualMutationKind::Create,
+            target_remote_id: None,
+            parent_remote_id: None,
+            original_path: Some(PathBuf::from("old.md")),
+            projected_path: PathBuf::from("new.md"),
+            title: "New".to_string(),
+            content_path: Some(old_path.clone()),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_virtual_mutation(mutation.clone())
+            .expect("save pending move");
+
+        persist_and_publish_virtual_move(
+            &mut store,
+            VirtualMoveTransition {
+                mutation,
+                entity: None,
+                freshness: None,
+                superseded_local_ids: Vec::new(),
+            },
+            &content_root,
+            &old_path,
+            &new_path,
+            None,
+            true,
+        )
+        .expect_err("retry must not adopt an unbound destination");
+
+        assert_eq!(fs::read_to_string(&old_path).unwrap(), "authorized source");
+        assert_eq!(
+            fs::read_to_string(&new_path).unwrap(),
+            "unrelated destination"
+        );
+        assert_eq!(
+            store
+                .get_virtual_mutation(&mount_id, "local:unbound-retry-destination")
+                .unwrap()
+                .unwrap()
+                .content_path,
+            Some(old_path)
+        );
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn virtual_move_retry_resumes_after_binding_before_destination_anchor() {
+        let mount_id = MountId::new("bound-staging-retry");
+        let state_root = temp_root("loc-virtual-move-bound-staging-retry");
+        let content_root = state_root.join("content/bound-staging-retry/files");
+        let old_path = content_root.join("old.md");
+        let new_path = content_root.join("new.md");
+        fs::create_dir_all(&content_root).expect("create content root");
+        fs::write(&old_path, "authorized source").expect("write source");
+        let mutation = VirtualMutationRecord {
+            mount_id: mount_id.clone(),
+            local_id: "local:bound-staging-retry".to_string(),
+            mutation_kind: VirtualMutationKind::Create,
+            target_remote_id: None,
+            parent_remote_id: None,
+            original_path: Some(PathBuf::from("old.md")),
+            projected_path: PathBuf::from("new.md"),
+            title: "New".to_string(),
+            content_path: Some(old_path.clone()),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_virtual_mutation(mutation.clone())
+            .expect("save pending move");
+        let source = super::open_trusted_regular_file(&content_root, &old_path, true, true)
+            .unwrap()
+            .unwrap();
+        let cleanup = super::PendingVirtualMoveCleanup::new(
+            &mount_id,
+            &mutation.local_id,
+            &content_root,
+            &old_path,
+            &new_path,
+            source.identity,
+        )
+        .unwrap();
+        super::persist_pending_virtual_move_cleanup(&content_root, &cleanup, &source.file).unwrap();
+        let staging_path = super::virtual_move_temp_path(&new_path);
+        crate::durable_fs::write_new_file_durable(
+            &content_root,
+            &staging_path,
+            b"authorized source",
+        )
+        .expect("write bound staging file");
+        let staged = super::read_trusted_regular_file(&content_root, &staging_path, None)
+            .expect("inspect staging file")
+            .expect("staging file exists");
+        let binding = super::PendingVirtualMoveDestinationBinding {
+            version: super::VIRTUAL_MOVE_CLEANUP_VERSION,
+            mount_id: mount_id.0.clone(),
+            local_id: mutation.local_id.clone(),
+            destination_path: super::EncodedNativePath::from_path(&new_path).unwrap(),
+            staging_path: super::EncodedNativePath::from_path(&staging_path).unwrap(),
+            destination_identity: staged.identity,
+            content_len: staged.contents.len() as u64,
+            content_sha256: super::virtual_move_content_sha256(&staged.contents),
+        };
+        super::persist_pending_virtual_move_destination_binding(
+            &content_root,
+            &mount_id,
+            &mutation.local_id,
+            &binding,
+        )
+        .expect("persist binding before destination anchor");
+        drop(staged);
+        drop(source);
+        assert!(staging_path.exists());
+        assert!(!new_path.exists());
+        assert!(
+            !super::pending_virtual_move_destination_anchor_path(
+                &content_root,
+                &mount_id,
+                &mutation.local_id,
+            )
+            .exists(),
+            "simulated crash occurs before the destination anchor"
+        );
+
+        persist_and_publish_virtual_move(
+            &mut store,
+            VirtualMoveTransition {
+                mutation,
+                entity: None,
+                freshness: None,
+                superseded_local_ids: Vec::new(),
+            },
+            &content_root,
+            &old_path,
+            &new_path,
+            None,
+            true,
+        )
+        .expect("retry publishes only the durably bound staging object");
+
+        assert!(!staging_path.exists());
+        assert!(!old_path.exists());
+        assert_eq!(fs::read_to_string(new_path).unwrap(), "authorized source");
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn virtual_move_cleanup_refuses_a_replaced_bound_destination() {
+        let mount_id = MountId::new("replaced-bound-destination");
+        let state_root = temp_root("loc-virtual-move-replaced-bound-destination");
+        let content_root = state_root.join("content/replaced-bound-destination/files");
+        let old_path = content_root.join("old.md");
+        let new_path = content_root.join("new.md");
+        fs::create_dir_all(&content_root).expect("create content root");
+        fs::write(&old_path, "original bytes").expect("write source");
+        fs::write(&new_path, "original bytes").expect("write destination");
+        let mutation = VirtualMutationRecord {
+            mount_id: mount_id.clone(),
+            local_id: "local:replaced-bound-destination".to_string(),
+            mutation_kind: VirtualMutationKind::Create,
+            target_remote_id: None,
+            parent_remote_id: None,
+            original_path: Some(PathBuf::from("old.md")),
+            projected_path: PathBuf::from("new.md"),
+            title: "New".to_string(),
+            content_path: Some(new_path.clone()),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_virtual_mutation(mutation.clone())
+            .expect("save finalized move");
+        let source = super::open_trusted_regular_file(&content_root, &old_path, true, true)
+            .unwrap()
+            .unwrap();
+        let cleanup = super::PendingVirtualMoveCleanup::new(
+            &mount_id,
+            &mutation.local_id,
+            &content_root,
+            &old_path,
+            &new_path,
+            source.identity,
+        )
+        .unwrap();
+        super::persist_pending_virtual_move_cleanup(&content_root, &cleanup, &source.file).unwrap();
+        drop(source);
+        persist_test_virtual_move_destination_binding(
+            &content_root,
+            &mount_id,
+            &mutation.local_id,
+            &new_path,
+        );
+        fs::remove_file(&new_path).expect("remove bound destination");
+        fs::write(&new_path, "original bytes").expect("replace with identical bytes");
+
+        super::retry_pending_virtual_move_cleanup(
+            &store,
+            &content_root,
+            &mount_id,
+            &mutation.local_id,
+        )
+        .expect_err("destination replacement must block source cleanup");
+        assert_eq!(fs::read_to_string(&old_path).unwrap(), "original bytes");
+        assert_eq!(fs::read_to_string(&new_path).unwrap(), "original bytes");
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
     fn virtual_move_cleanup_refuses_replacement_file_or_tree() {
         let mount_id = MountId::new("cleanup-replacement");
         let state_root = temp_root("loc-virtual-move-cleanup-replacement");
@@ -9627,6 +10240,12 @@ mod tests {
         super::persist_pending_virtual_move_cleanup(&content_root, &cleanup, &source.file)
             .expect("persist delayed cleanup record");
         drop(source);
+        persist_test_virtual_move_destination_binding(
+            &content_root,
+            &mount_id,
+            &mutation.local_id,
+            &new_path,
+        );
 
         fs::remove_file(&old_path).expect("remove original source");
         fs::write(&old_path, "original bytes").expect("write identical replacement source");
@@ -9727,7 +10346,7 @@ mod tests {
         )
         .expect_err("racing replacement must never cross the identity boundary");
 
-        let preserved = fs::read_dir(&content_root)
+        let preserved = fs::read_dir(content_root.parent().expect("content parent"))
             .expect("read quarantine parent")
             .filter_map(Result::ok)
             .find(|entry| {
@@ -9735,12 +10354,18 @@ mod tests {
                     .file_name()
                     .to_string_lossy()
                     .starts_with(".locality-identity-delete-")
+                    && matches!(
+                        fs::read_to_string(entry.path().join("object")),
+                        Ok(contents) if contents == "racing replacement"
+                    )
             })
             .expect("replacement is preserved in quarantine");
         assert_eq!(
-            fs::read_to_string(preserved.path()).expect("read preserved replacement"),
+            fs::read_to_string(preserved.path().join("object"))
+                .expect("read preserved replacement"),
             "racing replacement"
         );
+        fs::remove_dir_all(preserved.path()).expect("remove test quarantine");
         let _ = fs::remove_dir_all(state_root);
     }
 
@@ -9787,6 +10412,12 @@ mod tests {
         super::persist_pending_virtual_move_cleanup(&content_root, &cleanup, &source.file)
             .expect("persist cleanup state");
         drop(source);
+        persist_test_virtual_move_destination_binding(
+            &content_root,
+            &mount_id,
+            &mutation.local_id,
+            &new_path,
+        );
 
         let candidate = super::pending_virtual_move_cleanup_candidate_path(
             &content_root,
@@ -9807,6 +10438,44 @@ mod tests {
         assert!(!candidate.exists());
         assert_eq!(fs::read_to_string(new_path).unwrap(), "obsolete bytes");
         let _ = fs::remove_dir_all(state_root);
+    }
+
+    fn persist_test_virtual_move_destination_binding(
+        content_root: &Path,
+        mount_id: &MountId,
+        local_id: &str,
+        destination_path: &Path,
+    ) {
+        let opened = super::read_trusted_regular_file(content_root, destination_path, None)
+            .expect("inspect test destination")
+            .expect("test destination exists");
+        super::persist_pending_virtual_move_destination_anchor(
+            content_root,
+            mount_id,
+            local_id,
+            destination_path,
+            opened.identity,
+        )
+        .expect("anchor test destination");
+        let binding = super::PendingVirtualMoveDestinationBinding {
+            version: super::VIRTUAL_MOVE_CLEANUP_VERSION,
+            mount_id: mount_id.0.clone(),
+            local_id: local_id.to_string(),
+            destination_path: super::EncodedNativePath::from_path(destination_path)
+                .expect("encode test destination"),
+            staging_path: super::EncodedNativePath::from_path(destination_path)
+                .expect("encode test staging path"),
+            destination_identity: opened.identity,
+            content_len: opened.contents.len() as u64,
+            content_sha256: super::virtual_move_content_sha256(&opened.contents),
+        };
+        super::persist_pending_virtual_move_destination_binding(
+            content_root,
+            mount_id,
+            local_id,
+            &binding,
+        )
+        .expect("persist test destination binding");
     }
 
     #[cfg(unix)]

@@ -630,22 +630,26 @@ impl WindowsDirectory {
         set_handle_read_only(&self.handle, false)
     }
 
-    fn with_read_only_cleared_for_cleanup<T>(
+    pub(crate) fn with_read_only_cleared_for_cleanup<T>(
         &self,
         operation: impl FnOnce() -> io::Result<T>,
     ) -> io::Result<T> {
-        self.clear_read_only()?;
-        match operation() {
-            Ok(value) => Ok(value),
-            Err(operation) => match self.set_read_only() {
-                Ok(()) => Err(operation),
-                Err(restore) => Err(io::Error::new(
-                    restore.kind(),
-                    format!(
-                        "failed to restore directory read-only state: {restore}; preceding cleanup preparation also failed: {operation}"
-                    ),
-                )),
-            },
+        let original_read_only = handle_is_read_only(&self.handle)?;
+        if original_read_only {
+            self.clear_read_only()?;
+        }
+        let operation_result = operation();
+        let restore_result = set_handle_read_only(&self.handle, original_read_only);
+        match (operation_result, restore_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(operation), Ok(())) => Err(operation),
+            (Ok(_), Err(restore)) => Err(restore),
+            (Err(operation), Err(restore)) => Err(io::Error::new(
+                restore.kind(),
+                format!(
+                    "failed to restore original directory read-only state: {restore}; preceding cleanup operation also failed: {operation}"
+                ),
+            )),
         }
     }
 
@@ -837,6 +841,17 @@ fn set_handle_read_only(handle: &OwnedHandle, read_only: bool) -> io::Result<()>
     Ok(())
 }
 
+fn handle_is_read_only(handle: &OwnedHandle) -> io::Result<bool> {
+    let mut basic = FILE_BASIC_INFO::default();
+    query_handle(
+        handle,
+        FileBasicInfo,
+        (&mut basic as *mut FILE_BASIC_INFO).cast(),
+        size_of::<FILE_BASIC_INFO>(),
+    )?;
+    Ok(basic.FileAttributes & FILE_ATTRIBUTE_READONLY != 0)
+}
+
 pub(crate) fn set_file_read_only(file: &File) -> io::Result<()> {
     let handle: HANDLE = file.as_raw_handle().cast();
     let mut basic = FILE_BASIC_INFO::default();
@@ -863,7 +878,10 @@ pub(crate) fn set_file_read_only(file: &File) -> io::Result<()> {
 }
 
 fn mark_handle_delete(handle: &OwnedHandle) -> io::Result<()> {
-    set_handle_read_only(handle, false)?;
+    let original_read_only = handle_is_read_only(handle)?;
+    if original_read_only {
+        set_handle_read_only(handle, false)?;
+    }
     let disposition = FILE_DISPOSITION_INFO_EX {
         Flags: FILE_DISPOSITION_FLAG_DELETE
             | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
@@ -879,7 +897,16 @@ fn mark_handle_delete(handle: &OwnedHandle) -> io::Result<()> {
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        let operation = io::Error::last_os_error();
+        return match set_handle_read_only(handle, original_read_only) {
+            Ok(()) => Err(operation),
+            Err(restore) => Err(io::Error::new(
+                restore.kind(),
+                format!(
+                    "failed to restore original read-only state after delete failure: {restore}; delete also failed: {operation}"
+                ),
+            )),
+        };
     }
     Ok(())
 }
@@ -1320,6 +1347,49 @@ mod lock_tests {
             .expect("clear test directory attribute");
         drop(root);
         std::fs::remove_dir(path).expect("remove cleanup restore directory");
+    }
+
+    #[test]
+    fn late_cleanup_failures_preserve_writable_and_read_only_original_state() {
+        for original_read_only in [false, true] {
+            let path = temporary_test_directory(if original_read_only {
+                "late-failure-read-only"
+            } else {
+                "late-failure-writable"
+            });
+            std::fs::create_dir(&path).expect("create late-failure parent");
+            let parent = WindowsDirectory::open_absolute(&path).expect("open late-failure parent");
+            let child_path = path.join("child");
+            std::fs::create_dir(&child_path).expect("create late-failure child");
+            let child = parent
+                .open_directory_for_attributes(OsStr::new("child"))
+                .expect("open attributes-only child");
+            if original_read_only {
+                child.set_read_only().expect("seal child");
+            }
+
+            child
+                .with_read_only_cleared_for_cleanup(|| Ok(()))
+                .expect("complete cleanup preparation");
+            child
+                .mark_delete()
+                .expect_err("attributes-only handle cannot complete late deletion");
+            assert_eq!(
+                std::fs::metadata(&child_path)
+                    .expect("read child metadata")
+                    .permissions()
+                    .readonly(),
+                original_read_only,
+                "late delete failure preserves the original attribute state"
+            );
+
+            child
+                .clear_read_only()
+                .expect("clear child for test cleanup");
+            drop(child);
+            drop(parent);
+            std::fs::remove_dir_all(path).expect("remove late-failure fixture");
+        }
     }
 
     fn temporary_test_directory(label: &str) -> std::path::PathBuf {
