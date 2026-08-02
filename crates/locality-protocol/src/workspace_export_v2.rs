@@ -233,17 +233,31 @@ impl WorkspaceNamespacedInventoryV2 {
         let wire: WorkspaceNamespacedInventoryV2Wire = serde_json::from_slice(input)
             .map_err(|error| WorkspaceExportV2Error::InvalidJson(error.to_string()))?;
         let decoded = wire.into_inventory();
-        let entries = decoded
+        decoded.validate_against_export(session_layout, offer)?;
+        Ok(decoded)
+    }
+
+    /// Recompute this inventory from its immutable authorized records and
+    /// scope authority, then compare every canonical field against the sealed
+    /// session layout and offer. Callers that use the inventory as authority
+    /// for a follow-on sidecar must use this stronger validation rather than
+    /// comparing aggregate counts and the declared digest alone.
+    pub fn validate_against_export(
+        &self,
+        session_layout: &SessionLayout,
+        offer: &WorkspaceExportOfferV2,
+    ) -> Result<(), WorkspaceExportV2Error> {
+        let entries = self
             .records
             .iter()
             .filter_map(authorized_entry_from_record)
             .collect::<Vec<_>>();
-        let expected = Self::plan(session_layout, offer, &decoded.scope_sources, &entries)?;
+        let expected = Self::plan(session_layout, offer, &self.scope_sources, &entries)?;
         expected.validate_against_offer(offer)?;
-        if decoded != expected {
+        if self != &expected {
             return Err(WorkspaceExportV2Error::ArchiveDoesNotMatchInventory);
         }
-        Ok(decoded)
+        Ok(())
     }
 
     pub fn scope_sources(&self) -> &[WorkspaceScopeSourceAuthorityV2] {

@@ -16,62 +16,82 @@ use locality_core::workspace_layout::PortableMountId;
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::MAX_EXPORT_V2_PAX_VALUE_BYTES;
 use crate::OrderedSourceGeneration;
 use crate::freshness_delivery::{
-    FreshnessDeliveryError, GenerationFileIdentity, MAX_DELIVERY_ID_BYTES,
-    MAX_GENERATION_DELTA_CONTENT_BYTES, MAX_GENERATION_DELTA_ENTRIES,
-    canonical_target_inventory_sha256,
+    GenerationFileIdentity, MAX_DELIVERY_ID_BYTES, MAX_GENERATION_FILE_BYTES,
 };
-use crate::workspace_api_v2::WorkspaceExportOfferV2;
+use crate::workspace_api_v2::{WorkspaceExportOfferV2, WorkspaceProfileSessionV2};
+use crate::workspace_export_v2::{
+    WorkspaceNamespacedExportRecordV2, WorkspaceNamespacedInventoryV2,
+};
 use crate::workspace_layout::{
-    LayoutDigest, MAX_PROFILE_MOUNTS, WORKSPACE_LAYOUT_VERSION, WorkspaceProfileId,
+    LayoutDigest, MAX_PROFILE_MOUNTS, MAX_PROFILE_SCOPE_BINDINGS, WORKSPACE_LAYOUT_VERSION,
+    WorkspaceProfileId,
 };
 
 pub const GENERATION_BASELINE_FORMAT_VERSION: u16 = 1;
 pub const GENERATION_BASELINE_READER_VERSION: u16 = 1;
 pub const GENERATION_BASELINE_V1_DOMAIN: &[u8] = b"locality.generation-baseline.v1\0";
-pub const MAX_GENERATION_BASELINE_ENCODED_BYTES: usize = 64 * 1024 * 1024;
-pub const MAX_GENERATION_BASELINE_MOUNTS: usize = MAX_PROFILE_MOUNTS;
-pub const MAX_GENERATION_BASELINE_FILES: usize = MAX_GENERATION_DELTA_ENTRIES;
-pub const MAX_GENERATION_BASELINE_CONTENT_BYTES: u64 = MAX_GENERATION_DELTA_CONTENT_BYTES;
+pub const GENERATION_TARGET_INVENTORY_V1_DOMAIN: &[u8] =
+    b"locality.generation-target-inventory.v1\0";
+
+/// Content-version identity is sidecar-only and therefore cannot inherit an
+/// export-record bound. V1 deliberately uses the frozen export-v2 PAX scalar
+/// ceiling as its negotiated implementation capability.
+pub const MAX_GENERATION_BASELINE_CONTENT_VERSION_ID_BYTES: usize = MAX_EXPORT_V2_PAX_VALUE_BYTES;
+
+const GENERATION_BASELINE_JSON_BASE_BYTES: usize = 64 * 1024;
+const GENERATION_BASELINE_JSON_PER_SOURCE_STATE_BYTES: usize = 512;
+const GENERATION_BASELINE_JSON_PER_FILE_BYTES: usize = 512;
+const MAX_JSON_ESCAPE_EXPANSION: usize = 6;
 
 pub const GENERATION_BASELINE_V1_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/generation-baseline-v1.json");
 pub const GENERATION_BASELINE_PREIMAGE_V1_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/generation-baseline-preimage-v1.json");
 
-/// Complete generation state for one portable mount.
+/// Whether this source state can use the existing generation-delta V1 reader.
 ///
-/// V1 deliberately carries exactly one source and one observed generation per
-/// mount. Every file inherits that source/generation binding.
+/// A valid negotiated export may contain a file or identifier beyond the
+/// generation-delta V1 implementation ceilings. Such a baseline remains exact
+/// but is explicitly full-export-only instead of being rejected or silently
+/// accepted as delta-capable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationBaselineRefreshModeV1 {
+    GenerationDeltaV1,
+    FullExportOnly,
+}
+
+/// Exact observed generation and target inventory for one source within one
+/// mount. Shared mounts carry one of these records for every authorized source.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct GenerationBaselineMountV1 {
-    mount_id: PortableMountId,
+pub struct GenerationBaselineSourceV1 {
     source_connection_id: SourceConnectionId,
     observed_generation_id: SourceGenerationId,
     target_inventory_sha256: String,
+    refresh_mode: GenerationBaselineRefreshModeV1,
     files: Vec<GenerationFileIdentity>,
 }
 
-impl GenerationBaselineMountV1 {
+impl GenerationBaselineSourceV1 {
     pub fn new(
-        mount_id: PortableMountId,
         source_connection_id: SourceConnectionId,
         observed_generation_id: SourceGenerationId,
         files: Vec<GenerationFileIdentity>,
     ) -> Result<Self, GenerationBaselineError> {
-        let target_inventory_sha256 = canonical_target_inventory_sha256(&files)?;
+        validate_baseline_files(&files)?;
+        let target_inventory_sha256 = baseline_target_inventory_sha256(&files)?;
+        let refresh_mode =
+            refresh_mode_for_source_fields(&source_connection_id, &observed_generation_id, &files);
         Ok(Self {
-            mount_id,
             source_connection_id,
             observed_generation_id,
             target_inventory_sha256,
+            refresh_mode,
             files,
         })
-    }
-
-    pub fn mount_id(&self) -> &PortableMountId {
-        &self.mount_id
     }
 
     pub fn source_connection_id(&self) -> &SourceConnectionId {
@@ -86,8 +106,45 @@ impl GenerationBaselineMountV1 {
         &self.target_inventory_sha256
     }
 
+    pub fn refresh_mode(&self) -> GenerationBaselineRefreshModeV1 {
+        self.refresh_mode
+    }
+
     pub fn files(&self) -> &[GenerationFileIdentity] {
         &self.files
+    }
+}
+
+/// Complete source-generation state for one portable mount.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct GenerationBaselineMountV1 {
+    mount_id: PortableMountId,
+    sources: Vec<GenerationBaselineSourceV1>,
+}
+
+impl GenerationBaselineMountV1 {
+    pub fn new(
+        mount_id: PortableMountId,
+        mut sources: Vec<GenerationBaselineSourceV1>,
+    ) -> Result<Self, GenerationBaselineError> {
+        if sources.is_empty() || sources.len() > MAX_PROFILE_SCOPE_BINDINGS {
+            return Err(GenerationBaselineError::MountSourceCount {
+                mount_id: mount_id.as_str().to_string(),
+                actual: sources.len(),
+            });
+        }
+        for source in &mut sources {
+            source.refresh_mode = refresh_mode_for_source(&mount_id, source);
+        }
+        Ok(Self { mount_id, sources })
+    }
+
+    pub fn mount_id(&self) -> &PortableMountId {
+        &self.mount_id
+    }
+
+    pub fn sources(&self) -> &[GenerationBaselineSourceV1] {
+        &self.sources
     }
 }
 
@@ -142,49 +199,49 @@ impl GenerationBaselineResponseV1 {
         Ok(response)
     }
 
-    /// Build the binding fields directly from the exact export-v2 offer.
-    pub fn from_export_offer(
+    /// Build and validate against the exact sealed session, offer, and
+    /// recomputed canonical export inventory.
+    pub fn from_export(
+        session: &WorkspaceProfileSessionV2,
         offer: &WorkspaceExportOfferV2,
+        inventory: &WorkspaceNamespacedInventoryV2,
         mounts: Vec<GenerationBaselineMountV1>,
     ) -> Result<Self, GenerationBaselineError> {
-        offer
-            .validate()
-            .map_err(|_| GenerationBaselineError::InvalidExportOffer)?;
+        validate_export_context(session, offer, inventory)?;
         let sealed = offer.offer();
         let response = Self::new(
-            offer.profile_id().clone(),
-            offer.profile_revision(),
+            session.profile_id().clone(),
+            session.profile_revision(),
             sealed.session_id.clone(),
             sealed.export_attempt_id.clone(),
-            offer.layout_version(),
-            offer.layout_digest().clone(),
-            sealed.inventory_sha256.clone(),
+            session.session_layout().layout_version(),
+            session.session_layout().layout_digest().clone(),
+            inventory.inventory_sha256().to_string(),
             sealed.source_generations.clone(),
             mounts,
         )?;
-        response.validate_against_export_offer(offer)?;
+        response.validate_against_export(session, offer, inventory)?;
         Ok(response)
     }
 
-    /// Strict bounded decode. This validates the self-contained canonical seal
-    /// but cannot establish which authenticated attempt the caller requested.
-    pub fn decode_json(input: &[u8]) -> Result<Self, GenerationBaselineError> {
-        if input.len() > MAX_GENERATION_BASELINE_ENCODED_BYTES {
+    /// Strict bounded decode against the exact authoritative export context.
+    /// There is intentionally no unbound network decoder.
+    pub fn decode_json_against_export(
+        input: &[u8],
+        session: &WorkspaceProfileSessionV2,
+        offer: &WorkspaceExportOfferV2,
+        inventory: &WorkspaceNamespacedInventoryV2,
+    ) -> Result<Self, GenerationBaselineError> {
+        let maximum = maximum_encoded_bytes_for_export(session, offer, inventory)?;
+        if input.len() > maximum {
             return Err(GenerationBaselineError::EncodingTooLarge {
                 actual: input.len(),
+                maximum,
             });
         }
-        serde_json::from_slice(input)
-            .map_err(|error| GenerationBaselineError::InvalidJson(error.to_string()))
-    }
-
-    /// Strict bounded decode plus the required exact-attempt comparison.
-    pub fn decode_json_against_export_offer(
-        input: &[u8],
-        offer: &WorkspaceExportOfferV2,
-    ) -> Result<Self, GenerationBaselineError> {
-        let response = Self::decode_json(input)?;
-        response.validate_against_export_offer(offer)?;
+        let response: Self = serde_json::from_slice(input)
+            .map_err(|error| GenerationBaselineError::InvalidJson(error.to_string()))?;
+        response.validate_against_export(session, offer, inventory)?;
         Ok(response)
     }
 
@@ -194,39 +251,118 @@ impl GenerationBaselineResponseV1 {
         if self.recompute_baseline_sha256()? != self.baseline_sha256 {
             return Err(GenerationBaselineError::BaselineDigestMismatch);
         }
-        let encoded_bytes = self.serialized_len()?;
-        if encoded_bytes > MAX_GENERATION_BASELINE_ENCODED_BYTES {
-            return Err(GenerationBaselineError::EncodingTooLarge {
-                actual: encoded_bytes,
-            });
-        }
         Ok(())
     }
 
-    pub fn validate_against_export_offer(
+    /// Validate every overlapping file identity against the recomputed export
+    /// inventory. Content-version IDs are supplied by the authenticated
+    /// endpoint and are committed by both per-source target digests and the
+    /// whole-response baseline digest.
+    pub fn validate_against_export(
         &self,
+        session: &WorkspaceProfileSessionV2,
         offer: &WorkspaceExportOfferV2,
+        inventory: &WorkspaceNamespacedInventoryV2,
     ) -> Result<(), GenerationBaselineError> {
         self.validate()?;
-        offer
-            .validate()
-            .map_err(|_| GenerationBaselineError::InvalidExportOffer)?;
+        let expected_mounts = validate_export_context(session, offer, inventory)?;
         let sealed = offer.offer();
-        if self.profile_id != *offer.profile_id()
-            || self.profile_revision != offer.profile_revision()
+        if self.profile_id != *session.profile_id()
+            || self.profile_revision != session.profile_revision()
+            || self.session_id != *session.session_id()
             || self.session_id != sealed.session_id
             || self.export_attempt_id != sealed.export_attempt_id
+            || self.layout_version != session.session_layout().layout_version()
             || self.layout_version != offer.layout_version()
+            || self.layout_digest != *session.session_layout().layout_digest()
             || self.layout_digest != *offer.layout_digest()
+            || self.inventory_sha256 != inventory.inventory_sha256()
             || self.inventory_sha256 != sealed.inventory_sha256
             || self.source_generations != sealed.source_generations
         {
             return Err(GenerationBaselineError::ExportBindingMismatch);
         }
 
-        let (file_count, content_bytes) = self.file_totals()?;
-        if file_count != sealed.file_count || content_bytes != sealed.selected_content_bytes {
-            return Err(GenerationBaselineError::ExportTotalsMismatch);
+        if self.mounts.len() != expected_mounts.len() {
+            return Err(GenerationBaselineError::MountSetMismatch);
+        }
+        for (mount, expected) in self.mounts.iter().zip(&expected_mounts) {
+            if mount.mount_id != expected.mount_id
+                || mount
+                    .sources
+                    .iter()
+                    .map(|source| &source.source_connection_id)
+                    .ne(expected.source_connection_ids.iter())
+            {
+                return Err(GenerationBaselineError::MountSourceSetMismatch {
+                    mount_id: mount.mount_id.as_str().to_string(),
+                });
+            }
+        }
+
+        let expected_files = inventory
+            .records()
+            .iter()
+            .filter_map(|record| match record {
+                WorkspaceNamespacedExportRecordV2::File {
+                    mount_id,
+                    logical_path,
+                    projection_id,
+                    source_connection_id,
+                    content_sha256,
+                    byte_length,
+                    ..
+                } => Some((
+                    projection_id,
+                    (
+                        mount_id,
+                        source_connection_id,
+                        logical_path,
+                        content_sha256,
+                        *byte_length,
+                    ),
+                )),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut matched_projection_ids = BTreeSet::new();
+        for mount in &self.mounts {
+            for source in &mount.sources {
+                for file in &source.files {
+                    let Some((
+                        expected_mount,
+                        expected_source,
+                        expected_path,
+                        expected_sha256,
+                        expected_byte_length,
+                    )) = expected_files.get(&file.projection_id)
+                    else {
+                        return Err(GenerationBaselineError::InventoryFileMismatch {
+                            projection_id: file.projection_id.as_str().to_string(),
+                        });
+                    };
+                    if *expected_mount != &mount.mount_id
+                        || *expected_source != &source.source_connection_id
+                        || *expected_path != &file.logical_path
+                        || *expected_sha256 != &file.content_sha256
+                        || *expected_byte_length != file.byte_length
+                    {
+                        return Err(GenerationBaselineError::InventoryFileMismatch {
+                            projection_id: file.projection_id.as_str().to_string(),
+                        });
+                    }
+                    matched_projection_ids.insert(&file.projection_id);
+                }
+            }
+        }
+        if matched_projection_ids.len() != expected_files.len() {
+            return Err(GenerationBaselineError::InventoryFilesMissing);
+        }
+
+        let maximum = maximum_encoded_bytes_for_export(session, offer, inventory)?;
+        let actual = self.serialized_len()?;
+        if actual > maximum {
+            return Err(GenerationBaselineError::EncodingTooLarge { actual, maximum });
         }
         Ok(())
     }
@@ -252,22 +388,21 @@ impl GenerationBaselineResponseV1 {
         append_count(&mut output, self.mounts.len())?;
         for mount in &self.mounts {
             append_text(&mut output, mount.mount_id.as_str())?;
-            append_text(&mut output, mount.source_connection_id.as_str())?;
-            append_text(&mut output, mount.observed_generation_id.as_str())?;
-            append_text(&mut output, &mount.target_inventory_sha256)?;
-            append_count(&mut output, mount.files.len())?;
-            for file in &mount.files {
-                append_text(&mut output, file.projection_id.as_str())?;
-                append_text(&mut output, file.logical_path.as_str())?;
-                append_text(&mut output, file.content_version_id.as_str())?;
-                append_text(&mut output, &file.content_sha256)?;
-                append_u64(&mut output, file.byte_length);
+            append_count(&mut output, mount.sources.len())?;
+            for source in &mount.sources {
+                append_text(&mut output, source.source_connection_id.as_str())?;
+                append_text(&mut output, source.observed_generation_id.as_str())?;
+                append_text(&mut output, &source.target_inventory_sha256)?;
+                append_text(&mut output, refresh_mode_label(source.refresh_mode))?;
+                append_count(&mut output, source.files.len())?;
+                for file in &source.files {
+                    append_text(&mut output, file.projection_id.as_str())?;
+                    append_text(&mut output, file.logical_path.as_str())?;
+                    append_text(&mut output, file.content_version_id.as_str())?;
+                    append_text(&mut output, &file.content_sha256)?;
+                    append_u64(&mut output, file.byte_length);
+                }
             }
-        }
-        if output.len() > MAX_GENERATION_BASELINE_ENCODED_BYTES {
-            return Err(GenerationBaselineError::CanonicalPreimageTooLarge {
-                actual: output.len(),
-            });
         }
         Ok(output)
     }
@@ -341,18 +476,19 @@ impl GenerationBaselineResponseV1 {
                 actual: self.layout_version,
             });
         }
-        validate_identifier("session_id", self.session_id.as_str())?;
-        validate_identifier("export_attempt_id", self.export_attempt_id.as_str())?;
+        validate_nonempty("session_id", self.session_id.as_str())?;
+        validate_nonempty("export_attempt_id", self.export_attempt_id.as_str())?;
         validate_sha256("inventory_sha256", &self.inventory_sha256)?;
 
         if self.source_generations.is_empty()
-            || self.source_generations.len() > MAX_GENERATION_BASELINE_MOUNTS
+            || self.source_generations.len() > MAX_PROFILE_SCOPE_BINDINGS
         {
             return Err(GenerationBaselineError::SourceGenerationCount {
                 actual: self.source_generations.len(),
             });
         }
         let mut generation_by_source = BTreeMap::new();
+        let mut ordinal_by_source = BTreeMap::new();
         let mut generation_ids = BTreeSet::new();
         for (index, generation) in self.source_generations.iter().enumerate() {
             let expected = u32::try_from(index)
@@ -363,11 +499,11 @@ impl GenerationBaselineResponseV1 {
                     actual: generation.ordinal,
                 });
             }
-            validate_identifier(
+            validate_nonempty(
                 "source_connection_id",
                 generation.source_connection_id.as_str(),
             )?;
-            validate_identifier(
+            validate_nonempty(
                 "source_generation_id",
                 generation.source_generation_id.as_str(),
             )?;
@@ -380,12 +516,13 @@ impl GenerationBaselineResponseV1 {
             {
                 return Err(GenerationBaselineError::DuplicateSourceConnection);
             }
+            ordinal_by_source.insert(&generation.source_connection_id, generation.ordinal);
             if !generation_ids.insert(&generation.source_generation_id) {
                 return Err(GenerationBaselineError::DuplicateSourceGeneration);
             }
         }
 
-        if self.mounts.is_empty() || self.mounts.len() > MAX_GENERATION_BASELINE_MOUNTS {
+        if self.mounts.is_empty() || self.mounts.len() > MAX_PROFILE_MOUNTS {
             return Err(GenerationBaselineError::MountCount {
                 actual: self.mounts.len(),
             });
@@ -393,61 +530,84 @@ impl GenerationBaselineResponseV1 {
         let mut previous_mount_id: Option<&PortableMountId> = None;
         let mut mounted_sources = BTreeSet::new();
         let mut projection_ids = BTreeSet::new();
-        let mut file_count = 0_usize;
+        let mut source_state_count = 0_usize;
         let mut content_bytes = 0_u64;
-        for (index, mount) in self.mounts.iter().enumerate() {
+        for (mount_index, mount) in self.mounts.iter().enumerate() {
             if previous_mount_id.is_some_and(|previous| previous >= &mount.mount_id) {
-                return Err(GenerationBaselineError::NonCanonicalMountOrder { index });
+                return Err(GenerationBaselineError::NonCanonicalMountOrder { mount_index });
             }
             previous_mount_id = Some(&mount.mount_id);
-            validate_identifier("mount_id", mount.mount_id.as_str())?;
-            validate_identifier("source_connection_id", mount.source_connection_id.as_str())?;
-            validate_identifier(
-                "observed_generation_id",
-                mount.observed_generation_id.as_str(),
-            )?;
-            validate_sha256("target_inventory_sha256", &mount.target_inventory_sha256)?;
-
-            let Some(expected_generation) = generation_by_source.get(&mount.source_connection_id)
-            else {
-                return Err(GenerationBaselineError::MountSourceNotInGenerationVector {
+            validate_nonempty("mount_id", mount.mount_id.as_str())?;
+            if mount.sources.is_empty() {
+                return Err(GenerationBaselineError::MountSourceCount {
                     mount_id: mount.mount_id.as_str().to_string(),
-                });
-            };
-            if **expected_generation != mount.observed_generation_id {
-                return Err(GenerationBaselineError::MountGenerationMismatch {
-                    mount_id: mount.mount_id.as_str().to_string(),
+                    actual: 0,
                 });
             }
-            mounted_sources.insert(&mount.source_connection_id);
-
-            let target_inventory_sha256 = canonical_target_inventory_sha256(&mount.files)?;
-            if target_inventory_sha256 != mount.target_inventory_sha256 {
-                return Err(GenerationBaselineError::TargetInventoryMismatch {
-                    mount_id: mount.mount_id.as_str().to_string(),
-                });
-            }
-            file_count = file_count
-                .checked_add(mount.files.len())
+            source_state_count = source_state_count
+                .checked_add(mount.sources.len())
                 .ok_or(GenerationBaselineError::CanonicalValueTooLarge)?;
-            if file_count > MAX_GENERATION_BASELINE_FILES {
-                return Err(GenerationBaselineError::FileCount { actual: file_count });
+            if source_state_count > MAX_PROFILE_SCOPE_BINDINGS {
+                return Err(GenerationBaselineError::SourceStateCount {
+                    actual: source_state_count,
+                });
             }
-            for file in &mount.files {
-                validate_identifier("projection_id", file.projection_id.as_str())?;
-                validate_identifier("content_version_id", file.content_version_id.as_str())?;
-                if !projection_ids.insert(&file.projection_id) {
-                    return Err(GenerationBaselineError::DuplicateProjectionId {
-                        projection_id: file.projection_id.as_str().to_string(),
+
+            let mut previous_source_ordinal = None;
+            for (source_index, source) in mount.sources.iter().enumerate() {
+                validate_nonempty("source_connection_id", source.source_connection_id.as_str())?;
+                validate_nonempty(
+                    "observed_generation_id",
+                    source.observed_generation_id.as_str(),
+                )?;
+                validate_sha256("target_inventory_sha256", &source.target_inventory_sha256)?;
+                let Some(expected_generation) =
+                    generation_by_source.get(&source.source_connection_id)
+                else {
+                    return Err(GenerationBaselineError::MountSourceNotInGenerationVector {
+                        mount_id: mount.mount_id.as_str().to_string(),
+                    });
+                };
+                if **expected_generation != source.observed_generation_id {
+                    return Err(GenerationBaselineError::MountGenerationMismatch {
+                        mount_id: mount.mount_id.as_str().to_string(),
+                        source_connection_id: source.source_connection_id.as_str().to_string(),
                     });
                 }
-                content_bytes = content_bytes
-                    .checked_add(file.byte_length)
-                    .ok_or(GenerationBaselineError::ContentLengthOverflow)?;
-                if content_bytes > MAX_GENERATION_BASELINE_CONTENT_BYTES {
-                    return Err(GenerationBaselineError::ContentBytesTooLarge {
-                        actual: content_bytes,
+                let source_ordinal = ordinal_by_source[&source.source_connection_id];
+                if previous_source_ordinal.is_some_and(|previous| previous >= source_ordinal) {
+                    return Err(GenerationBaselineError::NonCanonicalMountSourceOrder {
+                        mount_index,
+                        source_index,
                     });
+                }
+                previous_source_ordinal = Some(source_ordinal);
+                mounted_sources.insert(&source.source_connection_id);
+
+                validate_baseline_files(&source.files)?;
+                if baseline_target_inventory_sha256(&source.files)?
+                    != source.target_inventory_sha256
+                {
+                    return Err(GenerationBaselineError::TargetInventoryMismatch {
+                        mount_id: mount.mount_id.as_str().to_string(),
+                        source_connection_id: source.source_connection_id.as_str().to_string(),
+                    });
+                }
+                if refresh_mode_for_source(&mount.mount_id, source) != source.refresh_mode {
+                    return Err(GenerationBaselineError::RefreshModeMismatch {
+                        mount_id: mount.mount_id.as_str().to_string(),
+                        source_connection_id: source.source_connection_id.as_str().to_string(),
+                    });
+                }
+                for file in &source.files {
+                    if !projection_ids.insert(&file.projection_id) {
+                        return Err(GenerationBaselineError::DuplicateProjectionId {
+                            projection_id: file.projection_id.as_str().to_string(),
+                        });
+                    }
+                    content_bytes = content_bytes
+                        .checked_add(file.byte_length)
+                        .ok_or(GenerationBaselineError::ContentLengthOverflow)?;
                 }
             }
         }
@@ -456,23 +616,242 @@ impl GenerationBaselineResponseV1 {
         }
         Ok(())
     }
+}
 
-    fn file_totals(&self) -> Result<(u64, u64), GenerationBaselineError> {
-        self.mounts
-            .iter()
-            .try_fold((0_u64, 0_u64), |(files, bytes), mount| {
-                let mount_files = u64::try_from(mount.files.len())
-                    .map_err(|_| GenerationBaselineError::CanonicalValueTooLarge)?;
-                let files = files
-                    .checked_add(mount_files)
-                    .ok_or(GenerationBaselineError::CanonicalValueTooLarge)?;
-                let bytes = mount.files.iter().try_fold(bytes, |total, file| {
-                    total
-                        .checked_add(file.byte_length)
-                        .ok_or(GenerationBaselineError::ContentLengthOverflow)
-                })?;
-                Ok((files, bytes))
-            })
+/// Derive a raw JSON ceiling from the exact verified inventory and negotiated
+/// attempt, rather than imposing a lower static file/content limit.
+pub fn maximum_encoded_bytes_for_export(
+    session: &WorkspaceProfileSessionV2,
+    offer: &WorkspaceExportOfferV2,
+    inventory: &WorkspaceNamespacedInventoryV2,
+) -> Result<usize, GenerationBaselineError> {
+    let expected_mounts = validate_export_context(session, offer, inventory)?;
+    let mut maximum = GENERATION_BASELINE_JSON_BASE_BYTES;
+    for value in [
+        session.profile_id().as_str(),
+        session.session_id().as_str(),
+        offer.offer().export_attempt_id.as_str(),
+        session.session_layout().layout_digest().as_str(),
+        inventory.inventory_sha256(),
+    ] {
+        add_escaped_bytes(&mut maximum, value.len())?;
+    }
+    for generation in &offer.offer().source_generations {
+        add_escaped_bytes(&mut maximum, generation.source_connection_id.as_str().len())?;
+        add_escaped_bytes(&mut maximum, generation.source_generation_id.as_str().len())?;
+    }
+    for mount in &expected_mounts {
+        add_escaped_bytes(&mut maximum, mount.mount_id.as_str().len())?;
+        for source in &mount.source_connection_ids {
+            maximum = maximum
+                .checked_add(GENERATION_BASELINE_JSON_PER_SOURCE_STATE_BYTES)
+                .ok_or(GenerationBaselineError::EncodedLimitOverflow)?;
+            add_escaped_bytes(&mut maximum, source.as_str().len())?;
+        }
+    }
+    for record in inventory.records() {
+        if let WorkspaceNamespacedExportRecordV2::File {
+            projection_id,
+            logical_path,
+            content_sha256,
+            ..
+        } = record
+        {
+            maximum = maximum
+                .checked_add(GENERATION_BASELINE_JSON_PER_FILE_BYTES)
+                .ok_or(GenerationBaselineError::EncodedLimitOverflow)?;
+            for length in [
+                projection_id.as_str().len(),
+                logical_path.as_str().len(),
+                MAX_GENERATION_BASELINE_CONTENT_VERSION_ID_BYTES,
+                content_sha256.len(),
+            ] {
+                add_escaped_bytes(&mut maximum, length)?;
+            }
+        }
+    }
+    Ok(maximum)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpectedMountSources {
+    mount_id: PortableMountId,
+    source_connection_ids: Vec<SourceConnectionId>,
+}
+
+fn validate_export_context(
+    session: &WorkspaceProfileSessionV2,
+    offer: &WorkspaceExportOfferV2,
+    inventory: &WorkspaceNamespacedInventoryV2,
+) -> Result<Vec<ExpectedMountSources>, GenerationBaselineError> {
+    session
+        .validate()
+        .map_err(|_| GenerationBaselineError::InvalidExportContext)?;
+    offer
+        .validate()
+        .map_err(|_| GenerationBaselineError::InvalidExportContext)?;
+    if session.profile_id() != offer.profile_id()
+        || session.profile_revision() != offer.profile_revision()
+        || session.session_id() != &offer.offer().session_id
+        || session.session_layout().layout_version() != offer.layout_version()
+        || session.session_layout().layout_digest() != offer.layout_digest()
+    {
+        return Err(GenerationBaselineError::InvalidExportContext);
+    }
+    inventory
+        .validate_against_export(session.session_layout(), offer)
+        .map_err(|_| GenerationBaselineError::InvalidExportInventory)?;
+
+    if inventory.scope_sources().len() != session.session_layout().entries().len() {
+        return Err(GenerationBaselineError::ScopeAuthorityMismatch);
+    }
+    let offered_sources = offer
+        .offer()
+        .source_generations
+        .iter()
+        .map(|generation| &generation.source_connection_id)
+        .collect::<BTreeSet<_>>();
+    let mut mount_source_pairs = BTreeSet::new();
+    let mut session_mounts = BTreeSet::new();
+    for (layout_entry, authority) in session
+        .session_layout()
+        .entries()
+        .iter()
+        .zip(inventory.scope_sources())
+    {
+        if layout_entry.scope_ordinal() != authority.scope_ordinal()
+            || !offered_sources.contains(authority.source_connection_id())
+        {
+            return Err(GenerationBaselineError::ScopeAuthorityMismatch);
+        }
+        session_mounts.insert(layout_entry.mount_id().clone());
+        mount_source_pairs.insert((
+            layout_entry.mount_id().clone(),
+            authority.source_connection_id().clone(),
+        ));
+    }
+    let inventory_mounts = inventory
+        .target_directories()
+        .iter()
+        .map(|target| target.mount_id().clone())
+        .collect::<BTreeSet<_>>();
+    if inventory_mounts != session_mounts {
+        return Err(GenerationBaselineError::MountSetMismatch);
+    }
+
+    Ok(session_mounts
+        .into_iter()
+        .map(|mount_id| {
+            let source_connection_ids = offer
+                .offer()
+                .source_generations
+                .iter()
+                .filter(|generation| {
+                    mount_source_pairs
+                        .contains(&(mount_id.clone(), generation.source_connection_id.clone()))
+                })
+                .map(|generation| generation.source_connection_id.clone())
+                .collect();
+            ExpectedMountSources {
+                mount_id,
+                source_connection_ids,
+            }
+        })
+        .collect())
+}
+
+fn validate_baseline_files(
+    files: &[GenerationFileIdentity],
+) -> Result<(), GenerationBaselineError> {
+    let mut previous_projection_id = None;
+    let mut path_collision_keys = BTreeSet::new();
+    for file in files {
+        validate_nonempty("projection_id", file.projection_id.as_str())?;
+        validate_nonempty("content_version_id", file.content_version_id.as_str())?;
+        if file.content_version_id.as_str().len() > MAX_GENERATION_BASELINE_CONTENT_VERSION_ID_BYTES
+        {
+            return Err(GenerationBaselineError::ContentVersionIdTooLong {
+                actual: file.content_version_id.as_str().len(),
+            });
+        }
+        validate_sha256("content_sha256", &file.content_sha256)?;
+        if previous_projection_id
+            .is_some_and(|previous: &ProjectionId| previous >= &file.projection_id)
+        {
+            return Err(GenerationBaselineError::NonCanonicalFileOrder);
+        }
+        previous_projection_id = Some(&file.projection_id);
+        if !path_collision_keys.insert(file.logical_path.portable_collision_key()) {
+            return Err(GenerationBaselineError::FilePathReuse);
+        }
+    }
+    Ok(())
+}
+
+fn baseline_target_inventory_sha256(
+    files: &[GenerationFileIdentity],
+) -> Result<String, GenerationBaselineError> {
+    validate_baseline_files(files)?;
+    let mut output = GENERATION_TARGET_INVENTORY_V1_DOMAIN.to_vec();
+    append_count(&mut output, files.len())?;
+    for file in files {
+        append_text(&mut output, file.projection_id.as_str())?;
+        append_text(&mut output, file.logical_path.as_str())?;
+        append_text(&mut output, file.content_version_id.as_str())?;
+        append_text(&mut output, &file.content_sha256)?;
+        append_u64(&mut output, file.byte_length);
+    }
+    Ok(sha256_label(&output))
+}
+
+fn refresh_mode_for_files(files: &[GenerationFileIdentity]) -> GenerationBaselineRefreshModeV1 {
+    if files.iter().all(|file| {
+        file.projection_id.as_str().len() <= MAX_DELIVERY_ID_BYTES
+            && file.content_version_id.as_str().len() <= MAX_DELIVERY_ID_BYTES
+            && file.byte_length <= MAX_GENERATION_FILE_BYTES
+    }) {
+        GenerationBaselineRefreshModeV1::GenerationDeltaV1
+    } else {
+        GenerationBaselineRefreshModeV1::FullExportOnly
+    }
+}
+
+fn refresh_mode_for_source(
+    mount_id: &PortableMountId,
+    source: &GenerationBaselineSourceV1,
+) -> GenerationBaselineRefreshModeV1 {
+    if mount_id.as_str().len() <= MAX_DELIVERY_ID_BYTES
+        && refresh_mode_for_source_fields(
+            &source.source_connection_id,
+            &source.observed_generation_id,
+            &source.files,
+        ) == GenerationBaselineRefreshModeV1::GenerationDeltaV1
+    {
+        GenerationBaselineRefreshModeV1::GenerationDeltaV1
+    } else {
+        GenerationBaselineRefreshModeV1::FullExportOnly
+    }
+}
+
+fn refresh_mode_for_source_fields(
+    source_connection_id: &SourceConnectionId,
+    observed_generation_id: &SourceGenerationId,
+    files: &[GenerationFileIdentity],
+) -> GenerationBaselineRefreshModeV1 {
+    if source_connection_id.as_str().len() <= MAX_DELIVERY_ID_BYTES
+        && observed_generation_id.as_str().len() <= MAX_DELIVERY_ID_BYTES
+        && refresh_mode_for_files(files) == GenerationBaselineRefreshModeV1::GenerationDeltaV1
+    {
+        GenerationBaselineRefreshModeV1::GenerationDeltaV1
+    } else {
+        GenerationBaselineRefreshModeV1::FullExportOnly
+    }
+}
+
+fn refresh_mode_label(mode: GenerationBaselineRefreshModeV1) -> &'static str {
+    match mode {
+        GenerationBaselineRefreshModeV1::GenerationDeltaV1 => "generation_delta_v1",
+        GenerationBaselineRefreshModeV1::FullExportOnly => "full_export_only",
     }
 }
 
@@ -505,9 +884,16 @@ struct OrderedSourceGenerationWire {
 #[serde(deny_unknown_fields)]
 struct GenerationBaselineMountV1Wire {
     mount_id: PortableMountId,
+    sources: Vec<GenerationBaselineSourceV1Wire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerationBaselineSourceV1Wire {
     source_connection_id: SourceConnectionId,
     observed_generation_id: SourceGenerationId,
     target_inventory_sha256: String,
+    refresh_mode: GenerationBaselineRefreshModeV1,
     files: Vec<GenerationBaselineFileV1Wire>,
 }
 
@@ -551,18 +937,25 @@ impl<'de> Deserialize<'de> for GenerationBaselineResponseV1 {
                 .into_iter()
                 .map(|mount| GenerationBaselineMountV1 {
                     mount_id: mount.mount_id,
-                    source_connection_id: mount.source_connection_id,
-                    observed_generation_id: mount.observed_generation_id,
-                    target_inventory_sha256: mount.target_inventory_sha256,
-                    files: mount
-                        .files
+                    sources: mount
+                        .sources
                         .into_iter()
-                        .map(|file| GenerationFileIdentity {
-                            projection_id: file.projection_id,
-                            logical_path: file.logical_path,
-                            content_version_id: file.content_version_id,
-                            content_sha256: file.content_sha256,
-                            byte_length: file.byte_length,
+                        .map(|source| GenerationBaselineSourceV1 {
+                            source_connection_id: source.source_connection_id,
+                            observed_generation_id: source.observed_generation_id,
+                            target_inventory_sha256: source.target_inventory_sha256,
+                            refresh_mode: source.refresh_mode,
+                            files: source
+                                .files
+                                .into_iter()
+                                .map(|file| GenerationFileIdentity {
+                                    projection_id: file.projection_id,
+                                    logical_path: file.logical_path,
+                                    content_version_id: file.content_version_id,
+                                    content_sha256: file.content_sha256,
+                                    byte_length: file.byte_length,
+                                })
+                                .collect(),
                         })
                         .collect(),
                 })
@@ -576,37 +969,91 @@ impl<'de> Deserialize<'de> for GenerationBaselineResponseV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GenerationBaselineError {
-    UpdateRequired { minimum: u16, supported: u16 },
-    UnsupportedFormatVersion { actual: u16 },
+    UpdateRequired {
+        minimum: u16,
+        supported: u16,
+    },
+    UnsupportedFormatVersion {
+        actual: u16,
+    },
     InvalidVersionEnvelope,
     ZeroProfileRevision,
-    UnsupportedLayoutVersion { actual: u16 },
+    UnsupportedLayoutVersion {
+        actual: u16,
+    },
     IdentifierEmpty(&'static str),
-    IdentifierTooLong(&'static str),
     InvalidSha256(&'static str),
-    SourceGenerationCount { actual: usize },
-    NonCanonicalSourceGenerationOrder { index: usize, actual: u32 },
+    ContentVersionIdTooLong {
+        actual: usize,
+    },
+    SourceGenerationCount {
+        actual: usize,
+    },
+    NonCanonicalSourceGenerationOrder {
+        index: usize,
+        actual: u32,
+    },
     DuplicateSourceConnection,
     DuplicateSourceGeneration,
-    MountCount { actual: usize },
-    NonCanonicalMountOrder { index: usize },
-    MountSourceNotInGenerationVector { mount_id: String },
-    MountGenerationMismatch { mount_id: String },
+    MountCount {
+        actual: usize,
+    },
+    MountSourceCount {
+        mount_id: String,
+        actual: usize,
+    },
+    SourceStateCount {
+        actual: usize,
+    },
+    NonCanonicalMountOrder {
+        mount_index: usize,
+    },
+    NonCanonicalMountSourceOrder {
+        mount_index: usize,
+        source_index: usize,
+    },
+    MountSourceNotInGenerationVector {
+        mount_id: String,
+    },
+    MountGenerationMismatch {
+        mount_id: String,
+        source_connection_id: String,
+    },
     SourceSetMismatch,
-    TargetInventoryMismatch { mount_id: String },
-    DuplicateProjectionId { projection_id: String },
-    FileCount { actual: usize },
+    TargetInventoryMismatch {
+        mount_id: String,
+        source_connection_id: String,
+    },
+    RefreshModeMismatch {
+        mount_id: String,
+        source_connection_id: String,
+    },
+    NonCanonicalFileOrder,
+    FilePathReuse,
+    DuplicateProjectionId {
+        projection_id: String,
+    },
     ContentLengthOverflow,
-    ContentBytesTooLarge { actual: u64 },
-    EncodingTooLarge { actual: usize },
-    CanonicalPreimageTooLarge { actual: usize },
     CanonicalValueTooLarge,
     BaselineDigestMismatch,
-    InvalidExportOffer,
+    InvalidExportContext,
+    InvalidExportInventory,
+    ScopeAuthorityMismatch,
+    MountSetMismatch,
+    MountSourceSetMismatch {
+        mount_id: String,
+    },
+    InventoryFileMismatch {
+        projection_id: String,
+    },
+    InventoryFilesMissing,
+    EncodedLimitOverflow,
+    EncodingTooLarge {
+        actual: usize,
+        maximum: usize,
+    },
     ExportBindingMismatch,
-    ExportTotalsMismatch,
     InvalidJson(String),
-    TargetInventory(FreshnessDeliveryError),
 }
 
 impl Display for GenerationBaselineError {
@@ -625,14 +1072,17 @@ impl Display for GenerationBaselineError {
                 write!(formatter, "workspace layout version {actual} is unsupported")
             }
             Self::IdentifierEmpty(field) => write!(formatter, "{field} must not be empty"),
-            Self::IdentifierTooLong(field) => write!(formatter, "{field} is too long"),
             Self::InvalidSha256(field) => write!(
                 formatter,
                 "{field} must be `sha256:` plus 64 lowercase hexadecimal digits"
             ),
+            Self::ContentVersionIdTooLong { actual } => write!(
+                formatter,
+                "content version ID is {actual} bytes, exceeding {MAX_GENERATION_BASELINE_CONTENT_VERSION_ID_BYTES}"
+            ),
             Self::SourceGenerationCount { actual } => write!(
                 formatter,
-                "generation baseline has {actual} source generations; expected 1 through {MAX_GENERATION_BASELINE_MOUNTS}"
+                "generation baseline has {actual} source generations; expected 1 through {MAX_PROFILE_SCOPE_BINDINGS}"
             ),
             Self::NonCanonicalSourceGenerationOrder { index, actual } => write!(
                 formatter,
@@ -646,74 +1096,106 @@ impl Display for GenerationBaselineError {
             }
             Self::MountCount { actual } => write!(
                 formatter,
-                "generation baseline has {actual} mounts; expected 1 through {MAX_GENERATION_BASELINE_MOUNTS}"
+                "generation baseline has {actual} mounts; expected 1 through {MAX_PROFILE_MOUNTS}"
             ),
-            Self::NonCanonicalMountOrder { index } => write!(
+            Self::MountSourceCount { mount_id, actual } => write!(
                 formatter,
-                "mount at index {index} is not in exact mount-ID byte order"
+                "mount `{mount_id}` has {actual} source states; expected 1 through {MAX_PROFILE_SCOPE_BINDINGS}"
+            ),
+            Self::SourceStateCount { actual } => write!(
+                formatter,
+                "generation baseline has {actual} source states, exceeding {MAX_PROFILE_SCOPE_BINDINGS}"
+            ),
+            Self::NonCanonicalMountOrder { mount_index } => write!(
+                formatter,
+                "mount at index {mount_index} is not in exact mount-ID byte order"
+            ),
+            Self::NonCanonicalMountSourceOrder { mount_index, source_index } => write!(
+                formatter,
+                "source state {source_index} in mount {mount_index} is not in source-generation order"
             ),
             Self::MountSourceNotInGenerationVector { mount_id } => write!(
                 formatter,
                 "mount `{mount_id}` references a source absent from the generation vector"
             ),
-            Self::MountGenerationMismatch { mount_id } => write!(
+            Self::MountGenerationMismatch {
+                mount_id,
+                source_connection_id,
+            } => write!(
                 formatter,
-                "mount `{mount_id}` observed a generation different from its source vector entry"
+                "mount `{mount_id}` source `{source_connection_id}` observed a generation different from its source vector entry"
             ),
             Self::SourceSetMismatch => formatter.write_str(
                 "mount sources do not exactly cover the source-generation vector",
             ),
-            Self::TargetInventoryMismatch { mount_id } => write!(
+            Self::TargetInventoryMismatch {
+                mount_id,
+                source_connection_id,
+            } => write!(
                 formatter,
-                "mount `{mount_id}` target inventory digest does not match its files"
+                "mount `{mount_id}` source `{source_connection_id}` target inventory digest does not match its files"
             ),
+            Self::RefreshModeMismatch {
+                mount_id,
+                source_connection_id,
+            } => write!(
+                formatter,
+                "mount `{mount_id}` source `{source_connection_id}` declares the wrong refresh mode"
+            ),
+            Self::NonCanonicalFileOrder => {
+                formatter.write_str("baseline files are not in canonical projection-ID order")
+            }
+            Self::FilePathReuse => formatter.write_str("baseline files reuse a logical path"),
             Self::DuplicateProjectionId { projection_id } => write!(
                 formatter,
-                "projection ID `{projection_id}` occurs in more than one baseline file"
-            ),
-            Self::FileCount { actual } => write!(
-                formatter,
-                "generation baseline has {actual} files, exceeding {MAX_GENERATION_BASELINE_FILES}"
+                "projection ID `{projection_id}` occurs in more than one baseline source state"
             ),
             Self::ContentLengthOverflow => formatter.write_str("content byte total overflow"),
-            Self::ContentBytesTooLarge { actual } => write!(
-                formatter,
-                "generation baseline describes {actual} content bytes, exceeding {MAX_GENERATION_BASELINE_CONTENT_BYTES}"
-            ),
-            Self::EncodingTooLarge { actual } => write!(
-                formatter,
-                "generation baseline encoding is {actual} bytes, exceeding {MAX_GENERATION_BASELINE_ENCODED_BYTES}"
-            ),
-            Self::CanonicalPreimageTooLarge { actual } => write!(
-                formatter,
-                "generation baseline canonical preimage is {actual} bytes, exceeding {MAX_GENERATION_BASELINE_ENCODED_BYTES}"
-            ),
             Self::CanonicalValueTooLarge => {
                 formatter.write_str("value is too large for canonical encoding")
             }
             Self::BaselineDigestMismatch => {
                 formatter.write_str("generation baseline digest does not match its canonical preimage")
             }
-            Self::InvalidExportOffer => formatter.write_str("export offer is invalid"),
+            Self::InvalidExportContext => {
+                formatter.write_str("session and export offer bindings are inconsistent")
+            }
+            Self::InvalidExportInventory => {
+                formatter.write_str("export inventory is not canonical for the session and offer")
+            }
+            Self::ScopeAuthorityMismatch => formatter.write_str(
+                "session layout and export scope-source authority do not match",
+            ),
+            Self::MountSetMismatch => {
+                formatter.write_str("baseline mount set does not match the export layout")
+            }
+            Self::MountSourceSetMismatch { mount_id } => write!(
+                formatter,
+                "mount `{mount_id}` source states do not match export scope authority"
+            ),
+            Self::InventoryFileMismatch { projection_id } => write!(
+                formatter,
+                "baseline projection `{projection_id}` does not match its authoritative export inventory record"
+            ),
+            Self::InventoryFilesMissing => {
+                formatter.write_str("baseline omits authoritative export inventory files")
+            }
+            Self::EncodedLimitOverflow => {
+                formatter.write_str("negotiated baseline encoding ceiling overflow")
+            }
+            Self::EncodingTooLarge { actual, maximum } => write!(
+                formatter,
+                "generation baseline encoding is {actual} bytes, exceeding negotiated ceiling {maximum}"
+            ),
             Self::ExportBindingMismatch => formatter.write_str(
                 "generation baseline does not match the exact profile, session, layout, inventory, attempt, and generation vector",
             ),
-            Self::ExportTotalsMismatch => formatter.write_str(
-                "generation baseline file and content-byte totals do not match the export offer",
-            ),
             Self::InvalidJson(error) => write!(formatter, "invalid generation baseline JSON: {error}"),
-            Self::TargetInventory(error) => Display::fmt(error, formatter),
         }
     }
 }
 
 impl std::error::Error for GenerationBaselineError {}
-
-impl From<FreshnessDeliveryError> for GenerationBaselineError {
-    fn from(error: FreshnessDeliveryError) -> Self {
-        Self::TargetInventory(error)
-    }
-}
 
 fn validate_versions(
     format_version: u16,
@@ -737,14 +1219,12 @@ fn validate_versions(
     Ok(())
 }
 
-fn validate_identifier(field: &'static str, value: &str) -> Result<(), GenerationBaselineError> {
+fn validate_nonempty(field: &'static str, value: &str) -> Result<(), GenerationBaselineError> {
     if value.is_empty() {
-        return Err(GenerationBaselineError::IdentifierEmpty(field));
+        Err(GenerationBaselineError::IdentifierEmpty(field))
+    } else {
+        Ok(())
     }
-    if value.len() > MAX_DELIVERY_ID_BYTES {
-        return Err(GenerationBaselineError::IdentifierTooLong(field));
-    }
-    Ok(())
 }
 
 fn validate_sha256(field: &'static str, value: &str) -> Result<(), GenerationBaselineError> {
@@ -758,6 +1238,17 @@ fn validate_sha256(field: &'static str, value: &str) -> Result<(), GenerationBas
     } else {
         Err(GenerationBaselineError::InvalidSha256(field))
     }
+}
+
+fn add_escaped_bytes(total: &mut usize, length: usize) -> Result<(), GenerationBaselineError> {
+    *total = total
+        .checked_add(
+            length
+                .checked_mul(MAX_JSON_ESCAPE_EXPANSION)
+                .ok_or(GenerationBaselineError::EncodedLimitOverflow)?,
+        )
+        .ok_or(GenerationBaselineError::EncodedLimitOverflow)?;
+    Ok(())
 }
 
 fn append_count(output: &mut Vec<u8>, count: usize) -> Result<(), GenerationBaselineError> {
