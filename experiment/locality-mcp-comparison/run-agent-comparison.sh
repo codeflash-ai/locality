@@ -949,11 +949,17 @@ run_strategy_pipeline() {
   local sandbox="$1"
   local strategy="$2"
   local remote_out_dir="$3"
+  local run_rc=0
+  local sync_rc=0
 
-  prepare_worktree "$sandbox"
-  sync_local_experiment "$sandbox"
-  run_launch_strategy_with_args "$sandbox" "$strategy" "$remote_out_dir"
-  sync_artifacts "$sandbox" "$strategy" "$remote_out_dir"
+  prepare_worktree "$sandbox" || return $?
+  sync_local_experiment "$sandbox" || return $?
+  run_launch_strategy_with_args "$sandbox" "$strategy" "$remote_out_dir" || run_rc=$?
+  sync_artifacts "$sandbox" "$strategy" "$remote_out_dir" || sync_rc=$?
+  if [ "$run_rc" -ne 0 ]; then
+    return "$run_rc"
+  fi
+  return "$sync_rc"
 }
 
 wait_for_strategy_pipeline() {
@@ -972,7 +978,7 @@ wait_for_strategy_pipeline() {
 }
 
 stop_strategy_pipelines() {
-  local rc=$?
+  local signal_rc="$1"
   local pid
 
   trap - INT TERM
@@ -981,7 +987,7 @@ stop_strategy_pipelines() {
       kill "$pid" >/dev/null 2>&1 || true
     fi
   done
-  exit "$rc"
+  exit "$signal_rc"
 }
 
 cleanup_amika_sandboxes_on_exit() {
@@ -1044,11 +1050,15 @@ EOF
 
 load_mcp_credentials_from_zshrc
 trap cleanup_amika_sandboxes_on_exit EXIT
+if [ "$REMOTE_PROVIDER" = "amika" ] && [ "$SYNC_ARTIFACTS" = "0" ]; then
+  echo "SYNC_ARTIFACTS=0; ephemeral Amika sandboxes will be deleted without retaining remote artifacts" >&2
+fi
 create_amika_sandboxes
 write_artifacts_manifest
 
 echo "Launching Locality and MCP strategy pipelines in parallel"
-trap stop_strategy_pipelines INT TERM
+trap 'stop_strategy_pipelines 130' INT
+trap 'stop_strategy_pipelines 143' TERM
 run_strategy_pipeline "$LOCALITY_SANDBOX" "locality" "$LOCALITY_REMOTE_OUT_DIR" &
 locality_pipeline_pid=$!
 run_strategy_pipeline "$MCP_SANDBOX" "notion-mcp" "$MCP_REMOTE_OUT_DIR" &

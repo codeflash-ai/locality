@@ -51,17 +51,25 @@ cat > "${fake_bin}/amika" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-printf 'amika' >> "${FAKE_AMIKA_LOG:?}"
 joined_args=""
+logged_command="amika"
 for arg in "$@"; do
-  printf ' %q' "$arg" >> "$FAKE_AMIKA_LOG"
+  printf -v quoted_arg '%q' "$arg"
+  logged_command="${logged_command} ${quoted_arg}"
   joined_args="${joined_args} ${arg}"
 done
-printf '\n' >> "$FAKE_AMIKA_LOG"
+printf '%s\n' "$logged_command" >> "${FAKE_AMIKA_LOG:?}"
 
 if [ "${1:-}" != "sandbox" ]; then
   printf 'unexpected fake amika command: %s\n' "$*" >&2
   exit 2
+fi
+
+if [ "${2:-}" = "create" ] && [[ " $* " == *" --snapshot ${FAKE_AMIKA_FAIL_CREATE_SNAPSHOT:-__never__} "* ]]; then
+  exit "${FAKE_AMIKA_FAIL_CREATE_RC:-23}"
+fi
+if [ "${2:-}" = "delete" ] && [ "${FAKE_AMIKA_FAIL_DELETE:-0}" = "1" ]; then
+  exit 29
 fi
 
 case "${2:-}" in
@@ -75,9 +83,6 @@ case "${2:-}" in
     ;;
   delete)
     shift 2
-    if [ -n "${FAKE_AMIKA_DELETE_EXIT_CODE:-}" ]; then
-      exit "$FAKE_AMIKA_DELETE_EXIT_CODE"
-    fi
     exit 0
     ;;
   ssh)
@@ -172,6 +177,53 @@ assert_contains "$fake_log" "scenario2"
 assert_not_contains "$fake_log" "test-with-notion-connector"
 assert_not_contains "$fake_log" "onyx-falcon"
 
+collision_log="${tmp_root}/collision-amika.log"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$collision_log" \
+  FAKE_AMIKA_LIST_JSON='[{"name":"launch-readiness-collision-locality"}]' \
+  RUN_ID="collision" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/collision-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/collision.err"
+collision_rc=$?
+set -e
+if [ "$collision_rc" -eq 0 ]; then
+  fail "an existing Amika sandbox name should fail before creation"
+fi
+assert_not_contains "$collision_log" "amika sandbox create"
+assert_not_contains "$collision_log" "amika sandbox delete"
+
+partial_create_log="${tmp_root}/partial-create-amika.log"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$partial_create_log" \
+  FAKE_AMIKA_LIST_JSON='[]' \
+  FAKE_AMIKA_FAIL_CREATE_SNAPSHOT="mcp-snapshot" \
+  RUN_ID="partial" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/partial-create-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/partial-create.err"
+partial_create_rc=$?
+set -e
+if [ "$partial_create_rc" -ne 23 ]; then
+  fail "partial Amika creation should preserve create failure 23, got ${partial_create_rc}"
+fi
+assert_contains "$partial_create_log" "amika sandbox delete --remote --force launch-readiness-partial-locality"
+assert_not_contains "$partial_create_log" "amika sandbox delete --remote --force launch-readiness-partial-locality launch-readiness-partial-mcp"
+
+no_sync_log="${tmp_root}/no-sync-amika.log"
+no_sync_err="${tmp_root}/no-sync.err"
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$no_sync_log" \
+  FAKE_AMIKA_LIST_JSON='[]' \
+  RUN_ID="no-sync" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/no-sync-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"$no_sync_err"
+assert_contains "$no_sync_err" "SYNC_ARTIFACTS=0; ephemeral Amika sandboxes will be deleted without retaining remote artifacts"
+assert_contains "$no_sync_log" "amika sandbox delete --remote --force launch-readiness-no-sync-locality launch-readiness-no-sync-mcp"
+
 custom_log="${tmp_root}/custom-amika.log"
 custom_out="${tmp_root}/custom-out"
 PATH="${fake_bin}:$PATH" \
@@ -181,6 +233,8 @@ PATH="${fake_bin}:$PATH" \
   SYNC_ARTIFACTS=0 \
   LOCALITY_SANDBOX="custom-locality" \
   MCP_SANDBOX="custom-mcp" \
+  LOCALITY_SNAPSHOT="custom-locality-snapshot" \
+  MCP_SNAPSHOT="custom-mcp-snapshot" \
   REMOTE_WORKTREE="/tmp/custom-worktree" \
   REMOTE_LOC_BIN="/opt/locality/bin/loc" \
   LOCAL_OUT_DIR="$custom_out" \
@@ -188,10 +242,13 @@ PATH="${fake_bin}:$PATH" \
 
 assert_contains "$custom_out/run.env" "locality_sandbox=custom-locality"
 assert_contains "$custom_out/run.env" "mcp_sandbox=custom-mcp"
+assert_contains "$custom_out/run.env" "locality_snapshot=custom-locality-snapshot"
+assert_contains "$custom_out/run.env" "mcp_snapshot=custom-mcp-snapshot"
 assert_contains "$custom_out/run.env" "remote_worktree=/tmp/custom-worktree"
 assert_contains "$custom_out/run.env" "remote_loc_bin=/opt/locality/bin/loc"
-assert_contains "$custom_log" "custom-locality"
-assert_contains "$custom_log" "custom-mcp"
+assert_contains "$custom_log" "amika sandbox create --remote --no-git --snapshot custom-locality-snapshot --name custom-locality"
+assert_contains "$custom_log" "amika sandbox create --remote --no-git --snapshot custom-mcp-snapshot --name custom-mcp"
+assert_contains "$custom_log" "amika sandbox delete --remote --force custom-locality custom-mcp"
 assert_contains "$custom_log" "--scenario"
 assert_contains "$custom_log" "custom-scenario"
 
@@ -200,14 +257,14 @@ set +e
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$cleanup_failure_log" \
   FAKE_AMIKA_LIST_JSON='[]' \
-  FAKE_AMIKA_DELETE_EXIT_CODE=43 \
+  FAKE_AMIKA_FAIL_DELETE=1 \
   RUN_ID="cleanup-failure" \
   SYNC_ARTIFACTS=0 \
   LOCAL_OUT_DIR="${tmp_root}/cleanup-failure-out" \
   "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/cleanup-failure.err"
 cleanup_failure_rc=$?
 set -e
-if [ "$cleanup_failure_rc" -ne 43 ]; then
+if [ "$cleanup_failure_rc" -ne 29 ]; then
   fail "successful benchmark should return cleanup failure, got ${cleanup_failure_rc}"
 fi
 assert_contains "$cleanup_failure_log" "amika sandbox delete --remote --force launch-readiness-cleanup-failure-locality launch-readiness-cleanup-failure-mcp"
