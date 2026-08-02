@@ -37,6 +37,18 @@ assert_line_before() {
   fi
 }
 
+assert_occurrences() {
+  local path="$1"
+  local needle="$2"
+  local expected="$3"
+  local actual
+
+  actual="$(grep -F -c -- "$needle" "$path" || true)"
+  if [ "$actual" -ne "$expected" ]; then
+    fail "expected ${expected} occurrences of ${needle} in ${path}, got ${actual}"
+  fi
+}
+
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-launch-readiness-amika-wrapper-test.XXXXXX")"
 cleanup() {
   rm -rf "$tmp_root"
@@ -59,6 +71,22 @@ for arg in "$@"; do
   joined_args="${joined_args} ${arg}"
 done
 printf '%s\n' "$logged_command" >> "${FAKE_AMIKA_LOG:?}"
+
+state_dir="${FAKE_AMIKA_STATE_DIR:-${FAKE_AMIKA_LOG}.state}"
+mkdir -p "$state_dir"
+
+argument_value() {
+  local wanted="$1"
+  shift
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "$wanted" ] && [ "$#" -gt 1 ]; then
+      printf '%s\n' "$2"
+      return 0
+    fi
+    shift
+  done
+  return 1
+}
 
 block_operation_if_requested() {
   local operation="$1"
@@ -99,16 +127,13 @@ fail_delete_while_operation_is_active() {
   done
 }
 
-if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "create" ] && [[ " $* " == *" --snapshot ${FAKE_AMIKA_FAIL_CREATE_SNAPSHOT:-__never__} "* ]]; then
-  exit "${FAKE_AMIKA_FAIL_CREATE_RC:-23}"
-fi
 if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "delete" ] && [ "${FAKE_AMIKA_FAIL_DELETE:-0}" = "1" ]; then
   exit 29
 fi
-if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "ssh" ] && [ -n "${FAKE_AMIKA_FAIL_SSH_RC:-}" ]; then
+if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "ssh" ] && [ -n "${FAKE_AMIKA_FAIL_SSH_RC:-}" ] && [[ "$joined_args" != *" -- true"* ]] && [[ "$joined_args" != *"AMIKA_PREREQUISITE_CHECK"* ]]; then
   exit "$FAKE_AMIKA_FAIL_SSH_RC"
 fi
-if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "ssh" ] && [ "${3:-}" != "--print" ] && [ -n "${FAKE_AMIKA_FAIL_SSH_CALL:-}" ]; then
+if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "ssh" ] && [ "${3:-}" != "--print" ] && [ -n "${FAKE_AMIKA_FAIL_SSH_CALL:-}" ] && [[ "$joined_args" != *" -- true"* ]] && [[ "$joined_args" != *"AMIKA_PREREQUISITE_CHECK"* ]]; then
   call_file="${FAKE_AMIKA_CALL_DIR:?}/${3}.count"
   mkdir -p "$FAKE_AMIKA_CALL_DIR"
   call_count=0
@@ -134,6 +159,23 @@ case "${1:-}:${2:-}" in
     fi
     printf '%s\n' "${FAKE_AMIKA_SANDBOX_TABLE:-NAME STATE LOCATION BRANCH REPO CREATOR CREATED
 existing-box stopped remote - - Test 2026-08-02T00:00:00Z}"
+    for state_file in "$state_dir"/*.state; do
+      [ -e "$state_file" ] || continue
+      sandbox_name="$(basename "$state_file" .state)"
+      sandbox_state="$(cat "$state_file")"
+      if [ "$sandbox_state" = "initializing" ] && { [ -z "${FAKE_AMIKA_INITIALIZING_SANDBOX:-}" ] || [ "$sandbox_name" = "$FAKE_AMIKA_INITIALIZING_SANDBOX" ]; }; then
+        list_count_file="$state_dir/$sandbox_name.list-count"
+        list_count=0
+        [ ! -f "$list_count_file" ] || list_count="$(cat "$list_count_file")"
+        list_count=$((list_count + 1))
+        printf '%s\n' "$list_count" > "$list_count_file"
+        if [ "$list_count" -gt "${FAKE_AMIKA_INITIALIZING_LISTS:-1}" ]; then
+          sandbox_state="started"
+          printf '%s\n' "$sandbox_state" > "$state_file"
+        fi
+      fi
+      printf '%s %s remote - - Test 2026-08-02T00:00:00Z\n' "$sandbox_name" "$sandbox_state"
+    done
     exit 0
     ;;
   snapshot:list)
@@ -152,16 +194,39 @@ mcp-snapshot active daytona aseem-mcp 2026-08-02T00:00:00Z}"
     ;;
   sandbox:create)
     block_operation_if_requested create
-    shift 2
+    sandbox_name="$(argument_value --name "$@")"
+    snapshot_name="$(argument_value --snapshot "$@")"
+    attempt_file="$state_dir/$sandbox_name.create-count"
+    create_attempt=0
+    [ ! -f "$attempt_file" ] || create_attempt="$(cat "$attempt_file")"
+    create_attempt=$((create_attempt + 1))
+    printf '%s\n' "$create_attempt" > "$attempt_file"
+    if { [ -z "${FAKE_AMIKA_CREATE_FAIL_SNAPSHOT:-}" ] || [ "$snapshot_name" = "$FAKE_AMIKA_CREATE_FAIL_SNAPSHOT" ]; } && [ "$create_attempt" -le "${FAKE_AMIKA_CREATE_FAIL_COUNT:-0}" ]; then
+      printf 'failed\n' > "$state_dir/$sandbox_name.state"
+      exit "${FAKE_AMIKA_FAIL_CREATE_RC:-23}"
+    fi
+    if [ -n "${FAKE_AMIKA_INITIALIZING_SANDBOX:-}" ] && [ "$sandbox_name" = "$FAKE_AMIKA_INITIALIZING_SANDBOX" ]; then
+      printf 'initializing\n' > "$state_dir/$sandbox_name.state"
+    else
+      printf 'started\n' > "$state_dir/$sandbox_name.state"
+    fi
     exit 0
     ;;
   sandbox:delete)
     fail_delete_while_operation_is_active
     shift 2
+    for arg in "$@"; do
+      case "$arg" in
+        --remote|--force) ;;
+        *) rm -f "$state_dir/$arg.state" "$state_dir/$arg.list-count" ;;
+      esac
+    done
     exit 0
     ;;
   sandbox:ssh)
-    block_operation_if_requested ssh
+    if [[ "$joined_args" != *" -- true"* ]] && [[ "$joined_args" != *"AMIKA_PREREQUISITE_CHECK"* ]]; then
+      block_operation_if_requested ssh
+    fi
     ;;
   *)
     printf 'unexpected fake amika command: %s\n' "$*" >&2
@@ -174,7 +239,26 @@ if [ "${3:-}" = "--print" ]; then
   exit 0
 fi
 
-if [ -n "${FAKE_AMIKA_CONCURRENCY_DIR:-}" ]; then
+if [[ "$joined_args" == *" -- true"* ]]; then
+  readiness_sandbox="${3:-}"
+  if [ -z "${FAKE_AMIKA_READINESS_SSH_FAIL_SANDBOX:-}" ] || [ "$readiness_sandbox" = "$FAKE_AMIKA_READINESS_SSH_FAIL_SANDBOX" ]; then
+    readiness_count_file="$state_dir/$readiness_sandbox.readiness-count"
+    readiness_count=0
+    [ ! -f "$readiness_count_file" ] || readiness_count="$(cat "$readiness_count_file")"
+    readiness_count=$((readiness_count + 1))
+    printf '%s\n' "$readiness_count" > "$readiness_count_file"
+    if [ "$readiness_count" -le "${FAKE_AMIKA_READINESS_SSH_FAILURES:-0}" ]; then
+      exit 255
+    fi
+  fi
+  exit 0
+fi
+
+if [[ "$joined_args" == *"AMIKA_PREREQUISITE_CHECK"* ]] && [ "${FAKE_AMIKA_FAIL_LOCALITY_PREREQUISITE:-0}" = "1" ] && [[ "${3:-}" == *locality* ]]; then
+  exit 61
+fi
+
+if [ -n "${FAKE_AMIKA_CONCURRENCY_DIR:-}" ] && [[ "$joined_args" != *"AMIKA_PREREQUISITE_CHECK"* ]]; then
   strategy=""
   other_strategy=""
   case "$joined_args" in
@@ -372,8 +456,9 @@ assert_contains "$fake_log" "amika sandbox create --remote --no-git --snapshot l
 assert_contains "$fake_log" "amika sandbox create --remote --no-git --snapshot mcp-snapshot --name launch-readiness-testrun-mcp"
 assert_contains "$fake_log" "amika sandbox delete --remote --force launch-readiness-testrun-locality launch-readiness-testrun-mcp"
 assert_not_contains "$fake_log" "amika sandbox start"
-assert_line_before "$fake_log" "amika sandbox create --remote --no-git --snapshot locality-snapshot --name launch-readiness-testrun-locality" "amika sandbox ssh"
-assert_line_before "$fake_log" "amika sandbox create --remote --no-git --snapshot mcp-snapshot --name launch-readiness-testrun-mcp" "amika sandbox ssh"
+assert_line_before "$fake_log" "amika sandbox create --remote --no-git --snapshot locality-snapshot --name launch-readiness-testrun-locality" "amika sandbox ssh launch-readiness-testrun-locality -- true"
+assert_line_before "$fake_log" "amika sandbox ssh launch-readiness-testrun-locality -- true" "amika sandbox create --remote --no-git --snapshot mcp-snapshot --name launch-readiness-testrun-mcp"
+assert_line_before "$fake_log" "amika sandbox create --remote --no-git --snapshot mcp-snapshot --name launch-readiness-testrun-mcp" "amika sandbox ssh launch-readiness-testrun-mcp -- true"
 assert_line_before "$fake_log" "amika sandbox ssh" "amika sandbox delete --remote --force launch-readiness-testrun-locality launch-readiness-testrun-mcp"
 test -f "$concurrency_dir/locality.overlapped" || fail "Locality launch did not overlap MCP launch"
 test -f "$concurrency_dir/notion-mcp.overlapped" || fail "MCP launch did not overlap Locality launch"
@@ -521,40 +606,90 @@ fi
 assert_not_contains "$mcp_collision_log" "amika sandbox create"
 assert_not_contains "$mcp_collision_log" "amika sandbox delete"
 
-first_create_log="${tmp_root}/first-create-amika.log"
-set +e
+retry_create_log="${tmp_root}/retry-create-amika.log"
+retry_create_state="${tmp_root}/retry-create-state"
+retry_create_out="${tmp_root}/retry-create-out"
 PATH="${fake_bin}:$PATH" \
-  FAKE_AMIKA_LOG="$first_create_log" \
-  FAKE_AMIKA_FAIL_CREATE_SNAPSHOT="locality-snapshot" \
-  RUN_ID="first-create" \
+  FAKE_AMIKA_LOG="$retry_create_log" \
+  FAKE_AMIKA_STATE_DIR="$retry_create_state" \
+  FAKE_AMIKA_CREATE_FAIL_SNAPSHOT="locality-snapshot" \
+  FAKE_AMIKA_CREATE_FAIL_COUNT=1 \
+  FAKE_AMIKA_READINESS_SSH_FAIL_SANDBOX="launch-readiness-retry-create-locality" \
+  FAKE_AMIKA_READINESS_SSH_FAILURES=1 \
+  AMIKA_READINESS_TIMEOUT_SECONDS=3 \
+  AMIKA_READINESS_POLL_SECONDS=1 \
+  RUN_ID="retry-create" \
   SYNC_ARTIFACTS=0 \
-  LOCAL_OUT_DIR="${tmp_root}/first-create-out" \
-  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/first-create.err"
-first_create_rc=$?
-set -e
-if [ "$first_create_rc" -ne 23 ]; then
-  fail "first Amika creation should preserve create failure 23, got ${first_create_rc}"
-fi
-assert_contains "$first_create_log" "amika sandbox create --remote --no-git --snapshot locality-snapshot --name launch-readiness-first-create-locality"
-assert_not_contains "$first_create_log" "amika sandbox create --remote --no-git --snapshot mcp-snapshot"
-assert_not_contains "$first_create_log" "amika sandbox delete"
+  LOCAL_OUT_DIR="$retry_create_out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null
+assert_occurrences "$retry_create_log" "amika sandbox create --remote --no-git --snapshot locality-snapshot --name launch-readiness-retry-create-locality" 2
+assert_contains "$retry_create_log" "amika sandbox delete --remote --force launch-readiness-retry-create-locality"
+assert_occurrences "$retry_create_log" "amika sandbox ssh launch-readiness-retry-create-locality -- true" 2
+assert_contains "$retry_create_out/amika-lifecycle.log" "strategy=locality sandbox=launch-readiness-retry-create-locality readiness_seconds="
 
-partial_create_log="${tmp_root}/partial-create-amika.log"
+exhausted_log="${tmp_root}/exhausted-amika.log"
+exhausted_err="${tmp_root}/exhausted.err"
 set +e
 PATH="${fake_bin}:$PATH" \
-  FAKE_AMIKA_LOG="$partial_create_log" \
-  FAKE_AMIKA_FAIL_CREATE_SNAPSHOT="mcp-snapshot" \
-  RUN_ID="partial" \
+  FAKE_AMIKA_LOG="$exhausted_log" \
+  FAKE_AMIKA_STATE_DIR="${tmp_root}/exhausted-state" \
+  FAKE_AMIKA_CREATE_FAIL_SNAPSHOT="locality-snapshot" \
+  FAKE_AMIKA_CREATE_FAIL_COUNT=3 \
+  AMIKA_READINESS_TIMEOUT_SECONDS=3 \
+  AMIKA_READINESS_POLL_SECONDS=1 \
+  RUN_ID="exhausted" \
   SYNC_ARTIFACTS=0 \
-  LOCAL_OUT_DIR="${tmp_root}/partial-create-out" \
-  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/partial-create.err"
-partial_create_rc=$?
+  LOCAL_OUT_DIR="${tmp_root}/exhausted-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"$exhausted_err"
+exhausted_rc=$?
 set -e
-if [ "$partial_create_rc" -ne 23 ]; then
-  fail "partial Amika creation should preserve create failure 23, got ${partial_create_rc}"
+if [ "$exhausted_rc" -eq 0 ]; then
+  fail "three failed exact-snapshot creates should fail provisioning"
 fi
-assert_contains "$partial_create_log" "amika sandbox delete --remote --force launch-readiness-partial-locality"
-assert_not_contains "$partial_create_log" "amika sandbox delete --remote --force launch-readiness-partial-locality launch-readiness-partial-mcp"
+assert_occurrences "$exhausted_log" "amika sandbox create --remote --no-git --snapshot locality-snapshot --name launch-readiness-exhausted-locality" 3
+assert_occurrences "$exhausted_log" "amika sandbox delete --remote --force launch-readiness-exhausted-locality" 3
+assert_contains "$exhausted_err" "Amika provisioning exhausted for locality: exact snapshot locality-snapshot failed after 3 attempts (last state=failed)"
+assert_not_contains "$exhausted_err" "fallback"
+
+initializing_log="${tmp_root}/initializing-amika.log"
+initializing_state="${tmp_root}/initializing-state"
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$initializing_log" \
+  FAKE_AMIKA_STATE_DIR="$initializing_state" \
+  FAKE_AMIKA_INITIALIZING_SANDBOX="launch-readiness-initializing-locality" \
+  FAKE_AMIKA_INITIALIZING_LISTS=1 \
+  FAKE_AMIKA_READINESS_SSH_FAIL_SANDBOX="launch-readiness-initializing-locality" \
+  FAKE_AMIKA_READINESS_SSH_FAILURES=2 \
+  AMIKA_READINESS_TIMEOUT_SECONDS=3 \
+  AMIKA_READINESS_POLL_SECONDS=1 \
+  RUN_ID="initializing" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/initializing-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null
+assert_occurrences "$initializing_log" "amika sandbox ssh launch-readiness-initializing-locality -- true" 3
+assert_line_before "$initializing_log" "amika sandbox ssh launch-readiness-initializing-locality -- true" "--scenario"
+
+prerequisite_log="${tmp_root}/prerequisite-amika.log"
+prerequisite_err="${tmp_root}/prerequisite.err"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$prerequisite_log" \
+  FAKE_AMIKA_STATE_DIR="${tmp_root}/prerequisite-state" \
+  FAKE_AMIKA_FAIL_LOCALITY_PREREQUISITE=1 \
+  AMIKA_READINESS_TIMEOUT_SECONDS=3 \
+  AMIKA_READINESS_POLL_SECONDS=1 \
+  RUN_ID="prerequisite" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/prerequisite-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"$prerequisite_err"
+prerequisite_rc=$?
+set -e
+if [ "$prerequisite_rc" -eq 0 ]; then
+  fail "a missing Locality prerequisite should fail before benchmark launch"
+fi
+assert_contains "$prerequisite_err" "Amika prerequisite check failed for locality sandbox launch-readiness-prerequisite-locality"
+assert_contains "$prerequisite_log" "amika sandbox delete --remote --force launch-readiness-prerequisite-locality launch-readiness-prerequisite-mcp"
+assert_not_contains "$prerequisite_log" "--scenario scenario2"
 
 no_sync_log="${tmp_root}/no-sync-amika.log"
 no_sync_err="${tmp_root}/no-sync.err"

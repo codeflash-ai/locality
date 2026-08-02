@@ -479,13 +479,219 @@ preflight_amika_environment() {
   done
 }
 
+add_owned_amika_sandbox() {
+  local name="$1"
+  local owned
+
+  if [ "${#CREATED_AMIKA_SANDBOXES[@]}" -gt 0 ]; then
+    for owned in "${CREATED_AMIKA_SANDBOXES[@]}"; do
+      [ "$owned" != "$name" ] || return 0
+    done
+  fi
+  CREATED_AMIKA_SANDBOXES+=("$name")
+}
+
+remove_owned_amika_sandbox() {
+  local name="$1"
+  local owned
+  local -a remaining=()
+
+  if [ "${#CREATED_AMIKA_SANDBOXES[@]}" -gt 0 ]; then
+    for owned in "${CREATED_AMIKA_SANDBOXES[@]}"; do
+      [ "$owned" = "$name" ] || remaining+=("$owned")
+    done
+  fi
+  if [ "${#remaining[@]}" -gt 0 ]; then
+    CREATED_AMIKA_SANDBOXES=("${remaining[@]}")
+  else
+    CREATED_AMIKA_SANDBOXES=()
+  fi
+}
+
+wait_for_amika_sandbox_absent() {
+  local name="$1"
+  local started_at
+  local elapsed
+  local table
+  local state
+
+  started_at="$(date +%s)"
+  while :; do
+    table="$(load_amika_sandbox_table)" || return $?
+    state="$(amika_table_state "$name" "$table")"
+    if [ -z "$state" ]; then
+      return 0
+    fi
+    elapsed=$(( $(date +%s) - started_at ))
+    if [ "$elapsed" -ge "$AMIKA_READINESS_TIMEOUT_SECONDS" ]; then
+      printf 'Timed out waiting for owned Amika sandbox to disappear: %s (state=%s)\n' "$name" "$state" >&2
+      return 1
+    fi
+    sleep "$AMIKA_READINESS_POLL_SECONDS"
+  done
+}
+
+delete_owned_amika_sandbox() {
+  local name="$1"
+  local owned
+  local is_owned=0
+
+  if [ "${#CREATED_AMIKA_SANDBOXES[@]}" -gt 0 ]; then
+    for owned in "${CREATED_AMIKA_SANDBOXES[@]}"; do
+      if [ "$owned" = "$name" ]; then
+        is_owned=1
+        break
+      fi
+    done
+  fi
+  [ "$is_owned" -eq 1 ] || return 0
+
+  run_managed_command amika sandbox delete --remote --force "$name" || return $?
+  wait_for_amika_sandbox_absent "$name" || return $?
+  remove_owned_amika_sandbox "$name"
+}
+
+AMIKA_LAST_STATE="missing"
+
+wait_for_amika_sandbox_ready() {
+  local name="$1"
+  local strategy="$2"
+  local started_at
+  local elapsed
+  local table
+  local state
+
+  started_at="$(date +%s)"
+  while :; do
+    table="$(load_amika_sandbox_table)" || return $?
+    state="$(amika_table_state "$name" "$table")"
+    AMIKA_LAST_STATE="${state:-missing}"
+    elapsed=$(( $(date +%s) - started_at ))
+    printf 'strategy=%s sandbox=%s observed_state=%s elapsed_seconds=%s\n' \
+      "$strategy" "$name" "$AMIKA_LAST_STATE" "$elapsed" >> "$AMIKA_LIFECYCLE_LOG"
+
+    case "$state" in
+      failed|'') return 1 ;;
+      started)
+        if run_managed_command amika_sandbox_ssh "$name" -- true; then
+          elapsed=$(( $(date +%s) - started_at ))
+          printf 'strategy=%s sandbox=%s readiness_seconds=%s\n' \
+            "$strategy" "$name" "$elapsed" >> "$AMIKA_LIFECYCLE_LOG"
+          return 0
+        fi
+        ;;
+    esac
+
+    if [ "$elapsed" -ge "$AMIKA_READINESS_TIMEOUT_SECONDS" ]; then
+      return 1
+    fi
+    sleep "$AMIKA_READINESS_POLL_SECONDS"
+  done
+}
+
+provision_amika_sandbox() {
+  local name="$1"
+  local snapshot="$2"
+  local strategy="$3"
+  local attempt
+  local create_rc
+  local table
+  local state
+
+  for ((attempt = 1; attempt <= AMIKA_CREATE_ATTEMPTS; attempt += 1)); do
+    printf 'strategy=%s sandbox=%s snapshot=%s attempt=%s phase=create\n' \
+      "$strategy" "$name" "$snapshot" "$attempt" >> "$AMIKA_LIFECYCLE_LOG"
+    if run_managed_command amika sandbox create --remote --no-git --snapshot "$snapshot" --name "$name"; then
+      create_rc=0
+    else
+      create_rc=$?
+    fi
+
+    table="$(load_amika_sandbox_table)" || return $?
+    state="$(amika_table_state "$name" "$table")"
+    AMIKA_LAST_STATE="${state:-missing}"
+    printf 'strategy=%s sandbox=%s snapshot=%s attempt=%s create_rc=%s state=%s\n' \
+      "$strategy" "$name" "$snapshot" "$attempt" "$create_rc" "$AMIKA_LAST_STATE" >> "$AMIKA_LIFECYCLE_LOG"
+    if [ -n "$state" ]; then
+      add_owned_amika_sandbox "$name"
+    fi
+
+    if [ "$create_rc" -eq 0 ] && [ -n "$state" ] && [ "$state" != "failed" ]; then
+      if wait_for_amika_sandbox_ready "$name" "$strategy"; then
+        return 0
+      fi
+    fi
+
+    if ! delete_owned_amika_sandbox "$name"; then
+      printf 'Failed to delete owned Amika sandbox after %s provisioning attempt %s: %s\n' \
+        "$strategy" "$attempt" "$name" >&2
+      return 1
+    fi
+  done
+
+  printf 'Amika provisioning exhausted for %s: exact snapshot %s failed after %s attempts (last state=%s)\n' \
+    "$strategy" "$snapshot" "$AMIKA_CREATE_ATTEMPTS" "$AMIKA_LAST_STATE" >&2
+  return 1
+}
+
+verify_amika_prerequisites() {
+  [ "$REMOTE_PROVIDER" = "amika" ] || return 0
+
+  local locality_roots="${LOCALITY_CONTEXT_DIRS:-${LOCALITY_CONTEXT_ROOTS:-}}"
+  local locality_command
+  local mcp_command
+  local has_linear=0
+  local has_notion=0
+  local has_slack_bot=0
+  local has_slack_team=0
+
+  [ -z "${LINEAR_API_KEY:-}" ] || has_linear=1
+  [ -z "${NOTION_API_TOKEN:-${NOTION_TOKEN:-${NOTION_ACCESS_TOKEN:-}}}" ] || has_notion=1
+  [ -z "${SLACK_BOT_TOKEN:-}" ] || has_slack_bot=1
+  [ -z "${SLACK_TEAM_ID:-}" ] || has_slack_team=1
+
+  locality_command="$(cat <<EOF
+set -euo pipefail
+AMIKA_PREREQUISITE_CHECK=locality
+test -d $(shell_quote "$REMOTE_SOURCE_REPO")/.git -o -f $(shell_quote "$REMOTE_SOURCE_REPO")/.git
+command -v codex >/dev/null 2>&1
+test -x $(shell_quote "$REMOTE_LOC_BIN") || command -v loc >/dev/null 2>&1
+while IFS= read -r root; do
+  [ -z \"\$root\" ] || test -d \"\$root\"
+done <<'LOCALITY_ROOTS'
+$locality_roots
+LOCALITY_ROOTS
+EOF
+)"
+  if ! run_managed_command amika_sandbox_ssh "$LOCALITY_SANDBOX" -- bash -lc "$locality_command"; then
+    printf 'Amika prerequisite check failed for locality sandbox %s\n' "$LOCALITY_SANDBOX" >&2
+    return 1
+  fi
+
+  mcp_command="$(cat <<EOF
+set -euo pipefail
+AMIKA_PREREQUISITE_CHECK=notion-mcp
+test -d $(shell_quote "$REMOTE_SOURCE_REPO")/.git -o -f $(shell_quote "$REMOTE_SOURCE_REPO")/.git
+command -v codex >/dev/null 2>&1
+secret_dir=\"\${LOCALITY_LAUNCH_READINESS_SECRET_DIR:-\$HOME/.config/locality-launch-readiness/mcp}\"
+[ $has_linear -eq 1 ] || test -s \"\$secret_dir/linear-api-key\"
+[ $has_notion -eq 1 ] || test -s \"\$secret_dir/notion-token\"
+[ $has_slack_bot -eq 1 ] || test -s \"\$secret_dir/slack-bot-token\"
+[ $has_slack_team -eq 1 ] || test -s \"\$secret_dir/slack-team-id\"
+EOF
+)"
+  if ! run_managed_command amika_sandbox_ssh "$MCP_SANDBOX" -- bash -lc "$mcp_command"; then
+    printf 'Amika prerequisite check failed for notion-mcp sandbox %s\n' "$MCP_SANDBOX" >&2
+    return 1
+  fi
+}
+
 create_amika_sandboxes() {
   [ "$REMOTE_PROVIDER" = "amika" ] || return 0
 
-  run_managed_command amika sandbox create --remote --no-git --snapshot "$LOCALITY_SNAPSHOT" --name "$LOCALITY_SANDBOX"
-  CREATED_AMIKA_SANDBOXES+=("$LOCALITY_SANDBOX")
-  run_managed_command amika sandbox create --remote --no-git --snapshot "$MCP_SNAPSHOT" --name "$MCP_SANDBOX"
-  CREATED_AMIKA_SANDBOXES+=("$MCP_SANDBOX")
+  provision_amika_sandbox "$LOCALITY_SANDBOX" "$LOCALITY_SNAPSHOT" locality
+  provision_amika_sandbox "$MCP_SANDBOX" "$MCP_SNAPSHOT" notion-mcp
+  verify_amika_prerequisites
 }
 
 cleanup_amika_sandboxes() {
