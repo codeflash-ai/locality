@@ -14,7 +14,6 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
-#[cfg(target_os = "macos")]
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
