@@ -25,7 +25,10 @@ Network callers must retain all three verified generation-2 values:
 - `WorkspaceNamespacedInventoryV2`, decoded or recomputed through export-v2.
 
 They pass those values to `decode_json_against_export`. There is intentionally
-no unbound network decoder. Before accepting a sidecar, the decoder recomputes
+no unbound network decoder, and `GenerationBaselineResponseV1` intentionally
+does not implement `Deserialize`. The private wire representation is decoded
+only inside the context-bound decoder, so generic Serde decoding cannot skip
+the session/attempt checks. Before accepting a sidecar, the decoder recomputes
 the canonical export inventory against the session layout and offer, then
 compares every baseline file to its authoritative export record. Mount ID,
 source connection ID, projection ID, logical path, content SHA-256, and byte
@@ -62,8 +65,9 @@ The sidecar does not impose the generation-delta V1 limits of 100,000 entries,
 512 MiB changed content, or 64 MiB per file on a full export that was valid
 under its negotiated `ExportAttemptLimits`. File count and content-byte truth
 come from the exact offer and recomputed inventory. The raw JSON ceiling is
-derived from that selected inventory, the sealed layout, and a bounded 4 KiB
-content-version ID capability instead of a fixed 64 MiB response ceiling.
+derived from that selected inventory, the sealed layout, every serialized
+source-state occurrence of its escaped observed generation ID, and a bounded
+4 KiB content-version ID capability instead of a fixed 64 MiB response ceiling.
 
 Each source state declares a deterministic `refresh_mode`:
 

@@ -13,7 +13,7 @@ use locality_core::portable::{
     SourceGenerationId,
 };
 use locality_core::workspace_layout::PortableMountId;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::MAX_EXPORT_V2_PAX_VALUE_BYTES;
@@ -150,6 +150,18 @@ impl GenerationBaselineMountV1 {
 
 /// Immutable sidecar response for the exact full-export attempt that produced
 /// the local tree.
+///
+/// This type deliberately does not implement [`serde::Deserialize`]. Network
+/// bytes must be decoded with
+/// [`GenerationBaselineResponseV1::decode_json_against_export`], which binds
+/// them to a verified session, attempt offer, and canonical export inventory.
+///
+/// ```compile_fail
+/// use locality_protocol::generation_baseline::GenerationBaselineResponseV1;
+///
+/// fn requires_unbound_deserialize<T: serde::de::DeserializeOwned>() {}
+/// requires_unbound_deserialize::<GenerationBaselineResponseV1>();
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct GenerationBaselineResponseV1 {
     format_version: u16,
@@ -168,7 +180,7 @@ pub struct GenerationBaselineResponseV1 {
 
 impl GenerationBaselineResponseV1 {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    fn new(
         profile_id: WorkspaceProfileId,
         profile_revision: u64,
         session_id: SessionId,
@@ -239,13 +251,14 @@ impl GenerationBaselineResponseV1 {
                 maximum,
             });
         }
-        let response: Self = serde_json::from_slice(input)
+        let wire: GenerationBaselineResponseV1Wire = serde_json::from_slice(input)
             .map_err(|error| GenerationBaselineError::InvalidJson(error.to_string()))?;
+        let response = Self::from_wire(wire);
         response.validate_against_export(session, offer, inventory)?;
         Ok(response)
     }
 
-    pub fn validate(&self) -> Result<(), GenerationBaselineError> {
+    fn validate(&self) -> Result<(), GenerationBaselineError> {
         self.validate_shape()?;
         validate_sha256("baseline_sha256", &self.baseline_sha256)?;
         if self.recompute_baseline_sha256()? != self.baseline_sha256 {
@@ -466,6 +479,58 @@ impl GenerationBaselineResponseV1 {
         &self.baseline_sha256
     }
 
+    fn from_wire(wire: GenerationBaselineResponseV1Wire) -> Self {
+        Self {
+            format_version: wire.format_version,
+            minimum_reader_version: wire.minimum_reader_version,
+            profile_id: wire.profile_id,
+            profile_revision: wire.profile_revision,
+            session_id: wire.session_id,
+            export_attempt_id: wire.export_attempt_id,
+            layout_version: wire.layout_version,
+            layout_digest: wire.layout_digest,
+            inventory_sha256: wire.inventory_sha256,
+            source_generations: wire
+                .source_generations
+                .into_iter()
+                .map(|generation| OrderedSourceGeneration {
+                    ordinal: generation.ordinal,
+                    source_connection_id: generation.source_connection_id,
+                    source_generation_id: generation.source_generation_id,
+                })
+                .collect(),
+            mounts: wire
+                .mounts
+                .into_iter()
+                .map(|mount| GenerationBaselineMountV1 {
+                    mount_id: mount.mount_id,
+                    sources: mount
+                        .sources
+                        .into_iter()
+                        .map(|source| GenerationBaselineSourceV1 {
+                            source_connection_id: source.source_connection_id,
+                            observed_generation_id: source.observed_generation_id,
+                            target_inventory_sha256: source.target_inventory_sha256,
+                            refresh_mode: source.refresh_mode,
+                            files: source
+                                .files
+                                .into_iter()
+                                .map(|file| GenerationFileIdentity {
+                                    projection_id: file.projection_id,
+                                    logical_path: file.logical_path,
+                                    content_version_id: file.content_version_id,
+                                    content_sha256: file.content_sha256,
+                                    byte_length: file.byte_length,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            baseline_sha256: wire.baseline_sha256,
+        }
+    }
+
     fn validate_shape(&self) -> Result<(), GenerationBaselineError> {
         validate_versions(self.format_version, self.minimum_reader_version)?;
         if self.profile_revision == 0 {
@@ -640,6 +705,17 @@ pub fn maximum_encoded_bytes_for_export(
         add_escaped_bytes(&mut maximum, generation.source_connection_id.as_str().len())?;
         add_escaped_bytes(&mut maximum, generation.source_generation_id.as_str().len())?;
     }
+    let generation_by_source = offer
+        .offer()
+        .source_generations
+        .iter()
+        .map(|generation| {
+            (
+                &generation.source_connection_id,
+                &generation.source_generation_id,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     for mount in &expected_mounts {
         add_escaped_bytes(&mut maximum, mount.mount_id.as_str().len())?;
         for source in &mount.source_connection_ids {
@@ -647,6 +723,10 @@ pub fn maximum_encoded_bytes_for_export(
                 .checked_add(GENERATION_BASELINE_JSON_PER_SOURCE_STATE_BYTES)
                 .ok_or(GenerationBaselineError::EncodedLimitOverflow)?;
             add_escaped_bytes(&mut maximum, source.as_str().len())?;
+            let observed_generation = generation_by_source
+                .get(source)
+                .ok_or(GenerationBaselineError::ScopeAuthorityMismatch)?;
+            add_escaped_bytes(&mut maximum, observed_generation.as_str().len())?;
         }
     }
     for record in inventory.records() {
@@ -905,66 +985,6 @@ struct GenerationBaselineFileV1Wire {
     content_version_id: ContentVersionId,
     content_sha256: String,
     byte_length: u64,
-}
-
-impl<'de> Deserialize<'de> for GenerationBaselineResponseV1 {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = GenerationBaselineResponseV1Wire::deserialize(deserializer)?;
-        let response = Self {
-            format_version: wire.format_version,
-            minimum_reader_version: wire.minimum_reader_version,
-            profile_id: wire.profile_id,
-            profile_revision: wire.profile_revision,
-            session_id: wire.session_id,
-            export_attempt_id: wire.export_attempt_id,
-            layout_version: wire.layout_version,
-            layout_digest: wire.layout_digest,
-            inventory_sha256: wire.inventory_sha256,
-            source_generations: wire
-                .source_generations
-                .into_iter()
-                .map(|generation| OrderedSourceGeneration {
-                    ordinal: generation.ordinal,
-                    source_connection_id: generation.source_connection_id,
-                    source_generation_id: generation.source_generation_id,
-                })
-                .collect(),
-            mounts: wire
-                .mounts
-                .into_iter()
-                .map(|mount| GenerationBaselineMountV1 {
-                    mount_id: mount.mount_id,
-                    sources: mount
-                        .sources
-                        .into_iter()
-                        .map(|source| GenerationBaselineSourceV1 {
-                            source_connection_id: source.source_connection_id,
-                            observed_generation_id: source.observed_generation_id,
-                            target_inventory_sha256: source.target_inventory_sha256,
-                            refresh_mode: source.refresh_mode,
-                            files: source
-                                .files
-                                .into_iter()
-                                .map(|file| GenerationFileIdentity {
-                                    projection_id: file.projection_id,
-                                    logical_path: file.logical_path,
-                                    content_version_id: file.content_version_id,
-                                    content_sha256: file.content_sha256,
-                                    byte_length: file.byte_length,
-                                })
-                                .collect(),
-                        })
-                        .collect(),
-                })
-                .collect(),
-            baseline_sha256: wire.baseline_sha256,
-        };
-        response.validate().map_err(serde::de::Error::custom)?;
-        Ok(response)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

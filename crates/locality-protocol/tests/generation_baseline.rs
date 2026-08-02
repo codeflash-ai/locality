@@ -122,25 +122,6 @@ fn mounts() -> Vec<GenerationBaselineMountV1> {
     ]
 }
 
-fn baseline_with(
-    source_generations: Vec<OrderedSourceGeneration>,
-    mounts: Vec<GenerationBaselineMountV1>,
-) -> Result<GenerationBaselineResponseV1, GenerationBaselineError> {
-    let session = session();
-    let offer = offer();
-    GenerationBaselineResponseV1::new(
-        session.profile_id().clone(),
-        session.profile_revision(),
-        offer.offer().session_id.clone(),
-        offer.offer().export_attempt_id.clone(),
-        offer.layout_version(),
-        offer.layout_digest().clone(),
-        offer.offer().inventory_sha256.clone(),
-        source_generations,
-        mounts,
-    )
-}
-
 fn baseline() -> GenerationBaselineResponseV1 {
     GenerationBaselineResponseV1::from_export(&session(), &offer(), &inventory(), mounts())
         .expect("valid baseline")
@@ -315,32 +296,29 @@ fn authoritative_content_version_ids_are_cryptographically_bound() {
 
 #[test]
 fn canonical_order_uniqueness_and_cross_field_consistency_are_enforced() {
-    let generations = offer().offer().source_generations.clone();
-    let mut reordered_generations = generations.clone();
-    reordered_generations.reverse();
+    let mut reordered_generations: Value =
+        serde_json::from_slice(GENERATION_BASELINE_V1_GOLDEN_JSON).unwrap();
+    reordered_generations["source_generations"]
+        .as_array_mut()
+        .unwrap()
+        .reverse();
     assert!(matches!(
-        baseline_with(reordered_generations, mounts()),
+        decode_value(&reordered_generations),
         Err(GenerationBaselineError::NonCanonicalSourceGenerationOrder { .. })
     ));
 
-    let mut reordered_mounts = mounts();
-    reordered_mounts.reverse();
+    let mut reordered_mounts: Value =
+        serde_json::from_slice(GENERATION_BASELINE_V1_GOLDEN_JSON).unwrap();
+    reordered_mounts["mounts"].as_array_mut().unwrap().reverse();
     assert!(matches!(
-        baseline_with(generations.clone(), reordered_mounts),
+        decode_value(&reordered_mounts),
         Err(GenerationBaselineError::NonCanonicalMountOrder { .. })
     ));
 
-    let crossed = GenerationBaselineMountV1::new(
-        PortableMountId::new("mount-alpha").unwrap(),
-        vec![source_state(
-            "source-drive",
-            "generation-notion-109",
-            vec![],
-        )],
-    )
-    .unwrap();
+    let mut crossed: Value = serde_json::from_slice(GENERATION_BASELINE_V1_GOLDEN_JSON).unwrap();
+    crossed["mounts"][0]["sources"][0]["observed_generation_id"] = json!("generation-notion-109");
     assert!(matches!(
-        baseline_with(generations.clone(), vec![crossed, mounts()[1].clone()]),
+        decode_value(&crossed),
         Err(GenerationBaselineError::MountGenerationMismatch { .. })
     ));
 
@@ -355,29 +333,16 @@ fn canonical_order_uniqueness_and_cross_field_consistency_are_enforced() {
         Err(GenerationBaselineError::NonCanonicalFileOrder)
     );
 
-    let duplicate_projection = notion_files()[0].clone();
-    let duplicate_mounts = vec![
-        GenerationBaselineMountV1::new(
-            PortableMountId::new("mount-alpha").unwrap(),
-            vec![source_state(
-                "source-drive",
-                "generation-drive-44",
-                vec![duplicate_projection.clone()],
-            )],
-        )
-        .unwrap(),
-        GenerationBaselineMountV1::new(
-            PortableMountId::new("mount-zeta").unwrap(),
-            vec![source_state(
-                "source-notion",
-                "generation-notion-109",
-                vec![duplicate_projection],
-            )],
-        )
-        .unwrap(),
-    ];
+    let mut duplicate_projection: Value =
+        serde_json::from_slice(GENERATION_BASELINE_V1_GOLDEN_JSON).unwrap();
+    duplicate_projection["mounts"][0]["sources"][0] = serde_json::to_value(source_state(
+        "source-drive",
+        "generation-drive-44",
+        vec![notion_files()[0].clone()],
+    ))
+    .unwrap();
     assert!(matches!(
-        baseline_with(generations, duplicate_mounts),
+        decode_value(&duplicate_projection),
         Err(GenerationBaselineError::DuplicateProjectionId { .. })
     ));
 }
@@ -539,6 +504,117 @@ fn shared_mount_export(source_ids: &[&str], files: &[ExportFileSpec<'_>]) -> Exp
     }
 }
 
+fn repeated_source_mount_export(
+    mount_count: usize,
+    source_id: &str,
+    generation_id: &str,
+) -> ExportContext {
+    let profile_id = WorkspaceProfileId::new("018f4f6e-9f2c-7b1a-8c3d-4e5f60718294").unwrap();
+    let profile_revision = 8;
+    let mounts = (0..mount_count)
+        .map(|index| {
+            ProfileMount::new(
+                PortableMountId::new(format!("mount-{index:03}")).unwrap(),
+                MountTarget::new(format!("Target-{index:03}")).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let scope_bindings = mounts
+        .iter()
+        .enumerate()
+        .map(|(ordinal, mount)| {
+            ProfileScopeBinding::new(
+                ordinal as u32,
+                SourceScopeId::new(format!("scope-{ordinal:03}")).unwrap(),
+                mount.mount_id().clone(),
+            )
+        })
+        .collect();
+    let workspace =
+        WorkspaceLayout::new(profile_id.clone(), profile_revision, mounts, scope_bindings).unwrap();
+    let session = WorkspaceProfileSessionV2::new(
+        SessionId::new("session-repeated-source"),
+        "opaque-capability",
+        "2026-07-29T01:00:00Z",
+        profile_id,
+        profile_revision,
+        SessionLayout::from_workspace(&workspace).unwrap(),
+    )
+    .unwrap();
+    let capabilities = WorkspaceClientCapabilitiesV2::workspace_layout_v1(true);
+    let limits = ExportAttemptLimits {
+        max_files: 1,
+        max_directories: mount_count as u64,
+        max_content_bytes: 1,
+    };
+    let status = WorkspaceSessionStatusV2::new(
+        &session,
+        &capabilities,
+        SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        SandboxSessionState::Ready,
+        locality_protocol::FreshnessRequirement {
+            max_age_seconds: 300,
+            on_stale: StaleSessionBehavior::WaitThenFail,
+            wait_timeout_seconds: 30,
+        },
+        vec![replica_status(source_id)],
+        Some(limits.clone()),
+        None,
+        "2026-07-23T20:00:00Z",
+    )
+    .unwrap();
+    let sealed_offer = SealedExportOffer {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: session.session_id().clone(),
+        export_attempt_id: locality_core::portable::ExportAttemptId::new("attempt-repeated-source")
+            .unwrap(),
+        source_generations: vec![OrderedSourceGeneration {
+            ordinal: 0,
+            source_connection_id: SourceConnectionId::new(source_id),
+            source_generation_id: SourceGenerationId::new(generation_id).unwrap(),
+        }],
+        media_type: "application/x-tar".to_string(),
+        content_encoding: TarContentEncoding::Zstd,
+        limits,
+        control_entry_count: 1,
+        file_count: 0,
+        directory_count: mount_count as u64,
+        archive_entry_count: mount_count as u64 + 1,
+        selected_content_bytes: 0,
+        inventory_sha256: format!("sha256:{}", "0".repeat(64)),
+        writable_metadata_sha256: format!("sha256:{}", "1".repeat(64)),
+        sealed_at: "2026-07-23T19:00:01Z".to_string(),
+        expires_at: "2026-07-23T19:10:01Z".to_string(),
+    };
+    let placeholder_offer =
+        WorkspaceExportOfferV2::new(&session, &status, &capabilities, sealed_offer.clone())
+            .unwrap();
+    let scope_sources = (0..mount_count)
+        .map(|ordinal| {
+            WorkspaceScopeSourceAuthorityV2::new(ordinal as u32, SourceConnectionId::new(source_id))
+        })
+        .collect::<Vec<_>>();
+    let inventory = WorkspaceNamespacedInventoryV2::plan(
+        session.session_layout(),
+        &placeholder_offer,
+        &scope_sources,
+        &[],
+    )
+    .unwrap();
+    let mut final_sealed_offer = sealed_offer;
+    final_sealed_offer.inventory_sha256 = inventory.inventory_sha256().to_string();
+    let offer =
+        WorkspaceExportOfferV2::new(&session, &status, &capabilities, final_sealed_offer).unwrap();
+    inventory
+        .validate_against_export(session.session_layout(), &offer)
+        .unwrap();
+    ExportContext {
+        session,
+        offer,
+        inventory,
+    }
+}
+
 #[test]
 fn shared_mount_carries_canonical_per_source_state() {
     let specs = [ExportFileSpec {
@@ -624,17 +700,97 @@ fn negotiated_export_limits_do_not_become_lower_baseline_limits() {
     let mount =
         GenerationBaselineMountV1::new(PortableMountId::new("mount-shared").unwrap(), vec![source])
             .unwrap();
-    GenerationBaselineResponseV1::from_export(
+    let negotiated_baseline = GenerationBaselineResponseV1::from_export(
         &context.session,
         &context.offer,
         &context.inventory,
         vec![mount],
     )
     .expect("valid negotiated export remains representable with explicit fallback");
+    let encoded = serde_json::to_vec(&negotiated_baseline).unwrap();
+    let decoded = GenerationBaselineResponseV1::decode_json_against_export(
+        &encoded,
+        &context.session,
+        &context.offer,
+        &context.inventory,
+    )
+    .expect("full-export-only baseline remains valid on the strict wire path");
+    assert_eq!(decoded, negotiated_baseline);
 
     assert_eq!(
         baseline().mounts()[1].sources()[0].refresh_mode(),
         GenerationBaselineRefreshModeV1::GenerationDeltaV1
+    );
+}
+
+#[test]
+fn encoding_ceiling_budgets_escaped_generation_for_every_source_state() {
+    let escaped_generation = "\"\\\n\r\t\u{0000}".repeat(256);
+    let context = repeated_source_mount_export(256, "source-repeated", &escaped_generation);
+    let mounts = context
+        .session
+        .session_layout()
+        .entries()
+        .iter()
+        .map(|entry| {
+            GenerationBaselineMountV1::new(
+                entry.mount_id().clone(),
+                vec![source_state(
+                    "source-repeated",
+                    &escaped_generation,
+                    Vec::new(),
+                )],
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let baseline = GenerationBaselineResponseV1::from_export(
+        &context.session,
+        &context.offer,
+        &context.inventory,
+        mounts,
+    )
+    .expect("escaped generation occurrence is budgeted for every mount");
+    assert!(
+        baseline
+            .mounts()
+            .iter()
+            .all(|mount| mount.sources()[0].refresh_mode()
+                == GenerationBaselineRefreshModeV1::FullExportOnly)
+    );
+
+    let encoded = serde_json::to_vec(&baseline).unwrap();
+    let maximum =
+        maximum_encoded_bytes_for_export(&context.session, &context.offer, &context.inventory)
+            .unwrap();
+    assert!(encoded.len() <= maximum);
+    assert_eq!(
+        GenerationBaselineResponseV1::decode_json_against_export(
+            &encoded,
+            &context.session,
+            &context.offer,
+            &context.inventory,
+        )
+        .unwrap(),
+        baseline
+    );
+}
+
+#[test]
+fn strict_decoder_rejects_session_attempt_mixups() {
+    let mut mismatched_offer: Value =
+        serde_json::from_slice(WORKSPACE_EXPORT_OFFER_V2_GOLDEN_JSON).unwrap();
+    mismatched_offer["offer"]["export_attempt_id"] = json!("attempt-other");
+    let mismatched_offer: WorkspaceExportOfferV2 =
+        serde_json::from_value(mismatched_offer).unwrap();
+    assert_eq!(
+        GenerationBaselineResponseV1::decode_json_against_export(
+            GENERATION_BASELINE_V1_GOLDEN_JSON,
+            &session(),
+            &mismatched_offer,
+            &inventory(),
+        ),
+        Err(GenerationBaselineError::ExportBindingMismatch)
     );
 }
 
