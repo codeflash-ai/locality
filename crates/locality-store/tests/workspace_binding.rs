@@ -571,6 +571,68 @@ fn workspace_component_upgrade_preflights_global_compatibility_before_schema_mut
 }
 
 #[test]
+fn workspace_component_upgrade_allows_other_supported_component_migrations() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute_batch(
+            "DROP TABLE workspace_bindings;
+             DROP TABLE workspace_host_bindings;
+             CREATE TABLE workspace_bindings (
+                 mount_id TEXT PRIMARY KEY,
+                 binding_json TEXT NOT NULL,
+                 target_collision_key TEXT NOT NULL UNIQUE,
+                 FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+             );
+             UPDATE state_components
+             SET version = 2, min_reader_version = 2
+             WHERE component_id = 'durable:workspace_bindings';
+             UPDATE state_components
+             SET version = 2, min_reader_version = 1
+             WHERE component_id = 'durable:journals';",
+        )
+        .expect("prepare mixed supported component fixture");
+    drop(connection);
+    drop(store);
+
+    let reopened = fixture.open();
+    let connection = Connection::open(&reopened.db_path).expect("raw migrated connection");
+    let versions = connection
+        .prepare(
+            "SELECT component_id, version
+             FROM state_components
+             WHERE component_id IN ('durable:journals', 'durable:workspace_bindings')
+             ORDER BY component_id",
+        )
+        .expect("prepare component versions")
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .expect("query component versions")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect component versions");
+    assert_eq!(
+        versions,
+        vec![
+            ("durable:journals".to_string(), 3),
+            ("durable:workspace_bindings".to_string(), 3),
+        ]
+    );
+    let workspace_column_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('workspace_bindings')
+                WHERE name = 'workspace_id'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("workspace scope column");
+    assert!(workspace_column_exists);
+}
+
+#[test]
 fn workspace_rebind_preflight_rejects_dirty_state_without_changing_root() {
     let fixture = Fixture::new();
     let mut store = fixture.open();

@@ -41,7 +41,7 @@ use loc_cli::file_provider::{
     run_macos_file_provider_helper,
 };
 use loc_cli::local_oauth::run_local_oauth_authorization;
-use loc_cli::mount::{MountOptions, resolve_workspace_mount_root, run_mount};
+use loc_cli::mount::{MountOptions, MountReport, resolve_workspace_mount_root, run_mount};
 use loc_cli::pull::{PullReport, run_pull_with_state_root};
 use loc_cli::push::{
     PushOptions, PushReport, push_report_exit_code, run_push_with_daemon_at_state_root,
@@ -7689,8 +7689,8 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         GOOGLE_CALENDAR_CONNECTOR_ID | "gmail" | "granola" | "linear" | SLACK_CONNECTOR_ID => None,
         _ => unreachable!("unsupported desktop connector should be rejected before mount setup"),
     };
-    let preserved = if can_remount_existing_workspace {
-        prepare_existing_workspace_mount_for_remount(&mut store, &state_root, &mount_id)?
+    let remount_preparation = if can_remount_existing_workspace {
+        plan_existing_workspace_mount_for_remount(&mut store, &state_root, &mount_id)?
     } else {
         None
     };
@@ -7702,8 +7702,9 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         "{}".to_string()
     };
 
-    let mount_report = run_mount(
+    let (mount_report, preserved) = commit_desktop_mount(
         &mut store,
+        &state_root,
         MountOptions {
             mount_id,
             connector,
@@ -7714,8 +7715,8 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
             projection: projection.clone(),
             settings_json,
         },
-    )
-    .map_err(|error| error.message())?;
+        remount_preparation,
+    )?;
 
     ensure_daemon_running(&state_root)?;
     reload_daemon_mounts(&state_root)?;
@@ -7756,6 +7757,23 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
     }
 
     Ok(message)
+}
+
+fn commit_desktop_mount(
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    options: MountOptions,
+    remount_preparation: Option<WorkspaceRemountPreparation>,
+) -> Result<(MountReport, Option<PreservedLocalChanges>), String> {
+    let mount_report = run_mount(store, options).map_err(|error| error.message())?;
+    let preserved = match remount_preparation {
+        Some(preparation) => {
+            finish_existing_workspace_mount_remount(store, state_root, &preparation)?;
+            preparation.preserved
+        }
+        None => None,
+    };
+    Ok((mount_report, preserved))
 }
 
 fn append_macos_file_provider_activation_warning(message: &mut String, warning: &str) {
@@ -10904,6 +10922,19 @@ fn prepare_existing_workspace_mount_for_remount(
     state_root: &Path,
     mount_id: &MountId,
 ) -> Result<Option<PreservedLocalChanges>, String> {
+    let Some(preparation) = plan_existing_workspace_mount_for_remount(store, state_root, mount_id)?
+    else {
+        return Ok(None);
+    };
+    finish_existing_workspace_mount_remount(store, state_root, &preparation)?;
+    Ok(preparation.preserved)
+}
+
+fn plan_existing_workspace_mount_for_remount(
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    mount_id: &MountId,
+) -> Result<Option<WorkspaceRemountPreparation>, String> {
     let Some(mount) = store
         .get_mount(mount_id)
         .map_err(|error| format!("Could not inspect existing source mount: {error}"))?
@@ -10927,9 +10958,28 @@ fn prepare_existing_workspace_mount_for_remount(
     } else {
         None
     };
-    clear_mount_cached_projection(store, state_root, mount_id)?;
+    let cached_entities = store
+        .list_entities(mount_id)
+        .map_err(|error| format!("Could not inspect cached source items: {error}"))?;
 
-    Ok(preserved)
+    Ok(Some(WorkspaceRemountPreparation {
+        mount,
+        cached_entities,
+        preserved,
+    }))
+}
+
+fn finish_existing_workspace_mount_remount(
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    preparation: &WorkspaceRemountPreparation,
+) -> Result<(), String> {
+    clear_mount_cached_projection_snapshot(
+        store,
+        state_root,
+        &preparation.mount,
+        &preparation.cached_entities,
+    )
 }
 
 fn mount_has_pending_local_changes(
@@ -10983,6 +11033,13 @@ fn mount_has_unfinished_journals(
 struct PreservedLocalChanges {
     directory: PathBuf,
     count: usize,
+}
+
+#[derive(Debug)]
+struct WorkspaceRemountPreparation {
+    mount: MountConfig,
+    cached_entities: Vec<EntityRecord>,
+    preserved: Option<PreservedLocalChanges>,
 }
 
 #[derive(Serialize)]
@@ -11217,14 +11274,32 @@ fn clear_mount_cached_projection(
         Vec::new()
     };
 
-    if let Some(mount) = mount.as_ref() {
-        clear_visible_projection_paths(mount, &cached_entities)?;
-    }
+    let Some(mount) = mount else {
+        store
+            .clear_mount_source_state(mount_id)
+            .map_err(|error| format!("Could not clear cached source mount state: {error}"))?;
+        clear_mount_content_root(state_root, mount_id)?;
+        return Ok(());
+    };
+    clear_mount_cached_projection_snapshot(store, state_root, &mount, &cached_entities)
+}
+
+fn clear_mount_cached_projection_snapshot(
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    mount: &MountConfig,
+    cached_entities: &[EntityRecord],
+) -> Result<(), String> {
+    clear_visible_projection_paths(mount, cached_entities)?;
 
     store
-        .clear_mount_source_state(mount_id)
+        .clear_mount_source_state(&mount.mount_id)
         .map_err(|error| format!("Could not clear cached source mount state: {error}"))?;
 
+    clear_mount_content_root(state_root, &mount.mount_id)
+}
+
+fn clear_mount_content_root(state_root: &Path, mount_id: &MountId) -> Result<(), String> {
     let content_root = virtual_fs_content_root(state_root, mount_id);
     if content_root.exists() {
         fs::remove_dir_all(&content_root).map_err(|error| {
@@ -15790,6 +15865,90 @@ mod tests {
 
     impl localityd::source::SourcePushValidator for FakeAccessRefreshSource {}
     impl localityd::source::SourceAdapter for FakeAccessRefreshSource {}
+
+    #[test]
+    fn rejected_desktop_remount_preserves_original_source_and_content_cache() {
+        let temp = TestTempDir::new("desktop-rejected-remount-preserves-cache");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let workspace_root = temp.path().join("Locality");
+        let original_root = workspace_root.join("notion-main");
+        fs::create_dir_all(&workspace_root).expect("create workspace root");
+        super::run_mount(
+            &mut store,
+            super::MountOptions {
+                mount_id: mount_id.clone(),
+                connector: "notion".to_string(),
+                root: original_root.clone(),
+                remote_root_id: None,
+                connection_id: None,
+                read_only: false,
+                projection: ProjectionMode::LinuxFuse,
+                settings_json: "{}".to_string(),
+            },
+        )
+        .expect("initial portable mount");
+        let relative_path = Path::new("Team/Page/page.md");
+        let entity = EntityRecord::new(
+            mount_id.clone(),
+            RemoteId::new("page-1"),
+            EntityKind::Page,
+            "Page",
+            relative_path,
+        )
+        .with_hydration(HydrationState::Dirty);
+        store
+            .save_entity(entity.clone())
+            .expect("save dirty entity");
+        let content_path =
+            localityd::virtual_fs::virtual_fs_content_path(temp.path(), &mount_id, relative_path)
+                .expect("content path");
+        fs::create_dir_all(content_path.parent().expect("content parent"))
+            .expect("create content parent");
+        fs::write(&content_path, "pending desktop edit\n").expect("write content cache");
+
+        let preparation =
+            super::plan_existing_workspace_mount_for_remount(&mut store, temp.path(), &mount_id)
+                .expect("plan remount")
+                .expect("existing mount preparation");
+        let moved_root = temp.path().join("MovedLocality/notion-main");
+        let error = super::commit_desktop_mount(
+            &mut store,
+            temp.path(),
+            super::MountOptions {
+                mount_id: mount_id.clone(),
+                connector: "notion".to_string(),
+                root: moved_root,
+                remote_root_id: Some(RemoteId::new("different-source")),
+                connection_id: None,
+                read_only: false,
+                projection: ProjectionMode::LinuxFuse,
+                settings_json: "{}".to_string(),
+            },
+            Some(preparation),
+        )
+        .expect_err("changed trusted workspace root must be rejected");
+
+        assert!(error.contains("immutable outside an owning coordinator"));
+        assert_eq!(
+            store
+                .get_mount(&mount_id)
+                .expect("mount after rejected remount")
+                .expect("mount remains")
+                .root,
+            original_root
+        );
+        assert_eq!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("page-1"))
+                .expect("entity after rejected remount"),
+            Some(entity)
+        );
+        assert_eq!(
+            fs::read_to_string(content_path).expect("content cache after rejected remount"),
+            "pending desktop edit\n"
+        );
+    }
 
     #[test]
     fn plain_file_remount_preserves_visible_dirty_file_before_clearing_state() {

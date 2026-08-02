@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 
 use locality_core::model::{MountId, RemoteId};
 use locality_store::{
-    ConnectionId, LegacyWorkspaceMount, MountConfig, MountRepository, ProjectionMode, StoreError,
-    WorkspaceBindingRepository, WorkspaceHostBinding, WorkspaceHostBindingError,
-    WorkspaceHostBindingResolver, WorkspaceHostPlatform, WorkspaceId, WorkspaceProjectionIdentity,
+    ConnectionId, LegacyLayout0Reason, LegacyWorkspaceMount, MountConfig, MountRepository,
+    ProjectionMode, StoreError, WorkspaceBindingRepository, WorkspaceHostBinding,
+    WorkspaceHostBindingError, WorkspaceHostBindingResolver, WorkspaceHostPlatform, WorkspaceId,
+    WorkspaceProjectionIdentity,
 };
 use localityd::source::source_descriptor;
 use serde::Serialize;
@@ -158,6 +159,12 @@ where
         let plan = WorkspaceHostBindingResolver::current()
             .plan_workspace_migration(host_binding, std::slice::from_ref(&legacy))
             .map_err(MountError::HostBinding)?;
+        if let Some(layout0) = plan.layout0_mounts().first() {
+            return Err(MountError::WorkspaceBindingUnavailable {
+                mount_id: layout0.mount_id.clone(),
+                reason: layout0.reason,
+            });
+        }
         if let (Some(host_binding), Some(binding)) =
             (plan.host_binding(), plan.layout1_bindings().first())
         {
@@ -226,6 +233,10 @@ pub enum MountError {
     },
     CurrentDir(String),
     HostBinding(WorkspaceHostBindingError),
+    WorkspaceBindingUnavailable {
+        mount_id: MountId,
+        reason: LegacyLayout0Reason,
+    },
     MountPointConflict {
         root: PathBuf,
         mount_point: String,
@@ -253,6 +264,7 @@ impl MountError {
             Self::CreateRoot { .. } => "create_mount_root_failed",
             Self::CurrentDir(_) => "current_dir_failed",
             Self::HostBinding(_) => "invalid_mount_binding",
+            Self::WorkspaceBindingUnavailable { .. } => "invalid_mount_binding",
             Self::MountPointConflict { .. } => "mount_point_conflict",
             Self::UnsafeVirtualProjectionRoot { .. } => "unsafe_virtual_projection_root",
             Self::ReadGuidance { .. } => "read_mount_guidance_failed",
@@ -271,6 +283,11 @@ impl MountError {
             }
             Self::CurrentDir(message) => format!("failed to resolve current directory: {message}"),
             Self::HostBinding(error) => format!("invalid virtual mount host binding: {error}"),
+            Self::WorkspaceBindingUnavailable { mount_id, reason } => format!(
+                "virtual mount `{}` cannot be persisted as a portable workspace binding: {}",
+                mount_id.as_str(),
+                layout0_reason_message(*reason)
+            ),
             Self::MountPointConflict {
                 root,
                 mount_point,
@@ -302,6 +319,19 @@ impl MountError {
                     path.display()
                 )
             }
+        }
+    }
+}
+
+fn layout0_reason_message(reason: LegacyLayout0Reason) -> &'static str {
+    match reason {
+        LegacyLayout0Reason::InvalidHostPath => "its host path is invalid",
+        LegacyLayout0Reason::OutsideTrustedWorkspaceRoot => {
+            "it is not a direct child of the trusted workspace root"
+        }
+        LegacyLayout0Reason::InvalidMountTarget => "its mount target is not portable",
+        LegacyLayout0Reason::MountTargetCollision => {
+            "its mount target collides with another mount in the workspace"
         }
     }
 }

@@ -5402,24 +5402,7 @@ fn migrate_workspace_bindings_component_to_v3(connection: &mut Connection) -> St
         return Ok(());
     }
 
-    let blocking_issues = inspect_state_component_issues(connection)?
-        .into_iter()
-        .filter(|issue| {
-            !matches!(
-                issue,
-                StateCompatibilityIssue::OlderComponent {
-                    component_id,
-                    found: 2,
-                    current: 3,
-                } if component_id == "durable:workspace_bindings"
-            )
-        })
-        .collect::<Vec<_>>();
-    if !blocking_issues.is_empty() {
-        return Err(StoreError::StateCompatibility(format!(
-            "state components are not safe to mutate: {blocking_issues:?}",
-        )));
-    }
+    ensure_state_components_safe_before_mutation(connection, SCHEMA_VERSION)?;
 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     create_workspace_host_bindings_table(&transaction)?;
@@ -5565,9 +5548,11 @@ fn state_component_issue_allows_schema_migration(
         issue,
         StateCompatibilityIssue::OlderComponent {
             component_id,
-            found: 1 | 2,
+            found,
             current: 3,
-        } if user_version < SCHEMA_VERSION && component_id == "durable:workspace_bindings"
+        } if component_id == "durable:workspace_bindings"
+            && ((*found == 2 && user_version == SCHEMA_VERSION)
+                || (matches!(*found, 1 | 2) && user_version < SCHEMA_VERSION))
     ) || matches!(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }

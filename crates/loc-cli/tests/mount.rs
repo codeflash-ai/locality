@@ -6,7 +6,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use loc_cli::mount::{GuidanceFileAction, MountOptions, resolve_workspace_mount_root, run_mount};
+use loc_cli::mount::{
+    GuidanceFileAction, MountError, MountOptions, resolve_workspace_mount_root, run_mount,
+};
 use locality_connector::ConnectorCapabilities;
 use locality_core::model::{MountId, RemoteId};
 use locality_gmail::{GMAIL_OAUTH_SCOPES, gmail_capabilities_json};
@@ -20,7 +22,7 @@ use locality_slack::{
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorProfileRepository, CredentialStore, FileCredentialStore,
-    InMemoryStateStore, MountRepository, ProjectionMode, SqliteStateStore,
+    InMemoryStateStore, LegacyLayout0Reason, MountRepository, ProjectionMode, SqliteStateStore,
     WorkspaceBindingRepository,
 };
 use serde_json::Value;
@@ -339,6 +341,57 @@ fn failed_cli_virtual_remount_keeps_the_persisted_mount_unchanged() {
     assert_eq!(
         store.get_mount(&mount_id).expect("mount after failure"),
         Some(original)
+    );
+}
+
+#[test]
+fn cli_rejects_layout_zero_plan_without_retaining_success() {
+    let fixture = MountFixture::new("loc-cli-layout-zero-plan");
+    let workspace_root = fixture.root.join("Locality");
+    let mount_id = MountId::new("notion-main");
+    let mut store = InMemoryStateStore::new();
+    let options = |root: PathBuf| MountOptions {
+        mount_id: mount_id.clone(),
+        connector: "notion".to_string(),
+        root,
+        remote_root_id: None,
+        connection_id: None,
+        read_only: false,
+        projection: ProjectionMode::LinuxFuse,
+        settings_json: "{}".to_string(),
+    };
+
+    run_mount(&mut store, options(workspace_root.join("notion-main")))
+        .expect("initial portable mount");
+    let original_mount = store
+        .get_mount(&mount_id)
+        .expect("load original mount")
+        .expect("original mount");
+    let original_binding = store
+        .get_workspace_binding(&mount_id)
+        .expect("load original binding")
+        .expect("original binding");
+
+    let error = run_mount(&mut store, options(workspace_root.join("trailing.")))
+        .expect_err("layout-0 plan must fail");
+
+    assert_eq!(
+        error,
+        MountError::WorkspaceBindingUnavailable {
+            mount_id: mount_id.clone(),
+            reason: LegacyLayout0Reason::InvalidMountTarget,
+        }
+    );
+    assert_eq!(error.code(), "invalid_mount_binding");
+    assert_eq!(
+        store.get_mount(&mount_id).expect("mount after rejection"),
+        Some(original_mount)
+    );
+    assert_eq!(
+        store
+            .get_workspace_binding(&mount_id)
+            .expect("binding after rejection"),
+        Some(original_binding)
     );
 }
 
