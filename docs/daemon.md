@@ -30,12 +30,18 @@ TLS/base-URL restrictions, bounded response allocation, retries, redaction,
 and capability negotiation. `loc_cli::generation_http` is an exact compatibility
 re-export; the CLI does not own a second implementation.
 
-Each recurrence resolves the session capability at runtime and constructs this
-in-memory composition. Durable daemon state stores only the credential-store
-reference associated with the connection or session; it must not store the
-bearer capability, put it in IPC, or reconstruct it from persisted job data.
-Session renewal and capability issuance are separate lifecycle concerns and are
-not performed by this runtime.
+`GenerationHttpRuntimeReference` is the typed integration boundary for a future
+recurrence owner. It contains only the API base URL and session credential-store
+reference. Calling `resolve` reads and validates the current generation-2
+session credential, then constructs the in-memory composition. The bearer
+capability must not be copied into durable daemon state, IPC, or persisted job
+data.
+
+No `DaemonRuntime` job or scheduler currently invokes this boundary, so
+recurring generation delivery is not live. The current pull scheduler covers
+direct-provider reconciliation only. Durable recurrence configuration, mount
+selection, session renewal/capability issuance, and retry/status policy require
+separate integration before the daemon can own this loop.
 
 ## Process Management
 

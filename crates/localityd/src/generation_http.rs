@@ -35,6 +35,7 @@ use locality_protocol::generation_baseline::{
 use locality_protocol::workspace_api_v2::{WorkspaceExportOfferV2, WorkspaceProfileSessionV2};
 use locality_protocol::workspace_export_v2::WorkspaceNamespacedInventoryV2;
 use locality_protocol::workspace_layout::WorkspaceProfileId;
+use locality_store::{CredentialError, CredentialStore};
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use reqwest::header::{
@@ -280,6 +281,95 @@ impl std::error::Error for GenerationHttpError {
         match self {
             Self::RequestContract(error) => Some(error),
             _ => None,
+        }
+    }
+}
+
+/// Non-secret inputs needed to construct one generation HTTP runtime.
+///
+/// A recurrence owner may persist this reference, but must resolve it immediately
+/// before use so the session capability is read from the credential store rather
+/// than copied into daemon state or queued work. This type does not register or
+/// schedule recurrence work by itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationHttpRuntimeReference {
+    base_url: String,
+    session_credential_ref: String,
+}
+
+impl GenerationHttpRuntimeReference {
+    pub fn new(
+        base_url: impl Into<String>,
+        session_credential_ref: impl Into<String>,
+    ) -> Result<Self, GenerationHttpRuntimeResolutionError> {
+        let base_url = base_url.into();
+        let session_credential_ref = session_credential_ref.into();
+        if session_credential_ref.is_empty() {
+            return Err(GenerationHttpRuntimeResolutionError::EmptyCredentialReference);
+        }
+        Ok(Self {
+            base_url,
+            session_credential_ref,
+        })
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub fn session_credential_ref(&self) -> &str {
+        &self.session_credential_ref
+    }
+
+    /// Resolve the current generation-2 session credential and construct an
+    /// in-memory runtime for one caller-owned execution.
+    pub fn resolve(
+        &self,
+        credentials: &dyn CredentialStore,
+    ) -> Result<GenerationHttpRuntime, GenerationHttpRuntimeResolutionError> {
+        let encoded_session = credentials
+            .get(&self.session_credential_ref)
+            .map_err(GenerationHttpRuntimeResolutionError::Credential)?;
+        let session = WorkspaceProfileSessionV2::decode_json(encoded_session.as_bytes())
+            .map_err(|_| GenerationHttpRuntimeResolutionError::InvalidSessionCredential)?;
+        GenerationHttpRuntime::new(&self.base_url, &session)
+            .map_err(GenerationHttpRuntimeResolutionError::Http)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum GenerationHttpRuntimeResolutionError {
+    EmptyCredentialReference,
+    Credential(CredentialError),
+    InvalidSessionCredential,
+    Http(GenerationHttpError),
+}
+
+impl Display for GenerationHttpRuntimeResolutionError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyCredentialReference => {
+                formatter.write_str("generation session credential reference must not be empty")
+            }
+            Self::Credential(error) => {
+                write!(
+                    formatter,
+                    "generation session credential lookup failed: {error}"
+                )
+            }
+            Self::InvalidSessionCredential => formatter
+                .write_str("generation session credential is not a valid generation-2 session"),
+            Self::Http(error) => write!(formatter, "generation HTTP runtime setup failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for GenerationHttpRuntimeResolutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Credential(error) => Some(error),
+            Self::Http(error) => Some(error),
+            Self::EmptyCredentialReference | Self::InvalidSessionCredential => None,
         }
     }
 }
@@ -672,11 +762,11 @@ impl GenerationHttpTransport {
 
 /// In-memory composition for one authenticated generation session.
 ///
-/// Daemon recurrence code should resolve the session capability from its
-/// credential-store reference immediately before constructing this value. The
-/// capability is retained only in sensitive authorization headers, is never
-/// exposed by this API, and is redacted from diagnostics. Session persistence
-/// and renewal are deliberately outside this HTTP runtime.
+/// [`GenerationHttpRuntimeReference::resolve`] reads the session capability
+/// from its credential-store reference immediately before constructing this
+/// value. The capability is retained only in sensitive authorization headers,
+/// is never exposed by this API, and is redacted from diagnostics. Scheduling,
+/// session persistence, and renewal are deliberately outside this HTTP runtime.
 pub struct GenerationHttpRuntime {
     baseline_client: GenerationBaselineHttpClient,
     delivery_transport: GenerationHttpTransport,
