@@ -1577,7 +1577,13 @@ fn persist_windows_cloud_files_projection_recovery_with_durable_io(
 ) -> LocalityResult<()> {
     static MANIFEST_COUNTER: AtomicU64 = AtomicU64::new(0);
     let directory = windows_cloud_files_projection_recovery_manifest_dir(state_root);
-    create_dir_all_durable(state_root, &directory).map_err(LocalityError::from)?;
+    let state_root_parent = state_root.parent().ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "Locality state root `{}` has no trusted creation parent",
+            state_root.display()
+        ))
+    })?;
+    create_dir_all_durable(state_root_parent, &directory).map_err(LocalityError::from)?;
     let sequence = MANIFEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = directory.join(format!(
         "{}-r{:08}-{sequence}.json",
@@ -3500,6 +3506,7 @@ mod tests {
             Some(Path::new("restored/first.md")),
         )
         .expect("prepare source-present recovery");
+        assert!(state_root.is_dir(), "recovery creates the owned state root");
 
         let second_id = RemoteId::new("page-2");
         let second_source = access_root.join("second.md");
@@ -3888,6 +3895,7 @@ mod tests {
             Some(Path::new("restored/page.md")),
         )
         .expect("prepare recovery");
+        assert!(state_root.is_dir(), "recovery creates the owned state root");
         fs::rename(&source, &recovery.quarantine_path).expect("move payload to quarantine");
         inspect_windows_cloud_files_projection_recovery(&mut recovery);
         recovery.record_revision += 1;
@@ -3931,6 +3939,7 @@ mod tests {
 
         let repaired = repair_windows_cloud_files_projection_recoveries(&state_root, &access_root)
             .expect("discover orphan payload");
+        assert!(state_root.is_dir(), "recovery creates the owned state root");
         let orphan = repaired
             .iter()
             .find(|recovery| recovery.quarantine_path == orphan_path)
