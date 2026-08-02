@@ -49,6 +49,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_ATTEMPTS: u8 = 3;
 const MAX_ATTEMPTS: u8 = 10;
 const JSON_MEDIA_TYPE: &str = "application/json";
+const MAX_INITIAL_RESPONSE_BODY_CAPACITY: usize = 8 * 1024;
 pub const GENERATION_BASELINE_CONTENT_TYPE: &str = JSON_MEDIA_TYPE;
 pub const GENERATION_BASELINE_CACHE_CONTROL: &str = "no-store";
 const BODY_WINDOW_FRAME_OVERHEAD: usize =
@@ -333,6 +334,7 @@ impl GenerationBaselineHttpClient {
         session
             .validate()
             .map_err(|_| GenerationHttpError::InvalidBaselineContext)?;
+        require_route_safe_opaque_segment(session.session_id().as_str())?;
         let base_url = parse_base_url(base_url)?;
         let authorization = authorization_header(session.opaque_capability())?;
         let client = build_client(&base_url, options)?;
@@ -358,6 +360,7 @@ impl GenerationBaselineHttpClient {
         inventory: &WorkspaceNamespacedInventoryV2,
     ) -> Result<GenerationBaselineResponseV1, GenerationHttpError> {
         self.require_workspace_session_boundary(session)?;
+        require_route_safe_opaque_segment(offer.offer().export_attempt_id.as_str())?;
         let maximum = maximum_encoded_bytes_for_export(session, offer, inventory)
             .map_err(|_| GenerationHttpError::InvalidBaselineContext)?;
         let response = self.get_json(
@@ -943,6 +946,16 @@ fn is_canonical_route_uuid(value: &str) -> bool {
     WorkspaceProfileId::new(value).is_ok()
 }
 
+fn require_route_safe_opaque_segment(value: &str) -> Result<(), GenerationHttpError> {
+    // `url` follows the URL standard and normalizes these two exact path
+    // segments, so accepting either would silently change the opaque route ID.
+    if matches!(value, "." | "..") {
+        Err(GenerationHttpError::InvalidBaselineContext)
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_request_delta_id(delta_id: &str) -> Result<(), GenerationHttpError> {
     if is_canonical_route_uuid(delta_id) {
         Ok(())
@@ -1153,7 +1166,7 @@ fn read_wire_response(
             problem: GenerationHttpResponseProblem::ContentLengthTooLarge,
             retry: GenerationHttpRetryClassification::Never,
         })?;
-    let mut body = Vec::with_capacity(content_length.min(maximum));
+    let mut body = Vec::with_capacity(initial_response_body_capacity(content_length));
     response
         .by_ref()
         .take(u64::try_from(hard_limit).unwrap_or(u64::MAX))
@@ -1191,6 +1204,10 @@ fn read_wire_response(
         });
     }
     Ok(WireResponse { status, body })
+}
+
+fn initial_response_body_capacity(content_length: usize) -> usize {
+    content_length.min(MAX_INITIAL_RESPONSE_BODY_CAPACITY)
 }
 
 fn read_baseline_response(
@@ -1297,5 +1314,24 @@ fn require_content_length(
         Err(GenerationHttpResponseProblem::ContentLengthTooLarge)
     } else {
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_INITIAL_RESPONSE_BODY_CAPACITY, initial_response_body_capacity};
+
+    #[test]
+    fn response_body_initial_capacity_is_small_and_capped() {
+        assert_eq!(initial_response_body_capacity(0), 0);
+        assert_eq!(initial_response_body_capacity(17), 17);
+        assert_eq!(
+            initial_response_body_capacity(MAX_INITIAL_RESPONSE_BODY_CAPACITY),
+            MAX_INITIAL_RESPONSE_BODY_CAPACITY
+        );
+        assert_eq!(
+            initial_response_body_capacity(usize::MAX),
+            MAX_INITIAL_RESPONSE_BODY_CAPACITY
+        );
     }
 }

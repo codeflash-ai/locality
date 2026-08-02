@@ -499,6 +499,27 @@ fn client_rejects_a_different_session_capability_before_network_access() {
 }
 
 #[test]
+fn client_rejects_opaque_dot_segment_ids_before_network_access() {
+    for session_id in [".", ".."] {
+        let context = export_context(session_id, ATTEMPT_ID, SESSION_CAPABILITY);
+        let error = GenerationBaselineHttpClient::new("http://127.0.0.1:9", &context.session)
+            .expect_err("dot-segment session ID must not become a route");
+        assert_eq!(error, GenerationHttpError::InvalidBaselineContext);
+    }
+
+    let expected = export_context(SESSION_ID, ATTEMPT_ID, SESSION_CAPABILITY);
+    let client =
+        GenerationBaselineHttpClient::new("http://127.0.0.1:9", &expected.session).unwrap();
+    for attempt_id in [".", ".."] {
+        let context = export_context(SESSION_ID, attempt_id, SESSION_CAPABILITY);
+        let error = client
+            .fetch_generation_baseline(&context.session, &context.offer, &context.inventory)
+            .expect_err("dot-segment attempt ID must not become a route");
+        assert_eq!(error, GenerationHttpError::InvalidBaselineContext);
+    }
+}
+
+#[test]
 fn terminal_statuses_are_typed_sanitized_and_not_retried() {
     let context = export_context(SESSION_ID, ATTEMPT_ID, SESSION_CAPABILITY);
     for (status, code) in [

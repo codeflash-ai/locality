@@ -23,6 +23,9 @@ that same session plus the exact offer and namespaced inventory. The client
 derives the attempt route identity from the sealed offer, encodes both opaque
 IDs as individual URL path segments, sends the capability only in the
 `Authorization: Bearer` header, and never places it in a URL or diagnostic.
+The HTTP adapter rejects the exact opaque IDs `.` and `..` before network
+access because URL-standard dot-segment normalization cannot preserve them as
+exact route identities; they remain valid opaque values outside this route.
 
 The request is a replay-safe GET with `Accept: application/json` and
 `Cache-Control: no-store`. Every accepted response, including a structured
