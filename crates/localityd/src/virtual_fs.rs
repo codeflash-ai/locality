@@ -2634,6 +2634,36 @@ fn persist_and_publish_virtual_move<S>(
 where
     S: VirtualMoveRepository + VirtualMutationRepository,
 {
+    persist_and_publish_virtual_move_with_hook(
+        store,
+        transition,
+        content_root,
+        old_path,
+        new_content_path,
+        retitle,
+        retrying_published_move,
+        |_| Ok(()),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VirtualMovePersistBoundary {
+    CleanupPersistedBeforeBegin,
+}
+
+fn persist_and_publish_virtual_move_with_hook<S>(
+    store: &mut S,
+    transition: VirtualMoveTransition,
+    content_root: &Path,
+    old_path: &Path,
+    new_content_path: &Path,
+    retitle: Option<&str>,
+    retrying_published_move: bool,
+    mut after_boundary: impl FnMut(VirtualMovePersistBoundary) -> LocalityResult<()>,
+) -> LocalityResult<VirtualMutationRecord>
+where
+    S: VirtualMoveRepository + VirtualMutationRepository,
+{
     let mount_id = transition.mutation.mount_id.clone();
     let local_id = transition.mutation.local_id.clone();
     let expected_content_path = transition.mutation.content_path.clone();
@@ -2689,6 +2719,7 @@ where
             cleanup,
             &source.as_ref().expect("cleanup has source").file,
         )?;
+        after_boundary(VirtualMovePersistBoundary::CleanupPersistedBeforeBegin)?;
     }
 
     let persisted_destination_binding =
@@ -3613,15 +3644,21 @@ where
             path.display()
         )));
     }
-    let mutation = store
+    let Some(mutation) = store
         .get_virtual_mutation(mount_id, local_id)
         .map_err(LocalityError::from)?
-        .ok_or_else(|| {
-            LocalityError::InvalidState(format!(
-                "virtual move cleanup record `{}` has no matching durable mutation",
-                path.display()
-            ))
-        })?;
+    else {
+        return abandon_unbegun_virtual_move_cleanup(
+            content_root,
+            mount_id,
+            local_id,
+            &path,
+            &cleanup,
+            &source_root,
+            &source_path,
+            &destination_path,
+        );
+    };
     let pointer = mutation.content_path.as_deref();
     if pointer == Some(source_path.as_path()) {
         // Publication may have completed, but cleanup is not authorized until
@@ -3838,6 +3875,94 @@ where
         }
     }
     Ok(())
+}
+
+fn abandon_unbegun_virtual_move_cleanup(
+    content_root: &Path,
+    mount_id: &MountId,
+    local_id: &str,
+    cleanup_path: &Path,
+    cleanup: &PendingVirtualMoveCleanup,
+    source_root: &Path,
+    source_path: &Path,
+    destination_path: &Path,
+) -> LocalityResult<()> {
+    let authorized_root = virtual_move_source_trusted_root(content_root, mount_id, source_path)?;
+    if authorized_root != source_root {
+        return Err(LocalityError::InvalidState(format!(
+            "unbegun virtual move cleanup record `{}` has an invalid source root",
+            cleanup_path.display()
+        )));
+    }
+    let source_identity =
+        trusted_regular_file_identity(source_root, source_path).map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to verify unbegun virtual move source `{}`: {error}",
+                source_path.display()
+            ))
+        })?;
+    if source_identity != Some(cleanup.source_identity) {
+        return Err(LocalityError::InvalidState(format!(
+            "unbegun virtual move source `{}` changed after cleanup preparation; refusing to abandon recovery state",
+            source_path.display()
+        )));
+    }
+    let source_anchor = pending_virtual_move_cleanup_anchor_path(source_root, mount_id, local_id);
+    let source_anchor_identity = trusted_regular_file_identity(source_root, &source_anchor)
+        .map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to verify unbegun virtual move source anchor `{}`: {error}",
+                source_anchor.display()
+            ))
+        })?;
+    if source_anchor_identity.is_some_and(|identity| identity != cleanup.source_identity) {
+        return Err(LocalityError::InvalidState(format!(
+            "unbegun virtual move source anchor `{}` belongs to a different object",
+            source_anchor.display()
+        )));
+    }
+    let candidate = pending_virtual_move_cleanup_candidate_path(source_root, mount_id, local_id);
+    if trusted_regular_file_identity(source_root, &candidate)
+        .map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to inspect unbegun virtual move quarantine `{}`: {error}",
+                candidate.display()
+            ))
+        })?
+        .is_some()
+    {
+        return Err(LocalityError::InvalidState(format!(
+            "unbegun virtual move cleanup record `{}` already has a quarantined source",
+            cleanup_path.display()
+        )));
+    }
+    if trusted_regular_file_identity(content_root, destination_path)
+        .map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to inspect unbegun virtual move destination `{}`: {error}",
+                destination_path.display()
+            ))
+        })?
+        .is_some()
+        || read_pending_virtual_move_destination_binding(content_root, mount_id, local_id)?
+            .is_some()
+        || trusted_regular_file_identity(
+            content_root,
+            &pending_virtual_move_destination_anchor_path(content_root, mount_id, local_id),
+        )
+        .map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to inspect unbegun virtual move destination anchor: {error}"
+            ))
+        })?
+        .is_some()
+    {
+        return Err(LocalityError::InvalidState(format!(
+            "unbegun virtual move cleanup record `{}` has publication artifacts; refusing to abandon it",
+            cleanup_path.display()
+        )));
+    }
+    remove_pending_virtual_move_cleanup_state(content_root, mount_id, local_id, cleanup)
 }
 
 fn remove_trusted_regular_file_if_identity(
@@ -9914,6 +10039,115 @@ mod tests {
             .unwrap()
             .is_none(),
             "successful retry clears the durable cleanup record"
+        );
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn virtual_move_replays_repeated_crashes_after_cleanup_persistence_before_begin() {
+        let mount_id = MountId::new("cleanup-before-begin");
+        let state_root = temp_root("loc-virtual-move-cleanup-before-begin");
+        let content_root = state_root.join("content/cleanup-before-begin/files");
+        let old_path = content_root.join("old.md");
+        let new_path = content_root.join("new.md");
+        fs::create_dir_all(&content_root).expect("create content root");
+        fs::write(&old_path, "crash-safe source").expect("write source");
+
+        let mut store = InMemoryStateStore::new();
+        let mutation = VirtualMutationRecord {
+            mount_id: mount_id.clone(),
+            local_id: "move:cleanup-before-begin".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(RemoteId::new("cleanup-before-begin")),
+            parent_remote_id: None,
+            original_path: Some(PathBuf::from("old.md")),
+            projected_path: PathBuf::from("new.md"),
+            title: "New".to_string(),
+            content_path: Some(old_path.clone()),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+
+        for attempt in ["first move", "replay"] {
+            let error = super::persist_and_publish_virtual_move_with_hook(
+                &mut store,
+                VirtualMoveTransition {
+                    mutation: mutation.clone(),
+                    entity: None,
+                    freshness: None,
+                    superseded_local_ids: Vec::new(),
+                },
+                &content_root,
+                &old_path,
+                &new_path,
+                None,
+                false,
+                |boundary| {
+                    assert_eq!(
+                        boundary,
+                        super::VirtualMovePersistBoundary::CleanupPersistedBeforeBegin
+                    );
+                    Err(LocalityError::Io(format!(
+                        "injected crash during {attempt}"
+                    )))
+                },
+            )
+            .expect_err("crash before mutation creation");
+            assert!(error.to_string().contains("injected crash"));
+            assert!(
+                store
+                    .get_virtual_mutation(&mount_id, &mutation.local_id)
+                    .unwrap()
+                    .is_none(),
+                "begin_virtual_move must not run before the injected crash"
+            );
+            assert!(old_path.exists());
+            assert!(!new_path.exists());
+            assert!(
+                super::read_pending_virtual_move_cleanup(
+                    &content_root,
+                    &super::pending_virtual_move_cleanup_path(
+                        &content_root,
+                        &mount_id,
+                        &mutation.local_id,
+                    ),
+                )
+                .unwrap()
+                .is_some(),
+                "the pre-begin cleanup intent is durable after {attempt}"
+            );
+        }
+
+        let finalized = persist_and_publish_virtual_move(
+            &mut store,
+            VirtualMoveTransition {
+                mutation: mutation.clone(),
+                entity: None,
+                freshness: None,
+                superseded_local_ids: Vec::new(),
+            },
+            &content_root,
+            &old_path,
+            &new_path,
+            None,
+            false,
+        )
+        .expect("replay abandons the exact pre-begin intent and completes");
+
+        assert_eq!(finalized.content_path.as_deref(), Some(new_path.as_path()));
+        assert!(!old_path.exists());
+        assert_eq!(fs::read_to_string(&new_path).unwrap(), "crash-safe source");
+        assert!(
+            super::read_pending_virtual_move_cleanup(
+                &content_root,
+                &super::pending_virtual_move_cleanup_path(
+                    &content_root,
+                    &mount_id,
+                    &mutation.local_id,
+                ),
+            )
+            .unwrap()
+            .is_none()
         );
         let _ = fs::remove_dir_all(state_root);
     }

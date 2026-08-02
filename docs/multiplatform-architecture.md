@@ -523,6 +523,10 @@ Desktop staging also verifies the renamed object's exact identity and required
 emptiness after the no-replace rename. A source replacement or newly non-empty
 directory at that boundary is left in the recorded staging quarantine and the
 remount fails closed; it is never treated as the object authorized for cleanup.
+Prepared rollback applies the same rule in reverse: it verifies the restored
+identity after the no-replace rename, and returns a raced replacement or symlink
+to the recorded staging quarantine instead of leaving it at the user-visible
+path.
 
 Virtual-move cleanup is an artifact-state teardown. The source quarantine,
 source identity anchor, destination identity anchor, and destination binding
@@ -530,6 +534,11 @@ are each removed idempotently, with destination identity/content revalidation
 when an earlier boundary already completed. The primary cleanup intent is the
 last durable record deleted, so every crash boundary retains enough state for a
 retry and never authorizes deletion of a replacement source or destination.
+If a crash lands after the source anchor and cleanup intent are durable but
+before `begin_virtual_move`, replay abandons that intent only when the mutation
+and every publication artifact are absent and the exact source identity is
+still in place. It then prepares the move again; any ambiguity remains
+fail-closed recovery state.
 
 On Unix, identity-bound deletion first performs a no-replace rename into a
 random mode-0700 sibling quarantine with a durable device/inode manifest. Its

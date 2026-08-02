@@ -7859,7 +7859,11 @@ impl QuiescedWorkspaceRemountRuntime for DesktopQuiescedRemountRuntime<'_> {
     }
 
     fn reconcile_cleanup(&mut self) -> Result<(), String> {
-        reconcile_workspace_remount_recovery(self.state_root)
+        let ownership = self
+            .remount_ownership
+            .as_ref()
+            .ok_or_else(|| "Desktop remount recovery ownership is missing".to_string())?;
+        reconcile_workspace_remount_recovery_owned(self.state_root, ownership)
     }
 
     fn ensure_running(&mut self) -> Result<(), String> {
@@ -11949,12 +11953,16 @@ impl PersistedWorkspaceRemountRecovery {
     }
 }
 
+#[cfg(test)]
 fn reconcile_workspace_remount_recovery(state_root: &Path) -> Result<(), String> {
-    let _ownership = WorkspaceRemountOwnership::recover(state_root)?;
-    reconcile_workspace_remount_recovery_owned(state_root)
+    let ownership = WorkspaceRemountOwnership::recover(state_root)?;
+    reconcile_workspace_remount_recovery_owned(state_root, &ownership)
 }
 
-fn reconcile_workspace_remount_recovery_owned(state_root: &Path) -> Result<(), String> {
+fn reconcile_workspace_remount_recovery_owned(
+    state_root: &Path,
+    _ownership: &WorkspaceRemountOwnership,
+) -> Result<(), String> {
     let recoveries = load_workspace_remount_recoveries(state_root)?;
     let mut store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| format!("could not open Locality state for remount recovery: {error}"))?;
@@ -12015,7 +12023,7 @@ fn reconcile_workspace_remount_recovery_owned(state_root: &Path) -> Result<(), S
 
 fn reconcile_desktop_remount_recovery(state_root: &Path) -> Result<(), String> {
     let mut ownership = WorkspaceRemountOwnership::recover(state_root)?;
-    reconcile_workspace_remount_recovery_owned(state_root)?;
+    reconcile_workspace_remount_recovery_owned(state_root, &ownership)?;
     if !ownership.has_fence() {
         return Ok(());
     }
@@ -12369,6 +12377,13 @@ fn create_recovery_directory(state_root: &Path, path: &Path) -> Result<(), Strin
 }
 
 fn restore_staged_projection_path(path: &StagedProjectionPath) -> Result<(), String> {
+    restore_staged_projection_path_with_hook(path, || Ok(()))
+}
+
+fn restore_staged_projection_path_with_hook(
+    path: &StagedProjectionPath,
+    before_rename: impl FnOnce() -> io::Result<()>,
+) -> Result<(), String> {
     let trusted_root = path.staged.parent().and_then(Path::parent).ok_or_else(|| {
         format!(
             "staged recovery path `{}` has no owned parent",
@@ -12402,13 +12417,33 @@ fn restore_staged_projection_path(path: &StagedProjectionPath) -> Result<(), Str
                     format!("could not recreate `{}`: {error}", parent.display())
                 })?;
             }
+            before_rename().map_err(|error| {
+                format!(
+                    "could not prepare rollback rename from `{}`: {error}",
+                    path.staged.display()
+                )
+            })?;
             rename_and_sync(trusted_root, &path.staged, &path.original).map_err(|error| {
                 format!(
                     "could not restore `{}` from `{}`: {error}",
                     path.original.display(),
                     path.staged.display()
                 )
-            })
+            })?;
+            if let Err(identity_error) = verify_remount_path_identity(&path.original, path.identity)
+            {
+                return match rename_and_sync(trusted_root, &path.original, &path.staged) {
+                    Ok(()) => Err(format!(
+                        "{identity_error}; the raced replacement was returned to staging quarantine `{}`",
+                        path.staged.display()
+                    )),
+                    Err(quarantine_error) => Err(format!(
+                        "{identity_error}; preserving the raced replacement by returning it to staging quarantine `{}` also failed: {quarantine_error}",
+                        path.staged.display()
+                    )),
+                };
+            }
+            Ok(())
         }
         (true, true) => Err(format!(
             "could not restore `{}` because both it and staged path `{}` exist",
@@ -17407,7 +17442,7 @@ mod tests {
         let mut ownership = loc_cli::mount::WorkspaceRemountOwnership::recover(temp.path())
             .expect("recover fence ownership");
 
-        super::reconcile_workspace_remount_recovery_owned(temp.path())
+        super::reconcile_workspace_remount_recovery_owned(temp.path(), &ownership)
             .expect("resolve remount recovery");
         super::restore_supervision_before_clearing_remount_fence(&mut ownership, || {
             assert!(locality_platform::daemon_remount_fence_path(temp.path()).exists());
@@ -17418,6 +17453,90 @@ mod tests {
 
         assert!(restored.get());
         assert!(!locality_platform::daemon_remount_fence_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn active_desktop_remount_reconciles_committed_and_rollback_outcomes_under_owned_lock() {
+        for committed in [false, true] {
+            let label = if committed { "committed" } else { "rollback" };
+            let temp = TestTempDir::new(&format!("desktop-owned-remount-{label}"));
+            let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+            let mount_id = MountId::new(format!("notion-{label}"));
+            let workspace_root = temp.path().join("workspace");
+            let mount_root = workspace_root.join(&mount_id.0);
+            fs::create_dir_all(&workspace_root).expect("create workspace root");
+            #[cfg(unix)]
+            let projection = ProjectionMode::LinuxFuse;
+            #[cfg(windows)]
+            let projection = ProjectionMode::WindowsCloudFiles;
+            let options = super::MountOptions {
+                mount_id: mount_id.clone(),
+                connector: "notion".to_string(),
+                root: mount_root,
+                remote_root_id: Some(RemoteId::new("same-source")),
+                connection_id: None,
+                read_only: false,
+                projection,
+                settings_json: "{}".to_string(),
+            };
+            super::run_mount(&mut store, options.clone()).expect("initial mount");
+            let content_root =
+                localityd::virtual_fs::virtual_fs_content_root(temp.path(), &mount_id);
+            fs::create_dir_all(&content_root).expect("create old content root");
+            fs::write(content_root.join("cached.md"), "old cache").expect("write old cache");
+            let preparation = super::plan_existing_workspace_mount_for_remount(
+                &mut store,
+                temp.path(),
+                &mount_id,
+            )
+            .expect("plan remount")
+            .expect("existing mount");
+            let intended_mount = super::mount_config_for_options(&options);
+            let mut cleanup = super::WorkspaceProjectionCleanupTransaction::new(
+                temp.path(),
+                &preparation,
+                intended_mount,
+            );
+            cleanup.begin(&mut store).expect("begin recovery outcome");
+            if committed {
+                super::run_mount_with_workspace_cleanup(&mut store, options, || {
+                    cleanup
+                        .stage()
+                        .map_err(locality_store::StoreError::InvalidState)
+                })
+                .expect("commit remount while leaving cleanup for recovery");
+            } else {
+                cleanup.stage().expect("stage rollback outcome");
+            }
+            drop(cleanup);
+            drop(store);
+
+            let ownership = super::persist_daemon_remount_fence(temp.path(), &mount_id)
+                .expect("hold remount ownership");
+            let mut runtime = super::DesktopQuiescedRemountRuntime {
+                state_root: temp.path(),
+                mount_id: &mount_id,
+                remount_ownership: Some(ownership),
+            };
+            loc_cli::mount::QuiescedWorkspaceRemountRuntime::reconcile_cleanup(&mut runtime)
+                .expect("reconcile without reacquiring the held OS lock");
+
+            assert_eq!(
+                content_root.exists(),
+                !committed,
+                "prepared recovery restores while committed recovery collects"
+            );
+            assert_eq!(remount_recovery_marker_count(temp.path()), 0);
+            let reopened =
+                SqliteStateStore::open(temp.path().to_path_buf()).expect("reopen recovered store");
+            assert!(
+                reopened
+                    .list_workspace_remount_recoveries()
+                    .expect("list recovery outcomes")
+                    .is_empty()
+            );
+            assert!(runtime.remount_ownership.as_ref().unwrap().has_fence());
+        }
     }
 
     #[test]
@@ -18117,6 +18236,114 @@ mod tests {
         // identity quarantine. Before rollback, the replacement is already
         // outside the user-visible source path and cannot be collected as the
         // recorded object.
+    }
+
+    #[test]
+    fn desktop_rollback_returns_barrier_replacement_to_staging_quarantine() {
+        let temp = TestTempDir::new("desktop-remount-rollback-replacement-race");
+        let trusted_root = temp.path().join("projection");
+        let staging_directory = trusted_root.join("staging");
+        let staged = staging_directory.join("0");
+        let original = trusted_root.join("original.md");
+        let displaced = staging_directory.join("displaced-original");
+        fs::create_dir_all(&staging_directory).expect("create staging directory");
+        fs::write(&staged, "exact staged bytes").expect("write exact staged object");
+        let identity =
+            super::RemountFilesystemIdentity::inspect(&staged).expect("bind staged identity");
+        let recovery = super::StagedProjectionPath {
+            original: original.clone(),
+            staged: staged.clone(),
+            identity: Some(identity),
+        };
+
+        let before_replace = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let after_replace = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_staged = staged.clone();
+        let worker_displaced = displaced.clone();
+        let worker_before = std::sync::Arc::clone(&before_replace);
+        let worker_after = std::sync::Arc::clone(&after_replace);
+        let worker = std::thread::spawn(move || {
+            worker_before.wait();
+            fs::rename(&worker_staged, &worker_displaced).expect("displace exact staged object");
+            fs::write(&worker_staged, "racing replacement").expect("write replacement");
+            worker_after.wait();
+        });
+
+        let error = super::restore_staged_projection_path_with_hook(&recovery, || {
+            before_replace.wait();
+            after_replace.wait();
+            Ok(())
+        })
+        .expect_err("post-rename identity verification rejects replacement");
+        worker.join().expect("replacement worker");
+
+        assert!(error.contains("returned to staging quarantine"), "{error}");
+        assert!(!original.exists(), "the replacement is not left visible");
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "racing replacement");
+        assert_eq!(
+            fs::read_to_string(&displaced).unwrap(),
+            "exact staged bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_rollback_returns_barrier_symlink_to_staging_quarantine() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestTempDir::new("desktop-remount-rollback-symlink-race");
+        let trusted_root = temp.path().join("projection");
+        let staging_directory = trusted_root.join("staging");
+        let staged = staging_directory.join("0");
+        let original = trusted_root.join("original.md");
+        let displaced = staging_directory.join("displaced-original");
+        let outside = temp.path().join("outside.md");
+        fs::create_dir_all(&staging_directory).expect("create staging directory");
+        fs::write(&staged, "exact staged bytes").expect("write exact staged object");
+        fs::write(&outside, "outside bytes").expect("write outside target");
+        let identity =
+            super::RemountFilesystemIdentity::inspect(&staged).expect("bind staged identity");
+        let recovery = super::StagedProjectionPath {
+            original: original.clone(),
+            staged: staged.clone(),
+            identity: Some(identity),
+        };
+
+        let before_replace = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let after_replace = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_staged = staged.clone();
+        let worker_displaced = displaced.clone();
+        let worker_outside = outside.clone();
+        let worker_before = std::sync::Arc::clone(&before_replace);
+        let worker_after = std::sync::Arc::clone(&after_replace);
+        let worker = std::thread::spawn(move || {
+            worker_before.wait();
+            fs::rename(&worker_staged, &worker_displaced).expect("displace exact staged object");
+            symlink(&worker_outside, &worker_staged).expect("install racing symlink");
+            worker_after.wait();
+        });
+
+        let error = super::restore_staged_projection_path_with_hook(&recovery, || {
+            before_replace.wait();
+            after_replace.wait();
+            Ok(())
+        })
+        .expect_err("post-rename identity verification rejects symlink");
+        worker.join().expect("symlink worker");
+
+        assert!(error.contains("returned to staging quarantine"), "{error}");
+        assert!(fs::symlink_metadata(&original).is_err());
+        assert!(
+            fs::symlink_metadata(&staged)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside bytes");
+        assert_eq!(
+            fs::read_to_string(&displaced).unwrap(),
+            "exact staged bytes"
+        );
     }
 
     #[test]
