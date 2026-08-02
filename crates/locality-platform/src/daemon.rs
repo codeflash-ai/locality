@@ -1,4 +1,9 @@
 use std::fs::{self, OpenOptions};
+use std::io;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -16,6 +21,7 @@ pub const DAEMON_METADATA_FILENAME: &str = "localityd.manager.json";
 pub const DAEMON_STDOUT_LOG_FILENAME: &str = "localityd.out.log";
 pub const DAEMON_STDERR_LOG_FILENAME: &str = "localityd.err.log";
 pub const DAEMON_REMOUNT_FENCE_FILENAME: &str = "localityd.remount.fence";
+pub const DAEMON_REMOUNT_LOCK_FILENAME: &str = "localityd.remount.lock";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -124,6 +130,102 @@ pub fn daemon_socket_path(state_root: &Path) -> PathBuf {
 
 pub fn daemon_remount_fence_path(state_root: &Path) -> PathBuf {
     state_root.join(DAEMON_REMOUNT_FENCE_FILENAME)
+}
+
+pub fn daemon_remount_lock_path(state_root: &Path) -> PathBuf {
+    state_root.join(DAEMON_REMOUNT_LOCK_FILENAME)
+}
+
+/// Process-scoped exclusive ownership of remount coordination and recovery.
+///
+/// The lock lives beside (not inside) the removable durable fence so an owner
+/// can verify and delete its exact fence generation without releasing the OS
+/// exclusion boundary. Both CLI and Desktop use this same primitive.
+pub struct DaemonRemountCoordinatorLock {
+    _file: fs::File,
+}
+
+impl DaemonRemountCoordinatorLock {
+    pub fn try_acquire(state_root: &Path) -> io::Result<Self> {
+        fs::create_dir_all(state_root)?;
+        let path = daemon_remount_lock_path(state_root);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        try_lock_remount_file(&file).map_err(|error| {
+            if matches!(error.kind(), io::ErrorKind::WouldBlock) {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "another Locality coordinator owns remount recovery through `{}`",
+                        path.display()
+                    ),
+                )
+            } else {
+                error
+            }
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_remount_file(file: &fs::File) -> io::Result<()> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_remount_file(file: &fs::File) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_LOCK_VIOLATION};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped = OVERLAPPED::default();
+    let ok = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if ok != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error().map(|code| code as u32),
+        Some(ERROR_LOCK_VIOLATION) | Some(ERROR_IO_PENDING)
+    ) {
+        Err(io::Error::from(io::ErrorKind::WouldBlock))
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn try_lock_remount_file(_file: &fs::File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cross-process remount ownership is unavailable on this platform",
+    ))
 }
 
 pub fn ensure_daemon_start_allowed(paths: &DaemonProcessPaths) -> Result<(), DaemonProcessError> {

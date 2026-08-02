@@ -42,9 +42,9 @@ use loc_cli::file_provider::{
 use loc_cli::local_oauth::run_local_oauth_authorization;
 use loc_cli::mount::{
     MountOptions, MountReport, QuiescedWorkspaceRemountRuntime, RemountFilesystemIdentity,
-    WORKSPACE_REMOUNT_RECOVERY_VERSION, WorkspaceRemountRecoveryRecord,
-    clear_workspace_remount_fence, persist_workspace_remount_fence, resolve_workspace_mount_root,
-    run_mount, run_mount_with_workspace_cleanup, run_quiesced_workspace_remount,
+    WORKSPACE_REMOUNT_RECOVERY_VERSION, WorkspaceRemountOwnership, WorkspaceRemountRecoveryRecord,
+    resolve_workspace_mount_root, run_mount, run_mount_with_workspace_cleanup,
+    run_quiesced_workspace_remount,
 };
 use loc_cli::pull::{PullReport, run_pull_with_state_root};
 use loc_cli::push::{
@@ -100,9 +100,8 @@ use locality_notion::oauth::{
 };
 use locality_platform::{
     DAEMON_PID_FILENAME, DaemonManagerRestartFence, DaemonProcessPaths, append_service_log,
-    bundled_binary_next_to_current_exe, daemon_remount_fence_path,
-    default_state_root as platform_default_state_root, ensure_daemon_start_allowed,
-    logs_dir as platform_logs_dir, restore_daemon_manager_supervision,
+    bundled_binary_next_to_current_exe, default_state_root as platform_default_state_root,
+    ensure_daemon_start_allowed, logs_dir as platform_logs_dir, restore_daemon_manager_supervision,
     user_home as platform_user_home,
 };
 use locality_slack::{
@@ -7780,6 +7779,7 @@ fn create_desktop_remount_quiesced(
     let mut runtime = DesktopQuiescedRemountRuntime {
         state_root,
         mount_id: &mount_id,
+        remount_ownership: None,
     };
     let (store, mount_report, preserved) = run_quiesced_workspace_remount(&mut runtime, || {
         let mut store = SqliteStateStore::open(state_root.to_path_buf())
@@ -7800,22 +7800,35 @@ fn create_desktop_remount_quiesced(
 struct DesktopQuiescedRemountRuntime<'a> {
     state_root: &'a Path,
     mount_id: &'a MountId,
+    remount_ownership: Option<WorkspaceRemountOwnership>,
 }
 
 impl QuiescedWorkspaceRemountRuntime for DesktopQuiescedRemountRuntime<'_> {
     type SupervisionFence = DaemonManagerRestartFence;
 
     fn persist_fence(&mut self) -> Result<(), String> {
-        persist_daemon_remount_fence(self.state_root, self.mount_id)?;
+        self.remount_ownership = Some(persist_daemon_remount_fence(
+            self.state_root,
+            self.mount_id,
+        )?);
         if let Err(error) = stop_windows_cloud_files_provider_supervisor(self.state_root) {
-            let _ = remove_daemon_remount_fence(self.state_root);
+            if let Some(ownership) = self.remount_ownership.as_mut() {
+                let _ = remove_daemon_remount_fence(ownership);
+            }
+            self.remount_ownership = None;
             return Err(error);
         }
         Ok(())
     }
 
     fn clear_fence(&mut self) -> Result<(), String> {
-        remove_daemon_remount_fence(self.state_root)
+        let ownership = self
+            .remount_ownership
+            .as_mut()
+            .ok_or_else(|| "Desktop remount fence ownership is missing".to_string())?;
+        remove_daemon_remount_fence(ownership)?;
+        self.remount_ownership = None;
+        Ok(())
     }
 
     fn suspend_supervision(&mut self) -> Result<Self::SupervisionFence, String> {
@@ -7858,28 +7871,28 @@ impl QuiescedWorkspaceRemountRuntime for DesktopQuiescedRemountRuntime<'_> {
     }
 }
 
-fn persist_daemon_remount_fence(state_root: &Path, mount_id: &MountId) -> Result<(), String> {
-    persist_workspace_remount_fence(state_root, mount_id, &activity_timestamp())
+fn persist_daemon_remount_fence(
+    state_root: &Path,
+    mount_id: &MountId,
+) -> Result<WorkspaceRemountOwnership, String> {
+    WorkspaceRemountOwnership::begin(state_root, mount_id, "desktop", &activity_timestamp())
 }
 
-fn remove_daemon_remount_fence(state_root: &Path) -> Result<(), String> {
-    clear_workspace_remount_fence(state_root)
+fn remove_daemon_remount_fence(ownership: &mut WorkspaceRemountOwnership) -> Result<(), String> {
+    ownership.clear()
 }
 
-fn reconcile_daemon_remount_fence(state_root: &Path) -> Result<(), String> {
-    reconcile_daemon_remount_fence_with(state_root, restore_daemon_manager_supervision)
-}
-
+#[cfg(test)]
 fn reconcile_daemon_remount_fence_with(
     state_root: &Path,
     restore: impl FnOnce(&DaemonProcessPaths) -> Result<(), locality_platform::DaemonProcessError>,
 ) -> Result<(), String> {
-    let path = daemon_remount_fence_path(state_root);
-    if fs::symlink_metadata(&path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound) {
+    let mut ownership = WorkspaceRemountOwnership::recover(state_root)?;
+    if !ownership.has_fence() {
         return Ok(());
     }
     let paths = DaemonProcessPaths::new(state_root.to_path_buf());
-    restore_supervision_before_clearing_remount_fence(state_root, || {
+    restore_supervision_before_clearing_remount_fence(&mut ownership, || {
         restore(&paths).map_err(|error| {
             format!(
                 "Could not restore daemon supervision after remount recovery: {}",
@@ -7890,11 +7903,11 @@ fn reconcile_daemon_remount_fence_with(
 }
 
 fn restore_supervision_before_clearing_remount_fence(
-    state_root: &Path,
+    ownership: &mut WorkspaceRemountOwnership,
     restore: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     restore()?;
-    remove_daemon_remount_fence(state_root)
+    remove_daemon_remount_fence(ownership)
 }
 
 fn drain_daemon_for_remount(state_root: &Path) -> Result<(), String> {
@@ -11538,6 +11551,16 @@ impl WorkspaceProjectionCleanupTransaction {
         staging_directory: &Path,
         require_empty_directory: bool,
     ) -> Result<bool, String> {
+        self.stage_path_with_hook(path, staging_directory, require_empty_directory, || Ok(()))
+    }
+
+    fn stage_path_with_hook(
+        &mut self,
+        path: &Path,
+        staging_directory: &Path,
+        require_empty_directory: bool,
+        before_rename: impl FnOnce() -> io::Result<()>,
+    ) -> Result<bool, String> {
         let trusted_root = staging_directory.parent().ok_or_else(|| {
             format!(
                 "cleanup staging directory `{}` has no parent",
@@ -11592,6 +11615,12 @@ impl WorkspaceProjectionCleanupTransaction {
             staged: staged.clone(),
             identity: Some(identity),
         });
+        before_rename().map_err(|error| {
+            format!(
+                "could not prepare cleanup rename for `{}`: {error}",
+                path.display()
+            )
+        })?;
         rename_and_sync(trusted_root, path, &staged).map_err(|error| {
             format!(
                 "could not stage cleanup path `{}` at `{}`: {error}",
@@ -11599,6 +11628,45 @@ impl WorkspaceProjectionCleanupTransaction {
                 staged.display()
             )
         })?;
+        let staged_identity = RemountFilesystemIdentity::inspect(&staged).map_err(|error| {
+            format!(
+                "cleanup path `{}` was renamed to `{}`, but its identity could not be verified; the staged object was quarantined for recovery: {error}",
+                path.display(),
+                staged.display()
+            )
+        })?;
+        if staged_identity != identity {
+            return Err(format!(
+                "cleanup path `{}` was replaced at the rename boundary; the replacement was quarantined at `{}` and will not be deleted",
+                path.display(),
+                staged.display()
+            ));
+        }
+        if require_empty_directory
+            && fs::symlink_metadata(&staged)
+                .map_err(|error| {
+                    format!(
+                        "could not inspect staged cleanup path `{}`: {error}",
+                        staged.display()
+                    )
+                })?
+                .is_dir()
+            && fs::read_dir(&staged)
+                .map_err(|error| {
+                    format!(
+                        "could not recheck staged cleanup directory `{}`: {error}",
+                        staged.display()
+                    )
+                })?
+                .next()
+                .is_some()
+        {
+            return Err(format!(
+                "cleanup directory `{}` became non-empty at the rename boundary; it was quarantined at `{}` for rollback",
+                path.display(),
+                staged.display()
+            ));
+        }
         Ok(true)
     }
 
@@ -11882,6 +11950,11 @@ impl PersistedWorkspaceRemountRecovery {
 }
 
 fn reconcile_workspace_remount_recovery(state_root: &Path) -> Result<(), String> {
+    let _ownership = WorkspaceRemountOwnership::recover(state_root)?;
+    reconcile_workspace_remount_recovery_owned(state_root)
+}
+
+fn reconcile_workspace_remount_recovery_owned(state_root: &Path) -> Result<(), String> {
     let recoveries = load_workspace_remount_recoveries(state_root)?;
     let mut store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| format!("could not open Locality state for remount recovery: {error}"))?;
@@ -11938,6 +12011,23 @@ fn reconcile_workspace_remount_recovery(state_root: &Path) -> Result<(), String>
         ));
     }
     Ok(())
+}
+
+fn reconcile_desktop_remount_recovery(state_root: &Path) -> Result<(), String> {
+    let mut ownership = WorkspaceRemountOwnership::recover(state_root)?;
+    reconcile_workspace_remount_recovery_owned(state_root)?;
+    if !ownership.has_fence() {
+        return Ok(());
+    }
+    let paths = DaemonProcessPaths::new(state_root.to_path_buf());
+    restore_supervision_before_clearing_remount_fence(&mut ownership, || {
+        restore_daemon_manager_supervision(&paths).map_err(|error| {
+            format!(
+                "Could not restore daemon supervision after remount recovery: {}",
+                error.message()
+            )
+        })
+    })
 }
 
 fn load_workspace_remount_recoveries(
@@ -17312,11 +17402,14 @@ mod tests {
     fn startup_restores_supervision_before_clearing_persisted_daemon_fence() {
         let temp = TestTempDir::new("startup-daemon-remount-fence");
         let mount_id = MountId::new("notion-main");
-        super::persist_daemon_remount_fence(temp.path(), &mount_id).expect("persist fence");
+        drop(super::persist_daemon_remount_fence(temp.path(), &mount_id).expect("persist fence"));
         let restored = std::cell::Cell::new(false);
+        let mut ownership = loc_cli::mount::WorkspaceRemountOwnership::recover(temp.path())
+            .expect("recover fence ownership");
 
-        super::reconcile_workspace_remount_recovery(temp.path()).expect("resolve remount recovery");
-        super::reconcile_daemon_remount_fence_with(temp.path(), |_| {
+        super::reconcile_workspace_remount_recovery_owned(temp.path())
+            .expect("resolve remount recovery");
+        super::restore_supervision_before_clearing_remount_fence(&mut ownership, || {
             assert!(locality_platform::daemon_remount_fence_path(temp.path()).exists());
             restored.set(true);
             Ok(())
@@ -17331,7 +17424,7 @@ mod tests {
     fn startup_crash_during_supervision_restore_keeps_persisted_daemon_fence() {
         let temp = TestTempDir::new("startup-daemon-remount-fence-crash");
         let mount_id = MountId::new("notion-main");
-        super::persist_daemon_remount_fence(temp.path(), &mount_id).expect("persist fence");
+        drop(super::persist_daemon_remount_fence(temp.path(), &mount_id).expect("persist fence"));
 
         let crashed = std::panic::catch_unwind(|| {
             let _ = super::reconcile_daemon_remount_fence_with(temp.path(), |_| {
@@ -17351,14 +17444,17 @@ mod tests {
     fn drain_failure_crash_before_supervision_restore_keeps_persisted_fence() {
         let temp = TestTempDir::new("drain-failure-supervision-crash");
         let mount_id = MountId::new("notion-main");
-        super::persist_daemon_remount_fence(temp.path(), &mount_id).expect("persist fence");
+        drop(super::persist_daemon_remount_fence(temp.path(), &mount_id).expect("persist fence"));
+        let mut ownership = loc_cli::mount::WorkspaceRemountOwnership::recover(temp.path())
+            .expect("recover fence ownership");
 
-        let crashed = std::panic::catch_unwind(|| {
-            let _ = super::restore_supervision_before_clearing_remount_fence(temp.path(), || {
-                assert!(locality_platform::daemon_remount_fence_path(temp.path()).exists());
-                panic!("injected crash restoring supervision after drain failure")
-            });
-        });
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ =
+                super::restore_supervision_before_clearing_remount_fence(&mut ownership, || {
+                    assert!(locality_platform::daemon_remount_fence_path(temp.path()).exists());
+                    panic!("injected crash restoring supervision after drain failure")
+                });
+        }));
 
         assert!(crashed.is_err());
         assert!(locality_platform::daemon_remount_fence_path(temp.path()).exists());
@@ -17957,6 +18053,70 @@ mod tests {
             fs::read_to_string(displaced.join("old.txt")).unwrap(),
             "original"
         );
+    }
+
+    #[test]
+    fn desktop_staging_post_rename_rejects_barrier_replacement_race() {
+        let temp = TestTempDir::new("desktop-remount-stage-replacement-race");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let parent = temp.path().join("projection");
+        let original = parent.join("empty-parent");
+        let displaced = parent.join("displaced-original");
+        fs::create_dir_all(&original).expect("create original empty directory");
+        let mount = MountConfig::new(mount_id.clone(), "notion", parent.join("notion-main"))
+            .projection(ProjectionMode::LinuxFuse);
+        store.save_mount(mount.clone()).expect("save mount");
+        let preparation = super::WorkspaceRemountPreparation {
+            mount: mount.clone(),
+            cached_entities: Vec::new(),
+            preserved: None,
+        };
+        let mut cleanup =
+            super::WorkspaceProjectionCleanupTransaction::new(temp.path(), &preparation, mount);
+        cleanup.begin(&mut store).expect("begin recovery");
+        let staging = cleanup
+            .create_staging_directory(&parent)
+            .expect("create staging directory");
+
+        let before_replace = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let after_replace = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_original = original.clone();
+        let worker_displaced = displaced.clone();
+        let worker_before = std::sync::Arc::clone(&before_replace);
+        let worker_after = std::sync::Arc::clone(&after_replace);
+        let worker = std::thread::spawn(move || {
+            worker_before.wait();
+            fs::rename(&worker_original, &worker_displaced).expect("displace exact source");
+            fs::create_dir(&worker_original).expect("create racing replacement");
+            fs::write(worker_original.join("keep.txt"), "racing replacement")
+                .expect("write replacement content");
+            worker_after.wait();
+        });
+
+        let error = cleanup
+            .stage_path_with_hook(&original, &staging, true, || {
+                before_replace.wait();
+                after_replace.wait();
+                Ok(())
+            })
+            .expect_err("post-rename identity check rejects the replacement");
+        worker.join().expect("replacement worker");
+        assert!(error.contains("replaced at the rename boundary"), "{error}");
+        let quarantined = cleanup.staged_paths[0].staged.clone();
+        assert_eq!(
+            fs::read_to_string(quarantined.join("keep.txt")).unwrap(),
+            "racing replacement"
+        );
+        assert!(
+            displaced.exists(),
+            "the exact original object was never deleted"
+        );
+        // The transaction's normal rollback will refuse this expected-identity
+        // mismatch and may move the entire staging directory into the durable
+        // identity quarantine. Before rollback, the replacement is already
+        // outside the user-visible source path and cannot be collected as the
+        // recorded object.
     }
 
     #[test]
@@ -21133,25 +21293,14 @@ fn main() {
                 std::process::exit(0);
             }
             let state_root = default_state_root();
-            if let Err(error) = reconcile_workspace_remount_recovery(&state_root) {
+            if let Err(error) = reconcile_desktop_remount_recovery(&state_root) {
                 desktop_log(
                     "error",
                     "remount.recovery_failed",
-                    format!("could not reconcile interrupted remount cleanup: {error}"),
+                    format!("could not reconcile interrupted remount state: {error}"),
                 );
                 return Err(io::Error::other(format!(
                     "Locality could not recover an interrupted source remount: {error}"
-                ))
-                .into());
-            }
-            if let Err(error) = reconcile_daemon_remount_fence(&state_root) {
-                desktop_log(
-                    "error",
-                    "remount.daemon_fence_recovery_failed",
-                    format!("could not reconcile interrupted daemon remount fence: {error}"),
-                );
-                return Err(io::Error::other(format!(
-                    "Locality could not restore daemon supervision after remount recovery: {error}"
                 ))
                 .into());
             }

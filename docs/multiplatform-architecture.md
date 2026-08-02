@@ -495,6 +495,11 @@ drains the active daemon, runs the surface's atomic projection/source cleanup,
 reconciles cleanup recovery, restores supervision, and only then removes the
 fence and restarts the daemon. A drain or restore failure therefore cannot
 briefly expose a cleared fence while supervision is still disabled.
+The fence is paired with one shared OS-level exclusive coordinator lock. CLI
+and Desktop retain that lock across active remounts and complete recovery
+passes; each new fence carries an owner and random generation, and removal
+rechecks the exact bytes under the lock. A competing process therefore cannot
+recover through an active remount or delete a successor's fence generation.
 
 Both surfaces use the same version-3 append-only recovery records. Each marker
 is named by its exact recovery ID and binds every staging directory and moved
@@ -513,6 +518,18 @@ source changes additionally fail closed on dirty or
 conflicted entities and pending virtual creates or renames. A virtual-to-plain
 change is rejected until a dedicated migration can atomically retire its
 layout-1 binding.
+
+Desktop staging also verifies the renamed object's exact identity and required
+emptiness after the no-replace rename. A source replacement or newly non-empty
+directory at that boundary is left in the recorded staging quarantine and the
+remount fails closed; it is never treated as the object authorized for cleanup.
+
+Virtual-move cleanup is an artifact-state teardown. The source quarantine,
+source identity anchor, destination identity anchor, and destination binding
+are each removed idempotently, with destination identity/content revalidation
+when an earlier boundary already completed. The primary cleanup intent is the
+last durable record deleted, so every crash boundary retains enough state for a
+retry and never authorizes deletion of a replacement source or destination.
 
 On Unix, identity-bound deletion first performs a no-replace rename into a
 random mode-0700 sibling quarantine with a durable device/inode manifest. Its

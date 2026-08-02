@@ -284,34 +284,197 @@ where
     }
 }
 
-pub fn persist_workspace_remount_fence(
-    state_root: &Path,
-    mount_id: &MountId,
-    created_at: &str,
-) -> Result<(), String> {
-    let path = locality_platform::daemon_remount_fence_path(state_root);
-    let contents = format!(
-        "version=1\nmount_id={}\ncreated_at={created_at}\n",
-        mount_id.0
-    );
-    write_new_file_durable(state_root, &path, contents.as_bytes()).map_err(|error| {
-        format!(
-            "Could not persist daemon remount fence `{}`: {error}",
-            path.display()
-        )
-    })
+const WORKSPACE_REMOUNT_FENCE_VERSION: u32 = 2;
+const WORKSPACE_REMOUNT_FENCE_MAX_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceRemountFenceRecord {
+    version: u32,
+    owner: String,
+    generation: String,
+    mount_id: String,
+    created_at: String,
 }
 
-pub fn clear_workspace_remount_fence(state_root: &Path) -> Result<(), String> {
-    let path = locality_platform::daemon_remount_fence_path(state_root);
-    match remove_path_durable(state_root, &path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "Could not durably remove daemon remount fence `{}`: {error}",
-            path.display()
-        )),
+/// Exclusive cross-process ownership for one remount or recovery pass.
+///
+/// The sidecar OS lock is retained while recovery artifacts are inspected and
+/// while the exact owner/generation fence is deleted. A stale coordinator can
+/// therefore neither recover through an active remount nor clear a successor's
+/// fence generation.
+#[must_use = "dropping remount ownership releases cross-process exclusion"]
+pub struct WorkspaceRemountOwnership {
+    state_root: PathBuf,
+    _lock: locality_platform::DaemonRemountCoordinatorLock,
+    expected_fence: Option<Vec<u8>>,
+    owner: Option<String>,
+    generation: Option<String>,
+}
+
+impl WorkspaceRemountOwnership {
+    pub fn begin(
+        state_root: &Path,
+        mount_id: &MountId,
+        owner: &str,
+        created_at: &str,
+    ) -> Result<Self, String> {
+        let lock = locality_platform::DaemonRemountCoordinatorLock::try_acquire(state_root)
+            .map_err(|error| format!("Could not acquire remount coordinator ownership: {error}"))?;
+        let path = locality_platform::daemon_remount_fence_path(state_root);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect daemon remount fence `{}`: {error}",
+                    path.display()
+                ));
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "An interrupted remount fence already exists at `{}`; recover it before starting another remount",
+                    path.display()
+                ));
+            }
+        }
+        let generation = remount_fence_generation()?;
+        let owner = format!("{owner}:{}", std::process::id());
+        let record = WorkspaceRemountFenceRecord {
+            version: WORKSPACE_REMOUNT_FENCE_VERSION,
+            owner: owner.clone(),
+            generation: generation.clone(),
+            mount_id: mount_id.0.clone(),
+            created_at: created_at.to_string(),
+        };
+        let mut contents = serde_json::to_vec(&record)
+            .map_err(|error| format!("Could not encode daemon remount fence: {error}"))?;
+        contents.push(b'\n');
+        write_new_file_durable(state_root, &path, &contents).map_err(|error| {
+            format!(
+                "Could not persist daemon remount fence `{}`: {error}",
+                path.display()
+            )
+        })?;
+        Ok(Self {
+            state_root: state_root.to_path_buf(),
+            _lock: lock,
+            expected_fence: Some(contents),
+            owner: Some(owner),
+            generation: Some(generation),
+        })
     }
+
+    pub fn recover(state_root: &Path) -> Result<Self, String> {
+        let lock = locality_platform::DaemonRemountCoordinatorLock::try_acquire(state_root)
+            .map_err(|error| format!("Could not acquire remount recovery ownership: {error}"))?;
+        let path = locality_platform::daemon_remount_fence_path(state_root);
+        let contents = match fs::read(&path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "Could not read daemon remount fence `{}`: {error}",
+                    path.display()
+                ));
+            }
+        };
+        if contents
+            .as_ref()
+            .is_some_and(|contents| contents.len() > WORKSPACE_REMOUNT_FENCE_MAX_BYTES)
+        {
+            return Err(format!(
+                "Daemon remount fence `{}` exceeds its size limit",
+                path.display()
+            ));
+        }
+        let (expected_fence, owner, generation) = if contents.is_none() {
+            (None, None, None)
+        } else if let Ok(record) = serde_json::from_slice::<WorkspaceRemountFenceRecord>(
+            contents.as_deref().expect("checked persisted fence"),
+        ) {
+            if record.version != WORKSPACE_REMOUNT_FENCE_VERSION
+                || record.owner.is_empty()
+                || record.generation.is_empty()
+            {
+                return Err(format!(
+                    "Daemon remount fence `{}` has invalid owner/generation metadata",
+                    path.display()
+                ));
+            }
+            (contents, Some(record.owner), Some(record.generation))
+        } else if contents
+            .as_deref()
+            .is_some_and(|contents| contents.starts_with(b"version=1\n"))
+        {
+            // Released v1 fences had no owner token. The exact observed bytes
+            // are their recovery generation and are rechecked before removal.
+            (
+                contents.clone(),
+                Some("legacy-v1".to_string()),
+                Some(hex_generation(
+                    contents.as_deref().expect("checked legacy fence"),
+                )),
+            )
+        } else {
+            return Err(format!(
+                "Daemon remount fence `{}` has an unsupported format",
+                path.display()
+            ));
+        };
+        Ok(Self {
+            state_root: state_root.to_path_buf(),
+            _lock: lock,
+            expected_fence,
+            owner,
+            generation,
+        })
+    }
+
+    pub fn has_fence(&self) -> bool {
+        self.expected_fence.is_some()
+    }
+
+    pub fn owner_generation(&self) -> Option<(&str, &str)> {
+        self.owner.as_deref().zip(self.generation.as_deref())
+    }
+
+    pub fn clear(&mut self) -> Result<(), String> {
+        let Some(expected) = self.expected_fence.as_ref() else {
+            return Ok(());
+        };
+        let path = locality_platform::daemon_remount_fence_path(&self.state_root);
+        let current = fs::read(&path).map_err(|error| {
+            format!(
+                "Could not verify daemon remount fence `{}` before removal: {error}",
+                path.display()
+            )
+        })?;
+        if &current != expected {
+            return Err(format!(
+                "Daemon remount fence `{}` changed owner or generation; refusing stale removal",
+                path.display()
+            ));
+        }
+        remove_path_durable(&self.state_root, &path).map_err(|error| {
+            format!(
+                "Could not durably remove daemon remount fence `{}`: {error}",
+                path.display()
+            )
+        })?;
+        self.expected_fence = None;
+        Ok(())
+    }
+}
+
+fn remount_fence_generation() -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("Could not create remount fence generation: {error}"))?;
+    Ok(hex_generation(&bytes))
+}
+
+fn hex_generation(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 enum WorkspaceMountCommit<'a> {
@@ -761,7 +924,9 @@ fn absolute_path(path: &Path) -> Result<PathBuf, MountError> {
 
 #[cfg(test)]
 mod remount_coordinator_tests {
-    use super::{QuiescedWorkspaceRemountRuntime, run_quiesced_workspace_remount};
+    use super::{
+        QuiescedWorkspaceRemountRuntime, WorkspaceRemountOwnership, run_quiesced_workspace_remount,
+    };
 
     #[cfg(windows)]
     #[test]
@@ -912,5 +1077,80 @@ mod remount_coordinator_tests {
             runtime.events,
             ["persist_fence", "suspend", "drain", "restore"].map(|event| format!("shared:{event}"))
         );
+    }
+
+    #[test]
+    fn competing_process_cannot_recover_an_owned_remount_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "locality-remount-owner-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut owner = WorkspaceRemountOwnership::begin(
+            &root,
+            &locality_core::model::MountId::new("notion-main"),
+            "cli",
+            "1",
+        )
+        .unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("mount::remount_coordinator_tests::remount_lock_contender_helper")
+            .arg("--nocapture")
+            .env("LOCALITY_REMOUNT_LOCK_CONTENDER_ROOT", &root)
+            .status()
+            .expect("run competing remount coordinator");
+        assert!(
+            status.success(),
+            "contender unexpectedly acquired ownership"
+        );
+        owner.clear().unwrap();
+        drop(owner);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn remount_lock_contender_helper() {
+        let Some(root) = std::env::var_os("LOCALITY_REMOUNT_LOCK_CONTENDER_ROOT") else {
+            return;
+        };
+        let error = WorkspaceRemountOwnership::recover(std::path::Path::new(&root))
+            .err()
+            .expect("active owner must exclude competing recovery");
+        assert!(error.contains("another Locality coordinator"), "{error}");
+    }
+
+    #[test]
+    fn owner_cannot_clear_a_replaced_fence_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "locality-remount-generation-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut owner = WorkspaceRemountOwnership::begin(
+            &root,
+            &locality_core::model::MountId::new("notion-main"),
+            "desktop",
+            "1",
+        )
+        .unwrap();
+        std::fs::write(
+            locality_platform::daemon_remount_fence_path(&root),
+            b"{\"version\":2,\"owner\":\"successor\",\"generation\":\"2\",\"mount_id\":\"notion-main\",\"created_at\":\"2\"}\n",
+        )
+        .unwrap();
+        owner
+            .clear()
+            .expect_err("stale owner must not clear successor generation");
+        assert!(locality_platform::daemon_remount_fence_path(&root).exists());
+        drop(owner);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

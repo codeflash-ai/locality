@@ -122,9 +122,9 @@ use crate::local_oauth::{
 };
 use crate::mount::{
     MountError, MountOptions, MountReport, QuiescedWorkspaceRemountRuntime,
-    RemountFilesystemIdentity, WORKSPACE_REMOUNT_RECOVERY_VERSION, WorkspaceRemountRecoveryRecord,
-    clear_workspace_remount_fence, persist_workspace_remount_fence, resolve_workspace_mount_root,
-    run_mount, run_mount_with_workspace_cleanup, run_quiesced_workspace_remount,
+    RemountFilesystemIdentity, WORKSPACE_REMOUNT_RECOVERY_VERSION, WorkspaceRemountOwnership,
+    WorkspaceRemountRecoveryRecord, resolve_workspace_mount_root, run_mount,
+    run_mount_with_workspace_cleanup, run_quiesced_workspace_remount,
 };
 use crate::mv::{MvError, MvOptions, MvReport, run_mv_with_daemon_at_state_root};
 use crate::okf::{OkfExportError, OkfExportOptions, OkfExportReport, run_okf_export};
@@ -4059,37 +4059,34 @@ fn read_cli_remount_records(file: File) -> Result<Vec<WorkspaceRemountRecoveryRe
     Ok(records)
 }
 
-fn reconcile_cli_workspace_remount_fence(state_root: &Path) -> Result<(), String> {
-    reconcile_cli_workspace_remount_fence_with(state_root, |paths| {
-        restore_daemon_manager_supervision(paths).map_err(|error| error.message().to_string())
-    })
-}
-
+#[cfg(test)]
 fn reconcile_cli_workspace_remount_fence_with(
     state_root: &Path,
     restore: impl FnOnce(&DaemonProcessPaths) -> Result<(), String>,
 ) -> Result<(), String> {
-    let fence = locality_platform::daemon_remount_fence_path(state_root);
-    match fs::symlink_metadata(&fence) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(format!(
-                "could not inspect persisted CLI remount fence `{}`: {error}",
-                fence.display()
-            ));
-        }
-        Ok(_) => {}
+    let mut ownership = WorkspaceRemountOwnership::recover(state_root)?;
+    reconcile_cli_workspace_remount_fence_owned(state_root, &mut ownership, restore)
+}
+
+fn reconcile_cli_workspace_remount_fence_owned(
+    state_root: &Path,
+    ownership: &mut WorkspaceRemountOwnership,
+    restore: impl FnOnce(&DaemonProcessPaths) -> Result<(), String>,
+) -> Result<(), String> {
+    if !ownership.has_fence() {
+        return Ok(());
     }
     restore(&DaemonProcessPaths::new(state_root.to_path_buf())).map_err(|error| {
         format!("could not restore daemon supervision after CLI remount recovery: {error}")
     })?;
-    clear_workspace_remount_fence(state_root)
+    ownership.clear()
 }
 
 fn reconcile_cli_workspace_remount_recovery(
     store: &mut SqliteStateStore,
     state_root: &Path,
 ) -> Result<(), String> {
+    let mut ownership = WorkspaceRemountOwnership::recover(state_root)?;
     let outcomes = store
         .list_workspace_remount_recoveries()
         .map_err(|error| format!("could not list CLI remount recoveries: {error}"))?;
@@ -4153,7 +4150,9 @@ fn reconcile_cli_workspace_remount_recovery(
     }
     // Recovery owns the persisted fence too. Supervision must be restored
     // durably before daemon startup is unfenced, including restart recovery.
-    reconcile_cli_workspace_remount_fence(state_root)
+    reconcile_cli_workspace_remount_fence_owned(state_root, &mut ownership, |paths| {
+        restore_daemon_manager_supervision(paths).map_err(|error| error.message().to_string())
+    })
 }
 
 fn run_cli_coordinated_mount(
@@ -4297,6 +4296,7 @@ struct CliQuiescedRemountRuntime<'a> {
     mount_id: &'a MountId,
     daemon_was_ready: bool,
     cleanup_failure: Rc<RefCell<Option<String>>>,
+    remount_ownership: Option<WorkspaceRemountOwnership>,
 }
 
 impl<'a> CliQuiescedRemountRuntime<'a> {
@@ -4306,6 +4306,7 @@ impl<'a> CliQuiescedRemountRuntime<'a> {
             mount_id,
             daemon_was_ready: cli_daemon_is_ready(state_root),
             cleanup_failure: Rc::new(RefCell::new(None)),
+            remount_ownership: None,
         }
     }
 }
@@ -4319,11 +4320,20 @@ impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
             .unwrap_or_default()
             .as_nanos()
             .to_string();
-        persist_workspace_remount_fence(self.state_root, self.mount_id, &created_at)
+        let ownership =
+            WorkspaceRemountOwnership::begin(self.state_root, self.mount_id, "cli", &created_at)?;
+        self.remount_ownership = Some(ownership);
+        Ok(())
     }
 
     fn clear_fence(&mut self) -> Result<(), String> {
-        clear_workspace_remount_fence(self.state_root)
+        let ownership = self
+            .remount_ownership
+            .as_mut()
+            .ok_or_else(|| "CLI remount fence ownership is missing".to_string())?;
+        ownership.clear()?;
+        self.remount_ownership = None;
+        Ok(())
     }
 
     fn suspend_supervision(&mut self) -> Result<Self::SupervisionFence, String> {
@@ -10908,7 +10918,15 @@ mod tests {
             let marker = recovery_root.join(format!("{recovery_id}.jsonl"));
             fs::write(&marker, bytes).unwrap();
             let mount_id = MountId::new("notion-main");
-            crate::mount::persist_workspace_remount_fence(&state_root, &mount_id, "1").unwrap();
+            drop(
+                crate::mount::WorkspaceRemountOwnership::begin(
+                    &state_root,
+                    &mount_id,
+                    "cli-test",
+                    "1",
+                )
+                .unwrap(),
+            );
             let mut store = SqliteStateStore::open(state_root.clone()).unwrap();
 
             super::reconcile_cli_workspace_remount_recovery(&mut store, &state_root)
@@ -10952,7 +10970,10 @@ mod tests {
             .unwrap()
             .write_all(b"{not-json}\n")
             .unwrap();
-        crate::mount::persist_workspace_remount_fence(&state_root, &mount_id, "1").unwrap();
+        drop(
+            crate::mount::WorkspaceRemountOwnership::begin(&state_root, &mount_id, "cli-test", "1")
+                .unwrap(),
+        );
 
         super::reconcile_cli_workspace_remount_recovery(&mut store, &state_root)
             .expect_err("corrupt recovery must fail closed");
@@ -10969,7 +10990,10 @@ mod tests {
         let state_root = root.join("state");
         fs::create_dir_all(&state_root).unwrap();
         let mount_id = MountId::new("notion-main");
-        crate::mount::persist_workspace_remount_fence(&state_root, &mount_id, "1").unwrap();
+        drop(
+            crate::mount::WorkspaceRemountOwnership::begin(&state_root, &mount_id, "cli-test", "1")
+                .unwrap(),
+        );
 
         super::reconcile_cli_workspace_remount_fence_with(&state_root, |_| {
             Err("injected restore failure".to_string())
@@ -11019,7 +11043,10 @@ mod tests {
         journal.stage().unwrap();
         drop(journal);
         assert!(!content_root.exists());
-        crate::mount::persist_workspace_remount_fence(&state_root, &mount_id, "1").unwrap();
+        drop(
+            crate::mount::WorkspaceRemountOwnership::begin(&state_root, &mount_id, "cli-test", "1")
+                .unwrap(),
+        );
 
         reconcile_cli_workspace_remount_recovery(&mut store, &state_root)
             .expect("restart reconciliation");

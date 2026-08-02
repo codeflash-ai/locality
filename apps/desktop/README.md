@@ -119,6 +119,10 @@ daemon fence, drains supervision, commits source-state cleanup, and restores
 supervision before clearing the fence. Its version-3 recovery journal records
 the exact recovery ID, original and staged paths, and filesystem identities, so
 either Desktop startup or a later CLI invocation can reconcile the same crash.
+The CLI and Desktop share an OS-level exclusive recovery lock; owner/generation
+metadata is checked before fence deletion. Desktop also revalidates exact
+identity and emptiness after each staging rename, preserving a raced
+replacement in quarantine and failing closed.
 CLI remounts fail closed while dirty/conflicted entities or pending virtual
 creates/renames exist, retain an equivalent existing host-root spelling, and
 reject virtual-to-plain conversion until an explicit projection migration owns
