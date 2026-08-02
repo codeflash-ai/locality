@@ -23,6 +23,8 @@ pub const DAEMON_STDOUT_LOG_FILENAME: &str = "localityd.out.log";
 pub const DAEMON_STDERR_LOG_FILENAME: &str = "localityd.err.log";
 pub const DAEMON_REMOUNT_FENCE_FILENAME: &str = "localityd.remount.fence";
 pub const DAEMON_REMOUNT_LOCK_FILENAME: &str = "localityd.remount.lock";
+pub const DAEMON_REMOUNT_START_OWNER_ENV: &str = "LOCALITY_REMOUNT_START_OWNER";
+pub const DAEMON_REMOUNT_START_GENERATION_ENV: &str = "LOCALITY_REMOUNT_START_GENERATION";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -143,7 +145,7 @@ pub fn daemon_remount_lock_path(state_root: &Path) -> PathBuf {
 pub fn reset_locality_state_storage_coordinated(
     state_root: &Path,
 ) -> Result<locality_store::LocalStateResetStorageReport, DaemonProcessError> {
-    let _ownership = DaemonRemountCoordinatorLock::try_acquire(state_root).map_err(|error| {
+    let ownership = DaemonRemountCoordinatorLock::try_acquire(state_root).map_err(|error| {
         DaemonProcessError::new(
             if error.kind() == io::ErrorKind::WouldBlock {
                 "remount_in_progress"
@@ -153,11 +155,7 @@ pub fn reset_locality_state_storage_coordinated(
             error.to_string(),
         )
     })?;
-    locality_store::reset_locality_state_storage_preserving(
-        state_root,
-        &[OsStr::new(DAEMON_REMOUNT_LOCK_FILENAME)],
-    )
-    .map_err(|error| DaemonProcessError::new("state_reset_failed", error.to_string()))
+    ownership.reset_locality_state_storage()
 }
 
 /// Process-scoped exclusive ownership of remount coordination and recovery.
@@ -166,6 +164,7 @@ pub fn reset_locality_state_storage_coordinated(
 /// can verify and delete its exact fence generation without releasing the OS
 /// exclusion boundary. Both CLI and Desktop use this same primitive.
 pub struct DaemonRemountCoordinatorLock {
+    state_root: PathBuf,
     _file: fs::File,
 }
 
@@ -192,7 +191,26 @@ impl DaemonRemountCoordinatorLock {
                 error
             }
         })?;
-        Ok(Self { _file: file })
+        Ok(Self {
+            state_root: state_root.to_path_buf(),
+            _file: file,
+        })
+    }
+
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    /// Deletes resettable state while retaining this exact lock handle and its
+    /// inode for the complete storage sweep.
+    pub fn reset_locality_state_storage(
+        &self,
+    ) -> Result<locality_store::LocalStateResetStorageReport, DaemonProcessError> {
+        locality_store::reset_locality_state_storage_preserving(
+            &self.state_root,
+            &[OsStr::new(DAEMON_REMOUNT_LOCK_FILENAME)],
+        )
+        .map_err(|error| DaemonProcessError::new("state_reset_failed", error.to_string()))
     }
 }
 
@@ -204,13 +222,19 @@ impl DaemonRemountCoordinatorLock {
 /// fence check between process launch and daemon readiness.
 #[must_use = "dropping startup ownership permits remount coordination"]
 pub struct DaemonStartupCoordinatorLock {
-    _file: fs::File,
+    _file: Option<fs::File>,
 }
 
 impl DaemonStartupCoordinatorLock {
     pub fn try_acquire(paths: &DaemonProcessPaths) -> Result<Self, DaemonProcessError> {
         fs::create_dir_all(&paths.state_root)
             .map_err(|error| DaemonProcessError::new("io_error", error.to_string()))?;
+        if remount_start_is_authorized(paths)? {
+            // The remount owner retains the exclusive lock while this exact
+            // fence generation starts its replacement daemon. Normal starts
+            // still require the shared lock below.
+            return Ok(Self { _file: None });
+        }
         let path = daemon_remount_lock_path(&paths.state_root);
         let file = OpenOptions::new()
             .create(true)
@@ -233,8 +257,41 @@ impl DaemonStartupCoordinatorLock {
             }
         })?;
         ensure_daemon_start_allowed(paths)?;
-        Ok(Self { _file: file })
+        Ok(Self { _file: Some(file) })
     }
+}
+
+fn remount_start_is_authorized(paths: &DaemonProcessPaths) -> Result<bool, DaemonProcessError> {
+    let Ok(owner) = std::env::var(DAEMON_REMOUNT_START_OWNER_ENV) else {
+        return Ok(false);
+    };
+    let Ok(generation) = std::env::var(DAEMON_REMOUNT_START_GENERATION_ENV) else {
+        return Ok(false);
+    };
+    if owner.is_empty() || generation.is_empty() {
+        return Ok(false);
+    }
+    let fence = daemon_remount_fence_path(&paths.state_root);
+    let contents = match fs::read(&fence) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(DaemonProcessError::new("io_error", error.to_string())),
+    };
+    let Ok(record) = std::str::from_utf8(&contents) else {
+        return Ok(false);
+    };
+    // Owner is generated from a fixed surface name plus a decimal pid, and
+    // generation is lowercase hex. Reject anything outside those alphabets so
+    // exact compact-JSON field matching cannot be confused by escaping.
+    if !owner
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
+        || !generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Ok(false);
+    }
+    Ok(record.contains(&format!("\"owner\":\"{owner}\""))
+        && record.contains(&format!("\"generation\":\"{generation}\"")))
 }
 
 #[derive(Clone, Copy)]
@@ -378,7 +435,7 @@ pub struct DaemonProcessStopReport {
 /// operation waits for the current process to exit.
 pub struct DaemonManagerRestartFence {
     #[cfg(target_os = "macos")]
-    launchd_target: Option<String>,
+    launchd_policy: Option<(String, bool)>,
 }
 
 impl DaemonManagerRestartFence {
@@ -388,19 +445,20 @@ impl DaemonManagerRestartFence {
     ) -> Result<Self, DaemonProcessError> {
         #[cfg(target_os = "macos")]
         {
-            let launchd_target = if paths
+            let launchd_policy = if paths
                 .launch_agent
                 .as_ref()
                 .is_some_and(|path| path.exists())
-                && supervision_was_enabled == Some(true)
             {
                 let target = launchd_service_target(&launchd_domain()?);
-                set_launchd_service_enabled(&target, false)?;
-                Some(target)
+                if supervision_was_enabled == Some(true) {
+                    set_launchd_service_enabled(&target, false)?;
+                }
+                supervision_was_enabled.map(|enabled| (target, enabled))
             } else {
                 None
             };
-            Ok(Self { launchd_target })
+            Ok(Self { launchd_policy })
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -411,9 +469,9 @@ impl DaemonManagerRestartFence {
 
     pub fn restore(&mut self) -> Result<(), DaemonProcessError> {
         #[cfg(target_os = "macos")]
-        if let Some(target) = self.launchd_target.take() {
-            if let Err(error) = set_launchd_service_enabled(&target, true) {
-                self.launchd_target = Some(target);
+        if let Some((target, enabled)) = self.launchd_policy.take() {
+            if let Err(error) = set_launchd_service_enabled(&target, enabled) {
+                self.launchd_policy = Some((target, enabled));
                 return Err(error);
             }
         }
@@ -425,7 +483,7 @@ impl DaemonManagerRestartFence {
     pub fn remain_suspended(&mut self) {
         #[cfg(target_os = "macos")]
         {
-            self.launchd_target = None;
+            self.launchd_policy = None;
         }
     }
 }
@@ -439,13 +497,13 @@ pub fn restore_daemon_manager_supervision(
         .launch_agent
         .as_ref()
         .is_some_and(|path| path.exists())
-        && supervision_was_enabled == Some(true)
+        && let Some(enabled) = supervision_was_enabled
     {
         let target = launchd_service_target(&launchd_domain()?);
-        set_launchd_service_enabled(&target, true)?;
+        set_launchd_service_enabled(&target, enabled)?;
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = paths;
+    let _ = (paths, supervision_was_enabled);
     Ok(())
 }
 
@@ -476,8 +534,8 @@ pub fn daemon_manager_supervision_enabled(
 impl Drop for DaemonManagerRestartFence {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]
-        if let Some(target) = self.launchd_target.take() {
-            let _ = set_launchd_service_enabled(&target, true);
+        if let Some((target, enabled)) = self.launchd_policy.take() {
+            let _ = set_launchd_service_enabled(&target, enabled);
         }
     }
 }
@@ -553,6 +611,31 @@ impl DaemonProcessManager for DefaultDaemonProcessManager {
 
     fn detected_manager(&self, paths: &DaemonProcessPaths) -> DaemonManager {
         paths.detected_manager()
+    }
+}
+
+impl DefaultDaemonProcessManager {
+    /// Starts a daemon on behalf of an owner that still holds the exclusive
+    /// remount lock and durable fence.
+    pub fn start_during_remount(
+        &self,
+        config: &DaemonProcessStartConfig<'_>,
+        ownership: &DaemonRemountCoordinatorLock,
+    ) -> Result<DaemonProcessStartReport, DaemonProcessError> {
+        if ownership.state_root() != config.paths.state_root {
+            return Err(DaemonProcessError::new(
+                "remount_owner_mismatch",
+                "daemon start does not match the remount owner's state root",
+            ));
+        }
+        match self.resolve_start_manager(config.mode)? {
+            DaemonManager::Launchd => start_launchd(config),
+            DaemonManager::Session => start_session(config),
+            DaemonManager::Unknown => Err(DaemonProcessError::new(
+                "unsupported",
+                "daemon start manager could not be resolved",
+            )),
+        }
     }
 }
 
@@ -1011,6 +1094,49 @@ mod tests {
     }
 
     #[test]
+    fn exact_fence_generation_authorizes_replacement_daemon_under_owned_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "locality-daemon-owned-restart-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create state root");
+        let ownership =
+            DaemonRemountCoordinatorLock::try_acquire(&root).expect("exclusive remount ownership");
+        std::fs::write(
+            daemon_remount_fence_path(&root),
+            b"{\"version\":4,\"owner\":\"desktop:123\",\"generation\":\"aabbccdd\"}\n",
+        )
+        .expect("write exact remount fence");
+
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("daemon::tests::authorized_remount_daemon_start_helper")
+            .arg("--nocapture")
+            .env("LOCALITY_REMOUNT_START_TEST_ROOT", &root)
+            .env(super::DAEMON_REMOUNT_START_OWNER_ENV, "desktop:123")
+            .env(super::DAEMON_REMOUNT_START_GENERATION_ENV, "aabbccdd")
+            .status()
+            .expect("run authorized replacement daemon helper");
+
+        assert!(status.success());
+        drop(ownership);
+        std::fs::remove_dir_all(root).expect("remove state root");
+    }
+
+    #[test]
+    #[ignore]
+    fn authorized_remount_daemon_start_helper() {
+        let Some(root) = std::env::var_os("LOCALITY_REMOUNT_START_TEST_ROOT") else {
+            return;
+        };
+        let paths = DaemonProcessPaths::for_target(PathBuf::from(root), "linux", None);
+        let _startup = DaemonStartupCoordinatorLock::try_acquire(&paths)
+            .expect("exact owned fence generation authorizes replacement daemon startup");
+    }
+
+    #[test]
     fn coordinated_reset_preserves_lock_inode_and_rejects_active_remount() {
         let root = std::env::temp_dir().join(format!(
             "locality-daemon-reset-lock-{}-{:?}",
@@ -1029,8 +1155,18 @@ mod tests {
         assert!(ordinary.exists());
         drop(remount);
 
-        let report =
-            super::reset_locality_state_storage_coordinated(&root).expect("coordinated reset");
+        let reset_ownership =
+            DaemonRemountCoordinatorLock::try_acquire(&root).expect("reset ownership");
+        #[cfg(unix)]
+        let lock_inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(super::daemon_remount_lock_path(&root))
+                .expect("lock metadata before reset")
+                .ino()
+        };
+        let report = reset_ownership
+            .reset_locality_state_storage()
+            .expect("owned coordinated reset");
         assert!(!ordinary.exists());
         assert_eq!(
             report.preserved_state_entries,
@@ -1038,6 +1174,21 @@ mod tests {
         );
         let lock_path = super::daemon_remount_lock_path(&root);
         assert!(lock_path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&lock_path)
+                    .expect("lock metadata after reset")
+                    .ino(),
+                lock_inode
+            );
+        }
+        assert!(
+            DaemonRemountCoordinatorLock::try_acquire(&root).is_err(),
+            "the original reset ownership remains held through the storage wipe"
+        );
+        drop(reset_ownership);
         let _next = DaemonRemountCoordinatorLock::try_acquire(&root)
             .expect("preserved lock remains reusable");
         drop(_next);

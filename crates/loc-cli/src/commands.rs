@@ -40,9 +40,8 @@ use locality_notion::oauth::{
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
 };
 use locality_platform::{
-    DaemonManager, DaemonManagerRestartFence, DaemonProcessPaths,
-    daemon_manager_supervision_enabled, reset_locality_state_storage_coordinated,
-    restore_daemon_manager_supervision,
+    DaemonManager, DaemonManagerRestartFence, DaemonProcessPaths, DaemonRemountCoordinatorLock,
+    daemon_manager_supervision_enabled, restore_daemon_manager_supervision,
 };
 use locality_slack::{
     DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
@@ -124,9 +123,9 @@ use crate::local_oauth::{
 };
 use crate::mount::{
     MountError, MountOptions, MountReport, QuiescedWorkspaceRemountRuntime,
-    RemountFilesystemIdentity, WORKSPACE_REMOUNT_RECOVERY_VERSION, WorkspaceRemountOwnership,
-    WorkspaceRemountRecoveryRecord, resolve_workspace_mount_root, run_mount,
-    run_mount_with_workspace_cleanup, run_quiesced_workspace_remount,
+    RemountFilesystemIdentity, WORKSPACE_REMOUNT_RECOVERY_VERSION, WorkspaceRemountDaemonState,
+    WorkspaceRemountOwnership, WorkspaceRemountRecoveryRecord, resolve_workspace_mount_root,
+    run_mount, run_mount_with_workspace_cleanup, run_quiesced_workspace_remount,
 };
 use crate::mv::{MvError, MvOptions, MvReport, run_mv_with_daemon_at_state_root};
 use crate::okf::{OkfExportError, OkfExportOptions, OkfExportReport, run_okf_export};
@@ -2009,22 +2008,20 @@ fn reset(args: &[String], json: bool) -> i32 {
 
     let state_root = default_state_root();
     let mut warnings = Vec::new();
-    stop_daemon_for_reset(&state_root, &mut warnings);
-    reset_platform_projection_state_for_reset(&state_root, &mut warnings);
-    if let Err(error) = remove_desktop_support_state_for_reset() {
-        return command_error(
-            json,
-            CommandError::new("reset", "reset_failed", error),
-            EXIT_INTERNAL,
-        );
-    }
-
-    let storage = match reset_locality_state_storage_coordinated(&state_root) {
+    let storage = match reset_locality_state_with_steps(
+        &state_root,
+        || stop_daemon_for_reset(&state_root),
+        || {
+            reset_platform_projection_state_for_reset(&state_root, &mut warnings);
+            Ok(())
+        },
+        remove_desktop_support_state_for_reset,
+    ) {
         Ok(report) => report,
         Err(error) => {
             return command_error(
                 json,
-                CommandError::new("reset", "reset_failed", error.message()),
+                CommandError::new("reset", "reset_failed", error),
                 EXIT_INTERNAL,
             );
         }
@@ -2228,10 +2225,24 @@ fn connect(args: &[String], json: bool) -> i32 {
     }
 }
 
-fn stop_daemon_for_reset(state_root: &Path, warnings: &mut Vec<String>) {
-    if std::env::var("LOCALITY_DAEMON_DISABLE").ok().as_deref() == Some("1") {
-        return;
-    }
+fn reset_locality_state_with_steps(
+    state_root: &Path,
+    stop_daemon: impl FnOnce() -> Result<(), String>,
+    reset_projection: impl FnOnce() -> Result<(), String>,
+    remove_support_state: impl FnOnce() -> Result<(), String>,
+) -> Result<locality_store::LocalStateResetStorageReport, String> {
+    let ownership = DaemonRemountCoordinatorLock::try_acquire(state_root).map_err(|error| {
+        format!("Could not acquire reset/remount coordinator ownership: {error}")
+    })?;
+    stop_daemon()?;
+    reset_projection()?;
+    remove_support_state()?;
+    ownership
+        .reset_locality_state_storage()
+        .map_err(|error| error.message().to_string())
+}
+
+fn stop_daemon_for_reset(state_root: &Path) -> Result<(), String> {
     let mut args = vec![
         "stop".to_string(),
         "--state-dir".to_string(),
@@ -2243,12 +2254,12 @@ fn stop_daemon_for_reset(state_root: &Path, warnings: &mut Vec<String>) {
         args.push("--tcp-addr".to_string());
         args.push(tcp_addr);
     }
-    if let Err(error) = run_daemon_control(&args) {
-        warnings.push(format!(
-            "could not stop localityd before reset: {}",
-            error.message()
-        ));
+    let report = run_daemon_control(&args)
+        .map_err(|error| format!("could not stop localityd before reset: {}", error.message()))?;
+    if report.state != crate::daemon::DaemonRunState::Stopped {
+        return Err("could not confirm localityd shutdown before reset".to_string());
     }
+    Ok(())
 }
 
 fn reset_platform_projection_state_for_reset(state_root: &Path, warnings: &mut Vec<String>) {
@@ -4067,22 +4078,37 @@ fn reconcile_cli_workspace_remount_fence_with(
     restore: impl FnOnce(&DaemonProcessPaths) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut ownership = WorkspaceRemountOwnership::recover(state_root)?;
-    reconcile_cli_workspace_remount_fence_owned(state_root, &mut ownership, |paths, _| {
-        restore(paths)
-    })
+    reconcile_cli_workspace_remount_fence_owned(
+        state_root,
+        &mut ownership,
+        |_, _| Ok(()),
+        |paths, _| restore(paths),
+    )
 }
 
 fn reconcile_cli_workspace_remount_fence_owned(
     state_root: &Path,
     ownership: &mut WorkspaceRemountOwnership,
+    restart: impl FnOnce(&WorkspaceRemountOwnership, DaemonManager) -> Result<(), String>,
     restore: impl FnOnce(&DaemonProcessPaths, Option<bool>) -> Result<(), String>,
 ) -> Result<(), String> {
     if !ownership.has_fence() {
         return Ok(());
     }
+    let daemon_state = ownership.daemon_state();
+    if daemon_state.was_ready {
+        let manager = daemon_state.manager.ok_or_else(|| {
+            "persisted CLI remount recovery is missing its exact daemon manager".to_string()
+        })?;
+        restart(ownership, manager).map_err(|error| {
+            format!(
+                "could not restore exact-manager daemon readiness after CLI remount recovery: {error}"
+            )
+        })?;
+    }
     restore(
         &DaemonProcessPaths::new(state_root.to_path_buf()),
-        ownership.supervision_was_enabled(),
+        daemon_state.supervision_was_enabled,
     )
     .map_err(|error| {
         format!("could not restore daemon supervision after CLI remount recovery: {error}")
@@ -4158,10 +4184,18 @@ fn reconcile_cli_workspace_remount_recovery(
     }
     // Recovery owns the persisted fence too. Supervision must be restored
     // durably before daemon startup is unfenced, including restart recovery.
-    reconcile_cli_workspace_remount_fence_owned(state_root, &mut ownership, |paths, was_enabled| {
-        restore_daemon_manager_supervision(paths, was_enabled)
-            .map_err(|error| error.message().to_string())
-    })
+    reconcile_cli_workspace_remount_fence_owned(
+        state_root,
+        &mut ownership,
+        |ownership, manager| {
+            crate::daemon::restart_daemon_after_remount(state_root, manager, None, ownership)
+                .map_err(|error| error.message())
+        },
+        |paths, was_enabled| {
+            restore_daemon_manager_supervision(paths, was_enabled)
+                .map_err(|error| error.message().to_string())
+        },
+    )
 }
 
 fn run_cli_coordinated_mount(
@@ -4303,9 +4337,6 @@ fn run_cli_coordinated_mount(
 struct CliQuiescedRemountRuntime<'a> {
     state_root: &'a Path,
     mount_id: &'a MountId,
-    daemon_was_ready: Option<bool>,
-    daemon_manager: Option<DaemonManager>,
-    supervision_was_enabled: Option<bool>,
     cleanup_failure: Rc<RefCell<Option<String>>>,
     remount_ownership: Option<WorkspaceRemountOwnership>,
 }
@@ -4315,9 +4346,6 @@ impl<'a> CliQuiescedRemountRuntime<'a> {
         Self {
             state_root,
             mount_id,
-            daemon_was_ready: None,
-            daemon_manager: None,
-            supervision_was_enabled: None,
             cleanup_failure: Rc::new(RefCell::new(None)),
             remount_ownership: None,
         }
@@ -4336,7 +4364,7 @@ impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
         let paths = DaemonProcessPaths::new(self.state_root.to_path_buf());
         let mut daemon_was_ready = false;
         let mut daemon_manager = None;
-        let ownership = WorkspaceRemountOwnership::begin_capturing_supervision(
+        let ownership = WorkspaceRemountOwnership::begin_capturing_daemon_state(
             self.state_root,
             self.mount_id,
             "cli",
@@ -4353,13 +4381,15 @@ impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
                     }
                     daemon_manager = Some(manager);
                 }
-                daemon_manager_supervision_enabled(&paths)
-                    .map_err(|error| error.message().to_string())
+                let supervision_was_enabled = daemon_manager_supervision_enabled(&paths)
+                    .map_err(|error| error.message().to_string())?;
+                Ok(WorkspaceRemountDaemonState {
+                    was_ready: daemon_was_ready,
+                    manager: daemon_manager,
+                    supervision_was_enabled,
+                })
             },
         )?;
-        self.daemon_was_ready = Some(daemon_was_ready);
-        self.daemon_manager = daemon_manager;
-        self.supervision_was_enabled = ownership.supervision_was_enabled();
         self.remount_ownership = Some(ownership);
         Ok(())
     }
@@ -4396,9 +4426,10 @@ impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
 
     fn drain(&mut self) -> Result<(), String> {
         let daemon_was_ready = self
-            .daemon_was_ready
-            .unwrap_or_else(|| cli_daemon_is_ready(self.state_root));
-        self.daemon_was_ready = Some(daemon_was_ready);
+            .remount_ownership
+            .as_ref()
+            .map(|ownership| ownership.daemon_state().was_ready)
+            .unwrap_or(false);
         if !daemon_was_ready {
             return Ok(());
         }
@@ -4434,18 +4465,19 @@ impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
     }
 
     fn ensure_running(&mut self) -> Result<(), String> {
-        if self.daemon_was_ready != Some(true) || cli_daemon_is_ready(self.state_root) {
+        let ownership = self
+            .remount_ownership
+            .as_ref()
+            .ok_or_else(|| "CLI remount ownership is missing during daemon restart".to_string())?;
+        let daemon_state = ownership.daemon_state();
+        if !daemon_state.was_ready {
             return Ok(());
         }
-        let manager = self
-            .daemon_manager
+        let manager = daemon_state
+            .manager
             .ok_or_else(|| "live daemon manager was not captured before remount".to_string())?;
-        crate::daemon::restart_daemon_after_remount(
-            self.state_root,
-            manager,
-            self.supervision_was_enabled,
-        )
-        .map_err(|error| error.message())
+        crate::daemon::restart_daemon_after_remount(self.state_root, manager, None, ownership)
+            .map_err(|error| error.message())
     }
 
     fn reactivate_after_failed_commit(&mut self) -> Result<(), String> {
@@ -4491,6 +4523,8 @@ mod cli_remount_daemon_tests {
         std::fs::create_dir_all(&state_root).expect("create state root");
         let socket_path = locality_platform::daemon_socket_path(&state_root);
         let listener = UnixListener::bind(&socket_path).expect("bind late daemon socket");
+        std::fs::write(state_root.join("localityd.pid"), "123")
+            .expect("record session daemon manager");
         listener
             .set_nonblocking(true)
             .expect("configure daemon socket");
@@ -4530,10 +4564,19 @@ mod cli_remount_daemon_tests {
             shutdown_seen
         });
 
+        runtime.persist_fence().expect("capture late live daemon");
         runtime.drain().expect("drain live daemon");
 
-        assert_eq!(runtime.daemon_was_ready, Some(true));
+        assert!(
+            runtime
+                .remount_ownership
+                .as_ref()
+                .expect("remount ownership")
+                .daemon_state()
+                .was_ready
+        );
         assert!(server.join().expect("join daemon server"));
+        runtime.clear_fence().expect("clear remount fence");
         let _ = std::fs::remove_file(socket_path);
         std::fs::remove_dir_all(state_root).expect("remove state root");
     }
@@ -10671,6 +10714,7 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     use std::io::{self, Cursor, Read, Write};
     use std::path::{Path, PathBuf};
@@ -10719,12 +10763,91 @@ mod tests {
         projection_usage_options_for_target, prompt_for_push_confirmation,
         pull_direct_fallback_error, push_confirmation_preview_matches_displayed,
         push_preview_plan_matches, reconcile_cli_workspace_remount_recovery,
-        run_cli_coordinated_mount, should_prompt_for_push_confirmation,
-        should_refresh_notion_url_search, slack_mount_missing_path_error,
-        slack_oauth_broker_config, spinner_config_for_command, spinner_enabled,
-        status as run_status_command, validate_virtual_projection_registration,
+        reset_locality_state_with_steps, run_cli_coordinated_mount,
+        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
+        slack_mount_missing_path_error, slack_oauth_broker_config, spinner_config_for_command,
+        spinner_enabled, status as run_status_command, validate_virtual_projection_registration,
         write_connect_report, write_log_report,
     };
+
+    #[test]
+    fn active_remount_causes_zero_cli_reset_step_mutation() {
+        let state_root = unique_temp_path("loc-cli-reset-active-remount");
+        fs::create_dir_all(&state_root).expect("create state root");
+        let sentinel = state_root.join("state.sqlite3");
+        fs::write(&sentinel, b"preserve").expect("write sentinel");
+        let mut remount = crate::mount::WorkspaceRemountOwnership::begin(
+            &state_root,
+            &MountId::new("notion-main"),
+            "desktop",
+            "1",
+        )
+        .expect("hold active remount");
+        let stop_calls = Cell::new(0);
+        let projection_calls = Cell::new(0);
+        let support_calls = Cell::new(0);
+
+        let error = reset_locality_state_with_steps(
+            &state_root,
+            || {
+                stop_calls.set(stop_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                projection_calls.set(projection_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                support_calls.set(support_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("active remount must reject reset");
+
+        assert!(error.contains("another Locality coordinator"));
+        assert_eq!(
+            (
+                stop_calls.get(),
+                projection_calls.get(),
+                support_calls.get()
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(fs::read(&sentinel).expect("read sentinel"), b"preserve");
+        remount.clear().expect("clear remount fence");
+        drop(remount);
+        fs::remove_dir_all(state_root).expect("remove state root");
+    }
+
+    #[test]
+    fn failed_daemon_stop_prevents_all_cli_reset_mutation() {
+        let state_root = unique_temp_path("loc-cli-reset-stop-failure");
+        fs::create_dir_all(&state_root).expect("create state root");
+        let sentinel = state_root.join("state.sqlite3");
+        fs::write(&sentinel, b"preserve").expect("write sentinel");
+        let projection_called = Cell::new(false);
+        let support_called = Cell::new(false);
+
+        let error = reset_locality_state_with_steps(
+            &state_root,
+            || Err("daemon is still responding".to_string()),
+            || {
+                projection_called.set(true);
+                Ok(())
+            },
+            || {
+                support_called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("failed daemon stop must abort reset");
+
+        assert_eq!(error, "daemon is still responding");
+        assert!(!projection_called.get());
+        assert!(!support_called.get());
+        assert_eq!(fs::read(&sentinel).expect("read sentinel"), b"preserve");
+        fs::remove_dir_all(state_root).expect("remove state root");
+    }
 
     #[test]
     fn cli_account_change_uses_quiesced_coordinator_and_atomic_source_cleanup() {
@@ -11133,6 +11256,46 @@ mod tests {
             )
             .is_err()
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_exact_manager_restart_failure_keeps_persisted_fence() {
+        let root = unique_temp_path("loc-cli-remount-restart-failure");
+        let state_root = root.join("state");
+        fs::create_dir_all(&state_root).unwrap();
+        let mount_id = MountId::new("notion-main");
+        let owner = crate::mount::WorkspaceRemountOwnership::begin_capturing_daemon_state(
+            &state_root,
+            &mount_id,
+            "cli-test",
+            "1",
+            || {
+                Ok(crate::mount::WorkspaceRemountDaemonState {
+                    was_ready: true,
+                    manager: Some(locality_platform::DaemonManager::Session),
+                    supervision_was_enabled: None,
+                })
+            },
+        )
+        .unwrap();
+        drop(owner);
+        let mut ownership = crate::mount::WorkspaceRemountOwnership::recover(&state_root).unwrap();
+
+        let error = super::reconcile_cli_workspace_remount_fence_owned(
+            &state_root,
+            &mut ownership,
+            |_, manager| {
+                assert_eq!(manager, locality_platform::DaemonManager::Session);
+                Err("injected exact-manager restart failure".to_string())
+            },
+            |_, _| panic!("policy restore must not run before readiness"),
+        )
+        .expect_err("restart failure must retain fence");
+
+        assert!(error.contains("exact-manager daemon readiness"));
+        assert!(locality_platform::daemon_remount_fence_path(&state_root).exists());
+        drop(ownership);
         let _ = fs::remove_dir_all(root);
     }
 

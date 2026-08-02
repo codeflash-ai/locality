@@ -5,9 +5,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use locality_platform::{
-    DaemonManager, DaemonManagerRestartFence, DaemonProcessError, DaemonProcessManager,
-    DaemonProcessPaths, DaemonProcessStartConfig, DaemonProcessStartReport, DaemonStartMode,
-    DaemonStartupCoordinatorLock, DefaultDaemonProcessManager,
+    DAEMON_REMOUNT_START_GENERATION_ENV, DAEMON_REMOUNT_START_OWNER_ENV, DaemonManager,
+    DaemonProcessError, DaemonProcessManager, DaemonProcessPaths, DaemonProcessStartConfig,
+    DaemonProcessStartReport, DaemonStartMode, DaemonStartupCoordinatorLock,
+    DefaultDaemonProcessManager,
 };
 use localityd::ipc::{
     DaemonClientError, DaemonEndpoint, DaemonReloadReport, DaemonRequest, DaemonResponse,
@@ -159,32 +160,16 @@ pub fn run_daemon_control(args: &[String]) -> Result<DaemonControlReport, Daemon
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RemountDaemonRestartPlan {
     manager: DaemonManager,
-    restore_disabled_launchd: bool,
 }
 
 impl RemountDaemonRestartPlan {
-    fn new(
-        manager: DaemonManager,
-        supervision_was_enabled: Option<bool>,
-    ) -> Result<Self, DaemonControlError> {
+    fn new(manager: DaemonManager) -> Result<Self, DaemonControlError> {
         match manager {
-            DaemonManager::Launchd | DaemonManager::Session => Ok(Self {
-                manager,
-                restore_disabled_launchd: manager == DaemonManager::Launchd
-                    && supervision_was_enabled == Some(false),
-            }),
+            DaemonManager::Launchd | DaemonManager::Session => Ok(Self { manager }),
             DaemonManager::Unknown => Err(DaemonControlError::new(
                 "daemon_manager_unknown",
                 "could not determine the live daemon manager before remount",
             )),
-        }
-    }
-
-    fn start_flag(self) -> &'static str {
-        match self.manager {
-            DaemonManager::Launchd => "--launchd",
-            DaemonManager::Session => "--session",
-            DaemonManager::Unknown => unreachable!("validated remount daemon manager"),
         }
     }
 }
@@ -193,28 +178,38 @@ pub(crate) fn detected_daemon_manager(paths: &DaemonProcessPaths) -> DaemonManag
     DefaultDaemonProcessManager.detected_manager(paths)
 }
 
-pub(crate) fn restart_daemon_after_remount(
+pub fn restart_daemon_after_remount(
     state_root: &Path,
     manager: DaemonManager,
-    supervision_was_enabled: Option<bool>,
+    localityd_bin: Option<&Path>,
+    ownership: &crate::mount::WorkspaceRemountOwnership,
 ) -> Result<(), DaemonControlError> {
-    let plan = RemountDaemonRestartPlan::new(manager, supervision_was_enabled)?;
-    let args = vec![
-        "start".to_string(),
-        plan.start_flag().to_string(),
-        "--state-dir".to_string(),
-        state_root.display().to_string(),
-    ];
-    run_daemon_control(&args)?;
-
-    if plan.restore_disabled_launchd {
-        // Explicit launchd starts enable the service before kickstart. Restore
-        // the captured disabled state after readiness without switching the
-        // daemon to session mode.
-        let paths = DaemonProcessPaths::new(state_root.to_path_buf());
-        let mut fence =
-            DaemonManagerRestartFence::suspend(&paths, Some(true)).map_err(daemon_process_error)?;
-        fence.remain_suspended();
+    let plan = RemountDaemonRestartPlan::new(manager)?;
+    let options = DaemonOptions {
+        action: DaemonAction::Start,
+        mode: match plan.manager {
+            DaemonManager::Launchd => StartMode::Launchd,
+            DaemonManager::Session => StartMode::Session,
+            DaemonManager::Unknown => unreachable!("validated remount daemon manager"),
+        },
+        state_root: state_root.to_path_buf(),
+        localityd_bin: localityd_bin.map(Path::to_path_buf),
+        tcp_addr: env::var("LOCALITY_DAEMON_TCP_ADDR")
+            .ok()
+            .filter(|value| !value.is_empty()),
+        include_env: Vec::new(),
+    };
+    let paths = DaemonPaths::new(options.state_root.clone());
+    let report = start_daemon_inner(&options, &paths, Some(ownership))?;
+    if report.state != DaemonRunState::Running || report.manager != manager {
+        return Err(DaemonControlError::new(
+            "daemon_manager_mismatch",
+            format!(
+                "daemon recovery required {} readiness but observed {}",
+                manager.as_str(),
+                report.manager.as_str()
+            ),
+        ));
     }
     Ok(())
 }
@@ -263,8 +258,19 @@ fn start_daemon(
     options: &DaemonOptions,
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
-    let startup_lock =
-        DaemonStartupCoordinatorLock::try_acquire(paths).map_err(daemon_process_error)?;
+    start_daemon_inner(options, paths, None)
+}
+
+fn start_daemon_inner(
+    options: &DaemonOptions,
+    paths: &DaemonPaths,
+    remount_ownership: Option<&crate::mount::WorkspaceRemountOwnership>,
+) -> Result<DaemonControlReport, DaemonControlError> {
+    let startup_lock = if remount_ownership.is_none() {
+        Some(DaemonStartupCoordinatorLock::try_acquire(paths).map_err(daemon_process_error)?)
+    } else {
+        None
+    };
     if is_running(options, paths) {
         drop(startup_lock);
         repair_linux_fuse_units_for_daemon_start(&options.state_root);
@@ -287,16 +293,37 @@ fn start_daemon(
         .resolve_start_manager(options.mode)
         .map_err(daemon_process_error)?;
     validate_start_endpoint(options)?;
-    let environment = included_environment(options)?;
-    let artifacts = process_manager
-        .start(&DaemonProcessStartConfig {
-            mode: options.mode,
-            paths,
-            localityd_bin: &localityd_bin,
-            tcp_addr: options.tcp_addr.as_deref(),
-            environment,
-        })
-        .map_err(daemon_process_error)?;
+    let mut environment = included_environment(options)?;
+    if let Some(ownership) = remount_ownership {
+        let (owner, generation) = ownership.owner_generation().ok_or_else(|| {
+            DaemonControlError::new(
+                "remount_owner_missing",
+                "daemon recovery requires an owned durable remount fence",
+            )
+        })?;
+        environment.push((
+            DAEMON_REMOUNT_START_OWNER_ENV.to_string(),
+            owner.to_string(),
+        ));
+        environment.push((
+            DAEMON_REMOUNT_START_GENERATION_ENV.to_string(),
+            generation.to_string(),
+        ));
+    }
+    let config = DaemonProcessStartConfig {
+        mode: options.mode,
+        paths,
+        localityd_bin: &localityd_bin,
+        tcp_addr: options.tcp_addr.as_deref(),
+        environment,
+    };
+    let artifacts = match remount_ownership {
+        Some(ownership) => {
+            process_manager.start_during_remount(&config, ownership.coordinator_lock())
+        }
+        None => process_manager.start(&config),
+    }
+    .map_err(daemon_process_error)?;
 
     if !wait_for_state(options, paths, DaemonRunState::Running, START_TIMEOUT) {
         return Err(DaemonControlError::new(
@@ -1010,26 +1037,18 @@ mod tests {
         fs::write(&paths.pid_file, "123").expect("write session pid");
 
         let manager = detected_daemon_manager(&paths);
-        let plan = RemountDaemonRestartPlan::new(manager, Some(false)).expect("restart plan");
+        let plan = RemountDaemonRestartPlan::new(manager).expect("restart plan");
 
         assert_eq!(manager, DaemonManager::Session);
-        assert_eq!(plan.start_flag(), "--session");
-        assert!(!plan.restore_disabled_launchd);
+        assert_eq!(plan.manager, DaemonManager::Session);
         fs::remove_dir_all(root).expect("remove temp root");
     }
 
     #[test]
-    fn remount_restart_restores_explicitly_disabled_launchd_state() {
-        let plan = RemountDaemonRestartPlan::new(DaemonManager::Launchd, Some(false))
-            .expect("restart plan");
+    fn remount_restart_preserves_live_launchd_manager() {
+        let plan = RemountDaemonRestartPlan::new(DaemonManager::Launchd).expect("restart plan");
 
-        assert_eq!(plan.start_flag(), "--launchd");
-        assert!(plan.restore_disabled_launchd);
-        assert!(
-            !RemountDaemonRestartPlan::new(DaemonManager::Launchd, Some(true))
-                .expect("enabled launchd restart plan")
-                .restore_disabled_launchd
-        );
+        assert_eq!(plan.manager, DaemonManager::Launchd);
     }
 
     #[test]

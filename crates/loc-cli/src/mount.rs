@@ -9,6 +9,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use locality_core::model::{MountId, RemoteId};
+use locality_platform::DaemonManager;
 use locality_store::{
     ConnectionId, LegacyLayout0Reason, LegacyWorkspaceMount, MountConfig, MountRepository,
     ProjectionMode, StoreError, WorkspaceBindingRepository, WorkspaceHostBinding,
@@ -225,32 +226,27 @@ where
     let mut supervision = match runtime.suspend_supervision() {
         Ok(supervision) => supervision,
         Err(error) => {
-            let cleanup = runtime.clear_fence();
-            return Err(match cleanup {
-                Ok(()) => error,
-                Err(cleanup) => {
-                    format!("{error}; clearing the durable remount fence also failed: {cleanup}")
-                }
-            });
+            return Err(format!(
+                "{error}; durable remount recovery remains fenced until supervision policy can be restored"
+            ));
         }
     };
 
     if let Err(drain_error) = runtime.drain() {
-        if let Err(restore_error) = runtime
-            .restore_supervision(&mut supervision)
-            .and_then(|()| runtime.clear_fence())
-        {
+        if let Err(restart_error) = runtime.ensure_running() {
             runtime.remain_suspended(&mut supervision);
             return Err(format!(
-                "{drain_error}; restoring supervision before clearing the durable remount fence also failed: {restore_error}"
+                "{drain_error}; restarting after the cancelled remount also failed and recovery remains fenced: {restart_error}"
             ));
         }
-        return match runtime.ensure_running() {
-            Ok(()) => Err(drain_error),
-            Err(restart_error) => Err(format!(
-                "{drain_error}; restarting after the cancelled remount also failed: {restart_error}"
-            )),
-        };
+        if let Err(restore_error) = runtime.restore_supervision(&mut supervision) {
+            runtime.remain_suspended(&mut supervision);
+            return Err(format!(
+                "{drain_error}; restoring supervision after restart also failed and recovery remains fenced: {restore_error}"
+            ));
+        }
+        runtime.clear_fence()?;
+        return Err(drain_error);
     }
 
     let operation_result = operation();
@@ -266,12 +262,17 @@ where
         });
     }
 
+    if let Err(error) = runtime.ensure_running() {
+        runtime.remain_suspended(&mut supervision);
+        return Err(format!(
+            "restarting the exact pre-remount daemon manager failed; recovery remains fenced: {error}"
+        ));
+    }
     if let Err(error) = runtime.restore_supervision(&mut supervision) {
         runtime.remain_suspended(&mut supervision);
         return Err(error);
     }
     runtime.clear_fence()?;
-    runtime.ensure_running()?;
 
     match operation_result {
         Ok(value) => Ok(value),
@@ -284,7 +285,7 @@ where
     }
 }
 
-const WORKSPACE_REMOUNT_FENCE_VERSION: u32 = 3;
+const WORKSPACE_REMOUNT_FENCE_VERSION: u32 = 4;
 const WORKSPACE_REMOUNT_FENCE_MAX_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -297,6 +298,27 @@ struct WorkspaceRemountFenceRecord {
     created_at: String,
     #[serde(default)]
     supervision_was_enabled: Option<bool>,
+    #[serde(default)]
+    daemon_was_ready: bool,
+    #[serde(default)]
+    daemon_manager: Option<DaemonManager>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkspaceRemountDaemonState {
+    pub was_ready: bool,
+    pub manager: Option<DaemonManager>,
+    pub supervision_was_enabled: Option<bool>,
+}
+
+impl WorkspaceRemountDaemonState {
+    pub fn stopped(supervision_was_enabled: Option<bool>) -> Self {
+        Self {
+            was_ready: false,
+            manager: None,
+            supervision_was_enabled,
+        }
+    }
 }
 
 /// Exclusive cross-process ownership for one remount or recovery pass.
@@ -313,6 +335,8 @@ pub struct WorkspaceRemountOwnership {
     owner: Option<String>,
     generation: Option<String>,
     supervision_was_enabled: Option<bool>,
+    daemon_was_ready: bool,
+    daemon_manager: Option<DaemonManager>,
 }
 
 impl WorkspaceRemountOwnership {
@@ -322,7 +346,9 @@ impl WorkspaceRemountOwnership {
         owner: &str,
         created_at: &str,
     ) -> Result<Self, String> {
-        Self::begin_capturing_supervision(state_root, mount_id, owner, created_at, || Ok(None))
+        Self::begin_capturing_daemon_state(state_root, mount_id, owner, created_at, || {
+            Ok(WorkspaceRemountDaemonState::stopped(None))
+        })
     }
 
     /// Acquires exclusive remount ownership before inspecting process-manager
@@ -333,6 +359,20 @@ impl WorkspaceRemountOwnership {
         owner: &str,
         created_at: &str,
         capture_supervision: impl FnOnce() -> Result<Option<bool>, String>,
+    ) -> Result<Self, String> {
+        Self::begin_capturing_daemon_state(state_root, mount_id, owner, created_at, || {
+            capture_supervision().map(WorkspaceRemountDaemonState::stopped)
+        })
+    }
+
+    /// Acquires exclusive ownership, captures exact daemon readiness, manager,
+    /// and launchd policy, then persists all three before any drain occurs.
+    pub fn begin_capturing_daemon_state(
+        state_root: &Path,
+        mount_id: &MountId,
+        owner: &str,
+        created_at: &str,
+        capture_daemon_state: impl FnOnce() -> Result<WorkspaceRemountDaemonState, String>,
     ) -> Result<Self, String> {
         let lock = locality_platform::DaemonRemountCoordinatorLock::try_acquire(state_root)
             .map_err(|error| format!("Could not acquire remount coordinator ownership: {error}"))?;
@@ -352,7 +392,15 @@ impl WorkspaceRemountOwnership {
                 ));
             }
         }
-        let supervision_was_enabled = capture_supervision()?;
+        let daemon_state = capture_daemon_state()?;
+        if daemon_state.was_ready
+            && !matches!(
+                daemon_state.manager,
+                Some(DaemonManager::Launchd | DaemonManager::Session)
+            )
+        {
+            return Err("Could not capture the live daemon's exact process manager".to_string());
+        }
         let generation = remount_fence_generation()?;
         let owner = format!("{owner}:{}", std::process::id());
         let record = WorkspaceRemountFenceRecord {
@@ -361,7 +409,9 @@ impl WorkspaceRemountOwnership {
             generation: generation.clone(),
             mount_id: mount_id.0.clone(),
             created_at: created_at.to_string(),
-            supervision_was_enabled,
+            supervision_was_enabled: daemon_state.supervision_was_enabled,
+            daemon_was_ready: daemon_state.was_ready,
+            daemon_manager: daemon_state.manager,
         };
         let mut contents = serde_json::to_vec(&record)
             .map_err(|error| format!("Could not encode daemon remount fence: {error}"))?;
@@ -378,7 +428,9 @@ impl WorkspaceRemountOwnership {
             expected_fence: Some(contents),
             owner: Some(owner),
             generation: Some(generation),
-            supervision_was_enabled,
+            supervision_was_enabled: daemon_state.supervision_was_enabled,
+            daemon_was_ready: daemon_state.was_ready,
+            daemon_manager: daemon_state.manager,
         })
     }
 
@@ -405,14 +457,27 @@ impl WorkspaceRemountOwnership {
                 path.display()
             ));
         }
-        let (expected_fence, owner, generation, supervision_was_enabled) = if contents.is_none() {
-            (None, None, None, None)
+        let (
+            expected_fence,
+            owner,
+            generation,
+            supervision_was_enabled,
+            daemon_was_ready,
+            daemon_manager,
+        ) = if contents.is_none() {
+            (None, None, None, None, false, None)
         } else if let Ok(record) = serde_json::from_slice::<WorkspaceRemountFenceRecord>(
             contents.as_deref().expect("checked persisted fence"),
         ) {
-            if !matches!(record.version, 2 | WORKSPACE_REMOUNT_FENCE_VERSION)
+            if !matches!(record.version, 2 | 3 | WORKSPACE_REMOUNT_FENCE_VERSION)
                 || record.owner.is_empty()
                 || record.generation.is_empty()
+                || (record.version >= WORKSPACE_REMOUNT_FENCE_VERSION
+                    && record.daemon_was_ready
+                    && !matches!(
+                        record.daemon_manager,
+                        Some(DaemonManager::Launchd | DaemonManager::Session)
+                    ))
             {
                 return Err(format!(
                     "Daemon remount fence `{}` has invalid owner/generation metadata",
@@ -430,6 +495,10 @@ impl WorkspaceRemountOwnership {
                 Some(record.owner),
                 Some(record.generation),
                 supervision_was_enabled,
+                record.version >= WORKSPACE_REMOUNT_FENCE_VERSION && record.daemon_was_ready,
+                (record.version >= WORKSPACE_REMOUNT_FENCE_VERSION)
+                    .then_some(record.daemon_manager)
+                    .flatten(),
             )
         } else if contents
             .as_deref()
@@ -444,6 +513,8 @@ impl WorkspaceRemountOwnership {
                     contents.as_deref().expect("checked legacy fence"),
                 )),
                 Some(true),
+                false,
+                None,
             )
         } else {
             return Err(format!(
@@ -458,6 +529,8 @@ impl WorkspaceRemountOwnership {
             owner,
             generation,
             supervision_was_enabled,
+            daemon_was_ready,
+            daemon_manager,
         })
     }
 
@@ -471,6 +544,18 @@ impl WorkspaceRemountOwnership {
 
     pub fn supervision_was_enabled(&self) -> Option<bool> {
         self.supervision_was_enabled
+    }
+
+    pub fn daemon_state(&self) -> WorkspaceRemountDaemonState {
+        WorkspaceRemountDaemonState {
+            was_ready: self.daemon_was_ready,
+            manager: self.daemon_manager,
+            supervision_was_enabled: self.supervision_was_enabled,
+        }
+    }
+
+    pub fn coordinator_lock(&self) -> &locality_platform::DaemonRemountCoordinatorLock {
+        &self._lock
     }
 
     pub fn clear(&mut self) -> Result<(), String> {
@@ -960,7 +1045,8 @@ fn absolute_path(path: &Path) -> Result<PathBuf, MountError> {
 #[cfg(test)]
 mod remount_coordinator_tests {
     use super::{
-        QuiescedWorkspaceRemountRuntime, WorkspaceRemountOwnership, run_quiesced_workspace_remount,
+        QuiescedWorkspaceRemountRuntime, WorkspaceRemountDaemonState, WorkspaceRemountOwnership,
+        run_quiesced_workspace_remount,
     };
 
     #[cfg(windows)]
@@ -993,6 +1079,9 @@ mod remount_coordinator_tests {
         surface: &'static str,
         events: Vec<String>,
         drain_error: bool,
+        ensure_error: bool,
+        restore_error: bool,
+        panic_while_ensuring: bool,
         panic_while_restoring: bool,
     }
 
@@ -1022,7 +1111,11 @@ mod remount_coordinator_tests {
             if self.panic_while_restoring {
                 panic!("injected crash while restoring supervision");
             }
-            Ok(())
+            if self.restore_error {
+                Err("injected supervision policy restore failure".to_string())
+            } else {
+                Ok(())
+            }
         }
         fn remain_suspended(&mut self, _: &mut ()) {
             self.record("remain_suspended");
@@ -1041,7 +1134,14 @@ mod remount_coordinator_tests {
         }
         fn ensure_running(&mut self) -> Result<(), String> {
             self.record("ensure_running");
-            Ok(())
+            if self.panic_while_ensuring {
+                panic!("injected crash while restoring exact-manager readiness");
+            }
+            if self.ensure_error {
+                Err("injected exact-manager restart failure".to_string())
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1052,6 +1152,9 @@ mod remount_coordinator_tests {
                 surface,
                 events: Vec::new(),
                 drain_error: false,
+                ensure_error: false,
+                restore_error: false,
+                panic_while_ensuring: false,
                 panic_while_restoring: false,
             };
             run_quiesced_workspace_remount(&mut runtime, || Ok::<_, String>(()))
@@ -1063,9 +1166,9 @@ mod remount_coordinator_tests {
                     "suspend",
                     "drain",
                     "reconcile_cleanup",
+                    "ensure_running",
                     "restore",
                     "clear_fence",
-                    "ensure_running",
                 ]
                 .map(|event| format!("{surface}:{event}"))
             );
@@ -1078,6 +1181,9 @@ mod remount_coordinator_tests {
             surface: "shared",
             events: Vec::new(),
             drain_error: true,
+            ensure_error: false,
+            restore_error: false,
+            panic_while_ensuring: false,
             panic_while_restoring: false,
         };
         run_quiesced_workspace_remount(&mut runtime, || Ok::<_, String>(()))
@@ -1088,9 +1194,9 @@ mod remount_coordinator_tests {
                 "persist_fence",
                 "suspend",
                 "drain",
+                "ensure_running",
                 "restore",
                 "clear_fence",
-                "ensure_running",
             ]
             .map(|event| format!("shared:{event}"))
         );
@@ -1102,6 +1208,9 @@ mod remount_coordinator_tests {
             surface: "shared",
             events: Vec::new(),
             drain_error: true,
+            ensure_error: false,
+            restore_error: false,
+            panic_while_ensuring: false,
             panic_while_restoring: true,
         };
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1110,7 +1219,104 @@ mod remount_coordinator_tests {
         assert!(crashed.is_err());
         assert_eq!(
             runtime.events,
-            ["persist_fence", "suspend", "drain", "restore"].map(|event| format!("shared:{event}"))
+            [
+                "persist_fence",
+                "suspend",
+                "drain",
+                "ensure_running",
+                "restore"
+            ]
+            .map(|event| format!("shared:{event}"))
+        );
+    }
+
+    #[test]
+    fn restart_failure_keeps_recovery_fenced_before_policy_restore() {
+        let mut runtime = Runtime {
+            surface: "shared",
+            events: Vec::new(),
+            drain_error: false,
+            ensure_error: true,
+            restore_error: false,
+            panic_while_ensuring: false,
+            panic_while_restoring: false,
+        };
+
+        let error = run_quiesced_workspace_remount(&mut runtime, || Ok::<_, String>(()))
+            .expect_err("restart failure must remain recoverable");
+
+        assert!(error.contains("recovery remains fenced"));
+        assert_eq!(
+            runtime.events,
+            [
+                "persist_fence",
+                "suspend",
+                "drain",
+                "reconcile_cleanup",
+                "ensure_running",
+                "remain_suspended"
+            ]
+            .map(|event| format!("shared:{event}"))
+        );
+    }
+
+    #[test]
+    fn disabled_policy_restore_failure_keeps_recovery_fenced_after_readiness() {
+        let mut runtime = Runtime {
+            surface: "shared",
+            events: Vec::new(),
+            drain_error: false,
+            ensure_error: false,
+            restore_error: true,
+            panic_while_ensuring: false,
+            panic_while_restoring: false,
+        };
+
+        run_quiesced_workspace_remount(&mut runtime, || Ok::<_, String>(()))
+            .expect_err("policy restore failure must remain recoverable");
+
+        assert_eq!(
+            runtime.events,
+            [
+                "persist_fence",
+                "suspend",
+                "drain",
+                "reconcile_cleanup",
+                "ensure_running",
+                "restore",
+                "remain_suspended"
+            ]
+            .map(|event| format!("shared:{event}"))
+        );
+    }
+
+    #[test]
+    fn crash_during_exact_manager_restart_never_clears_durable_fence() {
+        let mut runtime = Runtime {
+            surface: "shared",
+            events: Vec::new(),
+            drain_error: false,
+            ensure_error: false,
+            restore_error: false,
+            panic_while_ensuring: true,
+            panic_while_restoring: false,
+        };
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = run_quiesced_workspace_remount(&mut runtime, || Ok::<_, String>(()));
+        }));
+
+        assert!(crashed.is_err());
+        assert_eq!(
+            runtime.events,
+            [
+                "persist_fence",
+                "suspend",
+                "drain",
+                "reconcile_cleanup",
+                "ensure_running"
+            ]
+            .map(|event| format!("shared:{event}"))
         );
     }
 
@@ -1213,6 +1419,47 @@ mod remount_coordinator_tests {
 
         let mut recovered = WorkspaceRemountOwnership::recover(&root).unwrap();
         assert_eq!(recovered.supervision_was_enabled(), Some(false));
+        recovered.clear().unwrap();
+        drop(recovered);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remount_fence_durably_preserves_exact_ready_manager_and_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "locality-remount-daemon-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let owner = WorkspaceRemountOwnership::begin_capturing_daemon_state(
+            &root,
+            &locality_core::model::MountId::new("notion-main"),
+            "desktop",
+            "1",
+            || {
+                Ok(WorkspaceRemountDaemonState {
+                    was_ready: true,
+                    manager: Some(locality_platform::DaemonManager::Launchd),
+                    supervision_was_enabled: Some(false),
+                })
+            },
+        )
+        .unwrap();
+        drop(owner);
+
+        let mut recovered = WorkspaceRemountOwnership::recover(&root).unwrap();
+        assert_eq!(
+            recovered.daemon_state(),
+            WorkspaceRemountDaemonState {
+                was_ready: true,
+                manager: Some(locality_platform::DaemonManager::Launchd),
+                supervision_was_enabled: Some(false),
+            }
+        );
         recovered.clear().unwrap();
         drop(recovered);
         std::fs::remove_dir_all(root).unwrap();

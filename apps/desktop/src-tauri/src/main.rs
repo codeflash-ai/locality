@@ -27,7 +27,7 @@ use loc_cli::connect::{
     run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_linear,
     run_connect_notion_broker_oauth, run_connect_slack_broker_oauth, run_disconnect,
 };
-use loc_cli::daemon::{DaemonRunState, run_daemon_control};
+use loc_cli::daemon::{DaemonRunState, restart_daemon_after_remount, run_daemon_control};
 use loc_cli::diff::{DiffReport, run_diff};
 #[cfg(target_os = "windows")]
 use loc_cli::file_provider::{
@@ -42,9 +42,9 @@ use loc_cli::file_provider::{
 use loc_cli::local_oauth::run_local_oauth_authorization;
 use loc_cli::mount::{
     MountOptions, MountReport, QuiescedWorkspaceRemountRuntime, RemountFilesystemIdentity,
-    WORKSPACE_REMOUNT_RECOVERY_VERSION, WorkspaceRemountOwnership, WorkspaceRemountRecoveryRecord,
-    resolve_workspace_mount_root, run_mount, run_mount_with_workspace_cleanup,
-    run_quiesced_workspace_remount,
+    WORKSPACE_REMOUNT_RECOVERY_VERSION, WorkspaceRemountDaemonState, WorkspaceRemountOwnership,
+    WorkspaceRemountRecoveryRecord, resolve_workspace_mount_root, run_mount,
+    run_mount_with_workspace_cleanup, run_quiesced_workspace_remount,
 };
 use loc_cli::pull::{PullReport, run_pull_with_state_root};
 use loc_cli::push::{
@@ -99,10 +99,10 @@ use locality_notion::oauth::{
     DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
 };
 use locality_platform::{
-    DAEMON_PID_FILENAME, DaemonManagerRestartFence, DaemonProcessPaths, append_service_log,
-    bundled_binary_next_to_current_exe, daemon_manager_supervision_enabled,
-    default_state_root as platform_default_state_root, ensure_daemon_start_allowed,
-    logs_dir as platform_logs_dir, restore_daemon_manager_supervision,
+    DAEMON_PID_FILENAME, DaemonManager, DaemonManagerRestartFence, DaemonProcessPaths,
+    DaemonRemountCoordinatorLock, append_service_log, bundled_binary_next_to_current_exe,
+    daemon_manager_supervision_enabled, default_state_root as platform_default_state_root,
+    ensure_daemon_start_allowed, logs_dir as platform_logs_dir, restore_daemon_manager_supervision,
     user_home as platform_user_home,
 };
 use locality_slack::{
@@ -6092,16 +6092,32 @@ fn install_marker_path(state_root: &Path) -> PathBuf {
 
 fn reset_locality_state_at(state_root: &Path) -> Result<(), String> {
     LOCAL_STATE_RESET_IN_PROGRESS.store(true, Ordering::Release);
-    let result = (|| {
-        stop_daemon_for_reset(state_root);
-        reset_platform_projection_state(state_root)?;
-        remove_desktop_support_state()?;
-        locality_platform::reset_locality_state_storage_coordinated(state_root)
-            .map_err(|error| error.message().to_string())?;
-        Ok(())
-    })();
+    let result = reset_locality_state_with_steps(
+        state_root,
+        || stop_daemon_for_reset(state_root),
+        || reset_platform_projection_state(state_root),
+        remove_desktop_support_state,
+    );
     LOCAL_STATE_RESET_IN_PROGRESS.store(false, Ordering::Release);
     result
+}
+
+fn reset_locality_state_with_steps(
+    state_root: &Path,
+    stop_daemon: impl FnOnce() -> Result<(), String>,
+    reset_projection: impl FnOnce() -> Result<(), String>,
+    remove_support_state: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let ownership = DaemonRemountCoordinatorLock::try_acquire(state_root).map_err(|error| {
+        format!("Could not acquire reset/remount coordinator ownership: {error}")
+    })?;
+    stop_daemon()?;
+    reset_projection()?;
+    remove_support_state()?;
+    ownership
+        .reset_locality_state_storage()
+        .map(|_| ())
+        .map_err(|error| error.message().to_string())
 }
 
 fn prepare_locality_uninstall_at(state_root: &Path) -> Result<(), String> {
@@ -6131,17 +6147,19 @@ fn prepare_locality_uninstall_at(state_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn stop_daemon_for_reset(state_root: &Path) {
-    if let Err(error) = run_daemon_control(&daemon_control_args_any_manager("stop", state_root)) {
-        desktop_log(
-            "warn",
-            "reset.stop_localityd_failed",
+fn stop_daemon_for_reset(state_root: &Path) -> Result<(), String> {
+    let report = run_daemon_control(&daemon_control_args_any_manager("stop", state_root)).map_err(
+        |error| {
             format!(
-                "could not stop localityd during local state reset: {}",
+                "Could not stop localityd during local state reset: {}",
                 error.message()
-            ),
-        );
+            )
+        },
+    )?;
+    if report.state != DaemonRunState::Stopped {
+        return Err("Could not confirm localityd shutdown during local state reset.".to_string());
     }
+    Ok(())
 }
 
 fn reset_platform_projection_state(state_root: &Path) -> Result<(), String> {
@@ -7876,7 +7894,28 @@ impl QuiescedWorkspaceRemountRuntime for DesktopQuiescedRemountRuntime<'_> {
     }
 
     fn ensure_running(&mut self) -> Result<(), String> {
-        ensure_daemon_running_locked(self.state_root)
+        let ownership = self.remount_ownership.as_ref().ok_or_else(|| {
+            "Desktop remount ownership is missing during daemon restart".to_string()
+        })?;
+        let daemon_state = ownership.daemon_state();
+        if !daemon_state.was_ready {
+            return Ok(());
+        }
+        let manager = daemon_state.manager.ok_or_else(|| {
+            "Desktop remount recovery is missing the live daemon manager".to_string()
+        })?;
+        restart_daemon_after_remount(
+            self.state_root,
+            manager,
+            bundled_localityd_binary().as_deref(),
+            ownership,
+        )
+        .map_err(|error| {
+            format!(
+                "Could not restart localityd after remount: {}",
+                error.message()
+            )
+        })
     }
 
     fn reactivate_after_failed_commit(&mut self) -> Result<(), String> {
@@ -7889,17 +7928,36 @@ fn persist_daemon_remount_fence(
     mount_id: &MountId,
 ) -> Result<WorkspaceRemountOwnership, String> {
     let paths = DaemonProcessPaths::new(state_root.to_path_buf());
-    WorkspaceRemountOwnership::begin_capturing_supervision(
+    WorkspaceRemountOwnership::begin_capturing_daemon_state(
         state_root,
         mount_id,
         "desktop",
         &activity_timestamp(),
         || {
-            daemon_manager_supervision_enabled(&paths).map_err(|error| {
-                format!(
-                    "Could not inspect localityd's process manager before remount: {}",
-                    error.message()
-                )
+            let daemon_was_ready = daemon_is_ready(state_root);
+            let daemon_manager = if daemon_was_ready {
+                let manager = paths.detected_manager();
+                if manager == DaemonManager::Unknown {
+                    return Err(
+                        "Could not determine whether the live daemon uses session or launchd"
+                            .to_string(),
+                    );
+                }
+                Some(manager)
+            } else {
+                None
+            };
+            let supervision_was_enabled =
+                daemon_manager_supervision_enabled(&paths).map_err(|error| {
+                    format!(
+                        "Could not inspect localityd's process manager before remount: {}",
+                        error.message()
+                    )
+                })?;
+            Ok(WorkspaceRemountDaemonState {
+                was_ready: daemon_was_ready,
+                manager: daemon_manager,
+                supervision_was_enabled,
             })
         },
     )
@@ -7933,6 +7991,25 @@ fn restore_supervision_before_clearing_remount_fence(
     ownership: &mut WorkspaceRemountOwnership,
     restore: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
+    restore_readiness_and_supervision_before_clearing_remount_fence(
+        ownership,
+        |_, _| Ok(()),
+        restore,
+    )
+}
+
+fn restore_readiness_and_supervision_before_clearing_remount_fence(
+    ownership: &mut WorkspaceRemountOwnership,
+    restart: impl FnOnce(&WorkspaceRemountOwnership, DaemonManager) -> Result<(), String>,
+    restore: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let daemon_state = ownership.daemon_state();
+    if daemon_state.was_ready {
+        let manager = daemon_state.manager.ok_or_else(|| {
+            "Persisted Desktop remount recovery is missing its exact daemon manager".to_string()
+        })?;
+        restart(ownership, manager)?;
+    }
     restore()?;
     remove_daemon_remount_fence(ownership)
 }
@@ -12051,15 +12128,33 @@ fn reconcile_desktop_remount_recovery(state_root: &Path) -> Result<(), String> {
         return Ok(());
     }
     let paths = DaemonProcessPaths::new(state_root.to_path_buf());
-    let supervision_was_enabled = ownership.supervision_was_enabled();
-    restore_supervision_before_clearing_remount_fence(&mut ownership, || {
-        restore_daemon_manager_supervision(&paths, supervision_was_enabled).map_err(|error| {
-            format!(
-                "Could not restore daemon supervision after remount recovery: {}",
-                error.message()
+    let daemon_state = ownership.daemon_state();
+    restore_readiness_and_supervision_before_clearing_remount_fence(
+        &mut ownership,
+        |ownership, manager| {
+            restart_daemon_after_remount(
+                state_root,
+                manager,
+                bundled_localityd_binary().as_deref(),
+                ownership,
             )
-        })
-    })
+            .map_err(|error| {
+                format!(
+                    "Could not restore exact-manager daemon readiness after remount recovery: {}",
+                    error.message()
+                )
+            })
+        },
+        || {
+            restore_daemon_manager_supervision(&paths, daemon_state.supervision_was_enabled)
+                .map_err(|error| {
+                    format!(
+                        "Could not restore daemon supervision after remount recovery: {}",
+                        error.message()
+                    )
+                })
+        },
+    )
 }
 
 fn load_workspace_remount_recoveries(
@@ -13897,6 +13992,7 @@ fn env_first(keys: &[&str]) -> Option<String> {
 mod tests {
     use super::LiveModeRemoteDriftMerge;
 
+    use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::io::Write;
@@ -17584,6 +17680,90 @@ mod tests {
     }
 
     #[test]
+    fn desktop_recovery_policy_restore_failure_keeps_exact_manager_fence() {
+        let temp = TestTempDir::new("desktop-recovery-disabled-policy-failure");
+        let mount_id = MountId::new("notion-main");
+        let owner = loc_cli::mount::WorkspaceRemountOwnership::begin_capturing_daemon_state(
+            temp.path(),
+            &mount_id,
+            "desktop",
+            "1",
+            || {
+                Ok(loc_cli::mount::WorkspaceRemountDaemonState {
+                    was_ready: true,
+                    manager: Some(locality_platform::DaemonManager::Launchd),
+                    supervision_was_enabled: Some(false),
+                })
+            },
+        )
+        .expect("persist exact daemon state");
+        drop(owner);
+        let mut ownership = loc_cli::mount::WorkspaceRemountOwnership::recover(temp.path())
+            .expect("recover fence ownership");
+        let events = std::cell::RefCell::new(Vec::new());
+
+        let error = super::restore_readiness_and_supervision_before_clearing_remount_fence(
+            &mut ownership,
+            |_, manager| {
+                events.borrow_mut().push("restart");
+                assert_eq!(manager, locality_platform::DaemonManager::Launchd);
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("restore_disabled_policy");
+                Err("injected launchd disable failure".to_string())
+            },
+        )
+        .expect_err("policy failure must preserve recovery state");
+
+        assert_eq!(error, "injected launchd disable failure");
+        assert_eq!(
+            events.into_inner(),
+            vec!["restart", "restore_disabled_policy"]
+        );
+        assert!(locality_platform::daemon_remount_fence_path(temp.path()).exists());
+        drop(ownership);
+    }
+
+    #[test]
+    fn desktop_recovery_crash_during_exact_manager_restart_keeps_fence() {
+        let temp = TestTempDir::new("desktop-recovery-restart-crash");
+        let mount_id = MountId::new("notion-main");
+        let owner = loc_cli::mount::WorkspaceRemountOwnership::begin_capturing_daemon_state(
+            temp.path(),
+            &mount_id,
+            "desktop",
+            "1",
+            || {
+                Ok(loc_cli::mount::WorkspaceRemountDaemonState {
+                    was_ready: true,
+                    manager: Some(locality_platform::DaemonManager::Session),
+                    supervision_was_enabled: None,
+                })
+            },
+        )
+        .expect("persist exact daemon state");
+        drop(owner);
+        let mut ownership = loc_cli::mount::WorkspaceRemountOwnership::recover(temp.path())
+            .expect("recover fence ownership");
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = super::restore_readiness_and_supervision_before_clearing_remount_fence(
+                &mut ownership,
+                |_, manager| {
+                    assert_eq!(manager, locality_platform::DaemonManager::Session);
+                    panic!("injected restart crash")
+                },
+                || panic!("policy restore must not run before readiness"),
+            );
+        }));
+
+        assert!(crashed.is_err());
+        assert!(locality_platform::daemon_remount_fence_path(temp.path()).exists());
+        drop(ownership);
+    }
+
+    #[test]
     fn drain_failure_crash_before_supervision_restore_keeps_persisted_fence() {
         let temp = TestTempDir::new("drain-failure-supervision-crash");
         let mount_id = MountId::new("notion-main");
@@ -20277,6 +20457,84 @@ mod tests {
     }
 
     #[test]
+    fn active_remount_causes_zero_desktop_reset_step_mutation() {
+        let temp = TestTempDir::new("desktop-reset-active-remount");
+        let state_root = temp.path().join("state");
+        fs::create_dir_all(&state_root).expect("create state root");
+        let sentinel = state_root.join("state.sqlite3");
+        fs::write(&sentinel, b"preserve").expect("write sentinel");
+        let mut remount = loc_cli::mount::WorkspaceRemountOwnership::begin(
+            &state_root,
+            &MountId::new("notion-main"),
+            "cli",
+            "1",
+        )
+        .expect("hold active remount");
+        let stop_calls = Cell::new(0);
+        let projection_calls = Cell::new(0);
+        let support_calls = Cell::new(0);
+
+        let error = super::reset_locality_state_with_steps(
+            &state_root,
+            || {
+                stop_calls.set(stop_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                projection_calls.set(projection_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                support_calls.set(support_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("active remount must reject reset");
+
+        assert!(error.contains("another Locality coordinator"));
+        assert_eq!(
+            (
+                stop_calls.get(),
+                projection_calls.get(),
+                support_calls.get()
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(fs::read(&sentinel).expect("read sentinel"), b"preserve");
+        remount.clear().expect("clear remount fence");
+    }
+
+    #[test]
+    fn failed_daemon_stop_prevents_all_desktop_reset_mutation() {
+        let temp = TestTempDir::new("desktop-reset-stop-failure");
+        let state_root = temp.path().join("state");
+        fs::create_dir_all(&state_root).expect("create state root");
+        let sentinel = state_root.join("state.sqlite3");
+        fs::write(&sentinel, b"preserve").expect("write sentinel");
+        let projection_called = Cell::new(false);
+        let support_called = Cell::new(false);
+
+        let error = super::reset_locality_state_with_steps(
+            &state_root,
+            || Err("daemon is still responding".to_string()),
+            || {
+                projection_called.set(true);
+                Ok(())
+            },
+            || {
+                support_called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("failed daemon stop must abort reset");
+
+        assert_eq!(error, "daemon is still responding");
+        assert!(!projection_called.get());
+        assert!(!support_called.get());
+        assert_eq!(fs::read(&sentinel).expect("read sentinel"), b"preserve");
+    }
+
+    #[test]
     fn state_clear_removes_metadata_but_preserves_state_root() {
         let temp = TestTempDir::new("clear-state-root");
         let state_root = temp.path().join(".loc");
@@ -20286,12 +20544,29 @@ mod tests {
         clear_state_root_contents(&state_root).expect("clear state");
 
         assert!(state_root.exists());
-        assert!(
-            fs::read_dir(&state_root)
-                .expect("read state root")
-                .next()
-                .is_none()
-        );
+        let entries = fs::read_dir(&state_root)
+            .expect("read state root")
+            .map(|entry| entry.expect("state entry").path())
+            .collect::<Vec<_>>();
+        let lock_path = locality_platform::daemon_remount_lock_path(&state_root);
+        assert_eq!(entries, vec![lock_path.clone()]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let lock_inode = fs::metadata(&lock_path).expect("lock metadata").ino();
+            let ownership =
+                locality_platform::DaemonRemountCoordinatorLock::try_acquire(&state_root)
+                    .expect("reacquire preserved lock inode");
+            assert_eq!(
+                fs::metadata(&lock_path)
+                    .expect("reused lock metadata")
+                    .ino(),
+                lock_inode
+            );
+            drop(ownership);
+        }
     }
 
     #[cfg(target_os = "windows")]
