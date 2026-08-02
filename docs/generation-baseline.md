@@ -57,6 +57,28 @@ compares every baseline file to its authoritative export record. Mount ID,
 source connection ID, projection ID, logical path, content SHA-256, and byte
 length must all match file-for-file; missing and extra files fail closed.
 
+The generation-2 tar adapter exposes that third value through the opt-in
+`validate_workspace_tar_with_inventory_v2` API and its
+`ValidatedWorkspaceArchiveWithInventoryV2` result. The existing
+`validate_workspace_tar` function and `ValidatedWorkspaceArchive` fields are
+unchanged, so exhaustive patterns and struct literals remain source compatible.
+Callers migrating to baseline seeding call the opt-in function, use
+`validated()` for the prior validation result, and retain `inventory()` as
+baseline authority. `into_parts()` transfers ownership of both values when
+they must outlive the wrapper.
+
+The returned inventory is the canonical `WorkspaceNamespacedInventoryV2`
+planned once from the exact bounded archive members, terminal-control scope
+authority, sealed session layout, and offer that also produce the returned
+materialization plan. The public protocol equivalent is
+`WorkspaceMaterializationPlanWithInventoryV2`; its `plan` method returns both
+values without cloning authorized entries into an intermediate collection.
+Callers must carry this inventory forward; they must not reconstruct baseline
+authority from the materialization plan, filesystem paths, or terminal-control
+counts. The inventory remains host-neutral and excludes writable provider
+preconditions and remote IDs. No inventory is returned when archive, content,
+control, context, or negotiated local-limit validation fails.
+
 `content_version_id` is not present in frozen export-v2 records. The
 authenticated endpoint supplies that authoritative immutable ID. Each
 per-source `target_inventory_sha256` commits the complete ordered tuple
