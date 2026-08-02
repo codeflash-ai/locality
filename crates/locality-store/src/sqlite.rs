@@ -5,7 +5,7 @@
 //! columns, while shadow block arrays and journal plans are stored as JSON blobs
 //! until query needs justify normalization.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,7 +22,9 @@ use locality_core::readable_diff::ReadableDiffOutput;
 use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::shadow::ShadowDocument;
 use locality_protocol::freshness_delivery::{GenerationDelta, MAX_DELIVERY_ID_BYTES};
-use locality_protocol::generation_baseline::GenerationBaselineRefreshModeV1;
+use locality_protocol::generation_baseline::{
+    GenerationBaselineRefreshModeV1, GenerationBaselineSourceV1,
+};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -873,6 +875,7 @@ fn validate_seed_generation(
     let mut projections = BTreeSet::new();
     let mut logical_paths = BTreeSet::new();
     let mut local_paths = BTreeSet::new();
+    let mut inventory = Vec::with_capacity(paths.len());
     for path in paths {
         let logical_path = locality_core::portable::LogicalPath::new(path.logical_path.clone())
             .map_err(|error| StoreError::InvalidState(error.to_string()))?;
@@ -889,20 +892,43 @@ fn validate_seed_generation(
                 "generation path seed does not match its observed generation".to_string(),
             ));
         }
-        if let Some(identity) = &path.base_identity
-            && (identity.projection_id != path.projection_id
-                || identity.logical_path.as_str() != path.logical_path)
+        let Some(identity) = &path.base_identity else {
+            return Err(StoreError::InvalidState(
+                "generation baseline path has no clean base identity".to_string(),
+            ));
+        };
+        if identity.projection_id != path.projection_id
+            || identity.logical_path.as_str() != path.logical_path
         {
             return Err(StoreError::InvalidState(
                 "generation path base identity does not match its row".to_string(),
             ));
         }
-        if path.state == GenerationPathState::Clean && path.local_logical_path != path.logical_path
+        if path.state != GenerationPathState::Clean
+            || path.local_logical_path != path.logical_path
+            || path.incoming_identity.is_some()
+            || path.base_payload_delta_id.is_some()
+            || path.base_payload_entry_index.is_some()
+            || path.conflict_payload_delta_id.is_some()
+            || path.conflict_payload_entry_index.is_some()
         {
             return Err(StoreError::InvalidState(
-                "clean generation path has a different local working path".to_string(),
+                "generation baseline path is not a complete clean base".to_string(),
             ));
         }
+        inventory.push(identity.clone());
+    }
+    inventory.sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
+    let baseline_source = GenerationBaselineSourceV1::new(
+        observed.source_connection_id.clone(),
+        observed.generation_id.clone(),
+        inventory,
+    )
+    .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+    if baseline_source.target_inventory_sha256() != observed.inventory_sha256 {
+        return Err(StoreError::InvalidState(
+            "observed generation inventory does not match its complete path identities".to_string(),
+        ));
     }
     Ok(())
 }
@@ -951,8 +977,22 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         &mut self,
         mut seeds: Vec<GenerationBaselineSeedRecordV2>,
     ) -> StoreResult<()> {
+        let mut mount_layouts = BTreeMap::new();
         for seed in &mut seeds {
             validate_seed_generation(&seed.seed.observed, &seed.seed.paths)?;
+            let layout = (
+                seed.seed.observed.workspace_layout_version,
+                seed.seed.observed.workspace_layout_digest.clone(),
+            );
+            if mount_layouts
+                .insert(seed.seed.observed.mount_id.clone(), layout.clone())
+                .is_some_and(|existing| existing != layout)
+            {
+                return Err(StoreError::InvalidState(format!(
+                    "mount `{}` baseline sources do not share one workspace layout",
+                    seed.seed.observed.mount_id.0
+                )));
+            }
             let expected_mode = generation_seed_refresh_mode(&seed.seed.observed, &seed.seed.paths);
             if seed.refresh_mode != expected_mode {
                 return Err(StoreError::InvalidState(format!(

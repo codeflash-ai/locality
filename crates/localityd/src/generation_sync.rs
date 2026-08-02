@@ -3461,6 +3461,9 @@ mod tests {
 
     fn seed(fixture: &Fixture, paths: Vec<GenerationFileIdentity>) -> SqliteStateStore {
         let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+        let mut canonical_inventory = paths.clone();
+        canonical_inventory.sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
+        let inventory_sha256 = canonical_target_inventory_sha256(&canonical_inventory).unwrap();
         store
             .save_mount(MountConfig::new(
                 fixture.mount_id.clone(),
@@ -3474,7 +3477,7 @@ mod tests {
                     mount_id: fixture.mount_id.clone(),
                     source_connection_id: SourceConnectionId::new("source-main"),
                     generation_id: SourceGenerationId::new("generation-1").unwrap(),
-                    inventory_sha256: sha256_label(b"base-inventory"),
+                    inventory_sha256,
                     workspace_layout_version: 1,
                     workspace_layout_digest: sha256_label(b"layout"),
                     last_receipt_sha256: None,
@@ -6675,7 +6678,7 @@ mod tests {
                     mount_id: other_mount_id.clone(),
                     source_connection_id: SourceConnectionId::new("source-other"),
                     generation_id: SourceGenerationId::new("generation-other").unwrap(),
-                    inventory_sha256: sha256_label(b"other-inventory"),
+                    inventory_sha256: canonical_target_inventory_sha256(&[]).unwrap(),
                     workspace_layout_version: 1,
                     workspace_layout_digest: sha256_label(b"layout"),
                     last_receipt_sha256: None,
@@ -6771,7 +6774,8 @@ mod tests {
                     mount_id: other_mount_id.clone(),
                     source_connection_id: SourceConnectionId::new("source-main"),
                     generation_id: SourceGenerationId::new("generation-1").unwrap(),
-                    inventory_sha256: sha256_label(b"other-inventory"),
+                    inventory_sha256: canonical_target_inventory_sha256(&[other_old.clone()])
+                        .unwrap(),
                     workspace_layout_version: 1,
                     workspace_layout_digest: sha256_label(b"layout"),
                     last_receipt_sha256: None,

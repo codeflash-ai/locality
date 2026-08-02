@@ -89,17 +89,17 @@ fn source_seed(
             incoming_identity: None,
             updated_at: "2026-07-31T11:00:00Z".to_string(),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let inventory = paths
+        .iter()
+        .map(|path| path.base_identity.clone().unwrap())
+        .collect::<Vec<_>>();
     GenerationBaselineSeedRecord::new(
         ObservedGenerationRecord {
             mount_id: mount_id.clone(),
             source_connection_id: SourceConnectionId::new(source),
             generation_id: generation(generation_id),
-            inventory_sha256: digest(match source {
-                "source-a" => 'a',
-                "source-b" => 'b',
-                _ => 'e',
-            }),
+            inventory_sha256: canonical_target_inventory_sha256(&inventory).unwrap(),
             workspace_layout_version: 1,
             workspace_layout_digest: digest('a'),
             last_receipt_sha256: None,
@@ -175,6 +175,7 @@ fn receipt(delta: &GenerationDelta) -> GenerationDeltaTerminalReceipt {
 }
 
 fn seed(store: &mut SqliteStateStore, fixture: &Fixture) {
+    let base_identity = identity("content-1", '1', 3);
     store
         .save_mount(MountConfig::new(
             fixture.mount_id.clone(),
@@ -188,7 +189,8 @@ fn seed(store: &mut SqliteStateStore, fixture: &Fixture) {
                 mount_id: fixture.mount_id.clone(),
                 source_connection_id: SourceConnectionId::new("source-main"),
                 generation_id: generation("generation-1"),
-                inventory_sha256: digest('1'),
+                inventory_sha256: canonical_target_inventory_sha256(&[base_identity.clone()])
+                    .unwrap(),
                 workspace_layout_version: 1,
                 workspace_layout_digest: digest('a'),
                 last_receipt_sha256: None,
@@ -200,7 +202,7 @@ fn seed(store: &mut SqliteStateStore, fixture: &Fixture) {
                 logical_path: "Roadmap.md".to_string(),
                 local_logical_path: "Roadmap.md".to_string(),
                 base_generation_id: generation("generation-1"),
-                base_identity: Some(identity("content-1", '1', 3)),
+                base_identity: Some(base_identity),
                 base_payload_delta_id: None,
                 base_payload_entry_index: None,
                 conflict_payload_delta_id: None,
@@ -224,23 +226,23 @@ fn observed_generation_seed_exact_replay_is_path_order_independent() {
             &fixture.mount_root,
         ))
         .unwrap();
-    let observed = ObservedGenerationRecord {
-        mount_id: fixture.mount_id.clone(),
-        source_connection_id: SourceConnectionId::new("source-main"),
-        generation_id: generation("generation-1"),
-        inventory_sha256: digest('1'),
-        workspace_layout_version: 1,
-        workspace_layout_digest: digest('a'),
-        last_receipt_sha256: None,
-        updated_at: "2026-07-31T11:00:00Z".to_string(),
-    };
     let path = |projection: &str, logical_path: &str| GenerationPathRecord {
         mount_id: fixture.mount_id.clone(),
         projection_id: ProjectionId::new(projection),
         logical_path: logical_path.to_string(),
         local_logical_path: logical_path.to_string(),
         base_generation_id: generation("generation-1"),
-        base_identity: None,
+        base_identity: Some(identity_for(
+            projection,
+            logical_path,
+            &format!("content-{projection}"),
+            if projection == "projection-a" {
+                'a'
+            } else {
+                'b'
+            },
+            1,
+        )),
         base_payload_delta_id: None,
         base_payload_entry_index: None,
         conflict_payload_delta_id: None,
@@ -252,6 +254,20 @@ fn observed_generation_seed_exact_replay_is_path_order_independent() {
     let first = path("projection-a", "A.md");
     let second = path("projection-b", "B.md");
     let expected = vec![first.clone(), second.clone()];
+    let inventory = expected
+        .iter()
+        .map(|path| path.base_identity.clone().unwrap())
+        .collect::<Vec<_>>();
+    let observed = ObservedGenerationRecord {
+        mount_id: fixture.mount_id.clone(),
+        source_connection_id: SourceConnectionId::new("source-main"),
+        generation_id: generation("generation-1"),
+        inventory_sha256: canonical_target_inventory_sha256(&inventory).unwrap(),
+        workspace_layout_version: 1,
+        workspace_layout_digest: digest('a'),
+        last_receipt_sha256: None,
+        updated_at: "2026-07-31T11:00:00Z".to_string(),
+    };
 
     store
         .seed_observed_generation(observed.clone(), expected.clone())
@@ -263,6 +279,89 @@ fn observed_generation_seed_exact_replay_is_path_order_independent() {
     assert_eq!(
         store.list_generation_paths(&fixture.mount_id).unwrap(),
         expected
+    );
+}
+
+#[test]
+fn baseline_seed_rejects_incomplete_or_mismatched_inventory_before_commit() {
+    let fixture = Fixture::new("baseline-inventory-validation");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+
+    let valid = source_seed(
+        &fixture.mount_id,
+        "source-a",
+        "generation-a1",
+        Some(identity_for("projection-a", "A.md", "content-a1", 'a', 1)),
+    );
+    let mut mismatched_digest = valid.clone();
+    mismatched_digest.observed.inventory_sha256 = digest('f');
+    assert!(
+        store
+            .seed_observed_generations(vec![mismatched_digest])
+            .is_err()
+    );
+
+    let mut missing_identity = valid.clone();
+    missing_identity.paths[0].base_identity = None;
+    assert!(
+        store
+            .seed_observed_generations(vec![missing_identity])
+            .is_err()
+    );
+
+    let mut dirty_path = valid;
+    dirty_path.paths[0].state = GenerationPathState::Dirty;
+    assert!(store.seed_observed_generations(vec![dirty_path]).is_err());
+    assert!(
+        store
+            .list_observed_generations(&fixture.mount_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn shared_mount_baseline_rejects_mixed_layouts_atomically() {
+    let fixture = Fixture::new("baseline-shared-layout-validation");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    let source_a = source_seed(
+        &fixture.mount_id,
+        "source-a",
+        "generation-a1",
+        Some(identity_for("projection-a", "A.md", "content-a1", 'a', 1)),
+    );
+    let mut source_b = source_seed(
+        &fixture.mount_id,
+        "source-b",
+        "generation-b1",
+        Some(identity_for("projection-b", "B.md", "content-b1", 'b', 1)),
+    );
+    source_b.observed.workspace_layout_digest = digest('b');
+
+    assert!(
+        store
+            .seed_observed_generations(vec![source_a, source_b])
+            .is_err()
+    );
+    assert!(
+        store
+            .list_observed_generations(&fixture.mount_id)
+            .unwrap()
+            .is_empty()
     );
 }
 
