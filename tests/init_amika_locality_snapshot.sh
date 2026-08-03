@@ -110,6 +110,7 @@ assert_contains "$fake_log" "--bootstrap-token-stdin"
 assert_contains "$fake_log" "/home/amika/scenario-prompt.md"
 assert_contains "$fake_log" "setup-codex-azure.sh"
 assert_contains "$fake_log" "codex exec"
+assert_contains "$fake_log" '< /dev/null'
 assert_contains "$fake_log" "test-model medium /home/amika/locality-snapshot"
 assert_contains "$fake_log" "cat /home/amika/final_report.md"
 if grep -F -q -- "$bootstrap_token" "$fake_log"; then

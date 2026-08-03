@@ -301,7 +301,7 @@ amika_ssh_secret_line "$SANDBOX_NAME" "$AZURE_OPENAI_API_KEY" -- sh -c '
     --disable hooks \
     -C /home/amika/workspace/locality \
     --add-dir "$snapshot_root" \
-    "$prompt" > /home/amika/scenario-codex.jsonl
+    "$prompt" < /dev/null > /home/amika/scenario-codex.jsonl
   unset azure_api_key
   test -s /home/amika/final_report.md || {
     printf "scenario did not create /home/amika/final_report.md\n" >&2
