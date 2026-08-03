@@ -224,6 +224,7 @@ struct DesktopSnapshot {
     active_mount_id: Option<String>,
     live_mode: MountLiveModeSummary,
     needs_onboarding: bool,
+    onboarding_completed: bool,
     settings: DesktopSettings,
     pending_changes: Vec<PendingChange>,
     recent_files: Vec<LocatedItem>,
@@ -293,6 +294,8 @@ struct ProviderRuntimeSummary {
 struct DesktopSettings {
     launch_at_login: bool,
     show_menu_bar: bool,
+    #[serde(default)]
+    onboarding_completed: bool,
 }
 
 impl Default for DesktopSettings {
@@ -300,6 +303,7 @@ impl Default for DesktopSettings {
         Self {
             launch_at_login: true,
             show_menu_bar: true,
+            onboarding_completed: false,
         }
     }
 }
@@ -738,6 +742,21 @@ async fn desktop_snapshot(app: AppHandle) -> DesktopSnapshot {
     };
     refresh_tray_icon_for_snapshot(&app, &snapshot);
     snapshot
+}
+
+#[tauri::command]
+async fn complete_onboarding(app: AppHandle) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(set_onboarding_completed)
+        .await
+        .map_err(|error| format!("Onboarding completion worker failed: {error}"))
+        .and_then(|result| result)
+    {
+        Ok(report) => {
+            refresh_desktop_surfaces(&app);
+            report
+        }
+        Err(message) => ActionReport { ok: false, message },
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -4186,6 +4205,7 @@ fn load_desktop_snapshot_from_store(
     let mount = choose_mount(&mounts, &connections);
     let connection = choose_connection(&connections, mount.as_ref());
     let needs_onboarding = desktop_needs_onboarding(connection.as_ref(), mount.as_ref());
+    let settings = desktop_settings();
     let pending_changes = match mount.as_ref() {
         Some(mount) => pending_changes_for_mount(store, state_root, &mount.mount_id)?,
         None => Vec::new(),
@@ -4251,7 +4271,8 @@ fn load_desktop_snapshot_from_store(
         active_mount_id: mount.as_ref().map(|mount| mount.mount_id.0.clone()),
         live_mode,
         needs_onboarding,
-        settings: desktop_settings(),
+        onboarding_completed: settings.onboarding_completed,
+        settings,
         pending_changes,
         recent_files,
         activity: activity_from_journals(&journals, store, state_root),
@@ -4265,6 +4286,7 @@ fn load_desktop_snapshot_from_store(
 
 fn degraded_snapshot(message: String) -> DesktopSnapshot {
     let state_root = default_state_root();
+    let settings = desktop_settings();
     DesktopSnapshot {
         health: AppHealth {
             state: "runtime_stopped".to_string(),
@@ -4305,7 +4327,8 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
         active_mount_id: None,
         live_mode: MountLiveModeSummary::off(),
         needs_onboarding: false,
-        settings: desktop_settings(),
+        onboarding_completed: settings.onboarding_completed,
+        settings,
         pending_changes: Vec::new(),
         recent_files: Vec::new(),
         activity: vec![ActivityItem {
@@ -5862,6 +5885,7 @@ fn desktop_settings() -> DesktopSettings {
     DesktopSettings {
         launch_at_login: cached_launch_at_login_enabled(persisted.launch_at_login),
         show_menu_bar: persisted.show_menu_bar,
+        onboarding_completed: persisted.onboarding_completed,
     }
 }
 
@@ -5923,6 +5947,17 @@ fn save_desktop_settings(settings: &DesktopSettings) -> Result<(), String> {
     let contents = serde_json::to_string_pretty(settings)
         .map_err(|error| format!("Could not serialize desktop settings: {error}"))?;
     fs::write(&path, contents).map_err(|error| format!("Could not write desktop settings: {error}"))
+}
+
+fn set_onboarding_completed() -> Result<ActionReport, String> {
+    let mut settings = load_desktop_settings().unwrap_or_default();
+    settings.onboarding_completed = true;
+    save_desktop_settings(&settings)?;
+
+    Ok(ActionReport {
+        ok: true,
+        message: "Onboarding marked complete.".to_string(),
+    })
 }
 
 fn set_menu_bar_visible(app: &AppHandle, visible: bool) -> Result<ActionReport, String> {
@@ -6198,6 +6233,7 @@ fn remove_desktop_support_state() -> Result<(), String> {
             home.join("Library/Caches/ai.codeflash.locality"),
             home.join("Library/HTTPStorages/ai.codeflash.locality"),
             home.join("Library/Saved Application State/ai.codeflash.locality.savedState"),
+            home.join("Library/WebKit/ai.codeflash.locality"),
         ] {
             remove_path_if_exists(&path)?;
         }
@@ -21110,9 +21146,11 @@ fn sample_snapshot() -> DesktopSnapshot {
         active_mount_id: Some("notion-main".to_string()),
         live_mode: MountLiveModeSummary::from_record(None, &sample_pending_changes()),
         needs_onboarding: false,
+        onboarding_completed: false,
         settings: DesktopSettings {
             launch_at_login: true,
             show_menu_bar: true,
+            onboarding_completed: false,
         },
         pending_changes: sample_pending_changes(),
         recent_files: vec![LocatedItem {
@@ -21856,6 +21894,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             desktop_snapshot,
+            complete_onboarding,
             debug_notion_queue_status,
             connect_notion,
             connect_notion_without_browser,

@@ -4,9 +4,22 @@ import { describe, expect, it } from "vitest";
 
 const styles = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
 
+function styleIndex(pattern, label) {
+  const match = pattern.exec(styles);
+  expect(match, `missing ${label}`).not.toBeNull();
+  return match?.index ?? -1;
+}
+
+function lastStyleIndex(pattern, label) {
+  const matches = [...styles.matchAll(pattern)];
+  expect(matches.length, `missing ${label}`).toBeGreaterThan(0);
+  return matches.at(-1)?.index ?? -1;
+}
+
 describe("onboarding layout styles", () => {
-  it("keeps the onboarding window chrome fixed while the content scrolls", () => {
+  it("keeps the onboarding window chrome and progress rail fixed while the content scrolls", () => {
     expect(styles).toMatch(/\.setup-window\s*\{\s*display:\s*grid;\s*grid-template-rows:\s*auto minmax\(0, 1fr\);\s*\}/s);
+    expect(styles).toMatch(/\.onboarding-window\s*\{[\s\S]*?grid-template-rows:\s*auto auto minmax\(0, 1fr\);/s);
     expect(styles).toMatch(
       /\.setup-window > \.setup-scrollport\s*\{\s*min-height:\s*0;\s*overflow-y:\s*auto;\s*overflow-x:\s*hidden;\s*overscroll-behavior:\s*contain;\s*scrollbar-gutter:\s*stable;\s*\}/s,
     );
@@ -20,9 +33,12 @@ describe("onboarding layout styles", () => {
     expect(styles).toMatch(/\.agent-demo-command\s*\{[\s\S]*?overflow-wrap:\s*anywhere;/s);
   });
 
-  it("keeps the onboarding demo video in a stable native-looking frame", () => {
+  it("keeps the onboarding video and editor mock in stable native-looking frames", () => {
     expect(styles).toMatch(/\.onboarding-video-demo\s*\{[\s\S]*?aspect-ratio:\s*143 \/ 90;/s);
     expect(styles).toMatch(/\.onboarding-video-demo video\s*\{[\s\S]*?object-fit:\s*cover;/s);
+    expect(styles).toMatch(/\.onboarding-editor-demo\s*\{[\s\S]*?min-height:\s*440px;/s);
+    expect(styles).toMatch(/\.editor-demo-body\s*\{[\s\S]*?grid-template-columns:\s*140px minmax\(0, 1fr\);/s);
+    expect(styles).toMatch(/\.editor-demo-document pre\s*\{[\s\S]*?white-space:\s*pre-wrap;/s);
   });
 
   it("keeps the first onboarding screen from overlapping at the native default width", () => {
@@ -44,5 +60,33 @@ describe("onboarding layout styles", () => {
       /\.setup-content\.split-setup \.setup-copy h1,\s*\.setup-content\.split-setup \.setup-copy p\s*\{[\s\S]*?max-width:\s*100%;/s,
     );
     expect(styles).toMatch(/\.onboarding-pill-row\s*\{[\s\S]*?flex-wrap:\s*wrap;/s);
+    expect(styles).toMatch(/\.onboarding-source-list \.connector-option\s*\{[\s\S]*?min-height:\s*76px;/s);
+    expect(styles).toMatch(/\.onboarding-source-list \.connector-option small\s*\{[\s\S]*?line-height:\s*1\.3;/s);
+  });
+
+  it("stacks onboarding content cleanly on narrow desktop windows", () => {
+    expect(styles).toMatch(
+      /@media \(max-width:\s*900px\)\s*\{[\s\S]*?\.setup-content\.split-setup\s*\{[\s\S]*?grid-template-columns:\s*1fr;[\s\S]*?padding:\s*44px 40px 52px;/s,
+    );
+    expect(styles).toMatch(
+      /@media \(max-width:\s*900px\)\s*\{[\s\S]*?\.setup-side\s*\{[\s\S]*?max-width:\s*560px;/s,
+    );
+    expect(styles).toMatch(
+      /@media \(max-width:\s*900px\)\s*\{[\s\S]*?\.onboarding-editor-demo\s*\{[\s\S]*?min-height:\s*360px;/s,
+    );
+  });
+
+  it("keeps narrow desktop editor overrides after the base editor rules", () => {
+    const baseEditorFrameIndex = styleIndex(/\.onboarding-editor-demo\s*\{[\s\S]*?min-height:\s*440px;/, "base editor frame");
+    const baseEditorBodyIndex = styleIndex(/\.editor-demo-body\s*\{[\s\S]*?min-height:\s*398px;/, "base editor body");
+    const baseEditorDocumentIndex = styleIndex(/\.editor-demo-document\s*\{[\s\S]*?padding:\s*28px 28px 24px;/, "base editor document");
+    const narrowEditorIndex = lastStyleIndex(
+      /@media \(max-width:\s*900px\)\s*\{[\s\S]*?\.onboarding-editor-demo\s*\{[\s\S]*?min-height:\s*360px;[\s\S]*?\.editor-demo-body\s*\{[\s\S]*?min-height:\s*318px;[\s\S]*?\.editor-demo-document\s*\{[\s\S]*?padding:\s*22px;/g,
+      "narrow editor override",
+    );
+
+    expect(narrowEditorIndex).toBeGreaterThan(baseEditorFrameIndex);
+    expect(narrowEditorIndex).toBeGreaterThan(baseEditorBodyIndex);
+    expect(narrowEditorIndex).toBeGreaterThan(baseEditorDocumentIndex);
   });
 });

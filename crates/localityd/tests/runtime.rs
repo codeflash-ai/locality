@@ -1447,14 +1447,15 @@ fn runtime_prime_virtual_mounts_queues_root_and_mount_point_refreshes() {
         .prime_virtual_mounts()
         .expect("prime virtual mounts");
 
-    let mut refreshes = vec![
-        refresh_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("first refresh"),
-        refresh_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("second refresh"),
-    ];
+    let expected_refreshes = BTreeSet::from([
+        (
+            "notion-main".to_string(),
+            ROOT_CONTAINER_IDENTIFIER.to_string(),
+        ),
+        ("notion-main".to_string(), "mount:notion-main".to_string()),
+    ]);
+    let mut refreshes =
+        collect_refreshes_until(&refresh_rx, &expected_refreshes, ASYNC_EVENT_TIMEOUT);
     refreshes.sort();
 
     assert_eq!(

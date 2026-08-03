@@ -2309,6 +2309,7 @@ fn remove_desktop_support_state_for_reset() -> Result<(), String> {
             home.join("Library/Caches/ai.codeflash.locality"),
             home.join("Library/HTTPStorages/ai.codeflash.locality"),
             home.join("Library/Saved Application State/ai.codeflash.locality.savedState"),
+            home.join("Library/WebKit/ai.codeflash.locality"),
         ] {
             remove_path_if_exists(&path)?;
         }

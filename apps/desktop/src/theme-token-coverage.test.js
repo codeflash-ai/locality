@@ -92,6 +92,19 @@ const roleTokens = [
   "--chip-bg",
   "--chip-text",
   "--chip-border",
+  "--onboarding-progress-bg",
+  "--onboarding-ambient-bg",
+  "--onboarding-demo-bg",
+  "--onboarding-demo-panel-bg",
+  "--onboarding-demo-line",
+  "--onboarding-demo-text",
+  "--onboarding-demo-muted",
+  "--onboarding-demo-chip-bg",
+  "--onboarding-demo-active-bg",
+  "--onboarding-demo-active-text",
+  "--onboarding-card-bg",
+  "--onboarding-card-selected-bg",
+  "--onboarding-ready-mark-bg",
 ];
 
 describe("desktop theme tokens", () => {

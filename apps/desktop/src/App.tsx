@@ -62,6 +62,7 @@ import { connectionMissing, connectionReady } from "./connection-state";
 import { copyLoginLinkDisabled, loginLinkFlowMode } from "./onboarding-connect";
 import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
 import { classifyMountSetupError } from "./onboarding-errors";
+import { onboardingProgressSegments, onboardingProgressStep, onboardingStepMeta, type OnboardingStep } from "./onboarding-steps";
 import {
   createFileProviderEnablementPoller,
   fileProviderEnablementHeadline,
@@ -133,7 +134,6 @@ const onboardingDemoVideoUrl = import.meta.env.VITE_LOCALITY_ONBOARDING_DEMO_VID
 
 type AppView = "home" | "files" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
-type OnboardingStep = 1 | 2 | 3 | 4 | 5;
 type OnboardingConnectorId = SourceConnectorId;
 type ReviewFilter = "all" | "approvals" | "problems";
 type FileStatusFilter = "all" | "review" | "conflict" | "synced";
@@ -143,6 +143,7 @@ type SourceListViewMode = "list" | "tiles";
 type AppTheme = "system" | "light" | "dark";
 
 const APP_THEME_STORAGE_KEY = "locality.desktop.theme";
+const ONBOARDING_COMPLETED_STORAGE_KEY = "locality.desktop.onboarding.completed";
 
 type ConnectorOption = {
   id: SourceConnectorId;
@@ -190,6 +191,7 @@ type DesktopSnapshot = {
   activeMountId?: string | null;
   liveMode: MountLiveMode;
   needsOnboarding: boolean;
+  onboardingCompleted: boolean;
   settings: {
     launchAtLogin: boolean;
     showMenuBar: boolean;
@@ -468,6 +470,7 @@ const sampleSnapshot: DesktopSnapshot = {
     coveredCount: 2,
   },
   needsOnboarding: false,
+  onboardingCompleted: false,
   settings: {
     launchAtLogin: true,
     showMenuBar: true,
@@ -862,7 +865,7 @@ function onboardingConnectorPills(connector: OnboardingConnectorId) {
 function onboardingReadyCopy(connector: OnboardingConnectorId) {
   switch (connector) {
     case "notion":
-      return "Your local workspace is ready. Agents can open this folder, edit Markdown, and leave changes for Review Center. Open the app to review changes, manage sync, and turn on Live Mode when you want file saves to update Notion and new Notion changes to appear locally.";
+      return "Your local workspace is ready. Agents can open this folder, edit Markdown, and leave changes for Review Center. Open the app to review changes, manage sync, and enable Live Mode when you're ready for file changes to sync back to Notion.";
     case "google-docs":
       return "Your Google Docs workspace is ready as local files. Agents can edit docs in Markdown and leave changes for Review Center before anything is pushed back.";
     case "google-calendar":
@@ -876,12 +879,6 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
     case "slack":
       return "Your Slack conversations are ready as local read-only files. Agents can search recent accessible channels, private channels, DMs, group DMs, and users with normal file tools.";
   }
-}
-
-function onboardingPromptHint(connector: OnboardingConnectorId) {
-  return connector === "granola" || connector === "slack"
-    ? "Ask an agent to use the mounted read-only files."
-    : "Claude and Codex are now set up to use Locality.";
 }
 
 function sampleAgentGuidanceReport(mountPath: string): AgentGuidanceInstallReport {
@@ -932,11 +929,11 @@ function snapshotNeedsOnboarding(snapshot: DesktopSnapshot) {
   return snapshot.needsOnboarding || connectionMissing(snapshot) || mountMissing(snapshot);
 }
 
-function routeShouldShowOnboarding(route: string, snapshot: DesktopSnapshot) {
+function routeShouldShowOnboarding(route: string, snapshot: DesktopSnapshot, onboardingCompleted: boolean) {
   if (route === "#tray" || routeForcesMainApp(route)) {
     return false;
   }
-  return routeForcesOnboarding(route) || previewRouteStartsOnboarding(route) || snapshotNeedsOnboarding(snapshot);
+  return routeForcesOnboarding(route) || (!onboardingCompleted && (previewRouteStartsOnboarding(route) || snapshotNeedsOnboarding(snapshot)));
 }
 
 async function callCommand<T>(command: string, args?: Record<string, unknown>, fallback?: T) {
@@ -1052,22 +1049,6 @@ function itemMatchesFileStatusFilter(item: LocatedItem, filter: FileStatusFilter
   return item.state === "ready";
 }
 
-function onboardingStepMeta(step: OnboardingStep) {
-  if (step === 2) {
-    return "Optional guide";
-  }
-  if (step === 3) {
-    return "2 of 4";
-  }
-  if (step === 4) {
-    return "3 of 4";
-  }
-  if (step === 5) {
-    return "4 of 4";
-  }
-  return "1 of 4";
-}
-
 function useMountLiveModeController(
   snapshot: DesktopSnapshot,
   onRefresh: () => Promise<void>,
@@ -1169,6 +1150,30 @@ function initialAppTheme(): AppTheme {
   }
 }
 
+function readOnboardingCompleted() {
+  try {
+    return window.localStorage.getItem(ONBOARDING_COMPLETED_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function writeOnboardingCompleted() {
+  try {
+    window.localStorage.setItem(ONBOARDING_COMPLETED_STORAGE_KEY, "true");
+  } catch {
+    // The in-memory state still lets the current session leave onboarding.
+  }
+}
+
+function clearOnboardingCompleted() {
+  try {
+    window.localStorage.removeItem(ONBOARDING_COMPLETED_STORAGE_KEY);
+  } catch {
+    // Reset still proceeds; this only affects the next desktop onboarding launch.
+  }
+}
+
 function resolvedAppTheme(theme: AppTheme): "light" | "dark" {
   if (theme !== "system") {
     return theme;
@@ -1185,6 +1190,7 @@ function applyAppTheme(theme: AppTheme) {
 
 export default function App() {
   const initialRoute = window.location.hash;
+  const initialOnboardingCompleted = readOnboardingCompleted();
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>(() =>
     isTauriRuntime() ? loadingSnapshot : sampleSnapshot,
   );
@@ -1193,8 +1199,9 @@ export default function App() {
   const [reviewInitialFilter, setReviewInitialFilter] = useState<ReviewFilter>("all");
   const [theme, setTheme] = useState<AppTheme>(() => initialAppTheme());
   const [route, setRoute] = useState(initialRoute);
+  const [onboardingCompleted, setOnboardingCompleted] = useState(initialOnboardingCompleted);
   const [showOnboarding, setShowOnboarding] = useState(() =>
-    routeForcesOnboarding(initialRoute) || previewRouteStartsOnboarding(initialRoute),
+    routeForcesOnboarding(initialRoute) || (!initialOnboardingCompleted && previewRouteStartsOnboarding(initialRoute)),
   );
   const [onboardingKey, setOnboardingKey] = useState(0);
   const [onboardingInitialStep, setOnboardingInitialStep] = useState<OnboardingStep>(() =>
@@ -1257,6 +1264,8 @@ export default function App() {
     refreshSnapshotPromise.current = promise;
     return promise;
   }
+
+  const effectiveOnboardingCompleted = isTauriRuntime() ? snapshot.onboardingCompleted : onboardingCompleted;
 
   async function checkForAppUpdate(options: AppUpdateCheckOptions = {}) {
     if (updateOperationRef.current) {
@@ -1541,7 +1550,7 @@ export default function App() {
       return;
     }
 
-    if (routeShouldShowOnboarding(route, snapshot)) {
+    if (routeShouldShowOnboarding(route, snapshot, effectiveOnboardingCompleted)) {
       setOnboardingInitialStep(1);
       setShowOnboarding(true);
       return;
@@ -1554,6 +1563,7 @@ export default function App() {
     setShowOnboarding(false);
   }, [
     route,
+    effectiveOnboardingCompleted,
     snapshot.connection.status,
     snapshot.mount.status,
     snapshot.needsOnboarding,
@@ -1616,7 +1626,7 @@ export default function App() {
   }
 
   const shouldRenderOnboarding =
-    showOnboarding || (snapshotLoaded && routeShouldShowOnboarding(route, snapshot));
+    showOnboarding || (snapshotLoaded && routeShouldShowOnboarding(route, snapshot, effectiveOnboardingCompleted));
 
   if (shouldRenderOnboarding) {
     return (
@@ -1626,7 +1636,22 @@ export default function App() {
         snapshotLoaded={snapshotLoaded}
         initialStep={onboardingInitialStep}
         onComplete={() => {
-          void refreshSnapshot().catch(() => undefined);
+          writeOnboardingCompleted();
+          setOnboardingCompleted(true);
+          if (isTauriRuntime()) {
+            void callCommand<ActionReport>("complete_onboarding", undefined, {
+              ok: true,
+              message: "Onboarding marked complete.",
+            })
+              .then(() => refreshSnapshot())
+              .catch(() => undefined);
+          } else {
+            void refreshSnapshot().catch(() => undefined);
+          }
+          if (window.location.hash !== "#app") {
+            window.history.replaceState(null, "", "#app");
+            setRoute("#app");
+          }
           setShowOnboarding(false);
           setView("home");
         }}
@@ -1656,6 +1681,8 @@ export default function App() {
       onInstallUpdate={installAppUpdate}
       appStoreDistribution={appStoreDistribution}
       onResetComplete={() => {
+        clearOnboardingCompleted();
+        setOnboardingCompleted(false);
         setOnboardingInitialStep(1);
         setOnboardingKey((key) => key + 1);
         setView("home");
@@ -2402,9 +2429,6 @@ function Onboarding({
   }
 
   const workspaceLabel = connectedWorkspace || snapshot.connection.workspaceName || "Your workspace";
-  const finalPrompt = selectedOnboardingConnector === "notion" && agentGuidanceReport?.prompt
-    ? agentGuidanceReport.prompt
-    : suggestedAgentPrompt(mountPath, selectedOnboardingConnector);
   const mountSetupError =
     mountOnboarding?.state === "failed"
       ? classifyMountSetupError(mountOnboarding.message)
@@ -2413,6 +2437,12 @@ function Onboarding({
   const fileProviderGuideVisible =
     mountOnboarding?.state === "needs_finder_enable" ||
     mountOnboarding?.state === "waiting_for_cloudstorage_root";
+  const localFolderReadyNow =
+    connectionReadyNow &&
+    !connectorSkipsMountStep(selectedOnboardingConnector) &&
+    !mountMissing(snapshot);
+  const canLeaveConnectorStep = !selectedConnectorBusy;
+  const canLeaveMountStep = !mounting && !fileProviderGuideVisible;
   const displayedFileProviderEnablement = fileProviderEnablement ??
     (mountOnboarding?.state === "waiting_for_cloudstorage_root"
       ? {
@@ -2426,28 +2456,54 @@ function Onboarding({
           path: mountPath,
         });
 
+  function goBackFromOnboarding() {
+    if (step === 5) {
+      setStep(connectorSkipsMountStep(selectedOnboardingConnector) ? 3 : 4);
+      return;
+    }
+    if (step === 4) {
+      if (!canLeaveMountStep) {
+        return;
+      }
+      setStep(3);
+      return;
+    }
+    if (step === 3) {
+      if (!canLeaveConnectorStep) {
+        return;
+      }
+      setStep(1);
+    }
+  }
+
+  function skipSourceOnboarding() {
+    if (!canLeaveConnectorStep) {
+      return;
+    }
+    finishOnboarding();
+  }
+
   return (
-    <main className="setup-shell">
-      <section className="setup-window">
-        <WindowChrome title="Locality Setup" meta={onboardingStepMeta(step)} />
+    <OnboardingFrame step={step} optionalGuideReturnStep={optionalGuideReturnStep}>
         {step === 1 && (
           <SetupContent variant="hero" side={<ProductLoopDemo />}>
             <div>
-              <div className="eyebrow">Meet Locality</div>
+              <div className="eyebrow"><span />Meet Locality</div>
               <h1>Turn work apps into agent-ready files.</h1>
               <p>
-                Locality turns tools like Notion into a local folder. Agents edit Markdown you can
-                inspect, while Locality keeps the connected app in sync after review.
+                Locality turns tools like Notion into a local folder. Agents edit
+                Markdown you can inspect, while Locality keeps the connected app
+                in sync after review.
               </p>
             </div>
             <div className="button-row">
-              <PrimaryButton onClick={() => setStep(3)}>Get Started</PrimaryButton>
-              <SecondaryButton onClick={() => openOptionalGuide(1)}>How agents use it</SecondaryButton>
+              <PrimaryButton icon={<ChevronRight />} onClick={() => setStep(3)}>Get Started</PrimaryButton>
+              <SecondaryButton icon={<ChevronRight />} onClick={() => openOptionalGuide(1)}>How agents use it</SecondaryButton>
             </div>
             <div className="onboarding-pill-row">
-              <span>Finder-native files</span>
-              <span>Markdown edits</span>
-              <span>Review before sync</span>
+              <span><FolderOpen />Finder-native files</span>
+              <span><Code2 />Markdown edits</span>
+              <span><Check />Review before sync</span>
             </div>
           </SetupContent>
         )}
@@ -2475,16 +2531,17 @@ function Onboarding({
         )}
 
         {step === 3 && (
-          <SetupContent
-            side={
-              <ConnectorOptions
-                selected={selectedOnboardingConnector}
-                connectedConnector={connectionReadyNow ? selectedOnboardingConnector : null}
-                busy={selectedConnectorBusy}
-                onSelect={selectOnboardingConnector}
-              />
-            }
-          >
+          <>
+            <SetupContent
+              side={
+                <ConnectorOptions
+                  selected={selectedOnboardingConnector}
+                  connectedConnector={connectionReadyNow ? selectedOnboardingConnector : null}
+                  busy={selectedConnectorBusy}
+                  onSelect={selectOnboardingConnector}
+                />
+              }
+            >
             <div>
               <div className="eyebrow">Connect source</div>
               {(selectedConnectorBusy || connectionReadyNow) && (
@@ -2548,8 +2605,11 @@ function Onboarding({
                 />
               </label>
             )}
-            <div className="button-row">
-              <PrimaryButton
+            <div className="button-row onboarding-nav-actions">
+              <SecondaryButton disabled={!canLeaveConnectorStep} onClick={goBackFromOnboarding}>
+                Back
+              </SecondaryButton>
+              <PrimaryButton icon={<ConnectorIcon connector={selectedOnboardingConnector} />}
                 busy={selectedConnectorBusy && !connectionReadyNow}
                 disabled={
                   !connectionReadyNow &&
@@ -2571,7 +2631,7 @@ function Onboarding({
                     : `Connect ${selectedSourceName}`}
               </PrimaryButton>
               {selectedOnboardingConnector === "notion" && (
-                <SecondaryButton
+                <SecondaryButton icon={<Clipboard />}
                   disabled={copyLoginLinkDisabled({
                     connectionReady: connectionReadyNow,
                     oauthInFlight,
@@ -2589,7 +2649,15 @@ function Onboarding({
             </div>
             {loginCopyMessage && <p className="quiet-note inline-note">{loginCopyMessage}</p>}
             {oauthError && <p className="field-error">{oauthError}</p>}
-          </SetupContent>
+            </SetupContent>
+            {!connectionReadyNow && (
+              <div className="onboarding-skip-corner">
+                <SecondaryButton compact disabled={!canLeaveConnectorStep} onClick={skipSourceOnboarding}>
+                  Skip
+                </SecondaryButton>
+              </div>
+            )}
+          </>
         )}
 
         {step === 4 && (
@@ -2658,6 +2726,10 @@ function Onboarding({
                 )}
                 {finderRevealError && <p className="field-error">{finderRevealError}</p>}
               </>
+            ) : localFolderReadyNow ? (
+              <PrimaryButton onClick={() => setStep(5)}>
+                Continue
+              </PrimaryButton>
             ) : showRecoveryChooser ? (
               <div className="button-row">
                 <PrimaryButton
@@ -2680,6 +2752,11 @@ function Onboarding({
                 {mountOnboardingPrimaryLabel(mountOnboarding, mounting)}
               </PrimaryButton>
             )}
+            <div className="button-row onboarding-nav-actions">
+              <SecondaryButton disabled={!canLeaveMountStep} onClick={goBackFromOnboarding}>
+                Back
+              </SecondaryButton>
+            </div>
             {!fileProviderGuideVisible && mountOnboardingNeedsInstructions(mountOnboarding) && (
               <p className="quiet-note">{mountOnboardingInstructions(mountOnboarding)}</p>
             )}
@@ -2694,21 +2771,27 @@ function Onboarding({
         )}
 
         {step === 5 && (
-          <SetupContent mark={<BrandTile variant="ready" />} variant="final">
-            <div>
-              <h1>Locality is ready!</h1>
+          <SetupContent variant="final">
+            <div className="onboarding-ready-copy">
+              <div className="onboarding-ready-mark">
+                <Check />
+              </div>
+              <h1>Locality is ready</h1>
               <p>{onboardingReadyCopy(selectedOnboardingConnector)}</p>
             </div>
             {mountOnboarding && <p className="field-error">{mountOnboarding.message}</p>}
             <div className="final-actions">
+              <SecondaryButton onClick={goBackFromOnboarding}>
+                Back
+              </SecondaryButton>
               <PrimaryButton onClick={finishOnboarding}>
                 Open Locality
               </PrimaryButton>
-              <SecondaryButton onClick={() => openOptionalGuide(5)}>
-                View Optional Guide
+              <SecondaryButton icon={<ChevronRight />} onClick={() => openOptionalGuide(5)}>
+                View optional guide
               </SecondaryButton>
             </div>
-            <div className="folder-inline final-folder-card">
+            <div className="folder-inline final-folder-card onboarding-folder-card">
               <div className="ready-head">
                 <div>
                   <strong>Folder</strong>
@@ -2718,29 +2801,14 @@ function Onboarding({
               </div>
               <div className="path-field ready-path-field">
                 <span>{mountPath}</span>
-                <SecondaryButton onClick={() => void openMountFolder()}>
-                  Open Folder
+                <SecondaryButton compact onClick={() => void openMountFolder()}>
+                  Open page
                 </SecondaryButton>
               </div>
-            </div>
-            <div className="agent-demo compact-agent-demo">
-              <div className="agent-demo-header">
-                <div>
-                  <strong>Try this agent prompt</strong>
-                  <p>{onboardingPromptHint(selectedOnboardingConnector)}</p>
-                </div>
-                <SecondaryButton
-                  onClick={() => copyText(finalPrompt)}
-                >
-                  Copy
-                </SecondaryButton>
-              </div>
-              <div className="agent-demo-command">{finalPrompt}</div>
             </div>
           </SetupContent>
         )}
-      </section>
-    </main>
+    </OnboardingFrame>
   );
 }
 
@@ -3727,18 +3795,14 @@ function MountsView({
       </ViewHeader>
 
       {!hasVisibleSources ? (
-        <section className="empty-action-panel">
+        <section className="empty-action-panel sources-empty-panel">
           <BrandTile variant="folder" />
           <div>
-            <h2>Add a Notion source</h2>
-            <p>Connect a source once, then use its local folder from Files or your editor.</p>
+            <h2>No sources connected yet</h2>
+            <p>Connect a source when you're ready. Locality will create a local folder after the connection is set up.</p>
           </div>
-          <PrimaryButton
-            busy={creating}
-            icon={<FolderOpen />}
-            onClick={openAddSourceDialog}
-          >
-            Add Notion Source
+          <PrimaryButton busy={creating} icon={<Plus />} onClick={openAddSourceDialog}>
+            Add Source
           </PrimaryButton>
         </section>
       ) : (
@@ -6062,6 +6126,7 @@ function SettingsView({
       if (report.ok) {
         setDestructiveAction(null);
         setDestructiveConfirmation("");
+        onResetComplete();
         await callCommand<ActionReport>(
           "quit_completely",
           undefined,
@@ -6546,7 +6611,7 @@ function DestructiveSettingsDialog({
     ? [
         "Your files in the Locality folder are kept.",
         "Your Notion workspace is not changed.",
-        "You will need to reconnect and re-verify the local folder.",
+        "Locality opens onboarding again after cleanup.",
       ]
     : [
         "Your files in the Locality folder are kept.",
@@ -7637,14 +7702,12 @@ function ProductLoopDemo() {
 
   if (onboardingDemoVideoUrl && videoAvailable) {
     return (
-      <div className="onboarding-video-demo">
+      <div className="onboarding-video-demo" aria-label="Locality onboarding video">
         <video
-          aria-label="Locality product demo"
           autoPlay
           loop
           muted
           playsInline
-          preload="auto"
           onError={() => setVideoAvailable(false)}
         >
           <source src={onboardingDemoVideoUrl} type="video/mp4" />
@@ -7654,36 +7717,51 @@ function ProductLoopDemo() {
   }
 
   return (
-    <div className="onboarding-product-demo">
-      <div className="demo-tile-grid">
-        <div className="demo-tile">
-          <div>
-            <strong>Notion</strong>
-            <span>Connected</span>
+    <div className="onboarding-editor-demo" aria-label="Local Markdown preview">
+      <div className="editor-demo-toolbar">
+        <i />
+        <i />
+        <i />
+        <span><Code2 />release-notes.md</span>
+      </div>
+      <div className="editor-demo-body">
+        <div className="editor-demo-sidebar">
+          <small>Workspace</small>
+          <div className="editor-demo-line">
+            <FolderOpen />
+            <span>docs</span>
           </div>
-          <p>Launch Plan</p>
+          <div className="editor-demo-line active">
+            <Code2 />
+            <span>release-notes.md</span>
+          </div>
+          <div className="editor-demo-line">
+            <Code2 />
+            <span>roadmap.md</span>
+          </div>
+          <div className="editor-demo-line">
+            <Code2 />
+            <span>changelog.md</span>
+          </div>
         </div>
-        <div className="demo-tile">
-          <div>
-            <strong>Local Markdown</strong>
-            <span>Editable</span>
-          </div>
-          <code>Locality/notion/Launch Plan/page.md</code>
-        </div>
-        <div className="demo-tile">
-          <div>
-            <strong>Needs review</strong>
-            <span>Safe</span>
-          </div>
-          <p>Edited intro paragraph</p>
-          <p>Updated launch checklist</p>
-        </div>
-        <div className="demo-tile">
-          <div>
-            <strong>Notion</strong>
-            <span>Updated</span>
-          </div>
-          <p>Launch Plan reflects the approved Markdown edits.</p>
+        <div className="editor-demo-document">
+          <pre>{`# Release Notes - v2.4
+
+Synced from Notion - edited locally
+
+## Summary
+
+Added local file sync for connected sources
+and resolved review conflicts on large
+workspaces.
+
+## Changes
+
+- Notion pages now sync as Markdown
+- Review panel highlights agent edits
+- Fixed folder watch performance
+
+Reviewed by Alex - synced 2m ago`}</pre>
         </div>
       </div>
     </div>
@@ -7738,6 +7816,50 @@ loc: notion-page`}</pre>
   );
 }
 
+type OnboardingConnectorCard = {
+  connector: OnboardingConnectorId;
+  title: string;
+  description: string;
+};
+
+const onboardingConnectorCards: OnboardingConnectorCard[] = [
+  {
+    connector: "notion",
+    title: "Notion",
+    description: "Pages, databases, properties, and Markdown edits.",
+  },
+  {
+    connector: "google-docs",
+    title: "Google Docs",
+    description: "Docs and Drive folders through the same local model.",
+  },
+  {
+    connector: "google-calendar",
+    title: "Google Calendar",
+    description: "Primary calendar events and reviewed event drafts.",
+  },
+  {
+    connector: "gmail",
+    title: "Gmail",
+    description: "Inbox and sent mail as local files, drafts after review.",
+  },
+  {
+    connector: "granola",
+    title: "Granola",
+    description: "Meeting summaries and transcripts as read-only files.",
+  },
+  {
+    connector: "linear",
+    title: "Linear",
+    description: "Issues by team with local Markdown edits and review.",
+  },
+  {
+    connector: "slack",
+    title: "Slack",
+    description: "Recent accessible conversations as read-only files.",
+  },
+];
+
 function ConnectorOptions({
   selected,
   connectedConnector,
@@ -7750,98 +7872,66 @@ function ConnectorOptions({
   onSelect: (connector: OnboardingConnectorId) => void;
 }) {
   return (
-    <div className="connector-options">
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "notion" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("notion")}
-      >
-        <ConnectorIcon connector="notion" />
-        <div>
-          <strong>Notion</strong>
-          <small>Pages, databases, properties, and Markdown edits.</small>
-        </div>
-        <span>{connectedConnector === "notion" ? "Connected" : "OAuth"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "google-docs" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("google-docs")}
-      >
-        <ConnectorIcon connector="google-docs" />
-        <div>
-          <strong>Google Docs</strong>
-          <small>Docs and Drive folders through the same local model.</small>
-        </div>
-        <span>{connectedConnector === "google-docs" ? "Connected" : "OAuth"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "google-calendar" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("google-calendar")}
-      >
-        <ConnectorIcon connector="google-calendar" />
-        <div>
-          <strong>Google Calendar</strong>
-          <small>Primary calendar events and reviewed event drafts.</small>
-        </div>
-        <span>{connectedConnector === "google-calendar" ? "Connected" : "OAuth"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "gmail" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("gmail")}
-      >
-        <ConnectorIcon connector="gmail" />
-        <div>
-          <strong>Gmail</strong>
-          <small>Inbox and sent as files, drafts as reviewed outbound mail.</small>
-        </div>
-        <span>{connectedConnector === "gmail" ? "Connected" : "OAuth"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "granola" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("granola")}
-      >
-        <ConnectorIcon connector="granola" />
-        <div>
-          <strong>Granola</strong>
-          <small>Meeting summaries and transcripts as read-only files.</small>
-        </div>
-        <span>{connectedConnector === "granola" ? "Connected" : "API key"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "linear" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("linear")}
-      >
-        <ConnectorIcon connector="linear" />
-        <div>
-          <strong>Linear</strong>
-          <small>Issues and teams as editable Markdown files.</small>
-        </div>
-        <span>{connectedConnector === "linear" ? "Connected" : "API key"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "slack" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("slack")}
-      >
-        <ConnectorIcon connector="slack" />
-        <div>
-          <strong>Slack</strong>
-          <small>Channels, DMs, group DMs, and users as read-only files.</small>
-        </div>
-        <span>{connectedConnector === "slack" ? "Connected" : "OAuth"}</span>
-      </button>
+    <div className="connector-options onboarding-source-list">
+      {onboardingConnectorCards.map((card) => {
+        const connected = connectedConnector === card.connector;
+        return (
+          <button
+            type="button"
+            className={`connector-option available selectable ${selected === card.connector ? "selected" : ""} ${
+              connected ? "connected" : ""
+            }`}
+            disabled={busy}
+            key={card.connector}
+            onClick={() => onSelect(card.connector)}
+          >
+            <ConnectorIcon connector={card.connector} />
+            <div>
+              <strong>{card.title}</strong>
+              <small>{card.description}</small>
+            </div>
+            <span className="connector-card-accessory">
+              {connected ? "Connected" : <ChevronRight />}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function OnboardingFrame({
+  step,
+  optionalGuideReturnStep,
+  children,
+}: {
+  step: OnboardingStep;
+  optionalGuideReturnStep: OnboardingStep | null;
+  children: React.ReactNode;
+}) {
+  const currentStep = onboardingProgressStep(step, optionalGuideReturnStep);
+
+  return (
+    <main className="setup-shell">
+      <section className="setup-window onboarding-window">
+        <WindowChrome title="Locality" meta={onboardingStepMeta(step, optionalGuideReturnStep)} />
+        <OnboardingProgressRail currentStep={currentStep} />
+        {children}
+      </section>
+    </main>
+  );
+}
+
+function OnboardingProgressRail({ currentStep }: { currentStep: 1 | 2 | 3 | 4 }) {
+  return (
+    <div className="setup-progress-rail" aria-label={`Onboarding progress ${currentStep} of 4`}>
+      {onboardingProgressSegments(currentStep).map((segment) => (
+        <span
+          aria-hidden="true"
+          className={segment.state === "complete" ? "complete" : ""}
+          key={segment.step}
+        />
+      ))}
     </div>
   );
 }

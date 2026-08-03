@@ -56,19 +56,42 @@ describe("desktop secondary surface theme contract", () => {
     expect(cssBlock(".sync-note.warning")).toContain("background: var(--status-warn-bg);");
     expect(cssBlock(".sync-note.warning")).toContain("color: var(--status-warn-text);");
     expect(cssBlock(".sync-note svg")).toContain("color: currentColor;");
-    expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.connector-option > span,\n.demo-tile span,\n.review-strip span")).toContain("border: 1px solid var(--chip-border);");
-    expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.connector-option > span,\n.demo-tile span,\n.review-strip span")).toContain("background: var(--chip-bg);");
-    expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.connector-option > span,\n.demo-tile span,\n.review-strip span")).toContain("color: var(--chip-text);");
-    expectCssBlock(".onboarding-product-demo", [
-      "background: var(--code-bg);",
-      "color: var(--ink);",
+    expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.demo-tile span,\n.review-strip span")).toContain("border: 1px solid var(--chip-border);");
+    expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.demo-tile span,\n.review-strip span")).toContain("background: var(--chip-bg);");
+    expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.demo-tile span,\n.review-strip span")).toContain("color: var(--chip-text);");
+    expectCssBlock(".onboarding-editor-demo", [
+      "border: 1px solid var(--onboarding-demo-line);",
+      "background: var(--onboarding-demo-bg);",
+      "color: var(--onboarding-demo-text);",
       "box-shadow: var(--modal-shadow);",
     ]);
     expectCssBlock(".onboarding-video-demo", [
-      "border: 1px solid var(--line);",
-      "background: var(--code-bg);",
+      "border: 1px solid var(--onboarding-demo-line);",
+      "background: var(--onboarding-demo-bg);",
       "box-shadow: var(--modal-shadow);",
     ]);
+    expectCssBlock(".onboarding-video-demo video", [
+      "background: var(--onboarding-demo-bg);",
+    ]);
+    expectCssBlock(".editor-demo-toolbar", [
+      "border-bottom: 1px solid var(--onboarding-demo-line);",
+      "background: var(--onboarding-demo-panel-bg);",
+    ]);
+    expectCssBlock(".editor-demo-toolbar span", [
+      "background: var(--onboarding-demo-chip-bg);",
+      "color: var(--onboarding-demo-muted);",
+    ]);
+    expectCssBlock(".editor-demo-sidebar", [
+      "border-right: 1px solid var(--onboarding-demo-line);",
+      "background: var(--onboarding-demo-panel-bg);",
+    ]);
+    expectCssBlock(".editor-demo-sidebar small", ["color: var(--onboarding-demo-muted);"]);
+    expectCssBlock(".editor-demo-line", ["color: var(--onboarding-demo-muted);"]);
+    expectCssBlock(".editor-demo-line.active", [
+      "background: var(--onboarding-demo-active-bg);",
+      "color: var(--onboarding-demo-active-text);",
+    ]);
+    expectCssBlock(".editor-demo-document pre", ["color: var(--onboarding-demo-text);"]);
     expectCssBlock(".demo-tile", ["border: 1px solid var(--line);", "background: var(--surface-muted);"]);
     expectCssBlock(".demo-tile p,\n.demo-tile code", ["color: var(--muted);"]);
     expectCssBlock(".agent-workspace-demo", ["background: var(--surface);", "box-shadow: var(--surface-shadow);"]);
@@ -76,10 +99,31 @@ describe("desktop secondary surface theme contract", () => {
     expectCssBlock(".path-field", ["background: var(--field-bg);"]);
     expectCssBlock(".agent-demo", ["background: var(--surface-active);"]);
     expectCssBlock(".agent-demo-command", ["background: var(--code-bg);"]);
+    expectCssBlock(".connector-option.available", [
+      "background: var(--onboarding-card-bg);",
+    ]);
     expectCssBlock(".connector-option.selectable:hover:not(:disabled),\n.connector-option.selectable.selected", [
       "border-color: var(--control-border-hover);",
-      "background: var(--control-selected-bg);",
+      "background: var(--onboarding-card-selected-bg);",
       "box-shadow: var(--surface-shadow);",
+    ]);
+    expectCssBlock(".connector-card-accessory", [
+      "background: transparent;",
+      "color: var(--muted);",
+    ]);
+    expectCssBlock(".connector-option.connected .connector-card-accessory", [
+      "border: 1px solid var(--chip-border);",
+      "background: var(--chip-bg);",
+      "color: var(--chip-text);",
+    ]);
+    expectCssBlock(':root[data-theme="dark"] .connector-option.available', [
+      "border-color: var(--line);",
+      "background: var(--onboarding-card-bg);",
+    ]);
+    expectCssBlock(':root[data-theme="dark"] .connector-option.selectable:hover:not(:disabled),\n:root[data-theme="dark"] .connector-option.selectable.selected', [
+      "border-color: var(--control-border-hover);",
+      "background: var(--onboarding-card-selected-bg);",
+      "color: var(--ink);",
     ]);
     expectCssBlock(".agent-guidance-card", [
       "border: 1px solid var(--control-border-hover);",
@@ -106,8 +150,16 @@ describe("desktop secondary surface theme contract", () => {
     expect(cssBlock(".progress-list li.done span,\n.progress-list li.active span")).toContain("color: var(--accent-ink);");
     expect(cssBlock(".progress-list li.active span")).toContain("background: transparent;");
 
-    expectNoRawSurfaceColors(cssBlock(".onboarding-product-demo"));
+    expectNoRawSurfaceColors(cssBlock(".onboarding-editor-demo"));
     expectNoRawSurfaceColors(cssBlock(".onboarding-video-demo"));
+    expectNoRawSurfaceColors(cssBlock(".onboarding-video-demo video"));
+    expectNoRawSurfaceColors(cssBlock(".editor-demo-toolbar"));
+    expectNoRawSurfaceColors(cssBlock(".editor-demo-toolbar span"));
+    expectNoRawSurfaceColors(cssBlock(".editor-demo-sidebar"));
+    expectNoRawSurfaceColors(cssBlock(".editor-demo-sidebar small"));
+    expectNoRawSurfaceColors(cssBlock(".editor-demo-line"));
+    expectNoRawSurfaceColors(cssBlock(".editor-demo-line.active"));
+    expectNoRawSurfaceColors(cssBlock(".editor-demo-document pre"));
     expectNoRawSurfaceColors(cssBlock(".brand-tile"));
     expectNoRawSurfaceColors(cssBlock(".brand-tile.notion"));
     expectNoRawSurfaceColors(cssBlock(".progress-list span"));
@@ -117,10 +169,15 @@ describe("desktop secondary surface theme contract", () => {
     expectNoRawSurfaceColors(cssBlock(".sync-note.connected"));
     expectNoRawSurfaceColors(cssBlock(".sync-note.warning"));
     expectNoRawSurfaceColors(cssBlock(".sync-note svg"));
-    expectNoRawSurfaceColors(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.connector-option > span,\n.demo-tile span,\n.review-strip span"));
+    expectNoRawSurfaceColors(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.demo-tile span,\n.review-strip span"));
     expectNoRawSurfaceColors(cssBlock(".demo-tile"));
     expectNoRawSurfaceColors(cssBlock(".demo-tile p,\n.demo-tile code"));
+    expectNoRawSurfaceColors(cssBlock(".connector-option.available"));
     expectNoRawSurfaceColors(cssBlock(".connector-option.selectable:hover:not(:disabled),\n.connector-option.selectable.selected"));
+    expectNoRawSurfaceColors(cssBlock(".connector-card-accessory"));
+    expectNoRawSurfaceColors(cssBlock(".connector-option.connected .connector-card-accessory"));
+    expectNoRawSurfaceColors(cssBlock(':root[data-theme="dark"] .connector-option.available'));
+    expectNoRawSurfaceColors(cssBlock(':root[data-theme="dark"] .connector-option.selectable:hover:not(:disabled),\n:root[data-theme="dark"] .connector-option.selectable.selected'));
     expectNoRawSurfaceColors(cssBlock(".agent-guidance-card"));
     expectNoRawSurfaceColors(cssBlock(".agent-guidance-card.warning"));
   });
@@ -169,6 +226,16 @@ describe("desktop secondary surface theme contract", () => {
     ]);
     expectCssBlock(".ready-folder", ["background: var(--surface-active);"]);
     expectCssBlock(".folder-inline", ["background: var(--surface-raised);"]);
+    expectCssBlock(".onboarding-ready-mark", [
+      "background: var(--onboarding-ready-mark-bg);",
+      "color: var(--accent);",
+    ]);
+    expectCssBlock(".onboarding-folder-card", [
+      "background: var(--surface-raised);",
+    ]);
+    expectCssBlock(".final-setup .ready-path-field", [
+      "background: var(--field-bg);",
+    ]);
 
     expectNoRawSurfaceColors(cssBlock(".finder-enable-illustration"));
     expectNoRawSurfaceColors(cssBlock(".finder-enable-control"));
@@ -176,6 +243,9 @@ describe("desktop secondary surface theme contract", () => {
     expectNoRawSurfaceColors(cssBlock('[data-theme="dark"] .finder-enable-toolbar'));
     expectNoRawSurfaceColors(cssBlock('[data-theme="dark"] .finder-enable-sidebar'));
     expectNoRawSurfaceColors(cssBlock('[data-theme="dark"] .finder-enable-control'));
+    expectNoRawSurfaceColors(cssBlock(".onboarding-ready-mark"));
+    expectNoRawSurfaceColors(cssBlock(".onboarding-folder-card"));
+    expectNoRawSurfaceColors(cssBlock(".final-setup .ready-path-field"));
   });
 
   it("keeps setup status strips and onboarding badges tokenized", () => {

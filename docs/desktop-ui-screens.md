@@ -89,10 +89,9 @@ shadow, or journal in normal surfaces. These can appear only in diagnostics.
 
 ```text
 First Run
-  Welcome
-  Connect Notion
-  Choose Folder
-  Prepare Workspace
+  Meet Locality
+  Connect Source
+  Local Folder
   Ready
 
 Daily Use
@@ -165,182 +164,134 @@ command directly cannot bypass confirmation.
 
 ## First-Run Onboarding
 
-### Screen 1: Welcome
+The first-run flow uses a custom window chrome with a four-segment progress rail
+directly below it. The right side of the chrome shows `1/4`, `2/4`, `3/4`, or
+`4/4`. Internal recovery and optional education screens may reuse the current
+visible segment, but the required setup path presents four visible positions:
 
-Goal: establish what Locality does and get the user to connect Notion.
+1. Meet Locality.
+2. Connect Source.
+3. Local Folder.
+4. Ready.
+
+The flow does not show the full sidebar. It should feel like the provided
+desktop comps: dark mode uses a charcoal canvas, neutral raised panels, emerald
+progress and actions, and a product mock on the right. Light mode keeps the same
+layout with a neutral off-white canvas, restrained borders, and a softer green
+ambient wash.
+
+### Screen 1: Meet Locality
+
+Goal: establish what Locality does before asking for a connected source.
+
+Eyebrow: `Meet Locality`
+
+Headline:
+
+```text
+Turn work apps into agent-ready files.
+```
+
+Supporting copy:
+
+```text
+Locality turns tools like Notion into a local folder. Agents edit Markdown you
+can inspect, while Locality keeps the connected app in sync after review.
+```
+
+Primary action: `Get Started`
+
+Secondary action: `How agents use it`
+
+Proof chips:
+
+- `Finder-native files`
+- `Markdown edits`
+- `Review before sync`
+
+Right-side visual: a static native-looking editor mock with a file sidebar,
+Markdown content, and a reviewed/synced status line. Do not use a video player
+or marketing illustration on this screen.
+
+### Screen 2: Connect Source
+
+Goal: connect the first source while keeping the product connector-neutral.
+
+Eyebrow: `Connect source`
+
+Headline:
+
+```text
+Start with Notion.
+```
+
+Supporting copy:
+
+```text
+Connect the source you want agents to help with. Your machine talks directly to
+Notion, and app credentials are protected by macOS Keychain.
+```
 
 Primary action: `Connect Notion`
 
-Secondary action: `I already connected Notion` only if a connection is detected.
+Secondary action for Notion: `Copy login link`
 
-Layout:
+Proof chips:
 
-```text
-┌──────────────────────────────────────────────────────────────┐
-│ Locality                                            1 of 4        │
-│                                                              │
-│ Let your agents edit Notion as local files.                  │
-│                                                              │
-│ Locality mounts your Notion workspace in CloudStorage. Agents edit│
-│ local files, then Locality syncs reviewed changes back to Notion. │
-│                                                              │
-│ [ Connect Notion ]                                           │
-│                                                              │
-│  Local edits stay pending until you review and push.          │
-└──────────────────────────────────────────────────────────────┘
-```
+- `Scoped access`
+- `Credentials in Keychain`
+- `Direct app connection`
 
-Notes:
+Right-side visual: five vertical connector cards in this order:
 
-- Keep the screen sparse. Do not mention every future connector here.
-- The safety line should be a quiet footer, not a warning banner.
+1. `Notion`
+2. `Google Docs`
+3. `Google Calendar`
+4. `Gmail`
+5. `Granola`
 
-States:
+The selected card uses an emerald-tinted dark surface in dark mode and a soft
+green selected surface in light mode. Other cards remain neutral and slightly
+darker than the surrounding canvas in dark mode.
 
-- no existing connection: show `Connect Notion`;
-- existing active Notion connection: show `Continue`;
-- existing revoked connection: show `Reconnect Notion`.
+### Screen 3: Local Folder
 
-### Screen 2: Connect Notion
+Goal: create or recover the local folder while preserving existing File Provider
+and mount recovery behavior.
 
-Goal: keep the user oriented while the Notion OAuth browser flow is open. The
-previous `Connect Notion` action already opened Notion, so this screen should
-not ask the user to open Notion again.
+This screen keeps the current Locality folder setup flow, Finder enable guide,
+retry actions, and recovery path. It uses the same top progress rail with
+segment three active.
 
-Primary action while waiting: disabled `Waiting for Notion`
+### Screen 4: Ready
 
-Secondary action: `Open browser again`
+Goal: complete onboarding with a centered success state and one clear handoff
+into the app.
 
-Layout:
+Headline:
 
 ```text
-┌──────────────────────────────────────────────────────────────┐
-│ Locality                                            2 of 4        │
-│                                                              │
-│ Finish connecting in Notion                                  │
-│                                                              │
-│ A browser window is open. Choose your workspace, pick the    │
-│ pages Locality can use, then approve access.                      │
-│                                                              │
-│ ✓ Browser opened                                             │
-│ ○ Select workspace and pages                                 │
-│ ○ Approve access                                             │
-│                                                              │
-│ [ Waiting for Notion ]                                       │
-│ Open browser again                                           │
-│                                                              │
-│  Credentials are stored securely in the OS credential store.  │
-└──────────────────────────────────────────────────────────────┘
+Locality is ready
 ```
 
-Error states:
-
-- browser failed to open: show `Copy authorization link`;
-- broker unreachable: show `Try again` and a brief "Could not start Notion
-  connection";
-- Notion denied access: show `Try again`.
-
-### Screen 3: Choose Folder
-
-Goal: choose where the workspace appears locally.
-
-Default value:
+Supporting copy:
 
 ```text
-~/Library/CloudStorage/Locality/notion-main
+Your local workspace is ready. Agents can open this folder, edit Markdown, and
+leave changes for Review Center. Open the app to review changes, manage sync,
+and enable Live Mode when you're ready for file changes to sync back to Notion.
 ```
 
-Primary action: `Continue`
+Primary action: `Open Locality`
 
-Secondary action: `Choose...`
+Secondary action: `View optional guide`
 
-Layout:
+Folder card:
 
-```text
-┌──────────────────────────────────────────────────────────────┐
-│ Locality                                            3 of 4        │
-│                                                              │
-│ Where should your Notion files appear?                       │
-│                                                              │
-│ ┌──────────────────────────────────────────────────────────┐ │
-│ │ ~/Library/CloudStorage/Locality/notion-main                              [... ]│ │
-│ └──────────────────────────────────────────────────────────┘ │
-│                                                              │
-│ [ Continue ]                                                 │
-│                                                              │
-│  This folder will include AGENTS.md and CLAUDE.md to help     │
-│  your agents edit files natively.                            │
-└──────────────────────────────────────────────────────────────┘
-```
-
-Validation:
-
-- empty path: disable primary action;
-- path outside user home: allow only with an explicit confirmation;
-- existing non-empty folder: allow if it is already an Locality mount, otherwise ask
-  the user to choose another folder or confirm creating `Locality/Notion 2`.
-
-### Screen 4: Ready, Syncing In Background
-
-Goal: complete onboarding as soon as the folder and agent guidance are ready,
-while making it clear that workspace sync continues in the background. Do not
-show an intermediate checklist that appears to finish instantly or asks the user
-to wait on background preparation.
-
-Primary action: `Open Notion Folder`
-
-Secondary actions: `Open a Notion page`, `Copy folder path`, `Copy agent prompt`
-
-Layout:
-
-```text
-┌──────────────────────────────────────────────────────────────┐
-│ Locality                                            4 of 4        │
-│                                                              │
-│  ✓                                                           │
-│ Locality is ready                                                 │
-│ Your Notion folder is mounted. Locality syncs quietly while        │
-│ agents edit local Markdown.                                  │
-│                                                              │
-│ ┌──────────────────────────────────────────────────────────┐ │
-│ │ Notion folder                         [ Copy ]           │ │
-│ │ ~/Library/CloudStorage/Locality/notion-main                                  │ │
-│ └──────────────────────────────────────────────────────────┘ │
-│                                                              │
-│ [ Open Notion Folder ]                                      │
-│                                                              │
-│ Open a Notion page                                           │
-│ ┌──────────────────────────────────────────────────────────┐ │
-│ │ Paste a Notion URL to get the local file path [Open Page]│ │
-│ └──────────────────────────────────────────────────────────┘ │
-│                                                              │
-│ ┌──────────────────────────────────────────────────────────┐ │
-│ │ Try this with an agent                                   │ │
-│ │ Find the Q4 launch plan and make it sharper for           │ │
-│ │ leadership review.                              [ Copy ]  │ │
-│ └──────────────────────────────────────────────────────────┘ │
-│                                                              │
-│ Agents can use Locality                                           │
-│ Now your agents know how to use `loc` to view and edit        │
-│ Notion. Installed for Claude, Codex, Warp, AGENTS.md,         │
-│ and Copilot.                                                 │
-└──────────────────────────────────────────────────────────────┘
-```
-
-Behavior:
-
-- Locality should begin reading accessible top-level Notion structure immediately
-  after connection, before the user reaches this screen.
-- Do not block on full workspace enumeration.
-- Show setup success as a small celebratory status pill. Mention background
-  sync once in supporting copy, not as a task the user has to wait on.
-- There is only one primary action.
-- `Open a Notion page` should be a real text input, not a link-only action.
-- The locate flow should prioritize the pasted page's preparation and show a
-  copyable local path when ready.
-- Include a small, human demo prompt that helps users understand the agent
-  workflow. Keep its copy button inline on the right side of the prompt so it
-  does not become another large action.
+- title `Folder`
+- mounted status pill `Mounted`
+- path field containing the mounted local path
+- compact path action `Open page`
 
 ## Tray Popover
 
