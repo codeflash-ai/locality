@@ -10,11 +10,13 @@ use locality_core::workspace_layout::{MountTarget, PortableMountId};
 use locality_protocol::workspace_api_v2::{
     WorkspaceClientCapabilitiesV2, WorkspaceProfileSessionV2,
 };
+use locality_protocol::workspace_export_v2::WorkspaceExportControlMetadataV2;
 use locality_protocol::{SandboxSessionState, SessionCapability, SessionErrorCode};
 use locality_store::{
-    CanonicalApiOrigin, CredentialError, HostedWorkspaceCredentialRef, HostedWorkspaceIdentity,
-    HostedWorkspaceMountMapping, HostedWorkspaceRepository, LegacyWorkspaceMount, SqliteStateStore,
-    StoreError, WorkspaceHostBindingResolver, open_credential_store,
+    CanonicalApiOrigin, CredentialError, CredentialStore, HostedWorkspaceCredentialRef,
+    HostedWorkspaceIdentity, HostedWorkspaceMountMapping, HostedWorkspaceRepository,
+    LegacyWorkspaceMount, SqliteStateStore, StoreError, WorkspaceHostBindingResolver,
+    open_credential_store,
 };
 use localityd::workspace_materializer::{
     PublishedWorkspace, StagedWorkspaceMaterialization, WorkspaceMaterializationError,
@@ -22,6 +24,8 @@ use localityd::workspace_materializer::{
     load_workspace_publication_receipt, publish_staged_workspace_with_hooks,
     recover_and_verify_workspace_publication_state,
 };
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::sandbox::{
     FreshnessWaitAvailability, SandboxContentEncodingPreference, SandboxHttpClient,
@@ -37,8 +41,9 @@ pub struct HostedWorkspaceAttachOptions {
     pub content_encoding: SandboxContentEncodingPreference,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct HostedWorkspaceAttachReport {
+    pub ok: bool,
     pub api_origin: String,
     pub profile_id: String,
     pub profile_revision: u64,
@@ -47,6 +52,31 @@ pub struct HostedWorkspaceAttachReport {
     pub files: u64,
     pub directories: u64,
     pub materialized_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HostedWorkspaceListReport {
+    pub ok: bool,
+    pub attachments: Vec<HostedWorkspaceListEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HostedWorkspaceListEntry {
+    pub api_origin: String,
+    pub profile_id: String,
+    pub profile_revision: u64,
+    pub root: String,
+    pub layout_version: u16,
+    pub layout_digest: String,
+    pub mounts: Vec<HostedWorkspaceMountListEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HostedWorkspaceMountListEntry {
+    pub portable_mount_id: String,
+    pub local_mount_id: String,
+    pub mount_target: String,
+    pub active: bool,
 }
 
 #[derive(Debug)]
@@ -133,7 +163,6 @@ pub fn run_hosted_workspace_attach_at_state_root(
     options: HostedWorkspaceAttachOptions,
     state_root: &Path,
 ) -> Result<HostedWorkspaceAttachReport, HostedWorkspaceAttachError> {
-    recover_hosted_workspace_attachments_at_state_root(state_root)?;
     let mut root = absolute_normalized_root(&options.root)?;
     validate_destination_parent(&root)?;
     let api_origin = CanonicalApiOrigin::new(&options.api_url)
@@ -171,7 +200,10 @@ pub fn run_hosted_workspace_attach_at_state_root(
     }
     let mappings = mappings_for_session(&store, &identity, &session)?;
     let transition_id = random_local_id("hosted-transition")?;
-    let pending = locality_store::PreparedHostedWorkspaceTransition::new(
+    let _transition_liveness =
+        locality_platform::HostedWorkspaceTransitionLock::try_acquire(state_root, &transition_id)
+            .map_err(|error| HostedWorkspaceAttachError::Lock(error.to_string()))?;
+    let prepared = locality_store::PreparedHostedWorkspaceTransition::new(
         transition_id.clone(),
         identity.clone(),
         options.credential_ref,
@@ -182,7 +214,7 @@ pub fn run_hosted_workspace_attach_at_state_root(
         mappings,
         now_timestamp(),
     )?;
-    {
+    let pending = {
         // The pending row is also a path reservation consumed by connector
         // mount preflight. Publish it while holding the same lock so connector
         // creation cannot validate an overlapping root and commit through this
@@ -190,8 +222,8 @@ pub fn run_hosted_workspace_attach_at_state_root(
         let _path_lock = locality_platform::DaemonRemountCoordinatorLock::try_acquire(state_root)
             .map_err(|error| HostedWorkspaceAttachError::Lock(error.to_string()))?;
         revalidate_hosted_workspace_placement(&store, &identity, &root)?;
-        store.begin_hosted_workspace_transition(pending)?;
-    }
+        store.begin_hosted_workspace_transition(prepared)?
+    };
 
     let staged = match download_and_stage(
         &client,
@@ -210,15 +242,10 @@ pub fn run_hosted_workspace_attach_at_state_root(
     };
 
     let published = commit_staged_hosted_workspace(
-        &mut store,
-        state_root,
-        &identity,
-        &transition_id,
-        &root,
-        staged,
-        &ownership,
+        &mut store, state_root, &identity, &pending, &root, staged, &ownership,
     )?;
     Ok(HostedWorkspaceAttachReport {
+        ok: true,
         api_origin: identity.api_origin().as_str().to_string(),
         profile_id: identity.profile_id().as_str().to_string(),
         profile_revision: session.profile_revision(),
@@ -227,6 +254,38 @@ pub fn run_hosted_workspace_attach_at_state_root(
         files: published.validated.files,
         directories: published.validated.directories,
         materialized_bytes: published.validated.content_bytes,
+    })
+}
+
+pub fn list_hosted_workspace_attachments_at_state_root(
+    state_root: &Path,
+) -> Result<HostedWorkspaceListReport, HostedWorkspaceAttachError> {
+    let store = SqliteStateStore::open(state_root.to_path_buf())?;
+    let mut attachments = Vec::new();
+    for attachment in store.list_hosted_workspace_attachments()? {
+        let mounts = store
+            .list_hosted_workspace_mount_mappings(attachment.identity())?
+            .into_iter()
+            .map(|mapping| HostedWorkspaceMountListEntry {
+                portable_mount_id: mapping.portable_mount_id().as_str().to_string(),
+                local_mount_id: mapping.local_mount_id().as_str().to_string(),
+                mount_target: mapping.mount_target().as_str().to_string(),
+                active: mapping.is_active(),
+            })
+            .collect();
+        attachments.push(HostedWorkspaceListEntry {
+            api_origin: attachment.identity().api_origin().as_str().to_string(),
+            profile_id: attachment.identity().profile_id().as_str().to_string(),
+            profile_revision: attachment.profile_revision(),
+            root: attachment.root().display().to_string(),
+            layout_version: attachment.layout_version(),
+            layout_digest: attachment.layout_digest().as_str().to_string(),
+            mounts,
+        });
+    }
+    Ok(HostedWorkspaceListReport {
+        ok: true,
+        attachments,
     })
 }
 
@@ -309,7 +368,7 @@ fn commit_staged_hosted_workspace(
     store: &mut SqliteStateStore,
     state_root: &Path,
     identity: &HostedWorkspaceIdentity,
-    transition_id: &str,
+    pending: &locality_store::PendingHostedWorkspaceTransition,
     root: &Path,
     staged: StagedWorkspaceMaterialization,
     ownership: &WorkspaceOwnershipCapability,
@@ -317,10 +376,15 @@ fn commit_staged_hosted_workspace(
     let _path_lock = locality_platform::DaemonRemountCoordinatorLock::try_acquire(state_root)
         .map_err(|error| HostedWorkspaceAttachError::Lock(error.to_string()))?;
     revalidate_hosted_workspace_placement(store, identity, root)?;
+    revalidate_pending_transition(store, pending)?;
+    validate_receipt_metadata_against_pending(
+        &staged.validated().terminal_control.metadata,
+        pending,
+    )?;
     let mut hooks = HostedWorkspacePublicationHooks {
         store,
         identity,
-        transition_id,
+        pending,
         root,
         committed: false,
     };
@@ -336,7 +400,7 @@ fn commit_staged_hosted_workspace(
 struct HostedWorkspacePublicationHooks<'a> {
     store: &'a mut SqliteStateStore,
     identity: &'a HostedWorkspaceIdentity,
-    transition_id: &'a str,
+    pending: &'a locality_store::PendingHostedWorkspaceTransition,
     root: &'a Path,
     committed: bool,
 }
@@ -344,13 +408,17 @@ struct HostedWorkspacePublicationHooks<'a> {
 impl WorkspacePublicationHooks for HostedWorkspacePublicationHooks<'_> {
     fn before_publication(&mut self) -> io::Result<()> {
         revalidate_hosted_workspace_placement(self.store, self.identity, self.root)
-            .map_err(io::Error::other)
+            .map_err(io::Error::other)?;
+        revalidate_pending_transition(self.store, self.pending).map_err(io::Error::other)
     }
 
     fn checkpoint(&mut self, checkpoint: WorkspacePublicationCheckpoint) -> io::Result<()> {
         if checkpoint == WorkspacePublicationCheckpoint::ReceiptDurable {
             self.store
-                .commit_hosted_workspace_transition(self.transition_id, &now_timestamp())
+                .commit_hosted_workspace_transition(
+                    self.pending.prepared().transition_id(),
+                    &now_timestamp(),
+                )
                 .map_err(io::Error::other)?;
             self.committed = true;
         }
@@ -363,29 +431,41 @@ impl WorkspacePublicationHooks for HostedWorkspacePublicationHooks<'_> {
 pub fn recover_hosted_workspace_attachments_at_state_root(
     state_root: &Path,
 ) -> Result<(), HostedWorkspaceAttachError> {
-    let mut store = SqliteStateStore::open(state_root.to_path_buf())?;
     let credentials = open_credential_store(state_root);
-    let attachments = store.list_hosted_workspace_attachments()?;
-    for attachment in &attachments {
-        let key = SandboxProfileKey::new(credentials.get(attachment.credential_ref().as_str())?)?;
-        recover_hosted_workspace_identity_locked(
-            &mut store,
-            state_root,
-            attachment.identity(),
-            &key,
-        )?;
+    recover_hosted_workspace_attachments_with_credentials_at_state_root(
+        state_root,
+        credentials.as_ref(),
+    )
+}
+
+/// Credential-injected recovery entry point for embedded owners and isolated
+/// tests. A missing credential scopes recovery out for only that identity.
+pub fn recover_hosted_workspace_attachments_with_credentials_at_state_root(
+    state_root: &Path,
+    credentials: &dyn CredentialStore,
+) -> Result<(), HostedWorkspaceAttachError> {
+    let mut store = SqliteStateStore::open(state_root.to_path_buf())?;
+    let mut identities = BTreeMap::new();
+    for attachment in store.list_hosted_workspace_attachments()? {
+        identities.insert(
+            attachment.identity().clone(),
+            attachment.credential_ref().clone(),
+        );
     }
-    let pending = store.list_pending_hosted_workspace_transitions()?;
-    for transition in pending {
-        let key = SandboxProfileKey::new(
-            credentials.get(transition.prepared().credential_ref().as_str())?,
-        )?;
-        recover_hosted_workspace_identity_locked(
-            &mut store,
-            state_root,
-            transition.prepared().identity(),
-            &key,
-        )?;
+    for transition in store.list_pending_hosted_workspace_transitions()? {
+        identities.insert(
+            transition.prepared().identity().clone(),
+            transition.prepared().credential_ref().clone(),
+        );
+    }
+    for (identity, credential_ref) in identities {
+        let secret = match credentials.get(credential_ref.as_str()) {
+            Ok(secret) => secret,
+            Err(CredentialError::NotFound(_)) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let key = SandboxProfileKey::new(secret)?;
+        recover_hosted_workspace_identity_locked(&mut store, state_root, &identity, &key)?;
     }
     Ok(())
 }
@@ -407,6 +487,18 @@ fn recover_hosted_workspace_identity_locked(
 ) -> Result<(), HostedWorkspaceAttachError> {
     let attachment = store.get_hosted_workspace_attachment(identity)?;
     let pending = store.get_pending_hosted_workspace_transition(identity)?;
+    let _transition_liveness = if let Some(pending) = &pending {
+        match locality_platform::HostedWorkspaceTransitionLock::try_acquire(
+            state_root,
+            pending.prepared().transition_id(),
+        ) {
+            Ok(lock) => Some(lock),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(HostedWorkspaceAttachError::Lock(error.to_string())),
+        }
+    } else {
+        None
+    };
     let Some(root) = pending
         .as_ref()
         .map(|pending| pending.prepared().target_root().to_path_buf())
@@ -451,6 +543,7 @@ fn recover_hosted_workspace_identity_locked(
         && metadata.layout_version() == pending.prepared().layout_version()
         && metadata.layout_digest() == pending.prepared().layout_digest();
     if proposed_matches {
+        validate_receipt_metadata_against_pending(metadata, &pending)?;
         store.commit_hosted_workspace_transition(
             pending.prepared().transition_id(),
             &now_timestamp(),
@@ -458,7 +551,8 @@ fn recover_hosted_workspace_identity_locked(
         return Ok(());
     }
     let current_matches = attachment.as_ref().is_some_and(|current| {
-        metadata.profile_id() == identity.profile_id()
+        current.root() == root
+            && metadata.profile_id() == identity.profile_id()
             && metadata.profile_revision() == current.profile_revision()
             && metadata.layout_version() == current.layout_version()
             && metadata.layout_digest() == current.layout_digest()
@@ -505,6 +599,36 @@ fn revalidate_hosted_workspace_placement(
     WorkspaceHostBindingResolver::current()
         .resolve_ephemeral_publication_root_on_current_host(root, &active)
         .map_err(|error| HostedWorkspaceAttachError::InvalidPlacement(error.to_string()))?;
+    Ok(())
+}
+
+fn revalidate_pending_transition(
+    store: &SqliteStateStore,
+    expected: &locality_store::PendingHostedWorkspaceTransition,
+) -> Result<(), HostedWorkspaceAttachError> {
+    let actual = store.get_pending_hosted_workspace_transition(expected.prepared().identity())?;
+    if actual.as_ref() != Some(expected) {
+        return Err(HostedWorkspaceAttachError::Recovery(
+            "hosted workspace pending transition changed before publication".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_receipt_metadata_against_pending(
+    metadata: &WorkspaceExportControlMetadataV2,
+    pending: &locality_store::PendingHostedWorkspaceTransition,
+) -> Result<(), HostedWorkspaceAttachError> {
+    let prepared = pending.prepared();
+    if metadata.profile_id() != prepared.identity().profile_id()
+        || metadata.profile_revision() != prepared.profile_revision()
+        || metadata.layout_version() != prepared.layout_version()
+        || metadata.layout_digest() != prepared.layout_digest()
+    {
+        return Err(HostedWorkspaceAttachError::Recovery(
+            "workspace publication receipt does not match the pending attachment".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -564,11 +688,10 @@ fn mappings_for_session(
             let local = existing
                 .get(&portable)
                 .map(|mapping| mapping.local_mount_id().clone())
-                .map(Ok)
-                .unwrap_or_else(random_local_mount_id);
+                .unwrap_or_else(|| deterministic_local_mount_id(identity, &portable));
             HostedWorkspaceMountMapping::proposal(
                 portable,
-                local?,
+                local,
                 target,
                 session.profile_revision(),
             )
@@ -593,8 +716,25 @@ fn unique_session_mounts(
     Ok(mounts)
 }
 
-fn random_local_mount_id() -> Result<MountId, HostedWorkspaceAttachError> {
-    random_local_id("hosted-mount").map(MountId::new)
+pub fn deterministic_local_mount_id(
+    identity: &HostedWorkspaceIdentity,
+    portable_mount_id: &PortableMountId,
+) -> MountId {
+    let mut digest = Sha256::new();
+    digest.update(b"locality.hosted-workspace.mount-id.v1\0");
+    digest.update(identity.api_origin().as_str().as_bytes());
+    digest.update(b"\0");
+    digest.update(identity.profile_id().as_str().as_bytes());
+    digest.update(b"\0");
+    digest.update(portable_mount_id.as_str().as_bytes());
+    let digest = digest.finalize();
+    let mut value = String::with_capacity("hosted-mount-".len() + digest.len() * 2);
+    value.push_str("hosted-mount-");
+    for byte in digest {
+        use std::fmt::Write;
+        write!(&mut value, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    MountId::new(value)
 }
 
 fn random_local_id(prefix: &str) -> Result<String, HostedWorkspaceAttachError> {
@@ -661,5 +801,112 @@ fn encoding_name(encoding: localityd::remote_truth::ReplicaArchiveEncoding) -> &
     match encoding {
         localityd::remote_truth::ReplicaArchiveEncoding::Identity => "identity",
         localityd::remote_truth::ReplicaArchiveEncoding::Zstd => "zstd",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use locality_protocol::workspace_export_v2::WorkspaceExportTerminalControlV2;
+    use locality_store::{InMemoryStateStore, PreparedHostedWorkspaceTransition};
+
+    fn prepared(
+        transition_id: &str,
+        revision: u64,
+        digest: &str,
+        root: &Path,
+    ) -> PreparedHostedWorkspaceTransition {
+        let identity = HostedWorkspaceIdentity::new(
+            CanonicalApiOrigin::new("https://api.example.com").unwrap(),
+            locality_protocol::workspace_layout::WorkspaceProfileId::new(
+                "018f4f6e-9f2c-7b1a-8c3d-4e5f60718293",
+            )
+            .unwrap(),
+        );
+        PreparedHostedWorkspaceTransition::new(
+            transition_id,
+            identity,
+            HostedWorkspaceCredentialRef::new("hosted-workspace:test").unwrap(),
+            root,
+            revision,
+            1,
+            locality_protocol::workspace_layout::LayoutDigest::new(digest).unwrap(),
+            vec![
+                HostedWorkspaceMountMapping::proposal(
+                    PortableMountId::new("portable").unwrap(),
+                    MountId::new("local"),
+                    MountTarget::new("docs").unwrap(),
+                    revision,
+                )
+                .unwrap(),
+            ],
+            "2026-08-03T00:00:00Z",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn receipt_metadata_must_match_the_exact_pending_attachment() {
+        let control: WorkspaceExportTerminalControlV2 = serde_json::from_str(include_str!(
+            "../../locality-protocol/fixtures/workspace-export-terminal-control-v2.json"
+        ))
+        .unwrap();
+        let root = std::env::temp_dir().join("locality-receipt-binding-test");
+        let mut store = InMemoryStateStore::new();
+        let matching = store
+            .begin_hosted_workspace_transition(prepared(
+                "matching",
+                7,
+                "sha256:6d739ad2748910520e4df1d680e9ea78a94230d0751e6346d3f5d3c57b9259b5",
+                &root,
+            ))
+            .unwrap();
+        validate_receipt_metadata_against_pending(&control.metadata, &matching).unwrap();
+
+        store
+            .cancel_hosted_workspace_transition("matching")
+            .unwrap();
+        let mismatched = store
+            .begin_hosted_workspace_transition(prepared(
+                "mismatched",
+                8,
+                "sha256:6d739ad2748910520e4df1d680e9ea78a94230d0751e6346d3f5d3c57b9259b5",
+                &root,
+            ))
+            .unwrap();
+        let error =
+            validate_receipt_metadata_against_pending(&control.metadata, &mismatched).unwrap_err();
+        assert_eq!(error.code(), "hosted_workspace_recovery_required");
+    }
+
+    #[test]
+    fn prepublication_revalidation_rejects_replaced_pending_payload() {
+        let root = std::env::temp_dir().join(random_local_id("pending-revalidation").unwrap());
+        let state_root = root.join("state");
+        let workspace_root = root.join("Workspace");
+        let mut store = SqliteStateStore::open(state_root.clone()).unwrap();
+        let expected = store
+            .begin_hosted_workspace_transition(prepared(
+                "expected",
+                7,
+                "sha256:6d739ad2748910520e4df1d680e9ea78a94230d0751e6346d3f5d3c57b9259b5",
+                &workspace_root,
+            ))
+            .unwrap();
+        store
+            .cancel_hosted_workspace_transition("expected")
+            .unwrap();
+        store
+            .begin_hosted_workspace_transition(prepared(
+                "replacement",
+                8,
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                &workspace_root,
+            ))
+            .unwrap();
+
+        let error = revalidate_pending_transition(&store, &expected).unwrap_err();
+        assert_eq!(error.code(), "hosted_workspace_recovery_required");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

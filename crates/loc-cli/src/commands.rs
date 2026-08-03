@@ -50,11 +50,11 @@ use locality_slack::{
 };
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
-    ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, EntityRecord,
-    EntityRepository, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
-    JournalRepository, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, SqliteStateStore, StoreError,
-    VirtualMutationKind, VirtualMutationRepository, WorkspaceBindingRepository,
+    ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
+    EntityRecord, EntityRepository, FreshnessStateRepository, HydrationJobRecord,
+    HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
+    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
+    StoreError, VirtualMutationKind, VirtualMutationRepository, WorkspaceBindingRepository,
     host_paths_equivalent, open_credential_store,
 };
 use localityd::autosave::auto_save_timestamp;
@@ -114,6 +114,10 @@ use crate::file_provider as file_provider_helper;
 use crate::history::{
     HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo,
     run_undo_with_applier_at_state_root, undo_report_exit_code,
+};
+use crate::hosted_workspace::{
+    HostedWorkspaceAttachOptions, HostedWorkspaceAttachReport, HostedWorkspaceListReport,
+    list_hosted_workspace_attachments_at_state_root, run_hosted_workspace_attach_at_state_root,
 };
 use crate::info::{InfoError, InfoOptions, InfoReport, run_info};
 use crate::inspect::{InspectError, InspectOptions, InspectReport, run_inspect};
@@ -234,6 +238,14 @@ enum LocalityCommand {
         #[command(subcommand)]
         command: SandboxCommand,
     },
+    #[command(
+        name = "hosted-workspace",
+        about = "Attach, refresh, or list durable hosted workspaces"
+    )]
+    HostedWorkspace {
+        #[command(subcommand)]
+        command: HostedWorkspaceCommand,
+    },
     #[command(about = "Search local mount metadata without contacting remote sources")]
     Search(SearchArgs),
     #[command(about = "Locate a mounted Notion page or database and print its local path")]
@@ -289,6 +301,46 @@ enum LocalityCommand {
 enum SandboxCommand {
     #[command(about = "Materialize or refresh a sealed read-only workspace replica")]
     Init(SandboxInitArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum HostedWorkspaceCommand {
+    #[command(about = "Attach a read-only hosted workspace")]
+    Attach(HostedWorkspaceAttachArgs),
+    #[command(about = "Refresh an existing read-only hosted workspace")]
+    Refresh(HostedWorkspaceAttachArgs),
+    #[command(about = "List durable hosted workspace attachments")]
+    List,
+}
+
+#[derive(Debug, Args)]
+struct HostedWorkspaceAttachArgs {
+    #[arg(long, value_name = "URL", help = "Locality backend API origin")]
+    api_url: String,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Absolute or current-directory-relative workspace root"
+    )]
+    root: String,
+    #[arg(
+        long,
+        value_name = "REF",
+        help = "Opaque hosted-workspace credential reference (for example hosted-workspace:team)"
+    )]
+    credential_ref: String,
+    #[arg(
+        long,
+        help = "Read the reusable Workspace Profile key from standard input"
+    )]
+    profile_key_stdin: bool,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "ENCODING",
+        help = "Require zstd or identity export encoding"
+    )]
+    encoding: Option<SandboxEncodingArg>,
 }
 
 #[derive(Debug, Args)]
@@ -1216,6 +1268,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         LocalityCommand::Sandbox {
             command: SandboxCommand::Init(options),
         } => sandbox_init(options, json),
+        LocalityCommand::HostedWorkspace { command } => hosted_workspace(command, json),
         LocalityCommand::Search(_) => search(&legacy_args[1..], json),
         LocalityCommand::Locate(_) => locate(&legacy_args[1..], json),
         LocalityCommand::Create { .. } => create(&legacy_args[1..], json),
@@ -1575,6 +1628,20 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                 }
             }
         }
+        LocalityCommand::HostedWorkspace { command } => {
+            args.push("hosted-workspace".to_string());
+            match command {
+                HostedWorkspaceCommand::Attach(options) => {
+                    args.push("attach".to_string());
+                    push_hosted_workspace_args(&mut args, options);
+                }
+                HostedWorkspaceCommand::Refresh(options) => {
+                    args.push("refresh".to_string());
+                    push_hosted_workspace_args(&mut args, options);
+                }
+                HostedWorkspaceCommand::List => args.push("list".to_string()),
+            }
+        }
         LocalityCommand::Search(options) => {
             args.push("search".to_string());
             for query_part in &options.query {
@@ -1725,6 +1792,187 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
         }
     }
     args
+}
+
+fn hosted_workspace(command: HostedWorkspaceCommand, json: bool) -> i32 {
+    match command {
+        HostedWorkspaceCommand::Attach(options) => {
+            hosted_workspace_attach("hosted-workspace attach", options, json)
+        }
+        HostedWorkspaceCommand::Refresh(options) => {
+            hosted_workspace_attach("hosted-workspace refresh", options, json)
+        }
+        HostedWorkspaceCommand::List => {
+            match list_hosted_workspace_attachments_at_state_root(&default_state_root()) {
+                Ok(report) => {
+                    if json {
+                        print_json(&report);
+                    } else {
+                        print_hosted_workspace_list_report(&report);
+                    }
+                    EXIT_SUCCESS
+                }
+                Err(error) => hosted_workspace_command_error(
+                    "hosted-workspace list",
+                    json,
+                    error.code(),
+                    error.to_string(),
+                ),
+            }
+        }
+    }
+}
+
+fn hosted_workspace_attach(
+    command: &'static str,
+    options: HostedWorkspaceAttachArgs,
+    json: bool,
+) -> i32 {
+    let credential_ref =
+        match locality_store::HostedWorkspaceCredentialRef::new(options.credential_ref.clone()) {
+            Ok(reference) => reference,
+            Err(error) => {
+                return hosted_workspace_command_error(
+                    command,
+                    json,
+                    "hosted_workspace_credential_ref_invalid",
+                    error.to_string(),
+                );
+            }
+        };
+    let state_root = default_state_root();
+    let credentials = open_credential_store(&state_root);
+    let profile_key_environment = std::env::var_os("LOCALITY_PROFILE_KEY");
+    let supplied_profile_key = if options.profile_key_stdin || profile_key_environment.is_some() {
+        match resolve_profile_key(
+            options.profile_key_stdin,
+            profile_key_environment,
+            &mut io::stdin().lock(),
+        ) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                return hosted_workspace_command_error(
+                    command,
+                    json,
+                    error.code(),
+                    error.to_string(),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    match (
+        credentials.get(credential_ref.as_str()),
+        supplied_profile_key,
+    ) {
+        (Ok(existing), Some(profile_key)) if existing != profile_key.expose() => {
+            return hosted_workspace_command_error(
+                command,
+                json,
+                "hosted_workspace_credential_mismatch",
+                "the credential reference already names a different Workspace Profile key"
+                    .to_string(),
+            );
+        }
+        (Ok(_), _) => {}
+        (Err(CredentialError::NotFound(_)), Some(profile_key)) => {
+            if let Err(error) = credentials.put(credential_ref.as_str(), profile_key.expose()) {
+                return hosted_workspace_command_error(
+                    command,
+                    json,
+                    error.code(),
+                    error.to_string(),
+                );
+            }
+        }
+        (Err(CredentialError::NotFound(_)), None) => {
+            return hosted_workspace_command_error(
+                command,
+                json,
+                "auth_required",
+                "the hosted workspace credential is missing; provide --profile-key-stdin or LOCALITY_PROFILE_KEY"
+                    .to_string(),
+            );
+        }
+        (Err(error), _) => {
+            return hosted_workspace_command_error(command, json, error.code(), error.to_string());
+        }
+    }
+    let attach = run_hosted_workspace_attach_at_state_root(
+        HostedWorkspaceAttachOptions {
+            api_url: options.api_url,
+            root: PathBuf::from(options.root),
+            credential_ref,
+            content_encoding: options
+                .encoding
+                .map_or(SandboxContentEncodingPreference::Automatic, Into::into),
+        },
+        &state_root,
+    );
+    match attach {
+        Ok(report) => {
+            if json {
+                print_json(&report);
+            } else {
+                print_hosted_workspace_attach_report(&report);
+            }
+            EXIT_SUCCESS
+        }
+        Err(error) => {
+            hosted_workspace_command_error(command, json, error.code(), error.to_string())
+        }
+    }
+}
+
+fn hosted_workspace_command_error(
+    command: &'static str,
+    json: bool,
+    code: &'static str,
+    message: String,
+) -> i32 {
+    let exit_code = match code {
+        "hosted_workspace_invalid_placement"
+        | "hosted_workspace_credential_ref_invalid"
+        | "hosted_workspace_credential_mismatch"
+        | "auth_required"
+        | "profile_key_invalid"
+        | "workspace_layout_update_required" => EXIT_VALIDATION,
+        _ => EXIT_INTERNAL,
+    };
+    command_error(json, CommandError::new(command, code, message), exit_code)
+}
+
+fn print_hosted_workspace_attach_report(report: &HostedWorkspaceAttachReport) {
+    println!("hosted workspace ready at {}", report.root);
+    println!(
+        "profile: {} revision {} ({})",
+        report.profile_id, report.profile_revision, report.api_origin
+    );
+    println!(
+        "materialized: {} mounts, {} files, {} directories, {} bytes",
+        report.mount_count, report.files, report.directories, report.materialized_bytes
+    );
+}
+
+fn print_hosted_workspace_list_report(report: &HostedWorkspaceListReport) {
+    if report.attachments.is_empty() {
+        println!("no hosted workspaces attached");
+        return;
+    }
+    for attachment in &report.attachments {
+        println!("{}", attachment.root);
+        println!(
+            "  profile: {} revision {} ({})",
+            attachment.profile_id, attachment.profile_revision, attachment.api_origin
+        );
+        for mount in attachment.mounts.iter().filter(|mount| mount.active) {
+            println!(
+                "  mount: {} -> {} ({})",
+                mount.portable_mount_id, mount.mount_target, mount.local_mount_id
+            );
+        }
+    }
 }
 
 fn sandbox_init(options: SandboxInitArgs, json: bool) -> i32 {
@@ -1934,6 +2182,16 @@ fn push_daemon_args(args: &mut Vec<String>, options: &DaemonArgs) {
     push_optional_flag_value(args, "--tcp-addr", options.tcp_addr.as_deref());
     for value in &options.include_env {
         push_flag_value(args, "--include-env", value);
+    }
+}
+
+fn push_hosted_workspace_args(args: &mut Vec<String>, options: &HostedWorkspaceAttachArgs) {
+    push_flag_value(args, "--api-url", &options.api_url);
+    push_flag_value(args, "--root", &options.root);
+    push_flag_value(args, "--credential-ref", &options.credential_ref);
+    push_flag(args, "--profile-key-stdin", options.profile_key_stdin);
+    if let Some(encoding) = options.encoding {
+        push_flag_value(args, "--encoding", encoding.as_str());
     }
 }
 
@@ -10766,9 +11024,9 @@ mod tests {
     use super::{
         Cli, ConnectReport, DEFAULT_DAEMON_CONTROL_TIMEOUT, DEFAULT_DAEMON_MUTATING_TIMEOUT,
         DEFAULT_DAEMON_PULL_TIMEOUT, DaemonRequest, DaemonUnavailableReason, EXIT_SUCCESS,
-        EXIT_USAGE, EXIT_VALIDATION, FileProviderCommandReport, LocalityCommand,
-        PushConfirmationPromptError, SLACK_CONNECTOR_ID, SandboxCommand, SandboxEncodingArg,
-        VirtualProjectionRegistration, absolute_command_path,
+        EXIT_USAGE, EXIT_VALIDATION, FileProviderCommandReport, HostedWorkspaceCommand,
+        LocalityCommand, PushConfirmationPromptError, SLACK_CONNECTOR_ID, SandboxCommand,
+        SandboxEncodingArg, VirtualProjectionRegistration, absolute_command_path,
         auto_registration_for_mounted_projection, daemon_request_timeout_for,
         default_mount_id_for_source, diff_report_exit_code, exact_located_entity_record,
         file_provider_list_lines, google_calendar_oauth_broker_config,
@@ -12373,6 +12631,43 @@ mod tests {
             legacy_args_for_command(cli.command.as_ref().expect("command")),
             vec!["log", "Roadmap.md", "--push-id", "push-1", "--diff"]
         );
+
+        let cli = parse_cli([
+            "hosted-workspace",
+            "attach",
+            "--api-url",
+            "https://api.example.com",
+            "--root",
+            "/tmp/Locality",
+            "--credential-ref",
+            "hosted-workspace:team",
+            "--profile-key-stdin",
+            "--encoding",
+            "zstd",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "hosted-workspace",
+                "attach",
+                "--api-url",
+                "https://api.example.com",
+                "--root",
+                "/tmp/Locality",
+                "--credential-ref",
+                "hosted-workspace:team",
+                "--profile-key-stdin",
+                "--encoding",
+                "zstd"
+            ]
+        );
+        let cli = parse_cli(["hosted-workspace", "list"]);
+        assert!(matches!(
+            cli.command,
+            Some(LocalityCommand::HostedWorkspace {
+                command: HostedWorkspaceCommand::List
+            })
+        ));
     }
 
     #[test]

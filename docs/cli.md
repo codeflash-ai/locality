@@ -973,6 +973,35 @@ daemon stopped
   socket: /Users/alice/.loc/localityd.sock
 ```
 
+## Hosted Workspaces
+
+`loc hosted-workspace attach` attaches a generation-2 read-only hosted profile;
+`refresh` updates the matching durable attachment at the same root, and `list`
+reads the committed attachments and stable portable-to-local mount mappings.
+Attach and refresh require the reusable profile key through stdin (or
+`LOCALITY_PROFILE_KEY`) and never accept it as an argument:
+
+```bash
+printf '%s\n' "$PROFILE_KEY" | loc hosted-workspace attach \
+  --api-url https://api.example.com \
+  --root "$HOME/Locality/Hosted" \
+  --credential-ref hosted-workspace:team \
+  --profile-key-stdin
+
+loc hosted-workspace refresh \
+  --api-url https://api.example.com \
+  --root "$HOME/Locality/Hosted" \
+  --credential-ref hosted-workspace:team
+
+loc hosted-workspace list --json
+```
+
+The credential reference is opaque local metadata; the key itself stays in the
+credential store. Refresh rejects relocation. `detach` is not yet exposed: it
+still requires one durable, ownership-checked filesystem removal and tombstone
+transaction with an explicit credential-retention policy. Desktop IPC is also
+deferred until it uses that same complete lifecycle contract.
+
 ## Initial `loc log --json` Shape
 
 `loc log [path] [--push-id <push-id>] [--diff]` reads the durable push journal

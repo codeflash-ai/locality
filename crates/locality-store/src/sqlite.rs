@@ -2905,6 +2905,7 @@ impl HostedWorkspaceRepository for SqliteStateStore {
         }
         let current = hosted_workspace_attachment_from_connection(&transaction, &identity)?;
         let attachment = committed_attachment(&pending, current.as_ref(), committed_at)?;
+        ensure_hosted_transition_mount_ids_available(&transaction, &pending)?;
         transaction.execute(
             "INSERT INTO hosted_workspace_attachments (
                 api_origin, profile_id, credential_ref, root, profile_revision,
@@ -3269,10 +3270,69 @@ fn pending_hosted_workspace_from_connection(
     .map(Some)
 }
 
+fn ensure_hosted_transition_mount_ids_available(
+    connection: &Connection,
+    pending: &PendingHostedWorkspaceTransition,
+) -> StoreResult<()> {
+    for mapping in pending.prepared().mounts() {
+        let reserved: bool = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM mounts WHERE mount_id = ?1
+                UNION ALL
+                SELECT 1 FROM hosted_workspace_mount_mappings
+                 WHERE local_mount_id = ?1
+                   AND (api_origin != ?2 OR profile_id != ?3)
+                UNION ALL
+                SELECT 1 FROM hosted_workspace_pending_mounts m
+                JOIN hosted_workspace_pending_transitions t
+                  ON t.transition_id = m.transition_id
+                 WHERE m.local_mount_id = ?1 AND t.transition_id != ?4
+             )",
+            params![
+                mapping.local_mount_id().as_str(),
+                pending.prepared().identity().api_origin().as_str(),
+                pending.prepared().identity().profile_id().as_str(),
+                pending.prepared().transition_id(),
+            ],
+            |row| row.get(0),
+        )?;
+        if reserved {
+            return Err(StoreError::InvalidState(format!(
+                "local mount `{}` became reserved outside this hosted profile",
+                mapping.local_mount_id().as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_connector_mount_id_available(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<()> {
+    let reserved: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM hosted_workspace_mount_mappings WHERE local_mount_id = ?1
+            UNION ALL
+            SELECT 1 FROM hosted_workspace_pending_mounts WHERE local_mount_id = ?1
+         )",
+        params![mount_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if reserved {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` is reserved by a hosted workspace",
+            mount_id.as_str()
+        )));
+    }
+    Ok(())
+}
+
 impl MountRepository for SqliteStateStore {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_connector_mount_id_available(&transaction, &mount.mount_id)?;
         let existing = transaction
             .query_row(
                 "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json
@@ -7561,6 +7621,7 @@ fn mount_from_connection(
 }
 
 fn save_mount_row(connection: &Connection, mount: &MountConfig) -> StoreResult<()> {
+    ensure_connector_mount_id_available(connection, &mount.mount_id)?;
     connection.execute(
         "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)

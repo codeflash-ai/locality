@@ -67,15 +67,25 @@ refresh replaces the complete authorized workspace tree from one immutable
 export. The absolute root is host-local placement and is never sent as profile
 identity or backend authority.
 
-`loc-cli::hosted_workspace` exposes the attach/refresh coordinator as a Rust API;
-it does not change `loc sandbox init` or add a user-facing command. Session
-negotiation, export download, and archive staging happen without the shared
-workspace-path lock. Final overlap validation, atomic filesystem publication,
-and the complete SQLite mapping commit run while holding the same cross-process
-lock as CLI/Desktop connector mount creation and remount. A durable pending
-transition plus the materializer journal closes crash windows between the
-filesystem receipt and SQLite commit. Relocation is represented by the store
-contract but this first coordinator rejects it before download or publication.
+`loc-cli::hosted_workspace` exposes the attach/refresh coordinator as a Rust API
+and through `loc hosted-workspace attach|refresh|list`; it does not change
+`loc sandbox init`. Session negotiation, export download, and archive staging
+happen without the shared workspace-path lock. A transition-specific
+cross-process liveness lease prevents recovery from cancelling an active stage.
+Final overlap validation, exact pending-payload revalidation, receipt binding,
+atomic filesystem publication, and the complete SQLite mapping commit run while
+holding the same cross-process lock as CLI/Desktop connector mount creation and
+remount. The mapping commit rechecks global `MountId` uniqueness in its SQLite
+transaction. A durable pending transition plus the materializer journal closes
+crash windows between the filesystem receipt and SQLite commit. Relocation is
+represented by the store contract but this first coordinator rejects it before
+download or publication.
+
+Detach remains intentionally unavailable. It needs a shared durable transaction
+that binds ownership-checked filesystem removal, attachment/mapping tombstones,
+credential retention or deletion policy, and crash recovery. Desktop IPC also
+remains unavailable until it can call that same complete lifecycle rather than
+introducing a second attachment state machine.
 
 See [`cloud-sandbox-data-plane.md`](cloud-sandbox-data-plane.md) for the target
 architecture, database decision, data model, replica protocol, permissions,

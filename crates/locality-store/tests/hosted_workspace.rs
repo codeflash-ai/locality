@@ -9,7 +9,9 @@ use locality_protocol::workspace_layout::{LayoutDigest, WorkspaceProfileId};
 use locality_store::{
     CanonicalApiOrigin, HostedWorkspaceCredentialRef, HostedWorkspaceIdentity,
     HostedWorkspaceMountMapping, HostedWorkspaceRepository, InMemoryStateStore, MountConfig,
-    MountRepository, PreparedHostedWorkspaceTransition, SqliteStateStore, StoreError,
+    MountRepository, PreparedHostedWorkspaceTransition, ProjectionMode, SqliteStateStore,
+    StoreError, WorkspaceBinding, WorkspaceBindingRecord, WorkspaceBindingRepository,
+    WorkspaceHostBinding, WorkspaceHostPlatform, WorkspaceId, WorkspaceProjectionIdentity,
 };
 use rusqlite::Connection;
 
@@ -265,6 +267,166 @@ fn pending_profiles_cannot_reserve_the_same_local_mount_identity() {
     assert_pending_profiles_cannot_share_local_id(InMemoryStateStore::new());
     let fixture = Fixture::new("pending-local-collision");
     assert_pending_profiles_cannot_share_local_id(fixture.open());
+}
+
+#[test]
+fn connector_mount_cannot_claim_committed_or_pending_hosted_mount_identity() {
+    for committed in [false, true] {
+        let fixture = Fixture::new(if committed {
+            "connector-committed-id-collision"
+        } else {
+            "connector-pending-id-collision"
+        });
+        let mut store = fixture.open();
+        store
+            .begin_hosted_workspace_transition(transition(
+                "hosted-reservation",
+                identity("https://api.example.com", PROFILE_ID),
+                &fixture.workspace_root,
+                1,
+                DIGEST_A,
+                &[("portable", "hosted-reserved", "docs")],
+            ))
+            .unwrap();
+        if committed {
+            store
+                .commit_hosted_workspace_transition("hosted-reservation", "2026-08-03T00:00:00Z")
+                .unwrap();
+        }
+
+        assert!(matches!(
+            store.save_mount(MountConfig::new(
+                MountId::new("hosted-reserved"),
+                "notion",
+                fixture.root.join("connector")
+            )),
+            Err(StoreError::InvalidState(message)) if message.contains("reserved by a hosted workspace")
+        ));
+        assert!(store.load_mounts().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn connector_repair_commit_rechecks_pending_hosted_mount_identity() {
+    let fixture = Fixture::new("connector-repair-id-collision");
+    let mut store = fixture.open();
+    store
+        .begin_hosted_workspace_transition(transition(
+            "hosted-repair-reservation",
+            identity("https://api.example.com", PROFILE_ID),
+            &fixture.workspace_root,
+            1,
+            DIGEST_A,
+            &[("portable", "repair-local", "hosted-docs")],
+        ))
+        .unwrap();
+    let trusted_root = fixture.root.join("ConnectorWorkspace");
+    let mount_root = trusted_root.join("connector-docs");
+    fs::create_dir_all(&mount_root).unwrap();
+    let mount_id = MountId::new("repair-local");
+    let workspace_id = WorkspaceId::new("locality.workspace.hosted-repair-test").unwrap();
+    let host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        workspace_id.clone(),
+        &trusted_root,
+        WorkspaceProjectionIdentity::new("linux-fuse:hosted-repair-test").unwrap(),
+        1,
+    )
+    .unwrap();
+    let record = WorkspaceBindingRecord::new(
+        mount_id.clone(),
+        WorkspaceBinding::for_workspace(workspace_id, MountTarget::new("connector-docs").unwrap()),
+    );
+    let mount = MountConfig::new(mount_id.clone(), "notion", mount_root)
+        .projection(ProjectionMode::LinuxFuse);
+    let connection = Connection::open(&store.db_path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO mounts (
+                mount_id, connector, root, remote_root_id, read_only,
+                projection_json, connection_id, settings_json
+             ) VALUES (?1, 'notion', ?2, NULL, 0, ?3, NULL, '{}')",
+            rusqlite::params![
+                mount_id.as_str(),
+                mount.root.display().to_string(),
+                serde_json::to_string(&ProjectionMode::LinuxFuse).unwrap(),
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    store
+        .begin_workspace_remount_recovery("repair-attempt", &mount_id)
+        .unwrap();
+    let mut cleanup_called = false;
+    let mut cleanup = || {
+        cleanup_called = true;
+        Ok(())
+    };
+
+    assert!(matches!(
+        store.save_mount_with_workspace_binding_and_cleanup(
+            mount,
+            host,
+            record,
+            &mut cleanup
+        ),
+        Err(StoreError::InvalidState(message)) if message.contains("reserved by a hosted workspace")
+    ));
+    assert!(!cleanup_called);
+    assert!(store.get_mount(&mount_id).unwrap().is_some());
+}
+
+#[test]
+fn sqlite_commit_rechecks_mount_id_after_prepare_race() {
+    let fixture = Fixture::new("commit-id-race");
+    let identity = identity("https://api.example.com", PROFILE_ID);
+    let mut store = fixture.open();
+    store
+        .begin_hosted_workspace_transition(transition(
+            "raced-transition",
+            identity.clone(),
+            &fixture.workspace_root,
+            1,
+            DIGEST_A,
+            &[("portable", "raced-local-id", "docs")],
+        ))
+        .unwrap();
+
+    let connection = Connection::open(&store.db_path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO mounts (
+                mount_id, connector, root, remote_root_id, read_only,
+                projection_json, connection_id, settings_json
+             ) VALUES (?1, 'notion', ?2, NULL, 0, ?3, NULL, '{}')",
+            rusqlite::params![
+                "raced-local-id",
+                fixture.root.join("connector").display().to_string(),
+                serde_json::to_string(&locality_store::ProjectionMode::PlainFiles).unwrap(),
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        store.commit_hosted_workspace_transition(
+            "raced-transition",
+            "2026-08-03T00:00:01Z"
+        ),
+        Err(StoreError::InvalidState(message)) if message.contains("became reserved outside")
+    ));
+    assert!(
+        store
+            .get_hosted_workspace_attachment(&identity)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_pending_hosted_workspace_transition(&identity)
+            .unwrap()
+            .is_some()
+    );
 }
 
 fn assert_pending_profiles_cannot_share_local_id<S: HostedWorkspaceRepository>(mut store: S) {

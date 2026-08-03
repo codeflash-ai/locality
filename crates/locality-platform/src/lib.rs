@@ -30,9 +30,9 @@ pub use daemon::{
     DaemonManagerRestartFence, DaemonProcessError, DaemonProcessManager, DaemonProcessPaths,
     DaemonProcessStartConfig, DaemonProcessStartReport, DaemonProcessStopReport,
     DaemonRemountCoordinatorLock, DaemonStartMode, DaemonStartupCoordinatorLock,
-    DefaultDaemonProcessManager, MACOS_LAUNCHD_LABEL, daemon_manager_supervision_enabled,
-    daemon_remount_fence_path, daemon_remount_lock_path, daemon_socket_path,
-    ensure_daemon_start_allowed, reset_locality_state_storage_coordinated,
+    DefaultDaemonProcessManager, HostedWorkspaceTransitionLock, MACOS_LAUNCHD_LABEL,
+    daemon_manager_supervision_enabled, daemon_remount_fence_path, daemon_remount_lock_path,
+    daemon_socket_path, ensure_daemon_start_allowed, reset_locality_state_storage_coordinated,
     restore_daemon_manager_supervision,
 };
 pub use logs::{

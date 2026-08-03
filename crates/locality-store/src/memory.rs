@@ -180,6 +180,21 @@ impl InMemoryStateStore {
 impl MountRepository for InMemoryStateStore {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()> {
         if self
+            .hosted_workspace_mappings
+            .values()
+            .any(|mapping| mapping.local_mount_id() == &mount.mount_id)
+            || self
+                .pending_hosted_workspace_transitions
+                .values()
+                .flat_map(|pending| pending.prepared().mounts())
+                .any(|mapping| mapping.local_mount_id() == &mount.mount_id)
+        {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` is reserved by a hosted workspace",
+                mount.mount_id.as_str()
+            )));
+        }
+        if self
             .mounts
             .get(&mount.mount_id)
             .is_some_and(|existing| mount_source_identity_changed(existing, &mount))
@@ -316,6 +331,31 @@ impl HostedWorkspaceRepository for InMemoryStateStore {
             self.hosted_workspace_attachments.get(&identity),
             committed_at,
         )?;
+        for mapping in pending.prepared().mounts() {
+            let reserved_by_connector = self.mounts.contains_key(mapping.local_mount_id());
+            let reserved_by_attachment =
+                self.hosted_workspace_mappings
+                    .iter()
+                    .any(|((mapping_identity, _), existing)| {
+                        mapping_identity != &identity
+                            && existing.local_mount_id() == mapping.local_mount_id()
+                    });
+            let reserved_by_pending =
+                self.pending_hosted_workspace_transitions.iter().any(
+                    |(pending_identity, existing)| {
+                        pending_identity != &identity
+                            && existing.prepared().mounts().iter().any(|candidate| {
+                                candidate.local_mount_id() == mapping.local_mount_id()
+                            })
+                    },
+                );
+            if reserved_by_connector || reserved_by_attachment || reserved_by_pending {
+                return Err(StoreError::InvalidState(format!(
+                    "local mount `{}` became reserved outside this hosted profile",
+                    mapping.local_mount_id().as_str()
+                )));
+            }
+        }
         let previous = self.clone();
         for ((mapping_identity, _), mapping) in &mut self.hosted_workspace_mappings {
             if mapping_identity == &identity {

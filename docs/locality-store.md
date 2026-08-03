@@ -188,9 +188,12 @@ Pending preparation is idempotent only for the exact transition payload.
 Revision downgrade and reinterpretation of an existing revision fail closed.
 Local mount IDs must be unique across connector mounts, all committed hosted
 profiles, and all pending hosted transitions. Commit validates the captured base
-again, updates the attachment, deactivates removed mappings, upserts every
-proposed mapping, and removes pending state in one transaction. Removed mapping
-rows remain durable so reappearance reuses the same local identity.
+again, rechecks global local-mount-ID uniqueness, updates the attachment,
+deactivates removed mappings, upserts every proposed mapping, and removes
+pending state in one transaction. Connector mount save and atomic repair paths
+perform the inverse check. New local IDs are deterministic hashes of canonical
+API origin, hosted profile ID, and portable mount ID. Removed mapping rows remain
+durable so reappearance reuses the same local identity.
 
 No profile key, session capability, export URL, archive bytes, or absolute
 server placement is stored in these tables. Filesystem staging/publication is a

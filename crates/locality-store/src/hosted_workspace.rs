@@ -361,7 +361,7 @@ impl PreparedHostedWorkspaceTransition {
     }
 
     pub fn validate(&self) -> StoreResult<()> {
-        validate_identifier("transition ID", &self.transition_id, 200)?;
+        validate_transition_id(&self.transition_id)?;
         validate_host_root(&self.target_root)?;
         validate_profile_revision(self.profile_revision)?;
         validate_layout_version(self.layout_version)?;
@@ -437,6 +437,20 @@ impl PreparedHostedWorkspaceTransition {
     pub fn created_at(&self) -> &str {
         &self.created_at
     }
+}
+
+fn validate_transition_id(value: &str) -> StoreResult<()> {
+    if value.is_empty()
+        || value.len() > 200
+        || value.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        })
+    {
+        return Err(StoreError::InvalidState(
+            "hosted workspace transition ID is invalid".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
