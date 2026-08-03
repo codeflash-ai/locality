@@ -22,7 +22,10 @@ use locality_core::{LocalityError, LocalityResult};
 use serde::{Deserialize, Serialize};
 
 use crate::client::{GmailApi, HttpGmailApiClient};
-use crate::dto::{GmailDraftCreateRequest, GmailMessage, GmailRawMessage, GmailThread, header_map};
+use crate::dto::{
+    GmailDraftCreateRequest, GmailMessage, GmailMessageSendRequest, GmailRawMessage, GmailThread,
+    header_map,
+};
 use crate::oauth::GMAIL_CONNECTOR_ID;
 use crate::render::{
     GmailDraftDocument, GmailNativeBundle, GmailThreadMessageNativeBundle, GmailThreadNativeBundle,
@@ -37,6 +40,7 @@ const GMAIL_PAGE_SIZE: u32 = 100;
 const INBOX_FOLDER_ID: &str = "gmail-folder:inbox";
 const SENT_FOLDER_ID: &str = "gmail-folder:sent";
 const DRAFT_FOLDER_ID: &str = "gmail-folder:draft";
+const SEND_FOLDER_ID: &str = "gmail-folder:send";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct GmailConfig {
@@ -241,6 +245,11 @@ impl Connector for GmailConnector {
                     "draft",
                     &request.parent_path,
                 )?
+            }
+            ChildContainer::DirectoryChildren(remote_id)
+                if remote_id.as_str() == SEND_FOLDER_ID =>
+            {
+                Vec::new()
             }
             ChildContainer::PageChildren(remote_id) => {
                 let Some((mailbox, thread_id)) = parse_thread_remote_id(&remote_id) else {
@@ -475,15 +484,12 @@ impl Connector for GmailConnector {
             else {
                 return Err(LocalityError::Unsupported("gmail push operation"));
             };
-            if parent_id.as_str() != DRAFT_FOLDER_ID
-                || parent_kind.as_ref() != Some(&EntityKind::Directory)
-                || *parent_workspace
-            {
-                return Err(LocalityError::Unsupported("gmail create parent"));
-            }
-            if !is_direct_draft_child(source_path) {
-                return Err(LocalityError::Unsupported("gmail draft source path"));
-            }
+            let outbound_target = outbound_target_from_create(
+                parent_id,
+                parent_kind,
+                *parent_workspace,
+                source_path,
+            )?;
 
             let message_id = locality_message_id(request.push_id, &operation_id);
             if let Some(sent) = find_sent_message_by_message_id(self.api.as_ref(), &message_id)? {
@@ -500,19 +506,46 @@ impl Connector for GmailConnector {
 
             let draft = draft_from_push_create(title, properties, body)?;
             let mime = build_draft_mime_with_message_id(&draft, Some(&message_id))?;
-            let created = self.api.create_draft(GmailDraftCreateRequest {
-                message: GmailRawMessage {
-                    raw: raw_message_base64url(&mime),
-                },
-            })?;
-            let draft_message_id = RemoteId::new(created.message.id);
-            changed_remote_ids.push(draft_message_id.clone());
-            effects.push(JournalApplyEffect::CreatedEntity {
-                operation_id,
-                operation_index: index,
-                parent_id: RemoteId::new(DRAFT_FOLDER_ID),
-                entity_id: draft_message_id,
-            });
+            let raw = raw_message_base64url(&mime);
+            match outbound_target {
+                OutboundTarget::Draft => {
+                    let created = self.api.create_draft(GmailDraftCreateRequest {
+                        message: GmailRawMessage { raw },
+                    })?;
+                    let draft_message_id = RemoteId::new(created.message.id);
+                    changed_remote_ids.push(draft_message_id.clone());
+                    effects.push(JournalApplyEffect::CreatedEntity {
+                        operation_id,
+                        operation_index: index,
+                        parent_id: RemoteId::new(DRAFT_FOLDER_ID),
+                        entity_id: draft_message_id,
+                    });
+                }
+                OutboundTarget::Send => {
+                    let sent = match self.api.send_message(GmailMessageSendRequest { raw }) {
+                        Ok(sent) => sent,
+                        Err(send_error) => {
+                            match find_sent_message_by_message_id(self.api.as_ref(), &message_id) {
+                                Ok(Some(sent)) => sent,
+                                Ok(None) => return Err(send_error),
+                                Err(lookup_error) => {
+                                    return Err(LocalityError::Io(format!(
+                                        "gmail send ambiguous after send failure; sent lookup failed: {lookup_error}"
+                                    )));
+                                }
+                            }
+                        }
+                    };
+                    let sent_id = RemoteId::new(sent.id);
+                    changed_remote_ids.push(sent_id.clone());
+                    effects.push(JournalApplyEffect::CreatedEntity {
+                        operation_id,
+                        operation_index: index,
+                        parent_id: RemoteId::new(SENT_FOLDER_ID),
+                        entity_id: sent_id,
+                    });
+                }
+            }
         }
 
         Ok(ApplyPlanResult {
@@ -554,7 +587,13 @@ struct FolderSpec {
     title: &'static str,
 }
 
-fn folder_specs() -> [FolderSpec; 3] {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutboundTarget {
+    Draft,
+    Send,
+}
+
+fn folder_specs() -> [FolderSpec; 4] {
     [
         FolderSpec {
             id: INBOX_FOLDER_ID,
@@ -567,6 +606,10 @@ fn folder_specs() -> [FolderSpec; 3] {
         FolderSpec {
             id: DRAFT_FOLDER_ID,
             title: "draft",
+        },
+        FolderSpec {
+            id: SEND_FOLDER_ID,
+            title: "send",
         },
     ]
 }
@@ -1042,11 +1085,29 @@ fn mailbox_folder_id(mailbox: &str) -> &'static str {
     }
 }
 
-fn is_direct_draft_child(path: &Path) -> bool {
+fn outbound_target_from_create(
+    parent_id: &RemoteId,
+    parent_kind: &Option<EntityKind>,
+    parent_workspace: bool,
+    source_path: &Path,
+) -> LocalityResult<OutboundTarget> {
+    if parent_kind.as_ref() != Some(&EntityKind::Directory) || parent_workspace {
+        return Err(LocalityError::Unsupported("gmail create parent"));
+    }
+    match parent_id.as_str() {
+        DRAFT_FOLDER_ID if is_direct_child_of(source_path, "draft") => Ok(OutboundTarget::Draft),
+        DRAFT_FOLDER_ID => Err(LocalityError::Unsupported("gmail draft source path")),
+        SEND_FOLDER_ID if is_direct_child_of(source_path, "send") => Ok(OutboundTarget::Send),
+        SEND_FOLDER_ID => Err(LocalityError::Unsupported("gmail send source path")),
+        _ => Err(LocalityError::Unsupported("gmail create parent")),
+    }
+}
+
+fn is_direct_child_of(path: &Path, directory: &str) -> bool {
     let mut components = path.components();
     matches!(
         components.next(),
-        Some(Component::Normal(component)) if component == OsStr::new("draft")
+        Some(Component::Normal(component)) if component == OsStr::new(directory)
     ) && matches!(components.next(), Some(Component::Normal(_)))
         && components.next().is_none()
 }
@@ -1227,7 +1288,8 @@ mod tests {
     use crate::client::GmailApi;
     use crate::dto::{
         GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
-        GmailMessagePartBody, GmailMessageRef, GmailThread, GmailThreadList,
+        GmailMessagePartBody, GmailMessageRef, GmailMessageSendRequest, GmailThread,
+        GmailThreadList,
     };
     use crate::settings::GmailMountSettings;
 
@@ -1266,7 +1328,12 @@ mod tests {
         assert!(entries.iter().any(|entry| entry.path.starts_with("inbox/")));
         assert!(entries.iter().any(|entry| entry.path.starts_with("sent/")));
         assert!(entries.iter().any(|entry| entry.path.starts_with("draft/")));
-        assert!(!entries.iter().any(|entry| entry.path.starts_with("send/")));
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.path != std::path::PathBuf::from("send")
+                    && entry.path.starts_with("send"))
+        );
         let calls = api.calls.lock().expect("calls");
         assert_eq!(calls.list_max_results, vec![100, 100, 100]);
     }
@@ -1882,6 +1949,7 @@ mod tests {
         let calls = api.calls.lock().expect("calls");
         assert_eq!(calls.created_drafts, 1);
         assert!(calls.sent_drafts.is_empty());
+        assert_eq!(calls.sent_messages, 0);
         let raw = calls.created_draft_raw.last().expect("created draft raw");
         let mime = String::from_utf8(
             URL_SAFE_NO_PAD
@@ -2168,6 +2236,7 @@ mod tests {
         let calls = api.calls.lock().expect("calls");
         assert_eq!(calls.created_drafts, 0);
         assert!(calls.sent_drafts.is_empty());
+        assert_eq!(calls.sent_messages, 0);
         assert_eq!(
             calls.list_queries,
             vec![format!("rfc822msgid:<{message_id}>")]
@@ -2231,6 +2300,7 @@ mod tests {
         let calls = api.calls.lock().expect("calls");
         assert_eq!(calls.created_drafts, 1);
         assert!(calls.sent_drafts.is_empty());
+        assert_eq!(calls.sent_messages, 0);
         assert_eq!(
             calls.list_queries,
             vec![format!("rfc822msgid:<{message_id}>")]
@@ -2289,6 +2359,7 @@ mod tests {
         let calls = api.calls.lock().expect("calls");
         assert_eq!(calls.created_drafts, 1);
         assert!(calls.sent_drafts.is_empty());
+        assert_eq!(calls.sent_messages, 0);
     }
 
     #[test]
@@ -2332,6 +2403,7 @@ mod tests {
         let calls = api.calls.lock().expect("calls");
         assert_eq!(calls.created_drafts, 0);
         assert!(calls.sent_drafts.is_empty());
+        assert_eq!(calls.sent_messages, 0);
     }
 
     #[test]
@@ -2382,6 +2454,7 @@ mod tests {
         let calls = api.calls.lock().expect("calls");
         assert_eq!(calls.created_drafts, 0);
         assert!(calls.sent_drafts.is_empty());
+        assert_eq!(calls.sent_messages, 0);
     }
 
     #[test]
@@ -2491,12 +2564,11 @@ mod tests {
                     result_size_estimate: Some(1),
                 });
             }
-            if !calls.sent_drafts.is_empty()
-                && let Some(error) = calls.sent_search_error_after_send.clone()
-            {
+            let send_attempted = !calls.sent_drafts.is_empty() || calls.sent_messages > 0;
+            if send_attempted && let Some(error) = calls.sent_search_error_after_send.clone() {
                 return Err(error);
             }
-            if !calls.sent_drafts.is_empty()
+            if send_attempted
                 && let Some(sent_message_id) = calls
                     .sent_search_results_after_send
                     .get(query.unwrap_or_default())
@@ -2636,6 +2708,19 @@ mod tests {
                 id: "draft-1".to_string(),
                 message: message_fixture("draft-message-1"),
             })
+        }
+
+        fn send_message(
+            &self,
+            request: GmailMessageSendRequest,
+        ) -> locality_core::LocalityResult<GmailMessage> {
+            let mut calls = self.calls.lock().expect("calls");
+            calls.sent_messages += 1;
+            calls.sent_message_raw.push(request.raw);
+            if let Some(error) = calls.send_message_error.clone() {
+                return Err(error);
+            }
+            Ok(message_fixture("sent-msg-1"))
         }
 
         fn send_draft(

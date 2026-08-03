@@ -571,7 +571,7 @@ mod tests {
     use locality_gmail::client::GmailApi;
     use locality_gmail::dto::{
         GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
-        GmailMessagePartBody, GmailThread, GmailThreadList,
+        GmailMessagePartBody, GmailMessageSendRequest, GmailThread, GmailThreadList,
     };
 
     use super::*;
@@ -795,6 +795,10 @@ mod tests {
 
         fn create_draft(&self, _request: GmailDraftCreateRequest) -> LocalityResult<GmailDraft> {
             panic!("not used")
+        }
+
+        fn send_message(&self, _request: GmailMessageSendRequest) -> LocalityResult<GmailMessage> {
+            Ok(message_fixture("sent-msg-1"))
         }
 
         fn send_draft(&self, _request: GmailDraftSendRequest) -> LocalityResult<GmailMessage> {
