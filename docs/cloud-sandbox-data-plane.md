@@ -1991,12 +1991,20 @@ loc push /mnt/locality/notion/Projects/Agent\ Work/Design/page.md
 
 `--root` names the complete ephemeral publication unit exactly; it is not
 rewritten as a persistent workspace binding and no target suffix is appended.
-CLI and Desktop invoke the same host-binding resolver before network access and
-again after staging, immediately before publication. Read-only state inspection
-and local filesystem alias resolution reject a root equal to, above, or below a
-configured persistent mount. The check is not a global lock shared with mount
-creation, so orchestrators must allocate a dedicated sandbox path such as
-`/mnt/locality`, never a live Desktop/File Provider/FUSE/Cloud Files root.
+`loc sandbox init` invokes the host-binding resolver before network access and
+again after staging, immediately before publication. Its ephemeral check is not
+a global lock shared with mount creation, so orchestrators must still allocate a
+dedicated sandbox path such as `/mnt/locality`, never a live Desktop/File
+Provider/FUSE/Cloud Files root.
+
+The separate durable hosted-workspace attachment API uses a canonical API
+origin plus hosted profile ID as identity, keeps only a credential reference in
+SQLite, and retains stable portable-to-local mount mappings across revisions.
+Unlike ephemeral sandbox init, its final overlap revalidation, whole-tree
+publication, and atomic mount-set commit hold the same cross-process path lock
+used by CLI/Desktop connector mount creation and remount. Download and archive
+staging remain outside that lock. Hosted attachment rows do not enter connector
+discovery, Live Mode, push, or per-mount pull.
 
 In backend mode, `loc diff` is the agent-accessible review step and `loc push`
 means "submit this explicitly selected local plan to the Locality changeset

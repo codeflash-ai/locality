@@ -18,6 +18,7 @@
 | `repository` | Split repository traits for connector profiles, connections, mounts, entities, shadows, hydration jobs, and journals. |
 | `discovery` | Connector-neutral atomic batch-discovery commit, validation, and conservative pending-work guards. |
 | `generation_delivery` | Observed backend generations, per-path merge bases, and resumable generation-apply journal contracts. |
+| `hosted_workspace` | Durable hosted profile identity, credential references, portable-to-local mount mappings, and crash-recoverable attachment transitions. |
 | `memory` | Deterministic in-memory implementation for tests and early orchestration. |
 | `sqlite` | SQLite-backed durable implementation of the repository traits. |
 | `error` | Store-specific structured errors and conversion to `locality-core` errors. |
@@ -76,6 +77,14 @@
   binding. Explicit binding inserts
   check every configured mount, including unbound layout 0 roots, so an unbound
   basename cannot later collide with a portable target.
+- SQLite schema v28 / hosted-workspaces component v1 adds read-only hosted
+  profile attachments, stable portable-to-local mount history, and durable
+  pending transitions. Hosted rows are separate from connector `mounts`, and
+  only an opaque `hosted-workspace:` credential reference is persisted. The
+  attachment identity is `(canonical_api_origin, hosted_profile_id)`. Beginning
+  or committing a transition validates global local-mount-ID reservations;
+  commit updates the attachment and complete active mapping set in one SQLite
+  transaction while retaining inactive mapping history.
 - Workspace-binding component v4 adds stable local workspace identity plus a
   separate trusted host-root/projection record, layout sequence, and durable
   remount-recovery outcome without a schema-version bump. Opening released
@@ -161,6 +170,32 @@ These are executor APIs, not a claim about a daemon startup call site. Ambiguous
 filesystem state returns `needs_review`; repository and I/O failures propagate.
 Raw projection and version fields are checked before typed decoding so future
 layouts fail update-required without mutating durable state.
+
+## Hosted Workspace Attachments
+
+`HostedWorkspaceRepository` is the persistence boundary for a complete
+read-only hosted profile, not a connector mount adapter. It stores:
+
+- canonical API origin plus profile ID identity;
+- local credential-store reference, absolute host root, revision, layout
+  version/digest, and commit time;
+- one durable mapping history row per portable mount ID, including its stable
+  local `MountId`, current target, first/last-seen revisions, and active flag;
+- one compare-and-swap pending attach/refresh/relocate transition with the
+  complete proposed mount set and captured base state.
+
+Pending preparation is idempotent only for the exact transition payload.
+Revision downgrade and reinterpretation of an existing revision fail closed.
+Local mount IDs must be unique across connector mounts, all committed hosted
+profiles, and all pending hosted transitions. Commit validates the captured base
+again, updates the attachment, deactivates removed mappings, upserts every
+proposed mapping, and removes pending state in one transaction. Removed mapping
+rows remain durable so reappearance reuses the same local identity.
+
+No profile key, session capability, export URL, archive bytes, or absolute
+server placement is stored in these tables. Filesystem staging/publication is a
+coordinator responsibility; the repository records its crash-recoverable
+intent and final atomic mount-set outcome.
 
 ## Generation Delivery Transactions
 
@@ -283,6 +318,14 @@ The first schema keeps high-value lookup fields relational and stores complex co
   flag, projection mode (`plain_files`, `macos_file_provider`, `linux_fuse`, or
   `windows_cloud_files`), optional connection id, and connector-specific
   `settings_json`;
+- `hosted_workspace_attachments`: canonical API origin, hosted profile ID,
+  credential reference, local absolute root, committed revision, and layout
+  fence;
+- `hosted_workspace_mount_mappings`: stable portable-to-local mount identity
+  and retained revision history, kept outside connector runtime discovery;
+- `hosted_workspace_pending_transitions` and
+  `hosted_workspace_pending_mounts`: complete crash-recoverable proposed
+  attachment state committed as one mount-set transaction;
 - `entities`: mount id, remote id, kind, title, projected path, hydration, content hash, remote edit time;
 - `entity_search_fts`: legacy derived full-text index over entity titles/paths
   and observed remote titles/paths. It is rebuildable and stores no credential

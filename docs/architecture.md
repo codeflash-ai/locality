@@ -51,6 +51,32 @@ future GCP/Azure cells. Shared domain, connector, engine, protocol, and client
 crates remain public; private backend/PostgreSQL/AWS crates depend on exact
 public revisions, never the reverse.
 
+### Durable hosted workspace attachments
+
+The public client now has a read-only, plain-files attachment boundary for a
+hosted generation-2 workspace profile. Its durable identity is the canonical
+HTTP(S) API origin plus hosted profile ID. SQLite stores only an opaque
+credential-store reference; the reusable profile key remains in the local
+credential store. Each portable mount ID receives a distinct host-local
+`MountId`, and inactive mappings are retained so a mount that disappears and
+later returns keeps the same local identity.
+
+Hosted attachments are deliberately separate from connector `mounts`. They are
+therefore absent from connector discovery, Live Mode, push, and per-mount pull;
+refresh replaces the complete authorized workspace tree from one immutable
+export. The absolute root is host-local placement and is never sent as profile
+identity or backend authority.
+
+`loc-cli::hosted_workspace` exposes the attach/refresh coordinator as a Rust API;
+it does not change `loc sandbox init` or add a user-facing command. Session
+negotiation, export download, and archive staging happen without the shared
+workspace-path lock. Final overlap validation, atomic filesystem publication,
+and the complete SQLite mapping commit run while holding the same cross-process
+lock as CLI/Desktop connector mount creation and remount. A durable pending
+transition plus the materializer journal closes crash windows between the
+filesystem receipt and SQLite commit. Relocation is represented by the store
+contract but this first coordinator rejects it before download or publication.
+
 See [`cloud-sandbox-data-plane.md`](cloud-sandbox-data-plane.md) for the target
 architecture, database decision, data model, replica protocol, permissions,
 security model, migration path, and implementation phases. The rest of this

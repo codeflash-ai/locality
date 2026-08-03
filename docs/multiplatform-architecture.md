@@ -479,6 +479,14 @@ binding is valid layout 0 state, not corrupt or rebuildable metadata.
 layout 1 begins only when an owning coordinator supplies its trusted workspace
 root, accepts the resolver plan, and explicitly persists the binding.
 
+Read-only hosted workspaces use a sibling durable model rather than connector
+`MountConfig` rows. Their portable mount IDs map to stable, distinct local
+`MountId`s, while the complete hosted workspace root remains one local
+plain-files publication unit. CLI and Desktop connector mount changes and hosted
+publication share the remount/path coordinator lock, so final host-alias overlap
+validation cannot race mount creation. Hosted roots and mappings are excluded
+from connector discovery, Live Mode, push, and per-mount pull.
+
 Workspace-binding component v4 remains within schema v27. It adds the separate
 host-binding and remount-recovery tables and preserves released
 component-v2/v3 and v1 mount-binding rows. Those legacy rows continue to resolve
