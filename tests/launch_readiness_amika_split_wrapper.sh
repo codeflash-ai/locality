@@ -612,8 +612,12 @@ matches = re.findall(rb"__RECOVERY_COMMAND_RC__=([0-9]+)", transcript)
 if not matches:
     raise SystemExit("interactive recovery command produced no status marker")
 if b"event not found" in transcript:
+    sys.stderr.buffer.write(transcript)
     raise SystemExit(1)
-raise SystemExit(int(matches[-1]))
+command_rc = int(matches[-1])
+if command_rc:
+    sys.stderr.buffer.write(transcript)
+raise SystemExit(command_rc)
 PY
 
 forced_tty_bin="${tmp_root}/forced-tty-bin"
@@ -1079,15 +1083,15 @@ assert_contains "$sync_failure_err" "launch-readiness-sync-failure-locality"
 assert_contains "$sync_failure_err" "launch-readiness-sync-failure-mcp"
 assert_contains "$sync_failure_err" "/home/amika/workspace/locality-launch-readiness-sync-failure/target/launch-readiness-sync-failure-locality"
 assert_contains "$sync_failure_err" "/home/amika/workspace/locality-launch-readiness-sync-failure/target/launch-readiness-sync-failure-mcp"
-assert_contains "$sync_failure_err" "amika sandbox ssh launch-readiness-sync-failure-locality"
-assert_contains "$sync_failure_err" "amika sandbox ssh launch-readiness-sync-failure-mcp"
-assert_contains "$sync_failure_err" "amika sandbox ssh --print launch-readiness-sync-failure-locality"
-assert_contains "$sync_failure_err" "amika sandbox delete --remote --force launch-readiness-sync-failure-locality launch-readiness-sync-failure-mcp"
+assert_contains "$sync_failure_err" "amika sandbox ssh 'launch-readiness-sync-failure-locality'"
+assert_contains "$sync_failure_err" "amika sandbox ssh 'launch-readiness-sync-failure-mcp'"
+assert_contains "$sync_failure_err" "amika sandbox ssh '--print' 'launch-readiness-sync-failure-locality'"
+assert_contains "$sync_failure_err" "amika sandbox delete --remote --force 'launch-readiness-sync-failure-locality' 'launch-readiness-sync-failure-mcp'"
 assert_file_equals "$sync_failure_out/launch-readiness-sync-failure-locality/locality-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=0\nsync_attempted=1\nsync_rc=31'
 assert_file_equals "$sync_failure_out/launch-readiness-sync-failure-mcp/notion-mcp-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=0\nsync_attempted=1\nsync_rc=0'
 assert_contains "$sync_failure_out/amika-lifecycle.log" "pipeline_status strategy=locality setup_rc=0 benchmark_rc=0 sync_attempted=1 sync_rc=31"
 assert_contains "$sync_failure_out/amika-lifecycle.log" "retained_sandboxes locality=launch-readiness-sync-failure-locality mcp=launch-readiness-sync-failure-mcp"
-assert_contains "$sync_failure_out/amika-lifecycle.log" 'amika\ sandbox\ ssh\ launch-readiness-sync-failure-locality'
+assert_contains "$sync_failure_out/amika-lifecycle.log" "amika\\ sandbox\\ ssh\\ \\'launch-readiness-sync-failure-locality\\'"
 
 benchmark_and_sync_failure_log="${tmp_root}/benchmark-and-sync-failure.log"
 benchmark_and_sync_failure_calls="${tmp_root}/benchmark-and-sync-failure-calls"
@@ -1138,12 +1142,12 @@ recovery_command_err="${tmp_root}/recovery-command.err"
 recovery_command_sub_marker="${tmp_root}/recovery-command-sub-ran"
 recovery_backtick_marker="${tmp_root}/recovery-backtick-ran"
 recovery_local_out="${tmp_root}/recovery local 'quote' \$(touch $recovery_command_sub_marker) \`touch $recovery_backtick_marker\` !12345"
-recovery_remote_worktree="/home/amika/recovery remote 'quote' \$(touch $recovery_command_sub_marker) \`touch $recovery_backtick_marker\` !12345"
+recovery_remote_worktree="/tmp/!12345"
 set +e
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$recovery_command_log" \
   FAKE_RSYNC_FAIL_LOCALITY_RC=31 \
-  AMIKA_SANDBOX_FLAGS="--region test-region --profile recovery-profile" \
+  AMIKA_SANDBOX_FLAGS="--region test-region !value --profile recovery-profile" \
   REMOTE_WORKTREE="$recovery_remote_worktree" \
   RUN_ID="recovery-command" \
   SYNC_ARTIFACTS=1 \
@@ -1156,8 +1160,10 @@ if [ "$recovery_command_rc" -ne 31 ]; then
 fi
 recovery_local_out="$(cd "$recovery_local_out" && pwd)"
 assert_not_contains "$recovery_command_log" "amika sandbox delete"
-assert_contains "$recovery_command_err" "amika sandbox ssh --region test-region --profile recovery-profile launch-readiness-recovery-command-locality"
-assert_contains "$recovery_command_err" "amika sandbox ssh --region test-region --profile recovery-profile --print launch-readiness-recovery-command-locality"
+assert_contains "$recovery_command_err" "amika sandbox ssh '--region' 'test-region' '!value' '--profile' 'recovery-profile' 'launch-readiness-recovery-command-locality'"
+assert_contains "$recovery_command_err" "amika sandbox ssh '--region' 'test-region' '!value' '--profile' 'recovery-profile' '--print' 'launch-readiness-recovery-command-locality'"
+assert_contains "$recovery_command_err" "_amika_recovery_target=\$(amika sandbox ssh '--region' 'test-region' '!value' '--profile' 'recovery-profile' '--print' 'launch-readiness-recovery-command-locality') && rsync -az --delete \"\${_amika_recovery_target}\":'/tmp/!12345/target/launch-readiness-recovery-command-locality/'"
+assert_contains "$recovery_command_err" "'\\''"
 
 recovery_rsync_args="${tmp_root}/recovery-rsync-args"
 mkdir -p "$recovery_rsync_args"
@@ -1165,7 +1171,7 @@ executed_recovery_commands=0
 while IFS= read -r recovery_command; do
   recovery_command="${recovery_command#  }"
   case "$recovery_command" in
-    amika\ sandbox\ ssh*|rsync\ -az*|amika\ sandbox\ delete*)
+    amika\ sandbox\ ssh*|_amika_recovery_target=*|amika\ sandbox\ delete*)
       PATH="${fake_bin}:$PATH" \
         FAKE_AMIKA_LOG="$recovery_command_log" \
         FAKE_RSYNC_ARGS_DIR="$recovery_rsync_args" \
@@ -1179,8 +1185,8 @@ done < "$recovery_command_err"
 if [ "$executed_recovery_commands" -ne 5 ]; then
   fail "expected to execute five emitted recovery commands, got ${executed_recovery_commands}"
 fi
-assert_contains "$recovery_command_log" "amika sandbox ssh --region test-region --profile recovery-profile launch-readiness-recovery-command-locality"
-assert_contains "$recovery_command_log" "amika sandbox ssh --region test-region --profile recovery-profile --print launch-readiness-recovery-command-locality"
+assert_contains "$recovery_command_log" "!value"
+assert_contains "$recovery_command_log" "--profile recovery-profile --print launch-readiness-recovery-command-locality"
 assert_contains "$recovery_command_log" "amika sandbox delete --remote --force launch-readiness-recovery-command-locality launch-readiness-recovery-command-mcp"
 assert_file_equals "$recovery_rsync_args/source.1" "fake-user@fake-host-launch-readiness-recovery-command-locality:$recovery_remote_worktree/target/launch-readiness-recovery-command-locality/"
 assert_file_equals "$recovery_rsync_args/dest.1" "$recovery_local_out/artifacts/locality/"

@@ -1687,33 +1687,45 @@ cleanup_amika_sandboxes_on_exit() {
   exit "$cleanup_rc"
 }
 
-shell_join_quoted() {
-  local separator=""
+shell_quote_posix() {
+  local value="$1"
+  local prefix
+
+  printf "'"
+  while case "$value" in *"'"*) true ;; *) false ;; esac; do
+    prefix="${value%%\'*}"
+    printf '%s' "$prefix"
+    printf '%s' "'\\''"
+    value="${value#*\'}"
+  done
+  printf "%s'" "$value"
+}
+
+shell_append_quoted_args() {
   local arg
 
   for arg in "$@"; do
-    printf '%s' "$separator"
-    printf '%q' "$arg"
-    separator=" "
+    printf ' '
+    shell_quote_posix "$arg"
   done
 }
 
 amika_recovery_ssh_command() {
   local sandbox="$1"
+  printf 'amika sandbox ssh'
   if [ "${#AMIKA_FLAGS[@]}" -gt 0 ]; then
-    shell_join_quoted amika sandbox ssh "${AMIKA_FLAGS[@]}" "$sandbox"
-  else
-    shell_join_quoted amika sandbox ssh "$sandbox"
+    shell_append_quoted_args "${AMIKA_FLAGS[@]}"
   fi
+  shell_append_quoted_args "$sandbox"
 }
 
 amika_recovery_target_command() {
   local sandbox="$1"
+  printf 'amika sandbox ssh'
   if [ "${#AMIKA_FLAGS[@]}" -gt 0 ]; then
-    shell_join_quoted amika sandbox ssh "${AMIKA_FLAGS[@]}" --print "$sandbox"
-  else
-    shell_join_quoted amika sandbox ssh --print "$sandbox"
+    shell_append_quoted_args "${AMIKA_FLAGS[@]}"
   fi
+  shell_append_quoted_args --print "$sandbox"
 }
 
 amika_recovery_rsync_command() {
@@ -1725,9 +1737,9 @@ amika_recovery_rsync_command() {
   local local_artifact_dir_q
 
   target_command="$(amika_recovery_target_command "$sandbox")"
-  printf -v remote_source_path_q '%q' "$remote_out_dir/"
-  printf -v local_artifact_dir_q '%q' "$local_artifact_dir/"
-  printf 'rsync -az --delete "$(%s)":%s %s' \
+  remote_source_path_q="$(shell_quote_posix "$remote_out_dir/")"
+  local_artifact_dir_q="$(shell_quote_posix "$local_artifact_dir/")"
+  printf '_amika_recovery_target=$(%s) && rsync -az --delete "${_amika_recovery_target}":%s %s' \
     "$target_command" "$remote_source_path_q" "$local_artifact_dir_q"
 }
 
@@ -1748,7 +1760,7 @@ print_amika_recovery_instructions() {
   mcp_ssh="$(amika_recovery_ssh_command "$MCP_SANDBOX")"
   locality_rsync="$(amika_recovery_rsync_command "$LOCALITY_SANDBOX" "$LOCALITY_REMOTE_OUT_DIR" "$LOCAL_OUT_DIR/artifacts/locality")"
   mcp_rsync="$(amika_recovery_rsync_command "$MCP_SANDBOX" "$MCP_REMOTE_OUT_DIR" "$LOCAL_OUT_DIR/artifacts/notion-mcp")"
-  printf -v delete_command 'amika sandbox delete --remote --force %q %q' "$LOCALITY_SANDBOX" "$MCP_SANDBOX"
+  delete_command="amika sandbox delete --remote --force$(shell_append_quoted_args "$LOCALITY_SANDBOX" "$MCP_SANDBOX")"
 
   record_amika_recovery_line "Retaining Amika sandboxes because artifact sync failed"
   record_amika_recovery_line "Locality sandbox: $LOCALITY_SANDBOX"
