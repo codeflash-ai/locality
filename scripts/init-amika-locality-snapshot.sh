@@ -5,8 +5,8 @@ usage() {
   cat <<'EOF'
 Usage: init-amika-locality-snapshot.sh --api-url <origin> [options]
 
-Creates a fresh remote Amika sandbox, builds the Locality CLI from this checkout, and
-materializes a scoped workspace snapshot. It then runs one inline Notion-only
+Creates a fresh remote Amika sandbox, installs the verified Locality v0.3.7 CLI,
+and materializes a scoped workspace snapshot. It then runs one inline Notion-only
 scenario and prints both the prompt and generated report. The one-time bootstrap
 token is read from standard input and is never passed in a command-line argument.
 
@@ -34,6 +34,8 @@ fail() {
 API_URL=""
 SANDBOX_NAME="locality-snapshot-$(date -u +%Y%m%d-%H%M%S)"
 REMOTE_ROOT="/home/amika/locality-snapshot"
+LOC_RELEASE_VERSION="0.3.7"
+LOC_RELEASE_DEB_SHA256="692b05460839ba44b85cd1e6b3b6969ad4a3f62f3e81f420c4651159ad7ef195"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 AZURE_OPENAI_BASE_URL="${AZURE_OPENAI_BASE_URL:-https://aseem-mp32maxp-eastus2.openai.azure.com/openai/v1}"
@@ -143,29 +145,34 @@ printf 'Creating Amika sandbox %s...\n' "$SANDBOX_NAME"
   --name "$SANDBOX_NAME" \
   --yes >/dev/null)
 
-printf 'Building loc CLI at revision %s in %s...\n' "$SOURCE_REVISION" "$SANDBOX_NAME"
+printf 'Installing released loc CLI v%s in %s...\n' "$LOC_RELEASE_VERSION" "$SANDBOX_NAME"
 amika sandbox ssh "$SANDBOX_NAME" -- sh -c '
   set -eu
   revision=$1
+  loc_version=$2
+  expected_sha256=$3
   manifest=$(find "$HOME/workspace" -mindepth 2 -maxdepth 2 -type f -name Cargo.toml -print -quit)
   test -n "$manifest"
   repo_dir=${manifest%/Cargo.toml}
   git -C "$repo_dir" cat-file -e "$revision^{commit}"
   git -C "$repo_dir" checkout --detach "$revision"
-  if ! command -v cargo >/dev/null 2>&1; then
-    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs |
-      sh -s -- -y --profile minimal
-    . "$HOME/.cargo/env"
-  fi
-  cargo build --manifest-path "$manifest" --release -p loc-cli
   if [ "$repo_dir" != /home/amika/workspace/locality ]; then
     test ! -e /home/amika/workspace/locality
     ln -s "$repo_dir" /home/amika/workspace/locality
   fi
+  work_dir=$(mktemp -d)
+  trap '\''rm -rf "$work_dir"'\'' EXIT
+  package="$work_dir/Locality_Linux_v${loc_version}.deb"
+  curl -fsSL \
+    -o "$package" \
+    "https://github.com/codeflash-ai/locality/releases/download/v${loc_version}/Locality_Linux_v${loc_version}.deb"
+  printf "%s  %s\n" "$expected_sha256" "$package" | sha256sum -c -
+  dpkg-deb -x "$package" "$work_dir/package"
+  test -x "$work_dir/package/usr/bin/loc"
   mkdir -p "$HOME/.local/bin"
-  install -m 0755 "$repo_dir/target/release/loc" "$HOME/.local/bin/loc"
+  install -m 0755 "$work_dir/package/usr/bin/loc" "$HOME/.local/bin/loc"
   "$HOME/.local/bin/loc" sandbox init --help >/dev/null
-' sh "$SOURCE_REVISION"
+' sh "$SOURCE_REVISION" "$LOC_RELEASE_VERSION" "$LOC_RELEASE_DEB_SHA256"
 
 printf 'Materializing scoped workspace at %s:%s...\n' "$SANDBOX_NAME" "$REMOTE_ROOT"
 printf '%s\n' "$BOOTSTRAP_TOKEN" | amika sandbox ssh "$SANDBOX_NAME" -- \

@@ -90,8 +90,14 @@ output="$(
 
 assert_contains "$fake_log" "sandbox create --remote --name test-snapshot --yes"
 assert_contains "$fake_log" "sandbox ssh test-snapshot"
-assert_contains "$fake_log" "cargo build --manifest-path"
-assert_contains "$fake_log" "--release -p loc-cli"
+assert_contains "$fake_log" "Locality_Linux_v"
+assert_contains "$fake_log" "0.3.7"
+assert_contains "$fake_log" "692b05460839ba44b85cd1e6b3b6969ad4a3f62f3e81f420c4651159ad7ef195"
+assert_contains "$fake_log" "sha256sum -c"
+assert_contains "$fake_log" "dpkg-deb -x"
+if grep -F -q -- 'cargo build' "$fake_log"; then
+  fail "released CLI workflow should not build loc from source"
+fi
 assert_contains "$fake_log" '\$HOME/.local/bin/loc'
 assert_contains "$fake_log" "sandbox init"
 assert_contains "$fake_log" "--api-url https://api.dev.locality.dev"

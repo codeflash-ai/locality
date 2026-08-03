@@ -74,12 +74,12 @@ session-credential, and generation-2 materialization APIs inspect the default
 state root, while `*_at_state_root` variants accept an explicit state root.
 
 For a fresh remote Amika environment, the repository helper creates a sandbox,
-checks out the current repository revision, builds `loc-cli`, and streams a
-one-time bootstrap token to `loc sandbox init` over standard input. Building the
-current revision is intentional because an older published CLI may not expose
-the sandbox protocol yet. After materialization, the helper runs its inline
-Notion-only launch-gate scenario, prints the prompt, and prints
-`/home/amika/final_report.md`.
+checks out the current repository revision for scenario evidence, downloads the
+versioned Locality `v0.3.7` Linux package, verifies its pinned SHA-256, extracts
+the released `loc` binary without installing desktop dependencies, and streams
+a one-time bootstrap token to `loc sandbox init` over standard input. After
+materialization, the helper runs its inline Notion-only launch-gate scenario,
+prints the prompt, and prints `/home/amika/final_report.md`.
 
 The helper uses the existing Azure Codex setup. Export the Azure key locally;
 the script streams it directly to the remote Codex process without placing it
