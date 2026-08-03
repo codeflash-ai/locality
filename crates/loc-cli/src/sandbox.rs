@@ -15,15 +15,20 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, NaiveDateTime};
+use locality_protocol::freshness_wait::{
+    FRESHNESS_WAIT_FORMAT_VERSION, FRESHNESS_WAIT_READER_VERSION, FreshnessWaitAggregateState,
+    FreshnessWaitAttempt, FreshnessWaitAttemptRequest, MAX_FRESHNESS_WAIT_ATTEMPT_BYTES,
+};
 use locality_protocol::workspace_api_v2::{
-    WorkspaceClientCapabilitiesV2, WorkspaceExportOfferV2, WorkspaceProfileSessionRequestV2,
-    WorkspaceProfileSessionV2, WorkspaceSessionStatusV2,
+    WORKSPACE_HTTP_API_GENERATION_V2, WorkspaceClientCapabilitiesV2, WorkspaceExportOfferV2,
+    WorkspaceProfileSessionRequestV2, WorkspaceProfileSessionV2, WorkspaceSessionStatusV2,
 };
 use locality_protocol::{
-    ExportAttemptLimits, ExportAttemptRequest, OpaqueBootstrapExchangeRequest,
-    SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SandboxSessionState, SandboxSessionStatus,
-    SealedExportOffer, SessionCapability, SessionErrorCode, TarContentEncoding, TarExportOffer,
-    WorkspaceProfileSession,
+    ExportAttemptLimits, ExportAttemptRequest, FreshnessRequirement,
+    OpaqueBootstrapExchangeRequest, SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SandboxSessionState,
+    SandboxSessionStatus, SealedExportOffer, SessionCapability, SessionErrorCode,
+    TarContentEncoding, TarExportOffer, WorkspaceProfileSession,
 };
 use locality_store::{SqliteStateStore, WorkspaceHostBindingError, WorkspaceHostBindingResolver};
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
@@ -42,7 +47,7 @@ use localityd::workspace_materializer::{
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
-use reqwest::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, DATE, HeaderMap};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -61,6 +66,8 @@ const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const BOOTSTRAP_EXCHANGE_ATTEMPTS: usize = 2;
 const EXPORT_ATTEMPT_CREATION_ATTEMPTS: usize = 2;
 const EXPORT_ATTEMPT_STREAM_ATTEMPTS: usize = 2;
+const FRESHNESS_WAIT_REQUEST_ATTEMPTS: usize = 2;
+const FRESHNESS_WAIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const BOOTSTRAP_IDEMPOTENCY_DOMAIN: &[u8] = b"locality.session-exchange-idempotency.v1\0";
 const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
 const EXPORT_READ_AHEAD_CHUNK_BYTES: usize = 64 * 1024;
@@ -71,6 +78,7 @@ pub(crate) const PROFILE_BOOTSTRAP_TOKEN_INPUT: &str = "bootstrap_token_input";
 const PROFILE_CLIENT_SETUP: &str = "client_setup";
 const PROFILE_BOOTSTRAP_EXCHANGE: &str = "bootstrap_exchange";
 const PROFILE_SESSION_STATUS: &str = "session_status";
+const PROFILE_FRESHNESS_WAIT: &str = "freshness_wait";
 const PROFILE_EXPORT_OPEN_HEADERS: &str = "export_open_headers";
 const PROFILE_FIRST_CONSUMER_BODY_BYTE: &str = "first_consumer_body_byte";
 const PROFILE_STREAM_DECODE_MATERIALIZE: &str = "stream_decode_materialize";
@@ -1051,8 +1059,35 @@ fn run_generation2_workspace_init(
         expires_at: session.expires_at().to_string(),
     };
     validate_capability(&capability)?;
-    let status = client.workspace_session_status(&session, &capabilities)?;
+    let mut status = client.workspace_session_status(&session, &capabilities)?;
     mark_profile(&mut profile, PROFILE_SESSION_STATUS);
+    if status.state() == SandboxSessionState::Bootstrapping
+        && status.error().is_some_and(|error| {
+            error.retriable
+                && matches!(
+                    error.code,
+                    SessionErrorCode::Bootstrapping
+                        | SessionErrorCode::Stale
+                        | SessionErrorCode::Incomplete
+                )
+        })
+        && status.freshness_requirement().on_stale
+            == locality_protocol::StaleSessionBehavior::WaitThenFail
+        && capabilities.supports_freshness_wait()
+    {
+        match client.wait_for_workspace_freshness(
+            &session,
+            &capabilities,
+            status.freshness_requirement(),
+        )? {
+            FreshnessWaitAvailability::Completed => {
+                mark_profile(&mut profile, PROFILE_FRESHNESS_WAIT);
+                status = client.workspace_session_status(&session, &capabilities)?;
+                mark_profile(&mut profile, PROFILE_SESSION_STATUS);
+            }
+            FreshnessWaitAvailability::Unavailable => {}
+        }
+    }
     if status.state() != SandboxSessionState::Ready {
         return Err(SandboxInitError::SessionNotReady {
             state: status.state(),
@@ -1896,6 +1931,22 @@ struct SandboxHttpClient {
     api_url: reqwest::Url,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshnessWaitAvailability {
+    Completed,
+    Unavailable,
+}
+
+enum FreshnessWaitPostResult {
+    Response {
+        bytes: Vec<u8>,
+        authenticated_server_time: String,
+        response_headers_received_at: Instant,
+    },
+    RouteUnavailable,
+    DeadlineReached,
+}
+
 /// Validates the exact API URL shape accepted by sandbox and portable
 /// workspace clients without performing network I/O.
 pub fn validate_sandbox_api_url(api_url: &str) -> Result<(), SandboxInitError> {
@@ -2149,6 +2200,197 @@ impl SandboxHttpClient {
         })
     }
 
+    fn wait_for_workspace_freshness(
+        &self,
+        session: &WorkspaceProfileSessionV2,
+        capabilities: &WorkspaceClientCapabilitiesV2,
+        expected_freshness_requirement: &FreshnessRequirement,
+    ) -> Result<FreshnessWaitAvailability, SandboxInitError> {
+        let request = FreshnessWaitAttemptRequest {
+            format_version: FRESHNESS_WAIT_FORMAT_VERSION,
+            minimum_reader_version: FRESHNESS_WAIT_READER_VERSION,
+            api_generation: WORKSPACE_HTTP_API_GENERATION_V2,
+            session_id: session.session_id().clone(),
+            idempotency_key: random_idempotency_key()?,
+            capabilities: capabilities.clone(),
+        };
+        request
+            .validate()
+            .map_err(|error| invalid_freshness_wait_response(error.to_string()))?;
+
+        let (accepted, server_time, response_headers_received_at) =
+            match self.post_freshness_wait_attempt(session, &request, None)? {
+                FreshnessWaitPostResult::Response {
+                    bytes,
+                    authenticated_server_time,
+                    response_headers_received_at,
+                } => (
+                    bytes,
+                    authenticated_server_time,
+                    response_headers_received_at,
+                ),
+                FreshnessWaitPostResult::RouteUnavailable => {
+                    return Ok(FreshnessWaitAvailability::Unavailable);
+                }
+                FreshnessWaitPostResult::DeadlineReached => {
+                    unreachable!("the first freshness wait request has no local deadline")
+                }
+            };
+        let mut attempt = FreshnessWaitAttempt::decode_json(&accepted, &request, &server_time)
+            .map_err(|error| invalid_freshness_wait_response(error.to_string()))?;
+        if attempt.freshness_requirement != *expected_freshness_requirement {
+            return Err(invalid_freshness_wait_response(
+                "freshness wait requirement does not match the initiating session status"
+                    .to_string(),
+            ));
+        }
+        let mut local_deadline = if attempt.state == FreshnessWaitAggregateState::Waiting {
+            Some(freshness_wait_local_deadline(
+                &attempt,
+                &server_time,
+                response_headers_received_at,
+            )?)
+        } else {
+            None
+        };
+
+        loop {
+            if attempt.state == FreshnessWaitAggregateState::Terminal {
+                return Ok(FreshnessWaitAvailability::Completed);
+            }
+
+            let deadline = local_deadline.expect("validated waiting attempts have a deadline");
+            let retry_after = Duration::from_secs(
+                attempt
+                    .poll
+                    .as_ref()
+                    .and_then(|poll| poll.retry.retry_after_seconds)
+                    .expect("validated waiting attempts carry positive poll advice"),
+            );
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining <= retry_after {
+                if !remaining.is_zero() {
+                    thread::sleep(remaining);
+                }
+                return Ok(FreshnessWaitAvailability::Completed);
+            }
+            thread::sleep(retry_after);
+
+            let (successor_bytes, successor_server_time, successor_headers_received_at) =
+                match self.post_freshness_wait_attempt(session, &request, Some(deadline))? {
+                    FreshnessWaitPostResult::Response {
+                        bytes,
+                        authenticated_server_time,
+                        response_headers_received_at,
+                    } => (
+                        bytes,
+                        authenticated_server_time,
+                        response_headers_received_at,
+                    ),
+                    FreshnessWaitPostResult::RouteUnavailable => {
+                        return Ok(FreshnessWaitAvailability::Unavailable);
+                    }
+                    FreshnessWaitPostResult::DeadlineReached => {
+                        return Ok(FreshnessWaitAvailability::Completed);
+                    }
+                };
+            let successor = FreshnessWaitAttempt::decode_json(
+                &successor_bytes,
+                &request,
+                &successor_server_time,
+            )
+            .map_err(|error| invalid_freshness_wait_response(error.to_string()))?;
+            successor
+                .validate_successor(&attempt, &request, &successor_server_time)
+                .map_err(|error| invalid_freshness_wait_response(error.to_string()))?;
+
+            let successor_deadline = freshness_wait_local_deadline(
+                &successor,
+                &successor_server_time,
+                successor_headers_received_at,
+            )?;
+            local_deadline = Some(deadline.min(successor_deadline));
+            attempt = successor;
+        }
+    }
+
+    fn post_freshness_wait_attempt(
+        &self,
+        session: &WorkspaceProfileSessionV2,
+        request: &FreshnessWaitAttemptRequest,
+        local_deadline: Option<Instant>,
+    ) -> Result<FreshnessWaitPostResult, SandboxInitError> {
+        for attempt in 0..FRESHNESS_WAIT_REQUEST_ATTEMPTS {
+            let timeout = match local_deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(FreshnessWaitPostResult::DeadlineReached);
+                    }
+                    FRESHNESS_WAIT_REQUEST_TIMEOUT.min(remaining)
+                }
+                None => FRESHNESS_WAIT_REQUEST_TIMEOUT,
+            };
+            let response = match self
+                .client
+                .post(self.workspace_freshness_wait_attempts_v2_url(session.session_id().as_str()))
+                .header(ACCEPT, JSON_MEDIA_TYPE)
+                .bearer_auth(session.opaque_capability())
+                .timeout(timeout)
+                .json(request)
+                .send()
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = SandboxInitError::Http {
+                        operation: "freshness wait attempt",
+                        detail: error.without_url().to_string(),
+                    };
+                    if has_retry_remaining(attempt, FRESHNESS_WAIT_REQUEST_ATTEMPTS)
+                        && local_deadline.is_none_or(|deadline| Instant::now() < deadline)
+                    {
+                        continue;
+                    }
+                    if local_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return Ok(FreshnessWaitPostResult::DeadlineReached);
+                    }
+                    return Err(error);
+                }
+            };
+
+            if matches!(
+                response.status(),
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ) {
+                return Ok(FreshnessWaitPostResult::RouteUnavailable);
+            }
+            if is_retriable_idempotent_status(response.status())
+                && has_retry_remaining(attempt, FRESHNESS_WAIT_REQUEST_ATTEMPTS)
+                && local_deadline.is_none_or(|deadline| Instant::now() < deadline)
+            {
+                continue;
+            }
+            match read_freshness_wait_response(response) {
+                Ok((bytes, authenticated_server_time, response_headers_received_at)) => {
+                    return Ok(FreshnessWaitPostResult::Response {
+                        bytes,
+                        authenticated_server_time,
+                        response_headers_received_at,
+                    });
+                }
+                Err(error)
+                    if has_retry_remaining(attempt, FRESHNESS_WAIT_REQUEST_ATTEMPTS)
+                        && is_ambiguous_idempotent_error(&error, "freshness wait attempt")
+                        && local_deadline.is_none_or(|deadline| Instant::now() < deadline) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("freshness wait request loop always returns")
+    }
+
     fn create_workspace_export_attempt(
         &self,
         session: &WorkspaceProfileSessionV2,
@@ -2395,6 +2637,13 @@ impl SandboxHttpClient {
         )
     }
 
+    fn workspace_freshness_wait_attempts_v2_url(&self, session_id: &str) -> reqwest::Url {
+        endpoint_url(
+            &self.api_url,
+            &["v2", "sessions", session_id, "freshness-wait-attempts"],
+        )
+    }
+
     fn workspace_export_attempt_v2_url(&self, session_id: &str, attempt_id: &str) -> reqwest::Url {
         endpoint_url(
             &self.api_url,
@@ -2538,6 +2787,81 @@ fn read_json_response_bytes(
         });
     }
     Ok(bytes)
+}
+
+fn read_freshness_wait_response(
+    mut response: Response,
+) -> Result<(Vec<u8>, String, Instant), SandboxInitError> {
+    let response_headers_received_at = Instant::now();
+    ensure_status(&response, "freshness wait attempt", StatusCode::OK)?;
+    require_media_type(
+        response.headers(),
+        "freshness wait attempt",
+        JSON_MEDIA_TYPE,
+    )?;
+    let authenticated_server_time = authenticated_server_time(response.headers())?;
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take(MAX_FRESHNESS_WAIT_ATTEMPT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| SandboxInitError::Http {
+            operation: "freshness wait attempt",
+            detail: error.to_string(),
+        })?;
+    if bytes.len() > MAX_FRESHNESS_WAIT_ATTEMPT_BYTES {
+        return Err(SandboxInitError::JsonResponseTooLarge {
+            operation: "freshness wait attempt",
+            limit: MAX_FRESHNESS_WAIT_ATTEMPT_BYTES as u64,
+        });
+    }
+    Ok((
+        bytes,
+        authenticated_server_time,
+        response_headers_received_at,
+    ))
+}
+
+fn authenticated_server_time(headers: &HeaderMap) -> Result<String, SandboxInitError> {
+    let value = headers
+        .get(DATE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            invalid_freshness_wait_response(
+                "response is missing a valid authenticated HTTP Date header".to_string(),
+            )
+        })?;
+    let timestamp =
+        NaiveDateTime::parse_from_str(value, "%a, %d %b %Y %H:%M:%S GMT").map_err(|_| {
+            invalid_freshness_wait_response(
+                "response has an invalid authenticated HTTP Date header".to_string(),
+            )
+        })?;
+    Ok(timestamp.and_utc().format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+fn freshness_wait_local_deadline(
+    attempt: &FreshnessWaitAttempt,
+    authenticated_server_time: &str,
+    response_headers_received_at: Instant,
+) -> Result<Instant, SandboxInitError> {
+    let server_time = DateTime::parse_from_rfc3339(authenticated_server_time)
+        .map_err(|error| invalid_freshness_wait_response(error.to_string()))?;
+    let deadline = DateTime::parse_from_rfc3339(&attempt.original_deadline_at)
+        .map_err(|error| invalid_freshness_wait_response(error.to_string()))?;
+    let remaining = deadline.signed_duration_since(server_time).num_seconds();
+    let remaining = u64::try_from(remaining.max(0))
+        .map_err(|error| invalid_freshness_wait_response(error.to_string()))?;
+    response_headers_received_at
+        .checked_add(Duration::from_secs(remaining))
+        .ok_or_else(|| invalid_freshness_wait_response("deadline overflow".to_string()))
+}
+
+fn invalid_freshness_wait_response(detail: String) -> SandboxInitError {
+    SandboxInitError::InvalidJson {
+        operation: "freshness wait attempt",
+        detail,
+    }
 }
 
 fn ensure_success(response: &Response, operation: &'static str) -> Result<(), SandboxInitError> {

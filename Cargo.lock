@@ -2272,6 +2272,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 name = "loc-cli"
 version = "0.3.6"
 dependencies = [
+ "chrono",
  "clap",
  "getrandom 0.4.2",
  "locality-connector",
