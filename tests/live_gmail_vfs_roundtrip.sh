@@ -42,6 +42,10 @@ initial_pull_report="$tmp_root/initial-pull.json"
 diff_report="$tmp_root/diff.json"
 push_report="$tmp_root/push.json"
 pull_after_push_report="$tmp_root/pull-after-push.json"
+send_status_report="$tmp_root/send-status.json"
+send_diff_report="$tmp_root/send-diff.json"
+send_push_report="$tmp_root/send-push.json"
+send_pull_after_push_report="$tmp_root/send-pull-after-push.json"
 drafts_list_report="$tmp_root/gmail-drafts.json"
 draft_get_report="$tmp_root/gmail-draft.json"
 credential_path=""
@@ -82,17 +86,18 @@ wait_for_projected_mount_root() {
   live_fail "Gmail FUSE mount root did not appear at $mount_root"
 }
 
-wait_for_draft_dir() {
+wait_for_outbound_dirs() {
   local draft_dir="$mount_root/draft"
+  local send_dir="$mount_root/send"
   local attempts="${LOCALITY_GMAIL_LIVE_DRAFT_WAIT_ATTEMPTS:-80}"
   local attempt
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if [[ -d "$draft_dir" ]]; then
+    if [[ -d "$draft_dir" && -d "$send_dir" ]]; then
       return 0
     fi
     sleep 0.25
   done
-  live_fail "Gmail draft directory did not appear under the mount"
+  live_fail "Gmail draft/ and send/ directories did not appear under the mount"
 }
 
 projected_gmail_draft_matches_message() {
@@ -194,6 +199,21 @@ wait_for_marker_under_draft() {
     sleep 0.25
   done
   live_fail "created Gmail draft marker was not visible under draft/ after pull"
+}
+
+wait_for_marker_under_sent() {
+  local marker="$1"
+  local sent_dir="$mount_root/sent"
+  local attempts="${LOCALITY_GMAIL_LIVE_SENT_MARKER_WAIT_ATTEMPTS:-120}"
+  local attempt
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if [[ -d "$sent_dir" ]] && grep -R -F -q -- "$marker" "$sent_dir" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  live_fail "direct Gmail send marker was not visible under sent/ after pull"
 }
 
 find_gmail_draft_id() {
@@ -485,7 +505,7 @@ if [[ -n "$oauth_refresh_marker" ]]; then
     "$oauth_refresh_marker" \
     "Gmail live credential"
 fi
-wait_for_draft_dir
+wait_for_outbound_dirs
 
 unique="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 subject="Locality live Gmail $unique"
@@ -533,4 +553,43 @@ wait_for_marker_under_draft "$marker" "$raw_message_id"
 step="deleting created Gmail draft"
 delete_created_gmail_draft required
 
-echo "live Gmail API, CLI, daemon, and Linux FUSE draft checks passed"
+if [[ "${LOCALITY_LIVE_GMAIL_SEND:-0}" == "1" ]]; then
+  send_subject="Locality live Gmail send $unique"
+  send_marker="Locality live Gmail direct send marker $unique"
+  send_path="$mount_root/send/locality-live-gmail-send-$unique.md"
+
+  step="creating Gmail direct send through Linux FUSE"
+  printf -- '---\nto:\n  - "%s"\nsubject: "%s"\n---\n%s\n' \
+    "$LOCALITY_GMAIL_LIVE_TO_EMAIL" \
+    "$send_subject" \
+    "$send_marker" >"$send_path"
+
+  step="checking Gmail direct send status"
+  LOCALITY_STATE_DIR="$state_root" "$loc_bin" status --json "$send_path" \
+    >"$send_status_report" 2>>"$command_log"
+  assert_json_ok "$send_status_report" "Gmail send status report"
+
+  step="diffing Gmail direct send"
+  LOCALITY_STATE_DIR="$state_root" "$loc_bin" diff --json "$send_path" \
+    >"$send_diff_report" 2>>"$command_log"
+  assert_json_ok "$send_diff_report" "Gmail send diff report"
+  assert_json_field_equals "$send_diff_report" "action" "confirm_plan" "Gmail send diff report"
+
+  step="pushing Gmail direct send"
+  LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$send_path" \
+    >"$send_push_report" 2>>"$command_log"
+  assert_json_ok "$send_push_report" "Gmail send push report"
+
+  step="pulling Gmail workspace after direct send"
+  LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root" \
+    >"$send_pull_after_push_report" 2>>"$command_log"
+  assert_json_ok "$send_pull_after_push_report" "Gmail send pull-after-push report"
+
+  step="verifying Gmail direct send marker under sent"
+  wait_for_marker_under_sent "$send_marker"
+
+  echo "live Gmail API, CLI, daemon, and Linux FUSE draft and direct-send checks passed"
+else
+  echo "skip: set LOCALITY_LIVE_GMAIL_SEND=1 to run the live Gmail direct-send check; this sends a real email"
+  echo "live Gmail API, CLI, daemon, and Linux FUSE draft checks passed"
+fi
