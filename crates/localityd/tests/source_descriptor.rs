@@ -122,6 +122,9 @@ fn gmail_descriptor_comes_from_registry() {
     assert_eq!(descriptor.auth_env_var(), None);
     assert!(descriptor.supports_oauth());
     assert!(descriptor.mount_guidance().contains("Gmail facts"));
+    assert!(descriptor.mount_guidance().contains(
+        "Create a Markdown file directly under send/ to send immediately after explicit review"
+    ));
     assert_eq!(
         descriptor.create_entity_parent_kinds(),
         &[EntityKind::Directory]
@@ -242,6 +245,63 @@ fn google_calendar_write_policy_allows_only_direct_drafts() {
     );
     assert!(
         source_create_decision_for_parent_path(&mount, std::path::Path::new("draft")).is_writable()
+    );
+}
+
+#[test]
+fn gmail_write_policy_allows_only_direct_draft_and_send_children() {
+    let mut mount = MountConfig::new(
+        MountId::new("gmail-main"),
+        GMAIL_CONNECTOR_ID,
+        "/tmp/locality/gmail",
+    );
+    mount.read_only = false;
+
+    assert!(
+        !source_write_decision_for_path(&mount, std::path::Path::new("inbox/foo.md")).is_writable()
+    );
+    assert!(
+        !source_write_decision_for_path(&mount, std::path::Path::new("sent/foo.md")).is_writable()
+    );
+    assert!(source_write_decision_for_path(&mount, std::path::Path::new("draft")).is_writable());
+    assert!(
+        source_write_decision_for_path(&mount, std::path::Path::new("draft/foo.md")).is_writable()
+    );
+    assert!(
+        !source_write_decision_for_path(&mount, std::path::Path::new("draft/nested/foo.md"))
+            .is_writable()
+    );
+    assert!(source_write_decision_for_path(&mount, std::path::Path::new("send")).is_writable());
+    assert!(
+        source_write_decision_for_path(&mount, std::path::Path::new("send/foo.md")).is_writable()
+    );
+    assert!(
+        !source_write_decision_for_path(&mount, std::path::Path::new("send/nested/foo.md"))
+            .is_writable()
+    );
+    assert!(
+        source_create_decision_for_parent_path(&mount, std::path::Path::new("draft")).is_writable()
+    );
+    assert!(
+        source_create_decision_for_parent_path(&mount, std::path::Path::new("send")).is_writable()
+    );
+    assert!(
+        !source_create_decision_for_parent_path(&mount, std::path::Path::new("inbox"))
+            .is_writable()
+    );
+    assert!(
+        !source_create_decision_for_parent_path(&mount, std::path::Path::new("send/nested"))
+            .is_writable()
+    );
+    assert!(
+        !source_move_decision_for_parent_path(&mount, std::path::Path::new("draft")).is_writable()
+    );
+    let send_move_decision =
+        source_move_decision_for_parent_path(&mount, std::path::Path::new("send"));
+    assert!(!send_move_decision.is_writable());
+    assert_eq!(
+        send_move_decision.reason(),
+        Some("Gmail moves are not supported; create a new file directly under draft/ or send/")
     );
 }
 
@@ -1943,6 +2003,16 @@ fn local_gmail_validator_allows_valid_direct_draft_create() {
 }
 
 #[test]
+fn local_gmail_validator_allows_valid_direct_send_create() {
+    let issues = validate_gmail_create(
+        "send/foo.md",
+        "---\nto: [\"user@example.com\"]\nsubject: Hello\n---\nBody\n",
+    );
+
+    assert!(issues.is_empty());
+}
+
+#[test]
 fn local_gmail_validator_blocks_missing_and_empty_draft_recipients() {
     for markdown in [
         "---\nsubject: Hello\n---\nBody\n",
@@ -2010,7 +2080,17 @@ fn local_gmail_validator_blocks_nested_draft_create() {
         "---\nto: [\"user@example.com\"]\nsubject: Hello\n---\nBody\n",
     );
 
-    assert_eq!(issues, vec!["gmail_create_outside_draft"]);
+    assert_eq!(issues, vec!["gmail_create_outside_outbound_folder"]);
+}
+
+#[test]
+fn local_gmail_validator_blocks_nested_send_create() {
+    let issues = validate_gmail_create(
+        "send/nested/foo.md",
+        "---\nto: [\"user@example.com\"]\nsubject: Hello\n---\nBody\n",
+    );
+
+    assert_eq!(issues, vec!["gmail_create_outside_outbound_folder"]);
 }
 
 #[test]

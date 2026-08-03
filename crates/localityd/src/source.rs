@@ -317,11 +317,11 @@ pub fn source_create_decision_for_parent_path(
         };
     }
     if mount.connector == "gmail" {
-        return if parent_path == Path::new("draft") {
+        return if matches!(parent_path.to_str(), Some("draft" | "send")) {
             SourceWriteDecision::Writable
         } else {
             SourceWriteDecision::ReadOnly {
-                reason: "Gmail creates are only supported directly inside draft/",
+                reason: "Gmail creates are only supported directly inside draft/ or send/",
             }
         };
     }
@@ -362,12 +362,8 @@ pub fn source_move_decision_for_parent_path(
         };
     }
     if mount.connector == "gmail" {
-        return if parent_path == Path::new("draft") {
-            SourceWriteDecision::Writable
-        } else {
-            SourceWriteDecision::ReadOnly {
-                reason: "Gmail moves are only supported directly inside draft/",
-            }
+        return SourceWriteDecision::ReadOnly {
+            reason: "Gmail moves are not supported; create a new file directly under draft/ or send/",
         };
     }
     if mount.connector == GRANOLA_CONNECTOR_ID {
@@ -610,19 +606,25 @@ fn linear_source_descriptor() -> SourceDescriptor {
 }
 
 fn gmail_write_decision_for_path(relative_path: &Path) -> SourceWriteDecision {
-    match relative_path
-        .components()
-        .next()
-        .and_then(|component| match component {
-            std::path::Component::Normal(value) => value.to_str(),
-            _ => None,
-        }) {
-        Some("draft") => SourceWriteDecision::Writable,
+    let mut components = relative_path.components();
+    match components.next().and_then(|component| match component {
+        std::path::Component::Normal(value) => value.to_str(),
+        _ => None,
+    }) {
+        Some("draft" | "send") => match components.next() {
+            None => SourceWriteDecision::Writable,
+            Some(std::path::Component::Normal(_)) if components.next().is_none() => {
+                SourceWriteDecision::Writable
+            }
+            _ => SourceWriteDecision::ReadOnly {
+                reason: "Gmail writes are only supported directly under draft/ or send/",
+            },
+        },
         Some("inbox") | Some("sent") => SourceWriteDecision::ReadOnly {
             reason: "Gmail inbox and sent items are read-only",
         },
         _ => SourceWriteDecision::ReadOnly {
-            reason: "Gmail writes are only supported under draft/",
+            reason: "Gmail writes are only supported directly under draft/ or send/",
         },
     }
 }
@@ -752,9 +754,12 @@ fn gmail_mount_guidance() -> String {
     format!(
         "{}\n\
 Gmail facts:\n\
-- This mount projects Gmail inbox/, sent/, and draft/ folders.\n\
-- inbox/ and sent/ are read-only. Create a Markdown file directly under draft/ to create an unsent Gmail draft.\n\
-- Draft creates require `to` frontmatter and either `subject` or `title` frontmatter.\n",
+- This mount projects Gmail inbox/, sent/, draft/, and send/ folders.\n\
+- inbox/ and sent/ are read-only mailbox history.\n\
+- Create a Markdown file directly under draft/ to create an unsent Gmail draft.\n\
+- Create a Markdown file directly under send/ to send immediately after explicit review and push.\n\
+- Both outbound folders require `to` frontmatter and either `subject` or `title` frontmatter.\n\
+- Use send/ only when the user explicitly asks to send mail now; otherwise use draft/ for review in Gmail.\n",
         generic_mount_guidance("Gmail")
     )
 }

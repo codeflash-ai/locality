@@ -344,7 +344,7 @@ pub(crate) fn validate_gmail_changed_frontmatter(
             Some(1),
             "Gmail inbox and sent items are read-only",
             Some(
-                "create a new Markdown file directly under draft/ to create an unsent Gmail draft"
+                "create a new Markdown file directly under draft/ for an unsent Gmail draft or send/ to send after review"
                     .to_string(),
             ),
         ));
@@ -357,13 +357,13 @@ pub(crate) fn validate_gmail_create_frontmatter(
 ) -> LocalityResult<ValidationReport> {
     let mut report = ValidationReport::clean();
 
-    if !is_direct_draft_child(context.relative_path) {
+    if !is_direct_outbound_child(context.relative_path) {
         report.push(ValidationIssue::new(
-            "gmail_create_outside_draft",
+            "gmail_create_outside_outbound_folder",
             context.relative_path,
             Some(1),
-            "Gmail creates are only supported directly inside draft/",
-            Some("move the new email Markdown file directly under draft/".to_string()),
+            "Gmail creates are only supported directly inside draft/ or send/",
+            Some("move the new email Markdown file directly under draft/ or send/".to_string()),
         ));
     }
 
@@ -461,11 +461,11 @@ fn gmail_mailbox_from_path(path: &Path) -> Option<&str> {
         })
 }
 
-fn is_direct_draft_child(path: &Path) -> bool {
+fn is_direct_outbound_child(path: &Path) -> bool {
     let mut components = path.components();
     matches!(
         components.next(),
-        Some(Component::Normal(component)) if component == "draft"
+        Some(Component::Normal(component)) if component == "draft" || component == "send"
     ) && matches!(components.next(), Some(Component::Normal(_)))
         && components.next().is_none()
 }

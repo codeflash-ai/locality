@@ -1355,6 +1355,72 @@ fn prepare_stale_pending_move_rechecks_source_and_mount_write_policy() {
             .any(|issue| issue.code == "source_path_read_only")
     );
 
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.virtual_store("gmail");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("gmail-folder:send"),
+            EntityKind::Directory,
+            "send",
+            "send",
+        ))
+        .expect("save send folder");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("draft-1"),
+                EntityKind::Page,
+                "Draft subject",
+                "send/ENG-1.md",
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save moved outbound draft");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("draft-1"),
+                "Draft body",
+                8,
+                [RemoteId::new("body-1")],
+            )
+            .expect("shadow"),
+        )
+        .expect("save outbound shadow");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:draft-1-to-send".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(RemoteId::new("draft-1")),
+            parent_remote_id: Some(RemoteId::new("gmail-folder:send")),
+            original_path: Some(PathBuf::from("draft/ENG-1.md")),
+            projected_path: PathBuf::from("send/ENG-1.md"),
+            title: "Draft subject".to_string(),
+            content_path: None,
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save stale outbound move");
+    fs::create_dir_all(fixture.root.join("send")).expect("visible send folder");
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("send")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare stale Gmail outbound move");
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert!(prepared.pipeline.validation.issues.iter().any(|issue| {
+        issue.code == "source_move_parent_read_only"
+            && issue.message
+                == "Gmail moves are not supported; create a new file directly under draft/ or send/"
+    }));
+
     let (fixture, mut store) = linear_move_store(None, true);
     store
         .save_mount(
