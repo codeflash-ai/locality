@@ -9,6 +9,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use loc_cli::hosted_workspace::{
+    HostedWorkspaceAttachOptions, run_hosted_workspace_attach_at_state_root,
+};
 use loc_cli::sandbox::{
     SandboxBootstrapToken, SandboxContentEncodingPreference, SandboxInitError, SandboxInitOptions,
     SandboxProfileKey, resolve_bootstrap_token, resolve_sandbox_init_options_at_state_root,
@@ -40,7 +43,11 @@ use locality_protocol::{
     SessionProtocolError, StaleSessionBehavior, TarContentEncoding, TarExportOffer,
     canonical_export_inventory_sha256, canonical_writable_metadata_sha256,
 };
-use locality_store::{MountConfig, MountRepository, ProjectionMode, SqliteStateStore};
+use locality_store::{
+    CanonicalApiOrigin, CredentialStore, FileCredentialStore, HostedWorkspaceCredentialRef,
+    HostedWorkspaceIdentity, HostedWorkspaceRepository, MountConfig, MountRepository,
+    ProjectionMode, SqliteStateStore,
+};
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::ReplicaMaterializationLimits;
 use localityd::workspace_materializer::{
@@ -1187,6 +1194,104 @@ fn generation2_profile_waits_for_freshness_before_export() {
         "/v2/sessions/session-scope-7/export-attempts"
     );
     assert!(export.path.ends_with("/export"));
+    server.assert_no_request();
+}
+
+#[test]
+fn durable_hosted_workspace_attach_and_refresh_keep_stable_local_mount_ids() {
+    const CHILD_ENV: &str = "LOCALITY_HOSTED_WORKSPACE_TEST_CHILD";
+    if std::env::var(CHILD_ENV).as_deref() != Ok("1") {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "durable_hosted_workspace_attach_and_refresh_keep_stable_local_mount_ids",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("LOCALITY_CREDENTIAL_STORE", "file")
+            .output()
+            .expect("run isolated file-credential test");
+        assert!(
+            output.status.success(),
+            "isolated hosted workspace test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let directory = TestDirectory::new("durable-hosted-workspace");
+    let state_root = directory.0.join("state");
+    let root = directory.root();
+    let credential_ref =
+        HostedWorkspaceCredentialRef::new("hosted-workspace:fixture-profile").unwrap();
+    FileCredentialStore::new(&state_root)
+        .put(credential_ref.as_str(), &"a".repeat(64))
+        .expect("store fixture profile key");
+    let (session, offer, tar) = workspace_v2_fixture();
+    let compressed = zstd::stream::encode_all(tar.as_slice(), 1).expect("compress workspace tar");
+    let status: Value = serde_json::from_slice(WORKSPACE_SESSION_STATUS_V2_GOLDEN_JSON)
+        .expect("workspace status fixture");
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&status),
+        ResponseFixture::json(&offer),
+        ResponseFixture::export("zstd", compressed.clone()),
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&status),
+        ResponseFixture::json(&offer),
+        ResponseFixture::export("zstd", compressed),
+    ]);
+    let options = HostedWorkspaceAttachOptions {
+        api_url: server.api_url.clone(),
+        root: root.clone(),
+        credential_ref,
+        content_encoding: SandboxContentEncodingPreference::Zstd,
+    };
+
+    let attached = run_hosted_workspace_attach_at_state_root(options.clone(), &state_root)
+        .expect("attach hosted workspace");
+    assert_eq!(attached.mount_count, 2);
+    assert_eq!(attached.files, 2);
+    assert_eq!(fs::read(root.join("Sales/README.md")).unwrap(), b"Public\n");
+    let identity = HostedWorkspaceIdentity::new(
+        CanonicalApiOrigin::new(&server.api_url).unwrap(),
+        session.profile_id().clone(),
+    );
+    let store = SqliteStateStore::open(state_root.clone()).unwrap();
+    let first_mappings = store
+        .list_hosted_workspace_mount_mappings(&identity)
+        .unwrap();
+    assert_eq!(first_mappings.len(), 2);
+    assert!(store.load_mounts().unwrap().is_empty());
+    drop(store);
+
+    let refreshed = run_hosted_workspace_attach_at_state_root(options, &state_root)
+        .expect("refresh hosted workspace");
+    assert_eq!(refreshed.profile_revision, attached.profile_revision);
+    let store = SqliteStateStore::open(state_root).unwrap();
+    let refreshed_mappings = store
+        .list_hosted_workspace_mount_mappings(&identity)
+        .unwrap();
+    assert_eq!(refreshed_mappings, first_mappings);
+    assert!(
+        store
+            .get_pending_hosted_workspace_transition(&identity)
+            .unwrap()
+            .is_none()
+    );
+    for expected_path in [
+        "/v2/workspace-profile-sessions",
+        "/v2/sessions/session-scope-7",
+        "/v2/sessions/session-scope-7/export-attempts",
+        "/v2/sessions/session-scope-7/export-attempts/export-attempt-9/export",
+    ]
+    .into_iter()
+    .cycle()
+    .take(8)
+    {
+        assert_eq!(server.request().path, expected_path);
+    }
     server.assert_no_request();
 }
 
