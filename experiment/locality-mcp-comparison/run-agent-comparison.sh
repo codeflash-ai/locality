@@ -1641,6 +1641,7 @@ stop_strategy_pipelines() {
   local signal_rc="$1"
   local pid
 
+  RETAIN_AMIKA_SANDBOXES=0
   trap - INT TERM
   if [ -n "${active_deadline_watchdog_pid:-}" ]; then
     kill_process_tree_now "$active_deadline_watchdog_pid"
@@ -1686,28 +1687,48 @@ cleanup_amika_sandboxes_on_exit() {
   exit "$cleanup_rc"
 }
 
-escape_double_quoted_shell_text() {
-  local value="$1"
-  value="${value//\\/\\\\}"
-  value="${value//\"/\\\"}"
-  value="${value//\$/\\\$}"
-  value="${value//\`/\\\`}"
-  printf '%s' "$value"
+shell_join_quoted() {
+  local separator=""
+  local arg
+
+  for arg in "$@"; do
+    printf '%s' "$separator"
+    printf '%q' "$arg"
+    separator=" "
+  done
+}
+
+amika_recovery_ssh_command() {
+  local sandbox="$1"
+  if [ "${#AMIKA_FLAGS[@]}" -gt 0 ]; then
+    shell_join_quoted amika sandbox ssh "${AMIKA_FLAGS[@]}" "$sandbox"
+  else
+    shell_join_quoted amika sandbox ssh "$sandbox"
+  fi
+}
+
+amika_recovery_target_command() {
+  local sandbox="$1"
+  if [ "${#AMIKA_FLAGS[@]}" -gt 0 ]; then
+    shell_join_quoted amika sandbox ssh "${AMIKA_FLAGS[@]}" --print "$sandbox"
+  else
+    shell_join_quoted amika sandbox ssh --print "$sandbox"
+  fi
 }
 
 amika_recovery_rsync_command() {
   local sandbox="$1"
   local remote_out_dir="$2"
   local local_artifact_dir="$3"
-  local sandbox_q
-  local remote_out_dir_dq
+  local target_command
+  local remote_source_path_q
   local local_artifact_dir_q
 
-  printf -v sandbox_q '%q' "$sandbox"
-  remote_out_dir_dq="$(escape_double_quoted_shell_text "$remote_out_dir")"
-  printf -v local_artifact_dir_q '%q' "$local_artifact_dir"
-  printf 'rsync -az --delete "$(amika sandbox ssh --print %s):%s/" %s/' \
-    "$sandbox_q" "$remote_out_dir_dq" "$local_artifact_dir_q"
+  target_command="$(amika_recovery_target_command "$sandbox")"
+  printf -v remote_source_path_q '%q' "$remote_out_dir/"
+  printf -v local_artifact_dir_q '%q' "$local_artifact_dir/"
+  printf 'rsync -az --delete "$(%s)":%s %s' \
+    "$target_command" "$remote_source_path_q" "$local_artifact_dir_q"
 }
 
 record_amika_recovery_line() {
@@ -1723,8 +1744,8 @@ print_amika_recovery_instructions() {
   local mcp_rsync
   local delete_command
 
-  printf -v locality_ssh 'amika sandbox ssh %q' "$LOCALITY_SANDBOX"
-  printf -v mcp_ssh 'amika sandbox ssh %q' "$MCP_SANDBOX"
+  locality_ssh="$(amika_recovery_ssh_command "$LOCALITY_SANDBOX")"
+  mcp_ssh="$(amika_recovery_ssh_command "$MCP_SANDBOX")"
   locality_rsync="$(amika_recovery_rsync_command "$LOCALITY_SANDBOX" "$LOCALITY_REMOTE_OUT_DIR" "$LOCAL_OUT_DIR/artifacts/locality")"
   mcp_rsync="$(amika_recovery_rsync_command "$MCP_SANDBOX" "$MCP_REMOTE_OUT_DIR" "$LOCAL_OUT_DIR/artifacts/notion-mcp")"
   printf -v delete_command 'amika sandbox delete --remote --force %q %q' "$LOCALITY_SANDBOX" "$MCP_SANDBOX"
@@ -1806,7 +1827,6 @@ locality_pipeline_rc=0
 mcp_pipeline_rc=0
 wait_for_strategy_pipeline "$locality_pipeline_pid" "locality" || locality_pipeline_rc=$?
 wait_for_strategy_pipeline "$mcp_pipeline_pid" "notion-mcp" || mcp_pipeline_rc=$?
-trap - INT TERM
 
 locality_setup_rc=0
 locality_benchmark_rc=0

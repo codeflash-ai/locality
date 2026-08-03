@@ -300,8 +300,9 @@ mcp-snapshot active daytona aseem-mcp 2026-08-02T00:00:00Z}"
     ;;
 esac
 
-if [ "${3:-}" = "--print" ]; then
-  printf 'fake-user@fake-host-%s\n' "${4:-missing}"
+print_sandbox="$(argument_value --print "$@" || true)"
+if [ -n "$print_sandbox" ]; then
+  printf 'fake-user@fake-host-%s\n' "$print_sandbox"
   exit 0
 fi
 
@@ -415,6 +416,24 @@ for arg in "$@"; do
   logged_command="${logged_command} ${quoted_arg}"
 done
 printf '%s\n' "$logged_command" >> "${FAKE_AMIKA_LOG:?}"
+
+if [ -n "${FAKE_RSYNC_ARGS_DIR:-}" ]; then
+  mkdir -p "$FAKE_RSYNC_ARGS_DIR"
+  rsync_previous=""
+  rsync_last=""
+  for arg in "$@"; do
+    rsync_previous="$rsync_last"
+    rsync_last="$arg"
+  done
+  rsync_count=0
+  if [ -f "$FAKE_RSYNC_ARGS_DIR/count" ]; then
+    rsync_count="$(cat "$FAKE_RSYNC_ARGS_DIR/count")"
+  fi
+  rsync_count=$((rsync_count + 1))
+  printf '%s\n' "$rsync_count" > "$FAKE_RSYNC_ARGS_DIR/count"
+  printf '%s\n' "$rsync_previous" > "$FAKE_RSYNC_ARGS_DIR/source.$rsync_count"
+  printf '%s\n' "$rsync_last" > "$FAKE_RSYNC_ARGS_DIR/dest.$rsync_count"
+fi
 
 case " $* " in
   *"/artifacts/locality/"*)
@@ -535,6 +554,66 @@ with open(transcript_path, "wb") as transcript:
 os.close(master_fd)
 _, wait_status = os.waitpid(child_pid, 0)
 raise SystemExit(os.waitstatus_to_exitcode(wait_status))
+PY
+
+interactive_command_runner="${tmp_root}/run-interactive-command.py"
+cat > "$interactive_command_runner" <<'PY'
+import errno
+import os
+import pty
+import re
+import select
+import sys
+import time
+
+transcript_path, shell_command = sys.argv[1:]
+environment = os.environ.copy()
+environment["PS1"] = "__RECOVERY_PROMPT__ "
+environment["HISTFILE"] = "/dev/null"
+
+child_pid, master_fd = pty.fork()
+if child_pid == 0:
+    os.execvpe("bash", ["bash", "--noprofile", "--norc", "-i"], environment)
+
+transcript = bytearray()
+deadline = time.monotonic() + 5
+while b"__RECOVERY_PROMPT__ " not in transcript:
+    if time.monotonic() >= deadline:
+        os.kill(child_pid, 9)
+        raise SystemExit("interactive bash prompt timed out")
+    readable, _, _ = select.select([master_fd], [], [], 0.1)
+    if readable:
+        transcript.extend(os.read(master_fd, 65536))
+
+payload = (
+    shell_command
+    + "\nprintf '__RECOVERY_COMMAND_RC__=%s\\n' \"$?\"\nexit\n"
+).encode()
+offset = 0
+while offset < len(payload):
+    offset += os.write(master_fd, payload[offset:])
+
+while True:
+    try:
+        output = os.read(master_fd, 65536)
+    except OSError as error:
+        if error.errno == errno.EIO:
+            break
+        raise
+    if not output:
+        break
+    transcript.extend(output)
+
+os.close(master_fd)
+os.waitpid(child_pid, 0)
+with open(transcript_path, "wb") as transcript_file:
+    transcript_file.write(transcript)
+matches = re.findall(rb"__RECOVERY_COMMAND_RC__=([0-9]+)", transcript)
+if not matches:
+    raise SystemExit("interactive recovery command produced no status marker")
+if b"event not found" in transcript:
+    raise SystemExit(1)
+raise SystemExit(int(matches[-1]))
 PY
 
 forced_tty_bin="${tmp_root}/forced-tty-bin"
@@ -1053,6 +1132,99 @@ fi
 assert_not_contains "$both_sync_failure_log" "amika sandbox delete"
 assert_file_equals "$both_sync_failure_out/launch-readiness-both-sync-failure-locality/locality-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=0\nsync_attempted=1\nsync_rc=31'
 assert_file_equals "$both_sync_failure_out/launch-readiness-both-sync-failure-mcp/notion-mcp-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=0\nsync_attempted=1\nsync_rc=32'
+
+recovery_command_log="${tmp_root}/recovery-command.log"
+recovery_command_err="${tmp_root}/recovery-command.err"
+recovery_command_sub_marker="${tmp_root}/recovery-command-sub-ran"
+recovery_backtick_marker="${tmp_root}/recovery-backtick-ran"
+recovery_local_out="${tmp_root}/recovery local 'quote' \$(touch $recovery_command_sub_marker) \`touch $recovery_backtick_marker\` !12345"
+recovery_remote_worktree="/home/amika/recovery remote 'quote' \$(touch $recovery_command_sub_marker) \`touch $recovery_backtick_marker\` !12345"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$recovery_command_log" \
+  FAKE_RSYNC_FAIL_LOCALITY_RC=31 \
+  AMIKA_SANDBOX_FLAGS="--region test-region --profile recovery-profile" \
+  REMOTE_WORKTREE="$recovery_remote_worktree" \
+  RUN_ID="recovery-command" \
+  SYNC_ARTIFACTS=1 \
+  LOCAL_OUT_DIR="$recovery_local_out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"$recovery_command_err"
+recovery_command_rc=$?
+set -e
+if [ "$recovery_command_rc" -ne 31 ]; then
+  fail "retained recovery command setup should return sync failure 31, got ${recovery_command_rc}"
+fi
+recovery_local_out="$(cd "$recovery_local_out" && pwd)"
+assert_not_contains "$recovery_command_log" "amika sandbox delete"
+assert_contains "$recovery_command_err" "amika sandbox ssh --region test-region --profile recovery-profile launch-readiness-recovery-command-locality"
+assert_contains "$recovery_command_err" "amika sandbox ssh --region test-region --profile recovery-profile --print launch-readiness-recovery-command-locality"
+
+recovery_rsync_args="${tmp_root}/recovery-rsync-args"
+mkdir -p "$recovery_rsync_args"
+executed_recovery_commands=0
+while IFS= read -r recovery_command; do
+  recovery_command="${recovery_command#  }"
+  case "$recovery_command" in
+    amika\ sandbox\ ssh*|rsync\ -az*|amika\ sandbox\ delete*)
+      PATH="${fake_bin}:$PATH" \
+        FAKE_AMIKA_LOG="$recovery_command_log" \
+        FAKE_RSYNC_ARGS_DIR="$recovery_rsync_args" \
+        python3 "$interactive_command_runner" \
+          "${tmp_root}/recovery-command-$executed_recovery_commands.transcript" \
+          "$recovery_command" || fail "emitted recovery command is not safely pasteable: $recovery_command"
+      executed_recovery_commands=$((executed_recovery_commands + 1))
+      ;;
+  esac
+done < "$recovery_command_err"
+if [ "$executed_recovery_commands" -ne 5 ]; then
+  fail "expected to execute five emitted recovery commands, got ${executed_recovery_commands}"
+fi
+assert_contains "$recovery_command_log" "amika sandbox ssh --region test-region --profile recovery-profile launch-readiness-recovery-command-locality"
+assert_contains "$recovery_command_log" "amika sandbox ssh --region test-region --profile recovery-profile --print launch-readiness-recovery-command-locality"
+assert_contains "$recovery_command_log" "amika sandbox delete --remote --force launch-readiness-recovery-command-locality launch-readiness-recovery-command-mcp"
+assert_file_equals "$recovery_rsync_args/source.1" "fake-user@fake-host-launch-readiness-recovery-command-locality:$recovery_remote_worktree/target/launch-readiness-recovery-command-locality/"
+assert_file_equals "$recovery_rsync_args/dest.1" "$recovery_local_out/artifacts/locality/"
+assert_file_equals "$recovery_rsync_args/source.2" "fake-user@fake-host-launch-readiness-recovery-command-mcp:$recovery_remote_worktree/target/launch-readiness-recovery-command-mcp/"
+assert_file_equals "$recovery_rsync_args/dest.2" "$recovery_local_out/artifacts/notion-mcp/"
+if [ -e "$recovery_command_sub_marker" ] || [ -e "$recovery_backtick_marker" ]; then
+  fail "executing recovery commands evaluated path contents as shell code"
+fi
+
+retention_signal_log="${tmp_root}/retention-signal.log"
+retention_signal_out="${tmp_root}/retention-signal-out"
+retention_signal_marker="${tmp_root}/retention-signal-selected"
+retention_signal_bash_env="${tmp_root}/retention-signal-bash-env"
+cat > "$retention_signal_bash_env" <<'SH'
+retention_signal_debug() {
+  if [ "${RETAIN_AMIKA_SANDBOXES:-0}" -eq 1 ] && [ "${RETENTION_SIGNAL_SENT:-0}" -eq 0 ]; then
+    RETENTION_SIGNAL_SENT=1
+    : > "${RETENTION_SIGNAL_MARKER:?}"
+    kill -TERM "$$"
+  fi
+}
+trap retention_signal_debug DEBUG
+SH
+set +e
+PATH="${fake_bin}:$PATH" \
+  BASH_ENV="$retention_signal_bash_env" \
+  RETENTION_SIGNAL_MARKER="$retention_signal_marker" \
+  FAKE_AMIKA_LOG="$retention_signal_log" \
+  FAKE_RSYNC_FAIL_LOCALITY_RC=31 \
+  RUN_ID="retention-signal" \
+  SYNC_ARTIFACTS=1 \
+  LOCAL_OUT_DIR="$retention_signal_out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/retention-signal.err"
+retention_signal_rc=$?
+set -e
+if [ "$retention_signal_rc" -ne 143 ]; then
+  fail "TERM after retention selection should return 143, got ${retention_signal_rc}"
+fi
+test -f "$retention_signal_marker" || fail "TERM injection did not observe selected retention"
+assert_contains "$retention_signal_log" "amika sandbox delete --remote --force launch-readiness-retention-signal-locality launch-readiness-retention-signal-mcp"
+if [ -e "$retention_signal_log.state/launch-readiness-retention-signal-locality.state" ] ||
+  [ -e "$retention_signal_log.state/launch-readiness-retention-signal-mcp.state" ]; then
+  fail "TERM after retention selection left an owned sandbox registered"
+fi
 
 ssh_provider_amika_log="${tmp_root}/ssh-provider-amika.log"
 ssh_provider_transport_log="${tmp_root}/ssh-provider-transport.log"
