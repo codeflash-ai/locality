@@ -1095,6 +1095,7 @@ PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$blocked_create_log" \
   FAKE_AMIKA_STATE_DIR="$blocked_create_state" \
   FAKE_AMIKA_BLOCK_OPERATION=create \
+  FAKE_AMIKA_REGISTER_BEFORE_CREATE_BLOCK=1 \
   FAKE_AMIKA_ACTIVITY_DIR="${tmp_root}/blocked-create-activity" \
   AMIKA_CREATE_ATTEMPTS=1 \
   AMIKA_READINESS_TIMEOUT_SECONDS=1 \
