@@ -73,6 +73,38 @@ Library callers cannot opt out accidentally: convenience sandbox, profile-key,
 session-credential, and generation-2 materialization APIs inspect the default
 state root, while `*_at_state_root` variants accept an explicit state root.
 
+For a fresh remote Amika environment, the repository helper creates a sandbox,
+checks out the current repository revision, builds `loc-cli`, and streams a
+one-time bootstrap token to `loc sandbox init` over standard input. Building the
+current revision is intentional because an older published CLI may not expose
+the sandbox protocol yet. After materialization, the helper runs its inline
+Notion-only launch-gate scenario, prints the prompt, and prints
+`/home/amika/final_report.md`.
+
+The helper uses the existing Azure Codex setup. Export the Azure key locally;
+the script streams it directly to the remote Codex process without placing it
+in command arguments or writing it to a sandbox file:
+
+```bash
+export AZURE_OPENAI_API_KEY=<azure-key>
+```
+
+Then read a fresh Locality bootstrap token without adding it to shell history
+and run the helper from this repository:
+
+```bash
+read -rs LOCALITY_BOOTSTRAP_TOKEN
+printf '%s\n' "$LOCALITY_BOOTSTRAP_TOKEN" | \
+  scripts/init-amika-locality-snapshot.sh \
+    --api-url https://api.dev.locality.dev
+unset LOCALITY_BOOTSTRAP_TOKEN
+```
+
+The token is single-use. The helper creates a uniquely named sandbox, publishes
+the workspace at `/home/amika/locality-snapshot`, uses only `/home/amika` paths
+in the prompt, and leaves the sandbox running for inspection. Use `--name` when
+a stable sandbox name is needed.
+
 ## Provider Connections
 
 `loc connect notion [--name <id>]` creates a local provider connection. OAuth is preferred. By default the command uses the Locality OAuth broker because Notion's REST OAuth token endpoint requires a confidential client secret. The CLI asks the broker for a Notion authorization URL, opens the browser, listens for the localhost callback, sends only the returned authorization code plus signed broker session back to the broker, then stores the returned access token and refresh handle in the credential store. SQLite stores only connection metadata and a `secret_ref`.

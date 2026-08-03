@@ -237,6 +237,7 @@ test-launch-readiness-mcp-config: ## Validate launch-readiness Codex MCP isolati
 test-launch-readiness-wrappers: ## Validate launch-readiness wrapper defaults.
 	tests/launch_readiness_amika_split_wrapper.sh
 	tests/launch_readiness_aws_wrapper.sh
+	tests/init_amika_locality_snapshot.sh
 
 .PHONY: fmt
 fmt: ## Format Rust code.
