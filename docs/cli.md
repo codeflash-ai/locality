@@ -73,11 +73,12 @@ Library callers cannot opt out accidentally: convenience sandbox, profile-key,
 session-credential, and generation-2 materialization APIs inspect the default
 state root, while `*_at_state_root` variants accept an explicit state root.
 
-For a fresh remote Amika environment, the repository helper creates a sandbox,
-checks out the current repository revision for scenario evidence, downloads the
-versioned Locality `v0.3.7` Linux package, verifies its pinned SHA-256, extracts
-the released `loc` binary without installing desktop dependencies, and streams
-a one-time bootstrap token to `loc sandbox init` over standard input. After
+For a remote Amika environment, the repository helper creates a sandbox or
+reuses an explicitly named started sandbox, checks out the current repository
+revision for scenario evidence, downloads the versioned Locality `v0.3.7` Linux
+package, verifies its pinned SHA-256, extracts the released `loc` binary without
+installing desktop dependencies, and streams a reusable Workspace Profile key
+from the Admin UI to `loc sandbox init` over standard input. After
 materialization, the helper runs its inline Notion-only launch-gate scenario,
 prints the prompt, and prints `/home/amika/final_report.md`.
 
@@ -89,22 +90,37 @@ in command arguments or writing it to a sandbox file:
 export AZURE_OPENAI_API_KEY=<azure-key>
 ```
 
-Then read a reusable Workspace Profile key from the administration portal without
-adding it to shell history
-and run the helper from this repository:
+In `https://api.dev.locality.dev/admin/access`, select a ready Workspace Profile
+and create a key. The plaintext is shown once. Read it without adding it to
+shell history and run the helper from this repository:
 
 ```bash
-read -rs LOCALITY_BOOTSTRAP_TOKEN
+read -rs LOCALITY_PROFILE_KEY
 printf '%s\n' "$LOCALITY_PROFILE_KEY" | \
   scripts/init-amika-locality-snapshot.sh \
     --api-url https://api.dev.locality.dev
 unset LOCALITY_PROFILE_KEY
 ```
 
-The key can launch multiple short-lived sandboxes until revoked. The helper creates a uniquely named sandbox, publishes
-the workspace at `/home/amika/locality-snapshot`, uses only `/home/amika` paths
-in the prompt, and leaves the sandbox running for inspection. Use `--name` when
-a stable sandbox name is needed.
+The key remains reusable until it expires or is revoked. The helper creates a
+uniquely named sandbox, publishes the workspace at
+`/home/amika/locality-snapshot`, uses only `/home/amika` paths in the prompt,
+and leaves the sandbox running for inspection. Reuse an existing started
+sandbox only with an explicit name:
+
+```bash
+printf '%s\n' "$LOCALITY_PROFILE_KEY" | \
+  scripts/init-amika-locality-snapshot.sh \
+    --api-url https://api.dev.locality.dev \
+    --name saga-locality-snapshot \
+    --reuse
+```
+
+Revoke the temporary Workspace Profile key in Admin after testing.
+An existing generation-2 root is owned by the exact Profile key bytes used to
+create it. Reuse therefore requires that same still-active key; creating a new
+key for the same Workspace Profile does not authorize refresh of the old root.
+After revocation, remove the old root and materialize a new one with the new key.
 
 ## Provider Connections
 

@@ -5,15 +5,16 @@ usage() {
   cat <<'EOF'
 Usage: init-amika-locality-snapshot.sh --api-url <origin> [options]
 
-Creates a fresh remote Amika sandbox, installs the verified Locality v0.3.7 CLI,
-and materializes a scoped workspace snapshot. It then runs one inline Notion-only
-scenario and prints both the prompt and generated report. The reusable Workspace
-Profile key is read from standard input and is never passed in a command-line
-argument.
+Creates or reuses a remote Amika sandbox, installs the verified Locality v0.3.7
+CLI, and materializes a scoped workspace snapshot. It then runs one inline
+Notion-only scenario and prints both the prompt and generated report. The
+Workspace Profile key created in Admin is read from standard input and is never
+passed in a command-line argument.
 
 Options:
   --api-url <origin>       Locality backend API origin (required).
   --name <name>            Amika sandbox name. Default: locality-snapshot-<UTC>.
+  --reuse                   Reuse the explicitly named, already-started sandbox.
   --model <model>          Model passed to codex exec.
                            Default: CODEX_MODEL or gpt-5.6-sol.
   --reasoning <effort>     Reasoning effort passed to codex exec.
@@ -45,49 +46,108 @@ amika_ssh() {
   if [ "${1:-}" = "--" ]; then
     shift
   fi
-  if [ -t 2 ] && [ -r /dev/tty ]; then
-    remote_command="$(encode_remote_argv "$@")"
-    amika sandbox ssh -t "$sandbox" -- "$remote_command" < /dev/tty
-  else
-    amika sandbox ssh "$sandbox" "$@"
-  fi
+  remote_command="$(encode_remote_argv "$@")"
+  command -v expect >/dev/null 2>&1 || fail "expect is required for Amika PTY transport"
+  AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
+    expect -c '
+      set timeout 1800
+      spawn -noecho amika sandbox ssh -t $env(AMIKA_SANDBOX_NAME) -- $env(AMIKA_REMOTE_COMMAND)
+      expect {
+        eof {
+          set result [wait]
+          exit [lindex $result 3]
+        }
+        timeout {
+          catch {close}
+          catch {wait}
+          puts stderr "Amika operation did not finish within 30 minutes"
+          exit 124
+        }
+      }
+    '
 }
 
 amika_ssh_secret_line() {
   local sandbox="$1"
   local secret="$2"
+  local attempt=1
+  local status
   local remote_command
   shift 2
   if [ "${1:-}" = "--" ]; then
     shift
   fi
-  if [ -t 2 ] && [ -r /dev/tty ]; then
-    command -v expect >/dev/null 2>&1 || fail "expect is required for Amika TTY credential transfer"
-    remote_command="$(encode_remote_argv "$@")"
-    AMIKA_SECRET_LINE="$secret" AMIKA_SANDBOX_NAME="$sandbox" \
-      AMIKA_REMOTE_COMMAND="$remote_command" \
-      expect -f /dev/stdin <<'EXPECT'
-set timeout -1
-spawn -noecho amika sandbox ssh -t $env(AMIKA_SANDBOX_NAME) -- $env(AMIKA_REMOTE_COMMAND)
-expect "__LOCALITY_STDIN_READY__"
-send -- "$env(AMIKA_SECRET_LINE)\n"
-expect eof
-set result [wait]
-exit [lindex $result 3]
-EXPECT
-  else
-    printf '%s\n' "$secret" | amika sandbox ssh "$sandbox" "$@"
-  fi
+  command -v expect >/dev/null 2>&1 || fail "expect is required for Amika credential transfer"
+  remote_command="$(encode_remote_argv "$@")"
+
+  while [ "$attempt" -le 3 ]; do
+    if printf '%s\n' "$secret" | \
+      AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
+      expect -c '
+        set timeout 30
+        if {[gets stdin secret] < 0} {
+          puts stderr "credential input closed before a secret was read"
+          exit 65
+        }
+        spawn -noecho amika sandbox ssh -t $env(AMIKA_SANDBOX_NAME) -- $env(AMIKA_REMOTE_COMMAND)
+        expect {
+          "__LOCALITY_STDIN_READY__" {}
+          eof {
+            catch {wait}
+            puts stderr "Amika SSH closed before requesting credential input"
+            exit 75
+          }
+          timeout {
+            catch {close}
+            catch {wait}
+            puts stderr "Amika SSH did not request credential input within 30 seconds"
+            exit 75
+          }
+        }
+        send -- "$secret\n"
+        set secret ""
+        set timeout 1800
+        expect {
+          eof {
+            set result [wait]
+            exit [lindex $result 3]
+          }
+          timeout {
+            catch {close}
+            catch {wait}
+            puts stderr "Amika credential operation did not finish within 30 minutes; it was not retried"
+            exit 124
+          }
+        }
+      '; then
+      secret=""
+      return 0
+    else
+      status=$?
+    fi
+
+    if [ "$status" -ne 75 ] || [ "$attempt" -eq 3 ]; then
+      secret=""
+      return "$status"
+    fi
+    printf 'Amika credential transport closed before secret delivery; retrying (%s/3)...\n' "$attempt" >&2
+    attempt=$((attempt + 1))
+    sleep 1
+  done
 }
 
 API_URL=""
 SANDBOX_NAME="locality-snapshot-$(date -u +%Y%m%d-%H%M%S)"
+SANDBOX_NAME_EXPLICIT=false
+REUSE_SANDBOX=false
 REMOTE_ROOT="/home/amika/locality-snapshot"
 LOC_RELEASE_VERSION="0.3.7"
 LOC_RELEASE_DEB_SHA256="692b05460839ba44b85cd1e6b3b6969ad4a3f62f3e81f420c4651159ad7ef195"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 AZURE_OPENAI_BASE_URL="${AZURE_OPENAI_BASE_URL:-https://aseem-mp32maxp-eastus2.openai.azure.com/openai/v1}"
+AZURE_OPENAI_API_KEY_VALUE="${AZURE_OPENAI_API_KEY:-}"
+unset AZURE_OPENAI_API_KEY
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -101,7 +161,12 @@ while [ "$#" -gt 0 ]; do
     --name)
       [ "$#" -ge 2 ] || fail "--name requires a value"
       SANDBOX_NAME="$2"
+      SANDBOX_NAME_EXPLICIT=true
       shift 2
+      ;;
+    --reuse)
+      REUSE_SANDBOX=true
+      shift
       ;;
     --model)
       [ "$#" -ge 2 ] || fail "--model requires a value"
@@ -131,8 +196,11 @@ esac
 case "$SANDBOX_NAME" in
   *[!a-zA-Z0-9._-]*|'') fail "--name contains unsupported characters" ;;
 esac
+if [ "$REUSE_SANDBOX" = true ] && [ "$SANDBOX_NAME_EXPLICIT" != true ]; then
+  fail "--reuse requires an explicit --name"
+fi
 [ -n "$CODEX_MODEL" ] || fail "--model must not be empty"
-[ -n "${AZURE_OPENAI_API_KEY:-}" ] || fail "AZURE_OPENAI_API_KEY is required"
+[ -n "$AZURE_OPENAI_API_KEY_VALUE" ] || fail "AZURE_OPENAI_API_KEY is required"
 case "$AZURE_OPENAI_BASE_URL" in
   https://*) ;;
   *) fail "AZURE_OPENAI_BASE_URL must use https" ;;
@@ -196,29 +264,26 @@ if [ -t 0 ]; then
 else
   IFS= read -r PROFILE_KEY || fail "read the Workspace Profile key from standard input"
 fi
-[ -n "$PROFILE_KEY" ] || fail "Workspace Profile key must not be empty"
+[ "${#PROFILE_KEY}" -eq 64 ] || fail "Workspace Profile key must be 64 lowercase hexadecimal characters"
+case "$PROFILE_KEY" in
+  *[!0-9a-f]*) fail "Workspace Profile key must be 64 lowercase hexadecimal characters" ;;
+esac
 
-printf 'Creating Amika sandbox %s...\n' "$SANDBOX_NAME"
-(cd "$REPO_ROOT" && amika sandbox create \
-  --remote \
-  --name "$SANDBOX_NAME" \
-  --yes >/dev/null)
+if [ "$REUSE_SANDBOX" = true ]; then
+  printf 'Reusing Amika sandbox %s...\n' "$SANDBOX_NAME"
+else
+  printf 'Creating Amika sandbox %s...\n' "$SANDBOX_NAME"
+  (cd "$REPO_ROOT" && amika sandbox create \
+    --remote \
+    --name "$SANDBOX_NAME" \
+    --yes >/dev/null)
+fi
 
 printf 'Installing released loc CLI v%s in %s...\n' "$LOC_RELEASE_VERSION" "$SANDBOX_NAME"
 amika_ssh "$SANDBOX_NAME" -- sh -c '
   set -eu
-  revision=$1
-  loc_version=$2
-  expected_sha256=$3
-  manifest=$(find "$HOME/workspace" -mindepth 2 -maxdepth 2 -type f -name Cargo.toml -print -quit)
-  test -n "$manifest"
-  repo_dir=${manifest%/Cargo.toml}
-  git -C "$repo_dir" cat-file -e "$revision^{commit}"
-  git -C "$repo_dir" checkout --detach "$revision"
-  if [ "$repo_dir" != /home/amika/workspace/locality ]; then
-    test ! -e /home/amika/workspace/locality
-    ln -s "$repo_dir" /home/amika/workspace/locality
-  fi
+  loc_version=$1
+  expected_sha256=$2
   work_dir=$(mktemp -d)
   trap '\''rm -rf "$work_dir"'\'' EXIT
   package="$work_dir/Locality_Linux_v${loc_version}.deb"
@@ -231,7 +296,7 @@ amika_ssh "$SANDBOX_NAME" -- sh -c '
   mkdir -p "$HOME/.local/bin"
   install -m 0755 "$work_dir/package/usr/bin/loc" "$HOME/.local/bin/loc"
   "$HOME/.local/bin/loc" sandbox init --help >/dev/null
-' sh "$SOURCE_REVISION" "$LOC_RELEASE_VERSION" "$LOC_RELEASE_DEB_SHA256"
+' sh "$LOC_RELEASE_VERSION" "$LOC_RELEASE_DEB_SHA256"
 
 printf 'Materializing scoped workspace at %s:%s...\n' "$SANDBOX_NAME" "$REMOTE_ROOT"
 amika_ssh_secret_line "$SANDBOX_NAME" "$PROFILE_KEY" -- sh -c '
@@ -249,10 +314,35 @@ amika_ssh_secret_line "$SANDBOX_NAME" "$PROFILE_KEY" -- sh -c '
     --api-url "$API_URL" \
     --root "$REMOTE_ROOT" \
     --profile-key-stdin \
+    --profile \
     --json
 unset PROFILE_KEY
 
 printf 'Snapshot ready in Amika sandbox %s at %s\n' "$SANDBOX_NAME" "$REMOTE_ROOT"
+
+printf 'Preparing clean Locality evidence checkout at revision %s...\n' "$SOURCE_REVISION"
+amika_ssh "$SANDBOX_NAME" -- sh -c '
+  set -eu
+  revision=$1
+  repo_dir=/home/amika/workspace/locality
+  mkdir -p /home/amika/workspace
+  if [ ! -e "$repo_dir" ]; then
+    git clone https://github.com/codeflash-ai/locality.git "$repo_dir"
+  fi
+  test -d "$repo_dir/.git"
+  origin_url=$(git -C "$repo_dir" remote get-url origin)
+  case "$origin_url" in
+    https://github.com/codeflash-ai/locality|https://github.com/codeflash-ai/locality.git|git@github.com:codeflash-ai/locality.git) ;;
+    *) printf "unexpected Locality repository origin: %s\n" "$origin_url" >&2; exit 65 ;;
+  esac
+  test -z "$(git -C "$repo_dir" status --porcelain --untracked-files=all)" || {
+    printf "Locality evidence checkout is dirty; use a clean sandbox or remove the changes explicitly\n" >&2
+    exit 65
+  }
+  git -C "$repo_dir" fetch origin --prune
+  git -C "$repo_dir" cat-file -e "$revision^{commit}"
+  git -C "$repo_dir" checkout --detach "$revision"
+' sh "$SOURCE_REVISION"
 
 amika_ssh "$SANDBOX_NAME" -- sh -c '
   set -eu
@@ -274,7 +364,7 @@ unset PROMPT_BASE64
 printf '\n===== Inline scenario prompt =====\n%s\n' "$EFFECTIVE_PROMPT"
 printf '\n===== Running scenario in %s =====\n' "$SANDBOX_NAME"
 
-amika_ssh_secret_line "$SANDBOX_NAME" "$AZURE_OPENAI_API_KEY" -- sh -c '
+amika_ssh_secret_line "$SANDBOX_NAME" "$AZURE_OPENAI_API_KEY_VALUE" -- sh -c '
   set -eu
   model=$1
   reasoning=$2
@@ -309,6 +399,8 @@ amika_ssh_secret_line "$SANDBOX_NAME" "$AZURE_OPENAI_API_KEY" -- sh -c '
     exit 1
   }
 ' sh "$CODEX_MODEL" "$CODEX_REASONING_EFFORT" "$REMOTE_ROOT"
+AZURE_OPENAI_API_KEY_VALUE=""
+unset AZURE_OPENAI_API_KEY_VALUE
 
 printf '\n===== /home/amika/final_report.md =====\n'
 amika_ssh "$SANDBOX_NAME" -- cat /home/amika/final_report.md
