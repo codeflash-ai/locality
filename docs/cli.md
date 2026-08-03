@@ -89,18 +89,19 @@ in command arguments or writing it to a sandbox file:
 export AZURE_OPENAI_API_KEY=<azure-key>
 ```
 
-Then read a fresh Locality bootstrap token without adding it to shell history
+Then read a reusable Workspace Profile key from the administration portal without
+adding it to shell history
 and run the helper from this repository:
 
 ```bash
 read -rs LOCALITY_BOOTSTRAP_TOKEN
-printf '%s\n' "$LOCALITY_BOOTSTRAP_TOKEN" | \
+printf '%s\n' "$LOCALITY_PROFILE_KEY" | \
   scripts/init-amika-locality-snapshot.sh \
     --api-url https://api.dev.locality.dev
-unset LOCALITY_BOOTSTRAP_TOKEN
+unset LOCALITY_PROFILE_KEY
 ```
 
-The token is single-use. The helper creates a uniquely named sandbox, publishes
+The key can launch multiple short-lived sandboxes until revoked. The helper creates a uniquely named sandbox, publishes
 the workspace at `/home/amika/locality-snapshot`, uses only `/home/amika` paths
 in the prompt, and leaves the sandbox running for inspection. Use `--name` when
 a stable sandbox name is needed.

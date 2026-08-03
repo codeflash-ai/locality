@@ -7,8 +7,9 @@ Usage: init-amika-locality-snapshot.sh --api-url <origin> [options]
 
 Creates a fresh remote Amika sandbox, installs the verified Locality v0.3.7 CLI,
 and materializes a scoped workspace snapshot. It then runs one inline Notion-only
-scenario and prints both the prompt and generated report. The one-time bootstrap
-token is read from standard input and is never passed in a command-line argument.
+scenario and prints both the prompt and generated report. The reusable Workspace
+Profile key is read from standard input and is never passed in a command-line
+argument.
 
 Options:
   --api-url <origin>       Locality backend API origin (required).
@@ -20,7 +21,7 @@ Options:
   --help, -h               Show this help.
 
 Example:
-  printf '%s\n' "$LOCALITY_BOOTSTRAP_TOKEN" | \
+  printf '%s\n' "$LOCALITY_PROFILE_KEY" | \
     scripts/init-amika-locality-snapshot.sh \
       --api-url https://api.dev.locality.dev
 EOF
@@ -186,16 +187,16 @@ SOURCE_REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD)" || fail "could not resol
 
 if [ -t 0 ]; then
   stty -echo
-  IFS= read -r BOOTSTRAP_TOKEN || {
+  IFS= read -r PROFILE_KEY || {
     stty echo
-    fail "read the bootstrap token from standard input"
+    fail "read the Workspace Profile key from standard input"
   }
   stty echo
   printf '\n'
 else
-  IFS= read -r BOOTSTRAP_TOKEN || fail "read the bootstrap token from standard input"
+  IFS= read -r PROFILE_KEY || fail "read the Workspace Profile key from standard input"
 fi
-[ -n "$BOOTSTRAP_TOKEN" ] || fail "bootstrap token must not be empty"
+[ -n "$PROFILE_KEY" ] || fail "Workspace Profile key must not be empty"
 
 printf 'Creating Amika sandbox %s...\n' "$SANDBOX_NAME"
 (cd "$REPO_ROOT" && amika sandbox create \
@@ -233,23 +234,23 @@ amika_ssh "$SANDBOX_NAME" -- sh -c '
 ' sh "$SOURCE_REVISION" "$LOC_RELEASE_VERSION" "$LOC_RELEASE_DEB_SHA256"
 
 printf 'Materializing scoped workspace at %s:%s...\n' "$SANDBOX_NAME" "$REMOTE_ROOT"
-amika_ssh_secret_line "$SANDBOX_NAME" "$BOOTSTRAP_TOKEN" -- sh -c '
+amika_ssh_secret_line "$SANDBOX_NAME" "$PROFILE_KEY" -- sh -c '
   set -eu
   if [ -t 0 ]; then
     stty -echo
   fi
   printf "__LOCALITY_STDIN_READY__\n"
-  IFS= read -r bootstrap_token
+  IFS= read -r profile_key
   if [ -t 0 ]; then
     stty echo
   fi
-  printf "%s\n" "$bootstrap_token" | "$HOME/.local/bin/loc" sandbox init "$@"
+  printf "%s\n" "$profile_key" | "$HOME/.local/bin/loc" sandbox init "$@"
 ' sh \
     --api-url "$API_URL" \
     --root "$REMOTE_ROOT" \
-    --bootstrap-token-stdin \
+    --profile-key-stdin \
     --json
-unset BOOTSTRAP_TOKEN
+unset PROFILE_KEY
 
 printf 'Snapshot ready in Amika sandbox %s at %s\n' "$SANDBOX_NAME" "$REMOTE_ROOT"
 

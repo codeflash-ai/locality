@@ -19,7 +19,7 @@ tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-init-amika-snapshot-test.XXXXXX")"
 trap 'rm -rf "$tmp_root"' EXIT
 fake_bin="${tmp_root}/bin"
 fake_log="${tmp_root}/amika.log"
-bootstrap_input="${tmp_root}/bootstrap-token.input"
+profile_key_input="${tmp_root}/profile-key.input"
 azure_input="${tmp_root}/azure-key.input"
 prompt_input="${tmp_root}/scenario-prompt.input"
 fake_report="${tmp_root}/final_report.md"
@@ -42,9 +42,9 @@ fi
 
 if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "ssh" ]; then
   case " $* " in
-    *" --bootstrap-token-stdin "*)
+    *" --profile-key-stdin "*)
       IFS= read -r token
-      printf '%s\n' "$token" > "${FAKE_BOOTSTRAP_INPUT:?}"
+      printf '%s\n' "$token" > "${FAKE_PROFILE_KEY_INPUT:?}"
       printf '{"ok":true,"command":"sandbox_init","root":"/workspace/scoped"}\n'
       ;;
     *"base64 -d > /home/amika/scenario-prompt.md"*)
@@ -74,14 +74,14 @@ exit 2
 SH
 chmod +x "${fake_bin}/amika"
 
-bootstrap_token="test-bootstrap-token"
+profile_key="$(printf 'a%.0s' {1..64})"
 azure_key="test-azure-key"
 output="$(
-  printf '%s\n' "$bootstrap_token" | \
+  printf '%s\n' "$profile_key" | \
     PATH="${fake_bin}:$PATH" \
     AZURE_OPENAI_API_KEY="$azure_key" \
     FAKE_AMIKA_LOG="$fake_log" \
-    FAKE_BOOTSTRAP_INPUT="$bootstrap_input" \
+    FAKE_PROFILE_KEY_INPUT="$profile_key_input" \
     FAKE_AZURE_INPUT="$azure_input" \
     FAKE_PROMPT_INPUT="$prompt_input" \
     FAKE_REPORT="$fake_report" \
@@ -106,20 +106,20 @@ assert_contains "$fake_log" '.local/bin/loc'
 assert_contains "$fake_log" "sandbox init"
 assert_contains "$fake_log" "--api-url https://api.dev.locality.dev"
 assert_contains "$fake_log" "--root /home/amika/locality-snapshot"
-assert_contains "$fake_log" "--bootstrap-token-stdin"
+assert_contains "$fake_log" "--profile-key-stdin"
 assert_contains "$fake_log" "/home/amika/scenario-prompt.md"
 assert_contains "$fake_log" "setup-codex-azure.sh"
 assert_contains "$fake_log" "codex exec"
 assert_contains "$fake_log" '< /dev/null'
 assert_contains "$fake_log" "test-model medium /home/amika/locality-snapshot"
 assert_contains "$fake_log" "cat /home/amika/final_report.md"
-if grep -F -q -- "$bootstrap_token" "$fake_log"; then
-  fail "bootstrap token leaked into Amika arguments"
+if grep -F -q -- "$profile_key" "$fake_log"; then
+  fail "Workspace Profile key leaked into Amika arguments"
 fi
 if grep -F -q -- "$azure_key" "$fake_log"; then
   fail "Azure API key leaked into Amika arguments"
 fi
-[ "$(cat "$bootstrap_input")" = "$bootstrap_token" ] || fail "bootstrap token was not streamed to loc"
+[ "$(cat "$profile_key_input")" = "$profile_key" ] || fail "Workspace Profile key was not streamed to loc"
 [ "$(cat "$azure_input")" = "$azure_key" ] || fail "Azure API key was not streamed to the sandbox"
 assert_contains "$prompt_input" '/home/amika/locality-snapshot'
 assert_contains "$prompt_input" '/home/amika/workspace/locality'
@@ -139,11 +139,11 @@ grep -F -q -- 'Verified report body.' <<<"$output" || \
 : > "$fake_log"
 set +e
 missing_azure_output="$(
-  printf '%s\n' "$bootstrap_token" | \
+  printf '%s\n' "$profile_key" | \
     env -u AZURE_OPENAI_API_KEY \
       PATH="${fake_bin}:$PATH" \
       FAKE_AMIKA_LOG="$fake_log" \
-      FAKE_BOOTSTRAP_INPUT="$bootstrap_input" \
+      FAKE_PROFILE_KEY_INPUT="$profile_key_input" \
       FAKE_AZURE_INPUT="$azure_input" \
       FAKE_PROMPT_INPUT="$prompt_input" \
       FAKE_REPORT="$fake_report" \
@@ -163,7 +163,7 @@ invalid_output="$(
     PATH="${fake_bin}:$PATH" \
     AZURE_OPENAI_API_KEY="$azure_key" \
     FAKE_AMIKA_LOG="$fake_log" \
-    FAKE_BOOTSTRAP_INPUT="$bootstrap_input" \
+    FAKE_PROFILE_KEY_INPUT="$profile_key_input" \
     FAKE_AZURE_INPUT="$azure_input" \
     FAKE_PROMPT_INPUT="$prompt_input" \
     FAKE_REPORT="$fake_report" \
@@ -171,9 +171,9 @@ invalid_output="$(
 )"
 invalid_status=$?
 set -e
-[ "$invalid_status" -eq 2 ] || fail "empty bootstrap token should return usage status 2"
-[ ! -s "$fake_log" ] || fail "empty bootstrap token should fail before creating a sandbox"
-grep -F -q -- 'bootstrap token must not be empty' <<<"$invalid_output" || \
-  fail "empty bootstrap token error was not actionable"
+[ "$invalid_status" -eq 2 ] || fail "empty Workspace Profile key should return usage status 2"
+[ ! -s "$fake_log" ] || fail "empty Workspace Profile key should fail before creating a sandbox"
+grep -F -q -- 'Workspace Profile key must not be empty' <<<"$invalid_output" || \
+  fail "empty Workspace Profile key error was not actionable"
 
 printf 'init Amika Locality snapshot tests passed\n'
