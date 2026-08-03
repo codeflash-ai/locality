@@ -74,6 +74,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+export AMIKA_READINESS_TIMEOUT_SECONDS=3
+export AMIKA_READINESS_POLL_SECONDS=1
+
 fake_bin="${tmp_root}/bin"
 fake_log="${tmp_root}/amika.log"
 mkdir -p "$fake_bin"
@@ -119,6 +122,9 @@ block_operation_if_requested() {
   local activity_dir="${FAKE_AMIKA_ACTIVITY_DIR:?}"
   local active_file="$activity_dir/active.$$"
   mkdir -p "$activity_dir"
+  if [ "$operation" = "create" ] && [ "${FAKE_AMIKA_DELAY_REGISTRATION_AFTER_STOP:-0}" = "1" ]; then
+    : > "$state_dir/$sandbox_name.pending-registration"
+  fi
   : > "$active_file"
   : > "$activity_dir/ready.$$"
   stop_blocked_operation() {
@@ -176,8 +182,24 @@ case "${1:-}:${2:-}" in
       printf 'fake remote sandbox list failure\n' >&2
       exit "$FAKE_AMIKA_SANDBOX_LIST_RC"
     fi
+    if [ "${FAKE_AMIKA_BLOCK_LIST_AFTER_CREATE:-0}" = "1" ] && compgen -G "$state_dir/*.state" >/dev/null; then
+      block_operation_if_requested list
+    fi
     printf '%s\n' "${FAKE_AMIKA_SANDBOX_TABLE:-NAME STATE LOCATION BRANCH REPO CREATOR CREATED
 existing-box stopped remote - - Test 2026-08-02T00:00:00Z}"
+    for pending_file in "$state_dir"/*.pending-registration; do
+      [ -e "$pending_file" ] || continue
+      sandbox_name="$(basename "$pending_file" .pending-registration)"
+      delayed_count_file="$state_dir/$sandbox_name.delayed-list-count"
+      delayed_count=0
+      [ ! -f "$delayed_count_file" ] || delayed_count="$(cat "$delayed_count_file")"
+      delayed_count=$((delayed_count + 1))
+      printf '%s\n' "$delayed_count" > "$delayed_count_file"
+      if [ "$delayed_count" -gt "${FAKE_AMIKA_DELAY_REGISTRATION_LISTS:-1}" ]; then
+        printf 'failed\n' > "$state_dir/$sandbox_name.state"
+        rm -f "$pending_file"
+      fi
+    done
     for state_file in "$state_dir"/*.state; do
       [ -e "$state_file" ] || continue
       sandbox_name="$(basename "$state_file" .state)"
@@ -240,13 +262,15 @@ mcp-snapshot active daytona aseem-mcp 2026-08-02T00:00:00Z}"
     for arg in "$@"; do
       case "$arg" in
         --remote|--force) ;;
-        *) rm -f "$state_dir/$arg.state" "$state_dir/$arg.list-count" ;;
+        *) rm -f "$state_dir/$arg.state" "$state_dir/$arg.list-count" "$state_dir/$arg.pending-registration" "$state_dir/$arg.delayed-list-count" ;;
       esac
     done
     exit 0
     ;;
   sandbox:ssh)
-    if [[ "$joined_args" == *" -- true"* ]] && [ "${FAKE_AMIKA_BLOCK_READINESS:-0}" = "1" ]; then
+    if [[ "$joined_args" == *"AMIKA_PREREQUISITE_CHECK"* ]] && [ "${FAKE_AMIKA_BLOCK_PREREQUISITE:-0}" = "1" ]; then
+      block_operation_if_requested prerequisite
+    elif [[ "$joined_args" == *" -- true"* ]] && [ "${FAKE_AMIKA_BLOCK_READINESS:-0}" = "1" ]; then
       block_operation_if_requested ssh
     elif [[ "$joined_args" != *" -- true"* ]] && [[ "$joined_args" != *"AMIKA_PREREQUISITE_CHECK"* ]]; then
       block_operation_if_requested ssh
@@ -276,6 +300,42 @@ if [[ "$joined_args" == *" -- true"* ]]; then
     fi
   fi
   exit 0
+fi
+
+evaluate_prerequisite_if_requested() {
+  [ "${FAKE_AMIKA_EVALUATE_PREREQUISITES:-0}" = "1" ] || return 0
+  local overrides_b64
+  local overrides
+  overrides_b64="$(printf '%s\n' "$joined_args" | sed -n 's/.*prerequisite_overrides_b64=\([A-Za-z0-9+\/=]*\).*/\1/p' | head -n 1)"
+  overrides="$(printf '%s' "$overrides_b64" | base64 -d 2>/dev/null || true)"
+  (
+    export LOCALITY_CONTEXT_DIRS="${FAKE_REMOTE_LOCALITY_CONTEXT_DIRS:-}"
+    export LOCALITY_CONTEXT_ROOTS="${FAKE_REMOTE_LOCALITY_CONTEXT_ROOTS:-}"
+    export LINEAR_API_KEY="${FAKE_REMOTE_LINEAR_API_KEY:-}"
+    export NOTION_API_TOKEN="${FAKE_REMOTE_NOTION_API_TOKEN:-}"
+    export NOTION_TOKEN="${FAKE_REMOTE_NOTION_TOKEN:-}"
+    export NOTION_ACCESS_TOKEN="${FAKE_REMOTE_NOTION_ACCESS_TOKEN:-}"
+    export SLACK_BOT_TOKEN="${FAKE_REMOTE_SLACK_BOT_TOKEN:-}"
+    export SLACK_TEAM_ID="${FAKE_REMOTE_SLACK_TEAM_ID:-}"
+    eval "$overrides"
+
+    if [[ "$joined_args" == *"AMIKA_PREREQUISITE_CHECK=locality"* ]]; then
+      effective_roots="${LOCALITY_CONTEXT_DIRS:-${LOCALITY_CONTEXT_ROOTS:-}}"
+      if [ -n "$effective_roots" ] && [ "${FAKE_REMOTE_LOCALITY_ROOTS_EXIST:-0}" != "1" ]; then
+        exit 64
+      fi
+      exit 0
+    fi
+
+    [ -n "${LINEAR_API_KEY:-}" ] || [ "${FAKE_REMOTE_LINEAR_SECRET_FILE:-0}" = "1" ] || exit 65
+    [ -n "${NOTION_API_TOKEN:-${NOTION_TOKEN:-${NOTION_ACCESS_TOKEN:-}}}" ] || [ "${FAKE_REMOTE_NOTION_SECRET_FILE:-0}" = "1" ] || exit 66
+    [ -n "${SLACK_BOT_TOKEN:-}" ] || [ "${FAKE_REMOTE_SLACK_BOT_SECRET_FILE:-0}" = "1" ] || exit 67
+    [ -n "${SLACK_TEAM_ID:-}" ] || [ "${FAKE_REMOTE_SLACK_TEAM_SECRET_FILE:-0}" = "1" ] || exit 68
+  )
+}
+
+if [[ "$joined_args" == *"AMIKA_PREREQUISITE_CHECK"* ]]; then
+  evaluate_prerequisite_if_requested || exit $?
 fi
 
 if [[ "$joined_args" == *"AMIKA_PREREQUISITE_CHECK"* ]] && [ "${FAKE_AMIKA_FAIL_LOCALITY_PREREQUISITE:-0}" = "1" ] && [[ "${3:-}" == *locality* ]]; then
@@ -320,6 +380,12 @@ fi
 printf 'fake remote ok\n'
 SH
 chmod +x "${fake_bin}/amika"
+
+cat > "${fake_bin}/zsh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "${fake_bin}/zsh"
 
 cat > "${fake_bin}/rsync" <<'SH'
 #!/usr/bin/env bash
@@ -408,7 +474,7 @@ with open(stdout_path, "wb") as stdout_file, open(stderr_path, "wb") as stderr_f
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         process.wait()
-        raise SystemExit(124)
+        raise SystemExit(125)
 raise SystemExit(return_code)
 PY
 
@@ -752,6 +818,54 @@ assert_contains "$prerequisite_err" "Amika prerequisite check failed for localit
 assert_contains "$prerequisite_log" "amika sandbox delete --remote --force launch-readiness-prerequisite-locality launch-readiness-prerequisite-mcp"
 assert_not_contains "$prerequisite_log" "--scenario"
 
+empty_context_log="${tmp_root}/empty-context-amika.log"
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$empty_context_log" \
+  FAKE_AMIKA_STATE_DIR="${tmp_root}/empty-context-state" \
+  FAKE_AMIKA_EVALUATE_PREREQUISITES=1 \
+  FAKE_REMOTE_LOCALITY_CONTEXT_DIRS="/remote/context/that-is-not-mounted" \
+  FAKE_REMOTE_LOCALITY_ROOTS_EXIST=0 \
+  AMIKA_READINESS_TIMEOUT_SECONDS=3 \
+  AMIKA_READINESS_POLL_SECONDS=1 \
+  LOCALITY_CONTEXT_DIRS="" \
+  LINEAR_API_KEY="local-linear" \
+  NOTION_API_TOKEN="local-notion" \
+  SLACK_BOT_TOKEN="local-slack" \
+  SLACK_TEAM_ID="local-team" \
+  RUN_ID="empty-context" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/empty-context-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null
+assert_contains "$empty_context_log" "--scenario"
+
+empty_credential_log="${tmp_root}/empty-credential-amika.log"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$empty_credential_log" \
+  FAKE_AMIKA_STATE_DIR="${tmp_root}/empty-credential-state" \
+  FAKE_AMIKA_EVALUATE_PREREQUISITES=1 \
+  FAKE_REMOTE_LINEAR_API_KEY="remote-linear" \
+  FAKE_REMOTE_NOTION_API_TOKEN="remote-notion" \
+  FAKE_REMOTE_SLACK_BOT_TOKEN="remote-slack" \
+  FAKE_REMOTE_SLACK_TEAM_ID="remote-team" \
+  FAKE_REMOTE_LINEAR_SECRET_FILE=0 \
+  AMIKA_READINESS_TIMEOUT_SECONDS=3 \
+  AMIKA_READINESS_POLL_SECONDS=1 \
+  LINEAR_API_KEY="" \
+  NOTION_API_TOKEN="local-notion" \
+  SLACK_BOT_TOKEN="local-slack" \
+  SLACK_TEAM_ID="local-team" \
+  RUN_ID="empty-credential" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/empty-credential-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/empty-credential.err"
+empty_credential_rc=$?
+set -e
+if [ "$empty_credential_rc" -eq 0 ]; then
+  fail "an explicitly empty forwarded credential must override a nonempty remote env value"
+fi
+assert_not_contains "$empty_credential_log" "--scenario"
+
 delete_failure_log="${tmp_root}/retry-delete-failure-amika.log"
 set +e
 PATH="${fake_bin}:$PATH" \
@@ -883,6 +997,83 @@ if [ "$registered_signal_rc" -ne 143 ]; then
 fi
 assert_contains "$registered_signal_log" "amika sandbox delete --remote --force launch-readiness-registered-signal-locality"
 
+delayed_signal_log="${tmp_root}/delayed-signal-amika.log"
+delayed_signal_state="${tmp_root}/delayed-signal-state"
+delayed_signal_activity="${tmp_root}/delayed-signal-activity"
+delayed_signal_rc="$(
+  PATH="${fake_bin}:$PATH" \
+    FAKE_AMIKA_LOG="$delayed_signal_log" \
+    FAKE_AMIKA_STATE_DIR="$delayed_signal_state" \
+    FAKE_AMIKA_DELAY_REGISTRATION_AFTER_STOP=1 \
+    FAKE_AMIKA_BLOCK_OPERATION=create \
+    FAKE_AMIKA_BLOCK_MATCH='--snapshot locality-snapshot' \
+    FAKE_AMIKA_ACTIVITY_DIR="$delayed_signal_activity" \
+    AMIKA_READINESS_TIMEOUT_SECONDS=3 \
+    AMIKA_READINESS_POLL_SECONDS=1 \
+    RUN_ID="delayed-signal" \
+    SYNC_ARTIFACTS=0 \
+    LOCAL_OUT_DIR="${tmp_root}/delayed-signal-out" \
+    python3 "$signal_runner" TERM "$delayed_signal_activity" 1 \
+      "${tmp_root}/delayed-signal.out" "${tmp_root}/delayed-signal.err" "$WRAPPER" --scenario scenario2
+)"
+if [ "$delayed_signal_rc" -ne 143 ]; then
+  fail "TERM before delayed sandbox registration should return 143, got ${delayed_signal_rc}"
+fi
+assert_contains "$delayed_signal_log" "amika sandbox delete --remote --force launch-readiness-delayed-signal-locality"
+if [ -e "$delayed_signal_state/launch-readiness-delayed-signal-locality.state" ]; then
+  fail "delayed sandbox registration leaked after signal cleanup"
+fi
+
+blocked_list_log="${tmp_root}/blocked-list-amika.log"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$blocked_list_log" \
+  FAKE_AMIKA_STATE_DIR="${tmp_root}/blocked-list-state" \
+  FAKE_AMIKA_BLOCK_OPERATION=list \
+  FAKE_AMIKA_BLOCK_LIST_AFTER_CREATE=1 \
+  FAKE_AMIKA_ACTIVITY_DIR="${tmp_root}/blocked-list-activity" \
+  AMIKA_CREATE_ATTEMPTS=1 \
+  AMIKA_READINESS_TIMEOUT_SECONDS=1 \
+  AMIKA_READINESS_POLL_SECONDS=1 \
+  RUN_ID="blocked-list" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/blocked-list-out" \
+  python3 "$deadline_runner" 5 "${tmp_root}/blocked-list.out" "${tmp_root}/blocked-list.err" \
+    "$WRAPPER" --scenario scenario2
+blocked_list_rc=$?
+set -e
+if [ "$blocked_list_rc" -eq 125 ]; then
+  fail "post-create sandbox listing exceeded the lifecycle deadline"
+fi
+if [ "$blocked_list_rc" -eq 0 ]; then
+  fail "blocked post-create listing should fail provisioning"
+fi
+
+blocked_prerequisite_log="${tmp_root}/blocked-prerequisite-amika.log"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$blocked_prerequisite_log" \
+  FAKE_AMIKA_STATE_DIR="${tmp_root}/blocked-prerequisite-state" \
+  FAKE_AMIKA_BLOCK_OPERATION=prerequisite \
+  FAKE_AMIKA_BLOCK_PREREQUISITE=1 \
+  FAKE_AMIKA_ACTIVITY_DIR="${tmp_root}/blocked-prerequisite-activity" \
+  AMIKA_READINESS_TIMEOUT_SECONDS=1 \
+  AMIKA_READINESS_POLL_SECONDS=1 \
+  RUN_ID="blocked-prerequisite" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/blocked-prerequisite-out" \
+  python3 "$deadline_runner" 5 "${tmp_root}/blocked-prerequisite.out" "${tmp_root}/blocked-prerequisite.err" \
+    "$WRAPPER" --scenario scenario2
+blocked_prerequisite_rc=$?
+set -e
+if [ "$blocked_prerequisite_rc" -eq 125 ]; then
+  fail "prerequisite SSH exceeded the lifecycle deadline"
+fi
+if [ "$blocked_prerequisite_rc" -eq 0 ]; then
+  fail "blocked prerequisite SSH should fail before benchmark launch"
+fi
+assert_not_contains "$blocked_prerequisite_log" "--scenario"
+
 readiness_deadline_log="${tmp_root}/readiness-deadline-amika.log"
 set +e
 PATH="${fake_bin}:$PATH" \
@@ -901,7 +1092,7 @@ PATH="${fake_bin}:$PATH" \
     "$WRAPPER" --scenario scenario2
 readiness_deadline_rc=$?
 set -e
-if [ "$readiness_deadline_rc" -eq 124 ]; then
+if [ "$readiness_deadline_rc" -eq 125 ]; then
   fail "readiness polling exceeded its configured deadline"
 fi
 if [ "$readiness_deadline_rc" -eq 0 ]; then
