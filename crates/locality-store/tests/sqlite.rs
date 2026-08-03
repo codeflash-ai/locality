@@ -49,7 +49,7 @@ fn sqlite_store_initializes_idempotently() {
 
     assert!(first.db_path.exists());
     assert_eq!(first.db_path, second.db_path);
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
 
     assert_eq!(journal_mode, "wal");
 }
@@ -97,7 +97,7 @@ fn sqlite_store_seeds_state_compatibility_components() {
                 1,
                 0
             ),
-            ("core:schema".to_string(), "schema".to_string(), 27, 1, 1, 0),
+            ("core:schema".to_string(), "schema".to_string(), 28, 1, 1, 0),
             (
                 "durable:auto_save".to_string(),
                 "durable_json".to_string(),
@@ -119,6 +119,14 @@ fn sqlite_store_seeds_state_compatibility_components() {
                 "durable_transaction".to_string(),
                 7,
                 7,
+                1,
+                0
+            ),
+            (
+                "durable:hosted_workspaces".to_string(),
+                "durable_transaction".to_string(),
+                1,
+                1,
                 1,
                 0
             ),
@@ -415,12 +423,12 @@ fn sqlite_store_retires_removed_notion_workspace_roots_component() {
 }
 
 #[test]
-fn sqlite_schema_snapshot_matches_v27_contract() {
+fn sqlite_schema_snapshot_matches_v28_contract() {
     let fixture = SqliteFixture::new();
     let store = fixture.open();
     let connection = Connection::open(&store.db_path).expect("raw connection");
 
-    assert_eq!(SqliteStateStore::current_schema_version(), 27);
+    assert_eq!(SqliteStateStore::current_schema_version(), 28);
 
     assert_eq!(
         schema_column_snapshot(&connection),
@@ -437,6 +445,10 @@ generation_apply_journals: delta_id, mount_id, source_connection_id, base_genera
 generation_apply_outcomes: delta_id, entry_index, outcome_json, updated_at
 generation_inode_evidence: delta_id, entry_index, mount_id, logical_path, evidence_name, expected_sha256, byte_length, visible_evidence_name, visible_expected_sha256, visible_byte_length, base_payload_delta_id, base_payload_entry_index, resolved_at, created_at
 generation_paths: mount_id, source_connection_id, projection_id, logical_path, local_logical_path, base_generation_id, base_identity_json, base_payload_delta_id, base_payload_entry_index, conflict_payload_delta_id, conflict_payload_entry_index, state, incoming_identity_json, updated_at
+hosted_workspace_attachments: api_origin, profile_id, credential_ref, root, profile_revision, layout_version, layout_digest, updated_at
+hosted_workspace_mount_mappings: api_origin, profile_id, portable_mount_id, local_mount_id, mount_target, target_collision_key, active, first_seen_revision, last_seen_revision
+hosted_workspace_pending_mounts: transition_id, portable_mount_id, local_mount_id, mount_target, target_collision_key, first_seen_revision
+hosted_workspace_pending_transitions: transition_id, api_origin, profile_id, credential_ref, target_root, transition_kind, profile_revision, layout_version, layout_digest, base_profile_revision, base_layout_digest, base_root, created_at
 hydration_jobs: mount_id, remote_id, path, target_state_json, reason_json, attempts, last_error
 journals: push_id, mount_id, remote_ids_json, plan_json, preimages_json, apply_effects_json, status_json, metadata_json, readable_diff_json
 metadata_discovery_jobs: mount_id, container_identifier, priority_json, depth, attempts, last_error, created_at, updated_at
@@ -457,7 +469,7 @@ workspace_remount_recoveries: recovery_id, mount_id, committed"
 }
 
 #[test]
-fn sqlite_store_migrates_v18_to_v27_without_discarding_pending_work() {
+fn sqlite_store_migrates_v18_to_v28_without_discarding_pending_work() {
     let fixture = SqliteFixture::new();
     let mut store = fixture.open();
     store
@@ -523,13 +535,13 @@ fn sqlite_store_migrates_v18_to_v27_without_discarding_pending_work() {
     let migration_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM state_migrations
-             WHERE migration_id = 'schema-18-to-27'",
+             WHERE migration_id = 'schema-18-to-28'",
             [],
             |row| row.get(0),
         )
         .expect("migration history");
 
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
 
     assert_eq!(component, ("durable_transaction".to_string(), 1, 1, 1, 0));
     assert_eq!(migration_count, 1);
@@ -602,7 +614,7 @@ fn sqlite_store_migrates_released_workspace_v21_with_generation_tables_absent() 
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("user version");
 
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
     assert_eq!(
         reopened
             .get_workspace_binding(&fixture.mount_id)
@@ -672,13 +684,13 @@ fn sqlite_store_migrates_freshness_v24_with_workspace_binding_absent() {
     let migration_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM state_migrations
-             WHERE migration_id = 'schema-24-to-27'",
+             WHERE migration_id = 'schema-24-to-28'",
             [],
             |row| row.get(0),
         )
         .expect("migration history");
 
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
     assert_eq!(migration_count, 1);
     assert_eq!(
         reopened
@@ -710,7 +722,7 @@ fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
         before.issues,
         vec![StateCompatibilityIssue::OlderSchema {
             found: 12,
-            current: 27,
+            current: 28,
         }]
     );
 
@@ -721,13 +733,13 @@ fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
         .expect("user version");
     let migration_count: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM state_migrations WHERE migration_id = 'schema-12-to-27'",
+            "SELECT COUNT(*) FROM state_migrations WHERE migration_id = 'schema-12-to-28'",
             [],
             |row| row.get(0),
         )
         .expect("migration row count");
 
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
 
     assert_eq!(migration_count, 1);
     assert_eq!(
@@ -764,7 +776,7 @@ fn sqlite_store_rejects_newer_schema_version() {
         error,
         StoreError::SchemaVersion {
             found: 999,
-            supported: 27,
+            supported: 28,
         }
     );
 }
@@ -787,7 +799,7 @@ fn sqlite_store_reports_newer_schema_as_needing_update() {
         report.issues,
         vec![StateCompatibilityIssue::NewerSchema {
             found: 999,
-            supported: 27,
+            supported: 28,
         }]
     );
 }
@@ -1029,7 +1041,7 @@ fn sqlite_store_migrates_journals_component_v2_to_v3_without_rewriting_rows() {
         .expect("journal");
 
     assert_eq!((version, min_reader_version), (3, 3));
-    assert_eq!(before_user_version, 27);
+    assert_eq!(before_user_version, 28);
 
     assert_eq!(after_user_version, before_user_version);
     assert_eq!(after_row, before_row);
@@ -1087,7 +1099,7 @@ fn sqlite_store_migrates_journals_component_v1_to_v3_at_current_schema() {
         .expect("user version");
 
     assert_eq!(component, (3, 3));
-    assert_eq!(before_user_version, 27);
+    assert_eq!(before_user_version, 28);
 
     assert_eq!(after_user_version, before_user_version);
 }
@@ -1426,7 +1438,7 @@ fn sqlite_store_v13_valid_linux_fuse_v1_component_migrates_to_v2() {
 }
 
 #[test]
-fn sqlite_store_v14_missing_live_mode_component_migrates_to_v27() {
+fn sqlite_store_v14_missing_live_mode_component_migrates_to_v28() {
     let fixture = SqliteFixture::new();
     let mount_point_root = fixture
         .state_root
@@ -1473,7 +1485,7 @@ fn sqlite_store_v14_missing_live_mode_component_migrates_to_v27() {
         )
         .expect("live mode component version");
 
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
 
     assert!(sqlite_table_exists(&connection, "mount_live_modes"));
     assert_eq!(component_version, 1);
@@ -2916,7 +2928,7 @@ fn sqlite_store_migrates_v5_projection_and_connections_schema() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
 
     assert_eq!(connection_column_count, 1);
     assert_eq!(projection_column_count, 1);
@@ -2992,7 +3004,7 @@ fn sqlite_store_migrates_v6_projection_schema_to_connections() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
 
     assert_eq!(connection_column_count, 1);
     assert_eq!(connection_table_count, 1);
@@ -3078,7 +3090,7 @@ fn sqlite_store_migrates_v7_hydration_jobs_schema() {
         )
         .expect("hydration_jobs table");
 
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
 
     assert_eq!(hydration_jobs_table_count, 1);
     assert!(
@@ -3166,7 +3178,7 @@ fn sqlite_store_migrates_v8_connections_to_default_connector_profile() {
         )
         .expect("profile_id column");
 
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
 
     assert_eq!(profile_column_count, 1);
     let migrated_connection = store
@@ -3288,7 +3300,7 @@ fn sqlite_store_migrates_v11_entity_search_index() {
         )
         .expect("search tables");
 
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
 
     assert_eq!(search_table_count, 2);
     let matches = store
@@ -3764,7 +3776,7 @@ fn sqlite_store_migrates_v1_journals_with_empty_preimages() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
 
     assert!(entry.preimages.is_empty());
     assert!(entry.apply_effects.is_empty());
@@ -3836,7 +3848,7 @@ fn sqlite_store_migrates_v2_journals_with_empty_apply_effects() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
 
     assert!(entry.apply_effects.is_empty());
 }
@@ -3900,7 +3912,7 @@ fn sqlite_store_migrates_v16_journals_with_empty_edit_metadata() {
         .query_row(
             "SELECT COUNT(*)
              FROM state_migrations
-             WHERE migration_id = 'schema-16-to-27'",
+             WHERE migration_id = 'schema-16-to-28'",
             [],
             |row| row.get(0),
         )
@@ -3910,7 +3922,7 @@ fn sqlite_store_migrates_v16_journals_with_empty_edit_metadata() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
 
     assert_eq!(journals_component_version, 3);
     assert_eq!(
@@ -3979,7 +3991,7 @@ fn sqlite_store_migrates_v17_mounts_with_default_settings_json() {
         .query_row(
             "SELECT COUNT(*)
              FROM state_migrations
-             WHERE migration_id = 'schema-17-to-27'",
+             WHERE migration_id = 'schema-17-to-28'",
             [],
             |row| row.get(0),
         )
@@ -3994,7 +4006,7 @@ fn sqlite_store_migrates_v17_mounts_with_default_settings_json() {
         )
         .expect("journal component metadata");
 
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
 
     assert_eq!(settings_json, "{}");
     assert_eq!(migration_count, 1);

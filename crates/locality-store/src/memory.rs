@@ -21,6 +21,11 @@ use crate::discovery::{
     require_transaction_status, reservation_changed, transaction_missing,
 };
 use crate::error::{StoreError, StoreResult};
+use crate::hosted_workspace::{
+    HostedWorkspaceAttachment, HostedWorkspaceIdentity, HostedWorkspaceMountMapping,
+    PendingHostedWorkspaceTransition, PreparedHostedWorkspaceTransition, committed_attachment,
+    prepare_pending_transition,
+};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
@@ -29,11 +34,12 @@ use crate::records::{
 };
 use crate::repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, ConnectorStateRepository,
-    EntityRepository, EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository,
-    JournalRepository, MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
-    RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
-    VirtualMutationRepository, WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
-    validate_virtual_move_transition, virtual_move_content_changed, virtual_move_missing,
+    EntityRepository, EntitySearchRepository, FreshnessStateRepository, HostedWorkspaceRepository,
+    HydrationJobRepository, JournalRepository, MetadataDiscoveryJobRepository,
+    MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
+    VirtualMoveRepository, VirtualMoveTransition, VirtualMutationRepository,
+    WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome, validate_virtual_move_transition,
+    virtual_move_content_changed, virtual_move_missing,
 };
 use crate::workspace_binding::{
     WorkspaceBinding, WorkspaceBindingRecord, WorkspaceHostBinding, WorkspaceHostBindingResolver,
@@ -68,6 +74,16 @@ fn illegal_transition(
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStateStore {
     mounts: BTreeMap<MountId, MountConfig>,
+    hosted_workspace_attachments: BTreeMap<HostedWorkspaceIdentity, HostedWorkspaceAttachment>,
+    hosted_workspace_mappings: BTreeMap<
+        (
+            HostedWorkspaceIdentity,
+            locality_core::workspace_layout::PortableMountId,
+        ),
+        HostedWorkspaceMountMapping,
+    >,
+    pending_hosted_workspace_transitions:
+        BTreeMap<HostedWorkspaceIdentity, PendingHostedWorkspaceTransition>,
     workspace_bindings: BTreeMap<MountId, WorkspaceBinding>,
     workspace_host_bindings: BTreeMap<WorkspaceId, WorkspaceHostBinding>,
     workspace_remount_recoveries: BTreeMap<String, (MountId, WorkspaceRemountRecoveryOutcome)>,
@@ -180,6 +196,164 @@ impl MountRepository for InMemoryStateStore {
 
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>> {
         Ok(self.mounts.values().cloned().collect())
+    }
+}
+
+impl HostedWorkspaceRepository for InMemoryStateStore {
+    fn begin_hosted_workspace_transition(
+        &mut self,
+        prepared: PreparedHostedWorkspaceTransition,
+    ) -> StoreResult<PendingHostedWorkspaceTransition> {
+        let identity = prepared.identity().clone();
+        let existing_mappings = self.list_hosted_workspace_mount_mappings(&identity)?;
+        let mut reserved = self.mounts.keys().cloned().collect::<BTreeSet<_>>();
+        reserved.extend(
+            self.hosted_workspace_mappings
+                .iter()
+                .filter(|((mapping_identity, _), _)| mapping_identity != &identity)
+                .map(|(_, mapping)| mapping.local_mount_id().clone()),
+        );
+        reserved.extend(
+            self.pending_hosted_workspace_transitions
+                .iter()
+                .filter(|(pending_identity, _)| *pending_identity != &identity)
+                .flat_map(|(_, pending)| pending.prepared().mounts())
+                .map(|mapping| mapping.local_mount_id().clone()),
+        );
+        let pending = prepare_pending_transition(
+            self.hosted_workspace_attachments.get(&identity),
+            &existing_mappings,
+            &reserved,
+            prepared,
+        )?;
+        if let Some(existing) = self.pending_hosted_workspace_transitions.get(&identity) {
+            if existing == &pending {
+                return Ok(existing.clone());
+            }
+            return Err(StoreError::InvalidState(
+                "hosted workspace attachment already has a different pending transition"
+                    .to_string(),
+            ));
+        }
+        if self
+            .pending_hosted_workspace_transitions
+            .values()
+            .any(|existing| {
+                existing.prepared().transition_id() == pending.prepared().transition_id()
+            })
+        {
+            return Err(StoreError::InvalidState(
+                "hosted workspace transition ID is already in use".to_string(),
+            ));
+        }
+        self.pending_hosted_workspace_transitions
+            .insert(identity, pending.clone());
+        Ok(pending)
+    }
+
+    fn get_hosted_workspace_attachment(
+        &self,
+        identity: &HostedWorkspaceIdentity,
+    ) -> StoreResult<Option<HostedWorkspaceAttachment>> {
+        Ok(self.hosted_workspace_attachments.get(identity).cloned())
+    }
+
+    fn list_hosted_workspace_attachments(&self) -> StoreResult<Vec<HostedWorkspaceAttachment>> {
+        Ok(self
+            .hosted_workspace_attachments
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn list_hosted_workspace_mount_mappings(
+        &self,
+        identity: &HostedWorkspaceIdentity,
+    ) -> StoreResult<Vec<HostedWorkspaceMountMapping>> {
+        Ok(self
+            .hosted_workspace_mappings
+            .iter()
+            .filter(|((mapping_identity, _), _)| mapping_identity == identity)
+            .map(|(_, mapping)| mapping.clone())
+            .collect())
+    }
+
+    fn get_pending_hosted_workspace_transition(
+        &self,
+        identity: &HostedWorkspaceIdentity,
+    ) -> StoreResult<Option<PendingHostedWorkspaceTransition>> {
+        Ok(self
+            .pending_hosted_workspace_transitions
+            .get(identity)
+            .cloned())
+    }
+
+    fn list_pending_hosted_workspace_transitions(
+        &self,
+    ) -> StoreResult<Vec<PendingHostedWorkspaceTransition>> {
+        Ok(self
+            .pending_hosted_workspace_transitions
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn commit_hosted_workspace_transition(
+        &mut self,
+        transition_id: &str,
+        committed_at: &str,
+    ) -> StoreResult<HostedWorkspaceAttachment> {
+        let (identity, pending) = self
+            .pending_hosted_workspace_transitions
+            .iter()
+            .find(|(_, pending)| pending.prepared().transition_id() == transition_id)
+            .map(|(identity, pending)| (identity.clone(), pending.clone()))
+            .ok_or_else(|| {
+                StoreError::InvalidState("hosted workspace transition was not found".to_string())
+            })?;
+        let attachment = committed_attachment(
+            &pending,
+            self.hosted_workspace_attachments.get(&identity),
+            committed_at,
+        )?;
+        let previous = self.clone();
+        for ((mapping_identity, _), mapping) in &mut self.hosted_workspace_mappings {
+            if mapping_identity == &identity {
+                *mapping = mapping.clone().inactive();
+            }
+        }
+        for mapping in pending.prepared().mounts() {
+            self.hosted_workspace_mappings.insert(
+                (identity.clone(), mapping.portable_mount_id().clone()),
+                mapping.clone(),
+            );
+        }
+        self.hosted_workspace_attachments
+            .insert(identity.clone(), attachment.clone());
+        if self
+            .pending_hosted_workspace_transitions
+            .remove(&identity)
+            .is_none()
+        {
+            *self = previous;
+            return Err(StoreError::InvalidState(
+                "hosted workspace transition disappeared during commit".to_string(),
+            ));
+        }
+        Ok(attachment)
+    }
+
+    fn cancel_hosted_workspace_transition(&mut self, transition_id: &str) -> StoreResult<()> {
+        let identity = self
+            .pending_hosted_workspace_transitions
+            .iter()
+            .find(|(_, pending)| pending.prepared().transition_id() == transition_id)
+            .map(|(identity, _)| identity.clone())
+            .ok_or_else(|| {
+                StoreError::InvalidState("hosted workspace transition was not found".to_string())
+            })?;
+        self.pending_hosted_workspace_transitions.remove(&identity);
+        Ok(())
     }
 }
 

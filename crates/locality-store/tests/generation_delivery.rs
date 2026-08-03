@@ -1427,7 +1427,7 @@ fn schema_24_component_v3_migrates_existing_journals_without_pending_acknowledgm
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(component, (7, 7));
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
 }
 
 #[test]
@@ -2293,7 +2293,7 @@ fn schema_20_migration_preserves_pending_local_state_and_adds_delivery_tables() 
         fs::read(fixture.mount_root.join("dirty.md")).unwrap(),
         b"local pending bytes"
     );
-    assert_eq!(SqliteStateStore::current_schema_version(), 27);
+    assert_eq!(SqliteStateStore::current_schema_version(), 28);
     assert!(
         reopened
             .get_observed_generation(&fixture.mount_id)
@@ -2541,7 +2541,7 @@ fn partial_v2_v7_generation_migration_is_atomic_and_resumable_per_column() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(component, (7, 7));
-    assert_eq!(user_version, 27);
+    assert_eq!(user_version, 28);
     assert_eq!(
         reopened.list_generation_paths(&fixture.mount_id).unwrap()[0].local_logical_path,
         "Roadmap.md"

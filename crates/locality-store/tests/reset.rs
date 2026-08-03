@@ -3,8 +3,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use locality_core::model::MountId;
+use locality_core::workspace_layout::{MountTarget, PortableMountId};
+use locality_protocol::workspace_layout::{LayoutDigest, WorkspaceProfileId};
 use locality_store::{
-    ConnectionId, ConnectionRecord, ConnectionRepository, CredentialStore, FileCredentialStore,
+    CanonicalApiOrigin, ConnectionId, ConnectionRecord, ConnectionRepository, CredentialStore,
+    FileCredentialStore, HostedWorkspaceCredentialRef, HostedWorkspaceIdentity,
+    HostedWorkspaceMountMapping, HostedWorkspaceRepository, PreparedHostedWorkspaceTransition,
     SqliteStateStore, reset_locality_state_storage,
 };
 
@@ -27,6 +32,36 @@ fn reset_storage_clears_state_root_and_connection_credentials() {
     store
         .save_connection(connection_record("docs-main", "connection:docs-main"))
         .expect("save second connection");
+    store
+        .begin_hosted_workspace_transition(
+            PreparedHostedWorkspaceTransition::new(
+                "pending-reset",
+                HostedWorkspaceIdentity::new(
+                    CanonicalApiOrigin::new("https://api.example.com").unwrap(),
+                    WorkspaceProfileId::new("018f4f6e-9f2c-7b1a-8c3d-4e5f60718293").unwrap(),
+                ),
+                HostedWorkspaceCredentialRef::new("hosted-workspace:pending-reset").unwrap(),
+                fixture.mount_root.with_file_name("hosted-workspace"),
+                1,
+                1,
+                LayoutDigest::new(
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .unwrap(),
+                vec![
+                    HostedWorkspaceMountMapping::proposal(
+                        PortableMountId::new("hosted-mount").unwrap(),
+                        MountId::new("hosted-local-mount"),
+                        MountTarget::new("hosted").unwrap(),
+                        1,
+                    )
+                    .unwrap(),
+                ],
+                "2026-08-03T00:00:00Z",
+            )
+            .unwrap(),
+        )
+        .expect("save hosted pending transition");
     drop(store);
 
     let credentials = FileCredentialStore::new(&fixture.state_root);
@@ -36,14 +71,23 @@ fn reset_storage_clears_state_root_and_connection_credentials() {
     credentials
         .put("connection:docs-main", "docs-secret")
         .expect("write second credential");
+    credentials
+        .put("hosted-workspace:pending-reset", "profile-key-secret")
+        .expect("write hosted credential");
 
     let report = reset_locality_state_storage(&fixture.state_root).expect("reset storage");
 
-    assert_eq!(report.deleted_secret_refs.len(), 4, "{report:#?}");
+    assert_eq!(report.deleted_secret_refs.len(), 5, "{report:#?}");
     assert!(
         report
             .deleted_secret_refs
             .contains(&"connection:notion-main".to_string()),
+        "{report:#?}"
+    );
+    assert!(
+        report
+            .deleted_secret_refs
+            .contains(&"hosted-workspace:pending-reset".to_string()),
         "{report:#?}"
     );
     assert!(

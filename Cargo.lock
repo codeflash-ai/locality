@@ -2522,6 +2522,7 @@ dependencies = [
  "serde",
  "serde_json",
  "unicode-normalization 0.1.24",
+ "url",
  "windows-sys 0.61.2",
 ]
 
