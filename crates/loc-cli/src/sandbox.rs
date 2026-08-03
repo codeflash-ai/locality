@@ -25,10 +25,10 @@ use locality_protocol::workspace_api_v2::{
     WorkspaceProfileSessionRequestV2, WorkspaceProfileSessionV2, WorkspaceSessionStatusV2,
 };
 use locality_protocol::{
-    ExportAttemptLimits, ExportAttemptRequest, OpaqueBootstrapExchangeRequest,
-    SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SandboxSessionState, SandboxSessionStatus,
-    SealedExportOffer, SessionCapability, SessionErrorCode, TarContentEncoding, TarExportOffer,
-    WorkspaceProfileSession,
+    ExportAttemptLimits, ExportAttemptRequest, FreshnessRequirement,
+    OpaqueBootstrapExchangeRequest, SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SandboxSessionState,
+    SandboxSessionStatus, SealedExportOffer, SessionCapability, SessionErrorCode,
+    TarContentEncoding, TarExportOffer, WorkspaceProfileSession,
 };
 use locality_store::{SqliteStateStore, WorkspaceHostBindingError, WorkspaceHostBindingResolver};
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
@@ -1075,7 +1075,11 @@ fn run_generation2_workspace_init(
             == locality_protocol::StaleSessionBehavior::WaitThenFail
         && capabilities.supports_freshness_wait()
     {
-        match client.wait_for_workspace_freshness(&session, &capabilities)? {
+        match client.wait_for_workspace_freshness(
+            &session,
+            &capabilities,
+            status.freshness_requirement(),
+        )? {
             FreshnessWaitAvailability::Completed => {
                 mark_profile(&mut profile, PROFILE_FRESHNESS_WAIT);
                 status = client.workspace_session_status(&session, &capabilities)?;
@@ -2200,6 +2204,7 @@ impl SandboxHttpClient {
         &self,
         session: &WorkspaceProfileSessionV2,
         capabilities: &WorkspaceClientCapabilitiesV2,
+        expected_freshness_requirement: &FreshnessRequirement,
     ) -> Result<FreshnessWaitAvailability, SandboxInitError> {
         let request = FreshnessWaitAttemptRequest {
             format_version: FRESHNESS_WAIT_FORMAT_VERSION,
@@ -2233,6 +2238,12 @@ impl SandboxHttpClient {
             };
         let mut attempt = FreshnessWaitAttempt::decode_json(&accepted, &request, &server_time)
             .map_err(|error| invalid_freshness_wait_response(error.to_string()))?;
+        if attempt.freshness_requirement != *expected_freshness_requirement {
+            return Err(invalid_freshness_wait_response(
+                "freshness wait requirement does not match the initiating session status"
+                    .to_string(),
+            ));
+        }
         let mut local_deadline = if attempt.state == FreshnessWaitAggregateState::Waiting {
             Some(freshness_wait_local_deadline(
                 &attempt,

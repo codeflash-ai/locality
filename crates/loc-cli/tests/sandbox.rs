@@ -1333,6 +1333,42 @@ fn generation2_profile_rejects_invalid_freshness_retry_advice() {
 }
 
 #[test]
+fn generation2_profile_rejects_mismatched_freshness_requirement() {
+    let directory = TestDirectory::new("workspace-v2-mismatched-freshness-requirement");
+    let session = WorkspaceProfileSessionV2::decode_json(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON)
+        .expect("workspace session fixture");
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&workspace_v2_bootstrapping_status()),
+        ResponseFixture::json(&serde_json::json!({}))
+            .with_header("Date", "Fri, 31 Jul 2026 12:00:08 GMT")
+            .with_body_from_request(mismatched_requirement_freshness_attempt),
+    ]);
+
+    let error = run_sandbox_init_with_profile_key(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxProfileKey::new("a".repeat(64)).expect("profile key"),
+        SandboxContentEncodingPreference::Automatic,
+    )
+    .expect_err("wait attempts must preserve the initiating freshness requirement");
+
+    assert_eq!(error.code(), "backend_protocol_invalid");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match the initiating session status"),
+        "{error}"
+    );
+    for _ in 0..3 {
+        let _ = server.request();
+    }
+    server.assert_no_request();
+}
+
+#[test]
 fn generation2_terminal_freshness_failure_uses_existing_session_error_surface() {
     let directory = TestDirectory::new("workspace-v2-freshness-failed");
     let session = WorkspaceProfileSessionV2::decode_json(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON)
@@ -2989,6 +3025,13 @@ fn failed_freshness_attempt(request: &CapturedRequest) -> Vec<u8> {
 
 fn invalid_retry_freshness_attempt(request: &CapturedRequest) -> Vec<u8> {
     freshness_attempt_for_request(request, "invalid_retry")
+}
+
+fn mismatched_requirement_freshness_attempt(request: &CapturedRequest) -> Vec<u8> {
+    let mut attempt: Value = serde_json::from_slice(&waiting_freshness_attempt(request))
+        .expect("waiting freshness fixture");
+    attempt["freshness_requirement"]["max_age_seconds"] = serde_json::json!(301);
+    serde_json::to_vec(&attempt).expect("serialize mismatched freshness response")
 }
 
 fn freshness_attempt_for_request(request: &CapturedRequest, outcome: &str) -> Vec<u8> {
