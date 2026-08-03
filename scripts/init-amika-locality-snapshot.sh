@@ -33,59 +33,105 @@ fail() {
   exit 2
 }
 
-ACTIVE_EXPECT_PID=""
-PENDING_TRANSPORT_SIGNAL=""
+ACTIVE_CHILD_PID=""
+PENDING_CHILD_SIGNAL=""
+TERMINAL_STATE=""
+TERMINAL_STATE_ACTIVE=false
+ACTIVE_DELIVERY_DIR=""
 
-terminate_active_transport() {
+restore_terminal_state() {
+  local saved_state="${TERMINAL_STATE:-}"
+
+  if [ "${TERMINAL_STATE_ACTIVE:-false}" != true ]; then
+    return
+  fi
+  TERMINAL_STATE_ACTIVE=false
+  TERMINAL_STATE=""
+  stty "$saved_state" < /dev/tty 2>/dev/null || stty echo < /dev/tty 2>/dev/null || true
+}
+
+cleanup_delivery_marker() {
+  local delivery_dir="${ACTIVE_DELIVERY_DIR:-}"
+
+  if [ -z "$delivery_dir" ]; then
+    return
+  fi
+  ACTIVE_DELIVERY_DIR=""
+  rm -f -- "$delivery_dir/delivered" 2>/dev/null || true
+  rmdir "$delivery_dir" 2>/dev/null || true
+}
+
+forward_and_reap_active_child() {
+  local signal="$1"
+  local child_pid="${ACTIVE_CHILD_PID:-}"
+
+  if [ -z "$child_pid" ]; then
+    return
+  fi
+  ACTIVE_CHILD_PID=""
+  kill -s "$signal" "$child_pid" 2>/dev/null || true
+  wait "$child_pid" 2>/dev/null || true
+}
+
+cleanup_on_exit() {
+  local status="$1"
+
+  trap - EXIT
+  trap '' HUP INT TERM
+  restore_terminal_state
+  forward_and_reap_active_child TERM
+  cleanup_delivery_marker
+  exit "$status"
+}
+
+terminate_for_signal() {
   local signal="$1"
   local signal_number="$2"
-  local expect_pid="${ACTIVE_EXPECT_PID:-}"
 
   trap '' HUP INT TERM
   PROFILE_KEY=""
   AZURE_OPENAI_API_KEY_VALUE=""
-  if [ -n "$expect_pid" ]; then
-    kill -s "$signal" "$expect_pid" 2>/dev/null || true
-    wait "$expect_pid" 2>/dev/null || true
-  fi
-  ACTIVE_EXPECT_PID=""
+  restore_terminal_state
+  forward_and_reap_active_child "$signal"
+  cleanup_delivery_marker
   exit $((128 + signal_number))
 }
 
-trap 'terminate_active_transport HUP 1' HUP
-trap 'terminate_active_transport INT 2' INT
-trap 'terminate_active_transport TERM 15' TERM
+trap 'cleanup_on_exit $?' EXIT
+trap 'terminate_for_signal HUP 1' HUP
+trap 'terminate_for_signal INT 2' INT
+trap 'terminate_for_signal TERM 15' TERM
 
-prepare_expect_launch() {
-  PENDING_TRANSPORT_SIGNAL=""
-  trap 'PENDING_TRANSPORT_SIGNAL="HUP 1"' HUP
-  trap 'PENDING_TRANSPORT_SIGNAL="INT 2"' INT
-  trap 'PENDING_TRANSPORT_SIGNAL="TERM 15"' TERM
+prepare_child_launch() {
+  PENDING_CHILD_SIGNAL=""
+  trap 'PENDING_CHILD_SIGNAL="HUP 1"' HUP
+  trap 'PENDING_CHILD_SIGNAL="INT 2"' INT
+  trap 'PENDING_CHILD_SIGNAL="TERM 15"' TERM
 }
 
-activate_expect() {
-  ACTIVE_EXPECT_PID="$1"
-  trap 'terminate_active_transport HUP 1' HUP
-  trap 'terminate_active_transport INT 2' INT
-  trap 'terminate_active_transport TERM 15' TERM
-  case "$PENDING_TRANSPORT_SIGNAL" in
-    "HUP 1") terminate_active_transport HUP 1 ;;
-    "INT 2") terminate_active_transport INT 2 ;;
-    "TERM 15") terminate_active_transport TERM 15 ;;
+activate_child() {
+  ACTIVE_CHILD_PID="$1"
+  trap 'terminate_for_signal HUP 1' HUP
+  trap 'terminate_for_signal INT 2' INT
+  trap 'terminate_for_signal TERM 15' TERM
+  case "$PENDING_CHILD_SIGNAL" in
+    "HUP 1") terminate_for_signal HUP 1 ;;
+    "INT 2") terminate_for_signal INT 2 ;;
+    "TERM 15") terminate_for_signal TERM 15 ;;
   esac
 }
 
-wait_for_active_expect() {
-  local expect_pid="$1"
+wait_for_active_child() {
+  local child_pid="$1"
   local status
 
-  if wait "$expect_pid"; then
+  if wait "$child_pid"; then
     status=0
   else
     status=$?
   fi
-  if [ "${ACTIVE_EXPECT_PID:-}" = "$expect_pid" ]; then
-    ACTIVE_EXPECT_PID=""
+  if [ "${ACTIVE_CHILD_PID:-}" = "$child_pid" ]; then
+    ACTIVE_CHILD_PID=""
   fi
   return "$status"
 }
@@ -174,7 +220,7 @@ amika_ssh() {
   fi
   remote_command="$(encode_remote_argv "$@")"
   command -v expect >/dev/null 2>&1 || fail "expect is required for Amika PTY transport"
-  prepare_expect_launch
+  prepare_child_launch
   AMIKA_EXPECT_COMMON="$EXPECT_TRANSPORT_PROCS" \
     AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
     expect -c '
@@ -197,14 +243,16 @@ amika_ssh() {
         }
       }
     ' &
-  activate_expect "$!"
-  wait_for_active_expect "$ACTIVE_EXPECT_PID"
+  activate_child "$!"
+  wait_for_active_child "$ACTIVE_CHILD_PID"
 }
 
 amika_ssh_secret_line() {
   local sandbox="$1"
   local secret="$2"
   local attempt=1
+  local delivered
+  local delivery_marker
   local status
   local remote_command
   shift 2
@@ -213,11 +261,15 @@ amika_ssh_secret_line() {
   fi
   command -v expect >/dev/null 2>&1 || fail "expect is required for Amika credential transfer"
   remote_command="$(encode_remote_argv "$@")"
+  ACTIVE_DELIVERY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/amika-secret-delivery.XXXXXX")" || \
+    fail "could not create credential delivery state directory"
+  delivery_marker="$ACTIVE_DELIVERY_DIR/delivered"
 
   while [ "$attempt" -le 3 ]; do
-    prepare_expect_launch
+    prepare_child_launch
     AMIKA_EXPECT_COMMON="$EXPECT_TRANSPORT_PROCS" \
       AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
+      AMIKA_DELIVERY_MARKER="$delivery_marker" \
       expect -c '
         eval $env(AMIKA_EXPECT_COMMON)
         initialize_transport
@@ -245,6 +297,16 @@ amika_ssh_secret_line() {
           }
         }
         send -- "$secret\n"
+        if {[catch {
+          set marker [open $env(AMIKA_DELIVERY_MARKER) {WRONLY CREAT EXCL}]
+          close $marker
+        }]} {
+          set secret ""
+          reap_child SIGTERM
+          restore_terminal
+          puts stderr "could not record credential delivery; it was not retried"
+          exit 125
+        }
         set secret ""
         set timeout 1800
         expect {
@@ -262,22 +324,44 @@ amika_ssh_secret_line() {
           }
         }
       ' <<<"$secret" &
-    activate_expect "$!"
-    if wait_for_active_expect "$ACTIVE_EXPECT_PID"; then
+    activate_child "$!"
+    if wait_for_active_child "$ACTIVE_CHILD_PID"; then
       secret=""
+      cleanup_delivery_marker
       return 0
     else
       status=$?
     fi
 
-    if [ "$status" -ne 75 ] || [ "$attempt" -eq 3 ]; then
+    delivered=false
+    if [ -f "$delivery_marker" ]; then
+      delivered=true
+    fi
+    if [ "$status" -ne 75 ] || [ "$delivered" = true ] || [ "$attempt" -eq 3 ]; then
       secret=""
+      cleanup_delivery_marker
       return "$status"
     fi
     printf 'Amika credential transport closed before secret delivery; retrying (%s/3)...\n' "$attempt" >&2
     attempt=$((attempt + 1))
     sleep 1
   done
+}
+
+create_amika_sandbox() {
+  local sandbox="$1"
+
+  prepare_child_launch
+  (
+    cd "$REPO_ROOT"
+    exec amika sandbox create \
+      --remote \
+      --name "$sandbox" \
+      --no-git \
+      --yes
+  ) >/dev/null &
+  activate_child "$!"
+  wait_for_active_child "$ACTIVE_CHILD_PID"
 }
 
 API_URL=""
@@ -395,12 +479,14 @@ command -v git >/dev/null 2>&1 || fail "git is not available on PATH"
 SOURCE_REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD)" || fail "could not resolve source revision"
 
 if [ -t 0 ]; then
-  stty -echo
+  TERMINAL_STATE="$(stty -g < /dev/tty)" || fail "could not read terminal state"
+  TERMINAL_STATE_ACTIVE=true
+  stty -echo < /dev/tty || fail "could not disable terminal echo"
   IFS= read -r PROFILE_KEY || {
-    stty echo
+    restore_terminal_state
     fail "read the Workspace Profile key from standard input"
   }
-  stty echo
+  restore_terminal_state
   printf '\n'
 else
   IFS= read -r PROFILE_KEY || fail "read the Workspace Profile key from standard input"
@@ -411,11 +497,7 @@ case "$PROFILE_KEY" in
 esac
 
 printf 'Creating fresh Amika sandbox %s (existing sandboxes are never reused or replaced)...\n' "$SANDBOX_NAME"
-(cd "$REPO_ROOT" && amika sandbox create \
-  --remote \
-  --name "$SANDBOX_NAME" \
-  --no-git \
-  --yes >/dev/null) || \
+create_amika_sandbox "$SANDBOX_NAME" || \
   fail "could not create fresh sandbox ${SANDBOX_NAME}; no credentials were transferred (choose a new name or explicitly delete the old sandbox)"
 
 printf 'Installing released loc CLI v%s in %s...\n' "$LOC_RELEASE_VERSION" "$SANDBOX_NAME"

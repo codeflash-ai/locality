@@ -171,6 +171,10 @@ done
 printf '\n' >> "$FAKE_AMIKA_LOG"
 
 if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "create" ]; then
+  if [ -n "${FAKE_CREATE_BLOCK_PID_FILE:-}" ]; then
+    printf '%s\n' "$$" > "$FAKE_CREATE_BLOCK_PID_FILE"
+    exec sleep 300
+  fi
   if [ -n "${FAKE_CREATE_STATUS:-}" ]; then
     exit "$FAKE_CREATE_STATUS"
   fi
@@ -254,6 +258,88 @@ chmod +x "${fake_bin}/amika"
 
 profile_key="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 azure_key="test-azure-key"
+
+tty_bin="${tmp_root}/tty-bin"
+tty_stty_log="${tmp_root}/tty-stty.log"
+tty_restored="${tmp_root}/tty-restored"
+mkdir -p "$tty_bin"
+cat > "${tty_bin}/stty" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FAKE_STTY_LOG:?}"
+"${REAL_STTY:?}" "$@"
+stty_status=$?
+case "${1:-}" in
+  -g|-echo) ;;
+  *)
+    if [ "$stty_status" -eq 0 ]; then
+      printf 'restored\n' > "${FAKE_STTY_RESTORED:?}"
+    fi
+    ;;
+esac
+exit "$stty_status"
+SH
+chmod +x "${tty_bin}/stty"
+
+: > "$fake_log"
+set +e
+TTY_TEST_PATH="${tty_bin}:${fake_bin}:$PATH" \
+  TTY_TEST_SCRIPT="$SCRIPT" \
+  TTY_TEST_AZURE_KEY="$azure_key" \
+  TTY_TEST_AMIKA_LOG="$fake_log" \
+  TTY_TEST_STTY_LOG="$tty_stty_log" \
+  TTY_TEST_RESTORED="$tty_restored" \
+  TTY_TEST_REAL_STTY="$(command -v stty)" \
+  expect -c '
+    set timeout 10
+    spawn -noecho env \
+      PATH=$env(TTY_TEST_PATH) \
+      AZURE_OPENAI_API_KEY=$env(TTY_TEST_AZURE_KEY) \
+      FAKE_AMIKA_LOG=$env(TTY_TEST_AMIKA_LOG) \
+      FAKE_STTY_LOG=$env(TTY_TEST_STTY_LOG) \
+      FAKE_STTY_RESTORED=$env(TTY_TEST_RESTORED) \
+      REAL_STTY=$env(TTY_TEST_REAL_STTY) \
+      $env(TTY_TEST_SCRIPT) \
+        --api-url https://api.dev.locality.dev \
+        --name interrupted-read
+    set public_script_pid [exp_pid]
+    set echo_disabled 0
+    for {set attempt 0} {$attempt < 100} {incr attempt} {
+      after 50
+      if {[file exists $env(TTY_TEST_STTY_LOG)]} {
+        set handle [open $env(TTY_TEST_STTY_LOG) r]
+        set log [read $handle]
+        close $handle
+        if {[string first "-echo\n" $log] >= 0} {
+          set echo_disabled 1
+          break
+        }
+      }
+    }
+    if {!$echo_disabled} {
+      catch {exec kill -TERM $public_script_pid}
+      catch {expect eof}
+      catch {wait}
+      exit 124
+    }
+    exec kill -TERM $public_script_pid
+    expect eof
+    set result [wait]
+    if {[lindex $result 2] != 0} {
+      exit 125
+    }
+    exit [lindex $result 3]
+  ' >/dev/null 2>&1
+tty_interrupt_status=$?
+set -e
+[ "$tty_interrupt_status" -eq 143 ] || \
+  fail "TERM-interrupted public script credential read should return 143, got ${tty_interrupt_status}"
+[ -s "$tty_restored" ] || \
+  fail "credential read interruption did not restore the saved terminal state: $(cat "$tty_stty_log")"
+grep -F -x -q -- '-g' "$tty_stty_log" || fail "credential read did not capture terminal state"
+grep -F -x -q -- '-echo' "$tty_stty_log" || fail "credential read did not disable terminal echo"
+[ ! -s "$fake_log" ] || fail "credential read interruption contacted Amika"
+
 output="$(
   printf '%s\n' "$profile_key" | \
     PATH="${fake_bin}:$PATH" \
@@ -358,6 +444,43 @@ assert_contains "$fake_log" "sandbox create --remote --name colliding-snapshot -
 assert_not_contains "$fake_log" "sandbox ssh"
 grep -F -q -- 'no credentials were transferred' <<<"$create_failure_output" || \
   fail "sandbox collision failure did not explain credential safety"
+
+: > "$fake_log"
+create_block_pid_file="${tmp_root}/create-block.pid"
+create_interrupt_input="${tmp_root}/create-interrupt.input"
+create_interrupt_output="${tmp_root}/create-interrupt.output"
+printf '%s\n' "$profile_key" > "$create_interrupt_input"
+PATH="${fake_bin}:$PATH" \
+  AZURE_OPENAI_API_KEY="$azure_key" \
+  FAKE_AMIKA_LOG="$fake_log" \
+  FAKE_CREATE_BLOCK_PID_FILE="$create_block_pid_file" \
+  "$SCRIPT" --api-url https://api.dev.locality.dev --name interrupted-create \
+    <"$create_interrupt_input" >"$create_interrupt_output" 2>&1 &
+create_public_script_pid=$!
+for _ in $(seq 1 100); do
+  [ -s "$create_block_pid_file" ] && break
+  sleep 0.05
+done
+[ -s "$create_block_pid_file" ] || fail "sandbox creation interruption fixture did not start"
+blocked_create_pid="$(cat "$create_block_pid_file")"
+kill -TERM "$create_public_script_pid"
+set +e
+wait "$create_public_script_pid"
+create_interrupt_status=$?
+set -e
+[ "$create_interrupt_status" -eq 143 ] || \
+  fail "TERM-interrupted public script sandbox creation should return 143, got ${create_interrupt_status}: $(cat "$create_interrupt_output")"
+for _ in $(seq 1 100); do
+  if ! kill -0 "$blocked_create_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+if kill -0 "$blocked_create_pid" 2>/dev/null; then
+  fail "interrupted public script left sandbox creation child ${blocked_create_pid} running"
+fi
+assert_contains "$fake_log" "sandbox create --remote --name interrupted-create --no-git --yes"
+assert_not_contains "$fake_log" "sandbox ssh"
 
 : > "$fake_log"
 pre_sentinel_count="${tmp_root}/pre-sentinel.count"
@@ -470,6 +593,32 @@ set -e
 [ "$(cat "$post_sentinel_count")" -eq 1 ] || fail "post-sentinel failure must not retry"
 if grep -F -q -- 'credential transport closed' <<<"$post_sentinel_output"; then
   fail "post-sentinel failure was incorrectly classified as retryable transport"
+fi
+
+: > "$fake_log"
+post_sentinel_75_count="${tmp_root}/post-sentinel-75.count"
+set +e
+post_sentinel_75_output="$(
+  printf '%s\n' "$profile_key" | \
+    PATH="${fake_bin}:$PATH" \
+    AZURE_OPENAI_API_KEY="$azure_key" \
+    FAKE_AMIKA_LOG="$fake_log" \
+    FAKE_PROFILE_KEY_INPUT="$profile_key_input" \
+    FAKE_AZURE_INPUT="$azure_input" \
+    FAKE_PROMPT_INPUT="$prompt_input" \
+    FAKE_REPORT="$fake_report" \
+    FAKE_PRE_SENTINEL_COUNT="$post_sentinel_75_count" \
+    FAKE_POST_SENTINEL_STATUS=75 \
+    "$SCRIPT" --api-url https://api.dev.locality.dev --name post-sentinel-75 2>&1
+)"
+post_sentinel_75_status=$?
+set -e
+[ "$post_sentinel_75_status" -eq 75 ] || \
+  fail "post-sentinel child status 75 should be preserved, got ${post_sentinel_75_status}"
+[ "$(cat "$post_sentinel_75_count")" -eq 1 ] || \
+  fail "post-sentinel child status 75 replayed the credential"
+if grep -F -q -- 'credential transport closed' <<<"$post_sentinel_75_output"; then
+  fail "post-sentinel child status 75 was incorrectly classified as pre-delivery transport failure"
 fi
 
 : > "$fake_log"
