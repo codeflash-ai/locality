@@ -735,7 +735,7 @@ function suggestedAgentPrompt(mountPath: string, connector: OnboardingConnectorI
     case "google-calendar":
       return `Use Locality to inspect my Google Calendar source. Open the files under ${mountPath}, review calendar events with normal file tools, and prepare new event drafts for Locality review before creating them.`;
     case "gmail":
-      return `Use Locality to inspect my Gmail source. Open the files under ${mountPath}, search mail with normal file tools, and prepare draft updates only when the mounted draft files support it. Leave outbound changes for Locality review.`;
+      return `Use Locality to inspect my Gmail source. Open the files under ${mountPath}, search mail with normal file tools, use draft/ for unsent Gmail drafts, and use send/ only when I explicitly ask you to send mail. Leave outbound changes for Locality review.`;
     case "linear":
       return `Use Locality to edit my Linear issues. Open the files under ${mountPath}, update issue Markdown and editable frontmatter, and leave changes pending for Locality review before pushing.`;
     case "notion":
@@ -833,7 +833,7 @@ function onboardingConnectorDescription(
     case "google-calendar":
       return "Connect Google Calendar during setup so agents can review events and prepare new event drafts through local files.";
     case "gmail":
-      return "Connect Gmail during setup so agents can search mailboxes and prepare reviewed draft work from local files.";
+      return "Connect Gmail during setup so agents can search mailboxes and prepare reviewed outbound mail from local files.";
     case "granola":
       return "Paste a Granola API key to mount meeting summaries and transcripts as local read-only files. Keys are stored in your local credential store.";
     case "linear":
@@ -871,7 +871,7 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
     case "google-calendar":
       return "Your Google Calendar source is ready as local files. Agents can review events and prepare new event drafts before anything is created remotely.";
     case "gmail":
-      return "Your Gmail source is ready as local files. Agents can search mailbox content and prepare reviewed draft work without leaving the filesystem.";
+      return "Your Gmail source is ready as local files. Agents can search mailbox content and prepare reviewed outbound mail without leaving the filesystem.";
     case "granola":
       return "Your Granola meetings are ready as local read-only files. Agents can search summaries and transcripts with normal file tools, while Locality keeps the remote notes protected from edits.";
     case "linear":
@@ -3980,7 +3980,7 @@ function AddSourceDialog({
     {
       id: "gmail",
       name: "Gmail",
-      description: "Inbox and sent as readable files, drafts as reviewed outbound mail.",
+      description: "Inbox and sent as readable files, draft/ for Gmail drafts, send/ for reviewed direct sends.",
       status: sourceConnectorStatus(snapshot, "gmail"),
       keywords: ["gmail", "mail", "email", "inbox", "drafts"],
       mounted: sourceMounted(snapshot, "gmail"),
@@ -7841,7 +7841,7 @@ const onboardingConnectorCards: OnboardingConnectorCard[] = [
   {
     connector: "gmail",
     title: "Gmail",
-    description: "Inbox and sent mail as local files, drafts after review.",
+    description: "Inbox and sent mail as local files, draft/ for Gmail drafts, send/ for reviewed sends.",
   },
   {
     connector: "granola",

@@ -452,7 +452,8 @@ Connected sources can include Notion, Google Docs, Google Calendar, Gmail, Linea
 
 - Notion pages are directories with `page.md`; child pages live as child directories. Preserve Locality identity frontmatter, block IDs, directives starting with `::loc{{`, `_schema.yaml`, `AGENTS.md`, and `CLAUDE.md` unless explicitly asked.
 - Google Docs files are writable Markdown documents. Preserve Locality frontmatter and follow the mount-local `AGENTS.md` for supported formatting.
-- Calendar and Gmail mounts expose drafts for new or outbound objects. Create and edit drafts only through the filesystem shape described in the mount-local `AGENTS.md`, then use `loc diff <path>` and explicit push when the user asks to send or publish.
+- Calendar mounts expose drafts for new events. Create and edit Calendar drafts only through the filesystem shape described in the mount-local `AGENTS.md`, then use `loc diff <path>` and explicit push when the user asks to publish.
+- Gmail mounts expose `draft/` for unsent drafts and `send/` for direct sends. Use `send/` only when the user explicitly asks to send now; otherwise use `draft/`. Create and edit Gmail outbound files only through the filesystem shape described in the mount-local `AGENTS.md`, then use `loc diff <path>` and explicit push when the user asks to send.
 - Linear issue edits and Linear status moves are supported through the mounted issue files when the mount-local `AGENTS.md` says so. Inspect with `loc diff <path>` before pushing.
 - Slack and Granola mounts are read-only. Do not edit, create, delete, rename, or push files there.
 
@@ -1108,7 +1109,12 @@ mod tests {
         assert!(skill.contains("For discovery or research tasks, triage by path and title first"));
         assert!(skill.contains("If initial search gives no hits, refine the query and browse directory names before concluding context is unavailable"));
         assert!(skill.contains("If useful results are outside a user-provided path or source scope, do not read them until the user permits it"));
-        assert!(skill.contains("Calendar and Gmail mounts expose drafts"));
+        assert!(skill.contains("Calendar mounts expose drafts for new events"));
+        assert!(skill.contains("Gmail mounts expose `draft/` for unsent drafts"));
+        assert!(skill.contains("`send/` for direct sends"));
+        assert!(skill.contains(
+            "Use `send/` only when the user explicitly asks to send now; otherwise use `draft/`."
+        ));
         assert!(skill.contains("Linear issue edits"));
         assert!(skill.contains("Linear status moves"));
         assert!(skill.contains("Slack and Granola mounts are read-only"));
