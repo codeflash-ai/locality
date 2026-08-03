@@ -9,7 +9,7 @@ Runs two Codex evaluations in Amika sandboxes, downloads their JSONL event
 streams, profiles the conversations, and summarizes how each agent spent time.
 
 Defaults:
-  local artifacts:  target/codex-locality-comparison/<UTC_RUN_ID>/
+  local artifacts:  experiment/codex-locality-comparison/<UTC_RUN_ID>/
   transcript capture: streamed back over amika sandbox ssh
   Codex model: gpt-5.6-luna
   Codex reasoning effort: low
@@ -47,7 +47,7 @@ EOF
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
-OUT_DIR="${OUT_DIR:-$REPO_ROOT/target/codex-locality-comparison/$RUN_ID}"
+OUT_DIR="${OUT_DIR:-$REPO_ROOT/experiment/codex-locality-comparison/$RUN_ID}"
 REMOTE_RUN_ROOT="${REMOTE_RUN_ROOT:-~/locality-codex-runs}"
 MCP_SANDBOX="${MCP_SANDBOX:-aseem-mcp}"
 LOCALITY_SANDBOX="${LOCALITY_SANDBOX:-aseem-locality}"

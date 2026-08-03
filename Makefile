@@ -233,6 +233,11 @@ test-release-notes: ## Validate LLM-generated GitHub Release notes plumbing.
 test-launch-readiness-mcp-config: ## Validate launch-readiness Codex MCP isolation.
 	tests/launch_readiness_mcp_config.sh
 
+.PHONY: test-launch-readiness-wrappers
+test-launch-readiness-wrappers: ## Validate launch-readiness wrapper defaults.
+	tests/launch_readiness_amika_split_wrapper.sh
+	tests/launch_readiness_aws_wrapper.sh
+
 .PHONY: fmt
 fmt: ## Format Rust code.
 	$(CARGO) fmt --all

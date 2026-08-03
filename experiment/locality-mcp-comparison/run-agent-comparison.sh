@@ -12,11 +12,11 @@ Runs the launch-readiness benchmark concurrently on two remote sandboxes or inst
 Defaults:
   LOCALITY_SANDBOX=aseem-locality
   MCP_SANDBOX=aseem-mcp
-  LOCAL_OUT_DIR=target/launch-readiness-amika/<UTC_RUN_ID>/
+  LOCAL_OUT_DIR=experiment/launch-readiness-amika/<UTC_RUN_ID>/
   REMOTE_SOURCE_REPO=/home/ubuntu/workspace/locality
   REMOTE_WORKTREE=/home/ubuntu/workspace/locality-launch-readiness-<UTC_RUN_ID>
-  LOCALITY_REMOTE_OUT_DIR=<REMOTE_WORKTREE>/target/launch-readiness-<UTC_RUN_ID>-locality
-  MCP_REMOTE_OUT_DIR=<REMOTE_WORKTREE>/target/launch-readiness-<UTC_RUN_ID>-mcp
+  LOCALITY_REMOTE_OUT_DIR=<REMOTE_WORKTREE>/experiment/launch-readiness-<UTC_RUN_ID>-locality
+  MCP_REMOTE_OUT_DIR=<REMOTE_WORKTREE>/experiment/launch-readiness-<UTC_RUN_ID>-mcp
 
 Environment:
   RUN_ID                         Run id shared by both sandboxes.
@@ -84,7 +84,7 @@ LOCALITY_SSH_TARGET="${LOCALITY_SSH_TARGET:-}"
 MCP_SSH_TARGET="${MCP_SSH_TARGET:-}"
 SSH_OPTIONS="${SSH_OPTIONS:-}"
 
-LOCAL_OUT_DIR="${LOCAL_OUT_DIR:-${OUT_DIR:-$REPO_ROOT/target/launch-readiness-amika/$RUN_ID}}"
+LOCAL_OUT_DIR="${LOCAL_OUT_DIR:-${OUT_DIR:-$REPO_ROOT/experiment/launch-readiness-amika/$RUN_ID}}"
 LOCALITY_REMOTE_OUT_DIR_INPUT="${LOCALITY_REMOTE_OUT_DIR:-}"
 MCP_REMOTE_OUT_DIR_INPUT="${MCP_REMOTE_OUT_DIR:-}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
@@ -147,8 +147,8 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-LOCALITY_REMOTE_OUT_DIR="${LOCALITY_REMOTE_OUT_DIR_INPUT:-$REMOTE_WORKTREE/target/launch-readiness-$RUN_ID-locality}"
-MCP_REMOTE_OUT_DIR="${MCP_REMOTE_OUT_DIR_INPUT:-$REMOTE_WORKTREE/target/launch-readiness-$RUN_ID-mcp}"
+LOCALITY_REMOTE_OUT_DIR="${LOCALITY_REMOTE_OUT_DIR_INPUT:-$REMOTE_WORKTREE/experiment/launch-readiness-$RUN_ID-locality}"
+MCP_REMOTE_OUT_DIR="${MCP_REMOTE_OUT_DIR_INPUT:-$REMOTE_WORKTREE/experiment/launch-readiness-$RUN_ID-mcp}"
 
 if [ "$LOCALITY_SANDBOX" = "$MCP_SANDBOX" ]; then
   echo "LOCALITY_SANDBOX and MCP_SANDBOX must be different labels or sandboxes" >&2

@@ -6,7 +6,7 @@ CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BASE_OUT_DIR="${BASE_OUT_DIR:-$REPO_ROOT/target/launch-readiness-amika-repeated}"
+BASE_OUT_DIR="${BASE_OUT_DIR:-$REPO_ROOT/experiment/launch-readiness-amika-repeated}"
 
 cd "$REPO_ROOT"
 

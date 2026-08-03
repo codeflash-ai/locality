@@ -10,7 +10,7 @@ transcripts, profiles the conversations, and summarizes how each agent spent
 time.
 
 Defaults:
-  local artifacts:  target/claude-locality-comparison/<UTC_RUN_ID>/
+  local artifacts:  experiment/claude-locality-comparison/<UTC_RUN_ID>/
   transcript capture: streamed back over amika sandbox ssh
   remote cwd:
     test-with-notion-connector: ~
@@ -34,7 +34,7 @@ EOF
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
-OUT_DIR="${OUT_DIR:-$REPO_ROOT/target/claude-locality-comparison/$RUN_ID}"
+OUT_DIR="${OUT_DIR:-$REPO_ROOT/experiment/claude-locality-comparison/$RUN_ID}"
 REMOTE_RUN_ROOT="${REMOTE_RUN_ROOT:-~/locality-claude-runs}"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-}"

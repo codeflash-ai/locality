@@ -58,8 +58,12 @@ out_dir = Path(sys.argv[2]).resolve() if len(sys.argv) == 3 else root / "token-u
 by_scenario_dir = out_dir / "by-trial-scenario"
 cost_dir = out_dir / "cost"
 cost_by_scenario_dir = cost_dir / "by-trial-scenario"
+by_scenario_average_dir = out_dir / "by-scenario-average"
+cost_by_scenario_average_dir = cost_dir / "by-scenario-average"
 by_scenario_dir.mkdir(parents=True, exist_ok=True)
 cost_by_scenario_dir.mkdir(parents=True, exist_ok=True)
+by_scenario_average_dir.mkdir(parents=True, exist_ok=True)
+cost_by_scenario_average_dir.mkdir(parents=True, exist_ok=True)
 
 
 def read_pricing() -> dict:
@@ -180,6 +184,10 @@ def fmt_usd(value: float) -> str:
     if value > 0:
         return f"${value:.5f}"
     return "$0"
+
+
+def fmt_tsv_number(value: float) -> str:
+    return f"{float(value):.12g}"
 
 
 FONT_5X7 = {
@@ -625,6 +633,112 @@ write_chart(
     [f"Average uses {len(average_source_groups)} paired scenario/trial group(s)." if paired_groups else "Average uses available unpaired groups."],
 )
 
+scenario_groups: dict[str, list[dict]] = {}
+for group in groups.values():
+    scenario_groups.setdefault(group["scenario"], []).append(group)
+
+scenario_average_records = []
+scenario_cost_average_records = []
+scenario_average_charts = []
+for scenario, grouped in sorted(scenario_groups.items()):
+    paired_for_scenario = [
+        group for group in grouped if all(strategy in group["strategies"] for strategy in STRATEGIES)
+    ]
+    source_groups = paired_for_scenario if paired_for_scenario else grouped
+    scenario_average = {strategy: {key: 0.0 for key, _, _ in COMPONENTS} for strategy in STRATEGIES}
+    scenario_cost_average = {strategy: {key: 0.0 for key, _, _ in COST_COMPONENTS} for strategy in STRATEGIES}
+    scenario_counts = {strategy: 0 for strategy in STRATEGIES}
+
+    for group in source_groups:
+        for strategy in STRATEGIES:
+            row = group["strategies"].get(strategy)
+            if not row:
+                continue
+            cost_row = cost_components(row)
+            scenario_counts[strategy] += 1
+            for key, _, _ in COMPONENTS:
+                scenario_average[strategy][key] += row.get(key, 0)
+            for key, _, _ in COST_COMPONENTS:
+                scenario_cost_average[strategy][key] += cost_row.get(key, 0)
+
+    scenario_average_rows = {}
+    scenario_cost_average_rows = {}
+    for strategy in STRATEGIES:
+        count = scenario_counts[strategy]
+        if count == 0:
+            continue
+        row = {key: value / count for key, value in scenario_average[strategy].items()}
+        row["input_tokens"] = (
+            row["fresh_input_tokens"] + row["cached_input_tokens"] + row["cache_write_input_tokens"]
+        )
+        row["output_tokens"] = row["visible_output_tokens"] + row["reasoning_output_tokens"]
+        row["total_tokens"] = row["input_tokens"] + row["output_tokens"]
+        scenario_average_rows[strategy] = row
+
+        cost_row = {key: value / count for key, value in scenario_cost_average[strategy].items()}
+        cost_row["total_cost_usd"] = sum(cost_row[key] for key, _, _ in COST_COMPONENTS)
+        scenario_cost_average_rows[strategy] = cost_row
+
+    chart_path = by_scenario_average_dir / f"{slug(scenario)}.svg"
+    cost_chart_path = cost_by_scenario_average_dir / f"{slug(scenario)}.svg"
+    notes = [
+        f"Average uses {len(source_groups)} paired trial group(s)."
+        if paired_for_scenario
+        else f"Average uses {len(source_groups)} available unpaired trial group(s)."
+    ]
+    write_chart(
+        chart_path,
+        f"Average Token Usage: {scenario} Across Trials",
+        scenario_average_rows,
+        COMPONENTS,
+        "total_tokens",
+        fmt_tokens,
+        notes,
+    )
+    write_chart(
+        cost_chart_path,
+        f"Average Token Cost: {scenario} Across Trials",
+        scenario_cost_average_rows,
+        COST_COMPONENTS,
+        "total_cost_usd",
+        fmt_usd,
+        notes,
+    )
+    scenario_average_charts.append(
+        {
+            "scenario": scenario,
+            "source_trial_scenario_count": len(source_groups),
+            "strategy_counts": {strategy: scenario_counts[strategy] for strategy in STRATEGIES},
+            "chart": str(chart_path),
+            "chart_png": str(chart_path.with_suffix(".png")),
+            "cost_chart": str(cost_chart_path),
+            "cost_chart_png": str(cost_chart_path.with_suffix(".png")),
+        }
+    )
+    for strategy in STRATEGIES:
+        row = scenario_average_rows.get(strategy)
+        if row:
+            scenario_average_records.append(
+                {
+                    "scenario": scenario,
+                    "strategy": strategy,
+                    "source_trial_scenario_count": scenario_counts[strategy],
+                    **row,
+                    "chart": str(chart_path),
+                }
+            )
+        cost_row = scenario_cost_average_rows.get(strategy)
+        if cost_row:
+            scenario_cost_average_records.append(
+                {
+                    "scenario": scenario,
+                    "strategy": strategy,
+                    "source_trial_scenario_count": scenario_counts[strategy],
+                    **cost_row,
+                    "chart": str(cost_chart_path),
+                }
+            )
+
 tsv_path = out_dir / "token-usage.tsv"
 fieldnames = [
     "trial",
@@ -646,6 +760,34 @@ with tsv_path.open("w", newline="") as f:
     for record in records:
         writer.writerow({key: record.get(key, "") for key in fieldnames})
 
+scenario_average_tsv_path = out_dir / "scenario-average-token-usage.tsv"
+scenario_average_fieldnames = [
+    "scenario",
+    "strategy",
+    "source_trial_scenario_count",
+    "fresh_input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "visible_output_tokens",
+    "reasoning_output_tokens",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "chart",
+]
+with scenario_average_tsv_path.open("w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=scenario_average_fieldnames, delimiter="\t")
+    writer.writeheader()
+    for record in scenario_average_records:
+        writer.writerow(
+            {
+                key: fmt_tsv_number(record[key])
+                if key not in ("scenario", "strategy", "chart") and key in record
+                else record.get(key, "")
+                for key in scenario_average_fieldnames
+            }
+        )
+
 cost_tsv_path = out_dir / "cost-usage.tsv"
 cost_fieldnames = [
     "trial",
@@ -665,6 +807,32 @@ with cost_tsv_path.open("w", newline="") as f:
     for record in cost_records:
         writer.writerow({key: record.get(key, "") for key in cost_fieldnames})
 
+scenario_average_cost_tsv_path = out_dir / "scenario-average-cost-usage.tsv"
+scenario_average_cost_fieldnames = [
+    "scenario",
+    "strategy",
+    "source_trial_scenario_count",
+    "fresh_input_cost_usd",
+    "cached_input_cost_usd",
+    "cache_write_input_cost_usd",
+    "visible_output_cost_usd",
+    "reasoning_output_cost_usd",
+    "total_cost_usd",
+    "chart",
+]
+with scenario_average_cost_tsv_path.open("w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=scenario_average_cost_fieldnames, delimiter="\t")
+    writer.writeheader()
+    for record in scenario_cost_average_records:
+        writer.writerow(
+            {
+                key: fmt_tsv_number(record[key])
+                if key not in ("scenario", "strategy", "chart") and key in record
+                else record.get(key, "")
+                for key in scenario_average_cost_fieldnames
+            }
+        )
+
 manifest = {
     "root": str(root),
     "out_dir": str(out_dir),
@@ -677,7 +845,10 @@ manifest = {
     "cost_average_chart_png": str(cost_average_chart.with_suffix(".png")),
     "records_tsv": str(tsv_path),
     "cost_records_tsv": str(cost_tsv_path),
+    "scenario_average_records_tsv": str(scenario_average_tsv_path),
+    "cost_scenario_average_records_tsv": str(scenario_average_cost_tsv_path),
     "pricing_usd_per_1m_tokens": PRICING_USD_PER_1M,
+    "scenario_average_charts": scenario_average_charts,
     "charts": [
         {
             "trial": group["trial"],
@@ -705,12 +876,29 @@ index_lines = [
     f"- Average cost chart: `cost/{cost_average_chart.name}`, `cost/{cost_average_chart.with_suffix('.png').name}`",
     f"- Records TSV: `{tsv_path.name}`",
     f"- Cost TSV: `{cost_tsv_path.name}`",
+    f"- Scenario-average records TSV: `{scenario_average_tsv_path.name}`",
+    f"- Scenario-average cost TSV: `{scenario_average_cost_tsv_path.name}`",
     f"- Manifest: `{manifest_path.name}`",
     f"- Pricing: `{PRICING_USD_PER_1M}` USD per 1M tokens",
     "",
-    "## Trial Scenario Charts",
+    "## Scenario-Average Charts",
     "",
 ]
+for chart in manifest["scenario_average_charts"]:
+    index_lines.append(
+        f"- `{chart['scenario']}`: "
+        f"`by-scenario-average/{Path(chart['chart']).name}`, "
+        f"`by-scenario-average/{Path(chart['chart_png']).name}`, "
+        f"`cost/by-scenario-average/{Path(chart['cost_chart']).name}`, "
+        f"`cost/by-scenario-average/{Path(chart['cost_chart_png']).name}`"
+    )
+index_lines.extend(
+    [
+        "",
+    "## Trial Scenario Charts",
+    "",
+    ]
+)
 for chart in manifest["charts"]:
     index_lines.append(
         f"- `{chart['trial']}` / `{chart['scenario']}`: "
