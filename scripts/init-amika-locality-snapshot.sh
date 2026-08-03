@@ -31,6 +31,54 @@ fail() {
   exit 2
 }
 
+encode_remote_argv() {
+  local payload
+  payload="$(printf '%s\0' "$@" | base64 | tr -d '\n')"
+  printf 'python3 -c '\''import base64, os, sys; argv = [os.fsdecode(item) for item in base64.b64decode(sys.argv[1]).split(b"\\0")[:-1]]; os.execvp(argv[0], argv)'\'' %s' "$payload"
+}
+
+amika_ssh() {
+  local sandbox="$1"
+  local remote_command
+  shift
+  if [ "${1:-}" = "--" ]; then
+    shift
+  fi
+  if [ -t 2 ] && [ -r /dev/tty ]; then
+    remote_command="$(encode_remote_argv "$@")"
+    amika sandbox ssh -t "$sandbox" -- "$remote_command" < /dev/tty
+  else
+    amika sandbox ssh "$sandbox" "$@"
+  fi
+}
+
+amika_ssh_secret_line() {
+  local sandbox="$1"
+  local secret="$2"
+  local remote_command
+  shift 2
+  if [ "${1:-}" = "--" ]; then
+    shift
+  fi
+  if [ -t 2 ] && [ -r /dev/tty ]; then
+    command -v expect >/dev/null 2>&1 || fail "expect is required for Amika TTY credential transfer"
+    remote_command="$(encode_remote_argv "$@")"
+    AMIKA_SECRET_LINE="$secret" AMIKA_SANDBOX_NAME="$sandbox" \
+      AMIKA_REMOTE_COMMAND="$remote_command" \
+      expect -f /dev/stdin <<'EXPECT'
+set timeout -1
+spawn -noecho amika sandbox ssh -t $env(AMIKA_SANDBOX_NAME) -- $env(AMIKA_REMOTE_COMMAND)
+expect "__LOCALITY_STDIN_READY__"
+send -- "$env(AMIKA_SECRET_LINE)\n"
+expect eof
+set result [wait]
+exit [lindex $result 3]
+EXPECT
+  else
+    printf '%s\n' "$secret" | amika sandbox ssh "$sandbox" "$@"
+  fi
+}
+
 API_URL=""
 SANDBOX_NAME="locality-snapshot-$(date -u +%Y%m%d-%H%M%S)"
 REMOTE_ROOT="/home/amika/locality-snapshot"
@@ -136,7 +184,17 @@ command -v amika >/dev/null 2>&1 || fail "amika is not available on PATH"
 command -v git >/dev/null 2>&1 || fail "git is not available on PATH"
 SOURCE_REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD)" || fail "could not resolve source revision"
 
-IFS= read -r BOOTSTRAP_TOKEN || fail "read the bootstrap token from standard input"
+if [ -t 0 ]; then
+  stty -echo
+  IFS= read -r BOOTSTRAP_TOKEN || {
+    stty echo
+    fail "read the bootstrap token from standard input"
+  }
+  stty echo
+  printf '\n'
+else
+  IFS= read -r BOOTSTRAP_TOKEN || fail "read the bootstrap token from standard input"
+fi
 [ -n "$BOOTSTRAP_TOKEN" ] || fail "bootstrap token must not be empty"
 
 printf 'Creating Amika sandbox %s...\n' "$SANDBOX_NAME"
@@ -146,7 +204,7 @@ printf 'Creating Amika sandbox %s...\n' "$SANDBOX_NAME"
   --yes >/dev/null)
 
 printf 'Installing released loc CLI v%s in %s...\n' "$LOC_RELEASE_VERSION" "$SANDBOX_NAME"
-amika sandbox ssh "$SANDBOX_NAME" -- sh -c '
+amika_ssh "$SANDBOX_NAME" -- sh -c '
   set -eu
   revision=$1
   loc_version=$2
@@ -175,8 +233,18 @@ amika sandbox ssh "$SANDBOX_NAME" -- sh -c '
 ' sh "$SOURCE_REVISION" "$LOC_RELEASE_VERSION" "$LOC_RELEASE_DEB_SHA256"
 
 printf 'Materializing scoped workspace at %s:%s...\n' "$SANDBOX_NAME" "$REMOTE_ROOT"
-printf '%s\n' "$BOOTSTRAP_TOKEN" | amika sandbox ssh "$SANDBOX_NAME" -- \
-  sh -c 'exec "$HOME/.local/bin/loc" sandbox init "$@"' sh \
+amika_ssh_secret_line "$SANDBOX_NAME" "$BOOTSTRAP_TOKEN" -- sh -c '
+  set -eu
+  if [ -t 0 ]; then
+    stty -echo
+  fi
+  printf "__LOCALITY_STDIN_READY__\n"
+  IFS= read -r bootstrap_token
+  if [ -t 0 ]; then
+    stty echo
+  fi
+  printf "%s\n" "$bootstrap_token" | "$HOME/.local/bin/loc" sandbox init "$@"
+' sh \
     --api-url "$API_URL" \
     --root "$REMOTE_ROOT" \
     --bootstrap-token-stdin \
@@ -185,7 +253,7 @@ unset BOOTSTRAP_TOKEN
 
 printf 'Snapshot ready in Amika sandbox %s at %s\n' "$SANDBOX_NAME" "$REMOTE_ROOT"
 
-amika sandbox ssh "$SANDBOX_NAME" -- sh -c '
+amika_ssh "$SANDBOX_NAME" -- sh -c '
   set -eu
   azure_base_url=$1
   model=$2
@@ -196,18 +264,28 @@ amika sandbox ssh "$SANDBOX_NAME" -- sh -c '
     bash /home/amika/workspace/locality/experiment/locality-mcp-comparison/setup-codex-azure.sh
 ' sh "$AZURE_OPENAI_BASE_URL" "$CODEX_MODEL" "$CODEX_REASONING_EFFORT"
 
-printf '%s\n' "$EFFECTIVE_PROMPT" | amika sandbox ssh "$SANDBOX_NAME" -- \
-  sh -c 'cat > /home/amika/scenario-prompt.md'
+PROMPT_BASE64="$(printf '%s\n' "$EFFECTIVE_PROMPT" | base64 | tr -d '\n')"
+amika_ssh "$SANDBOX_NAME" -- sh -c '
+  printf "%s" "$1" | base64 -d > /home/amika/scenario-prompt.md
+' sh "$PROMPT_BASE64"
+unset PROMPT_BASE64
 
 printf '\n===== Inline scenario prompt =====\n%s\n' "$EFFECTIVE_PROMPT"
 printf '\n===== Running scenario in %s =====\n' "$SANDBOX_NAME"
 
-printf '%s\n' "$AZURE_OPENAI_API_KEY" | amika sandbox ssh "$SANDBOX_NAME" -- sh -c '
+amika_ssh_secret_line "$SANDBOX_NAME" "$AZURE_OPENAI_API_KEY" -- sh -c '
   set -eu
   model=$1
   reasoning=$2
   snapshot_root=$3
+  if [ -t 0 ]; then
+    stty -echo
+  fi
+  printf "__LOCALITY_STDIN_READY__\n"
   IFS= read -r azure_api_key
+  if [ -t 0 ]; then
+    stty echo
+  fi
   test -n "$azure_api_key"
   command -v codex >/dev/null 2>&1 || {
     printf "codex is not installed in the Amika sandbox\n" >&2
@@ -232,4 +310,4 @@ printf '%s\n' "$AZURE_OPENAI_API_KEY" | amika sandbox ssh "$SANDBOX_NAME" -- sh 
 ' sh "$CODEX_MODEL" "$CODEX_REASONING_EFFORT" "$REMOTE_ROOT"
 
 printf '\n===== /home/amika/final_report.md =====\n'
-amika sandbox ssh "$SANDBOX_NAME" -- cat /home/amika/final_report.md
+amika_ssh "$SANDBOX_NAME" -- cat /home/amika/final_report.md

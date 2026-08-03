@@ -47,8 +47,12 @@ if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "ssh" ]; then
       printf '%s\n' "$token" > "${FAKE_BOOTSTRAP_INPUT:?}"
       printf '{"ok":true,"command":"sandbox_init","root":"/workspace/scoped"}\n'
       ;;
-    *"cat > /home/amika/scenario-prompt.md"*)
-      cat > "${FAKE_PROMPT_INPUT:?}"
+    *"base64 -d > /home/amika/scenario-prompt.md"*)
+      last_arg=""
+      for arg in "$@"; do
+        last_arg="$arg"
+      done
+      printf '%s' "$last_arg" | base64 -d > "${FAKE_PROMPT_INPUT:?}"
       ;;
     *"codex exec"*)
       IFS= read -r azure_key
@@ -98,7 +102,7 @@ assert_contains "$fake_log" "dpkg-deb -x"
 if grep -F -q -- 'cargo build' "$fake_log"; then
   fail "released CLI workflow should not build loc from source"
 fi
-assert_contains "$fake_log" '\$HOME/.local/bin/loc'
+assert_contains "$fake_log" '.local/bin/loc'
 assert_contains "$fake_log" "sandbox init"
 assert_contains "$fake_log" "--api-url https://api.dev.locality.dev"
 assert_contains "$fake_log" "--root /home/amika/locality-snapshot"
