@@ -33,6 +33,63 @@ fail() {
   exit 2
 }
 
+ACTIVE_EXPECT_PID=""
+PENDING_TRANSPORT_SIGNAL=""
+
+terminate_active_transport() {
+  local signal="$1"
+  local signal_number="$2"
+  local expect_pid="${ACTIVE_EXPECT_PID:-}"
+
+  trap '' HUP INT TERM
+  PROFILE_KEY=""
+  AZURE_OPENAI_API_KEY_VALUE=""
+  if [ -n "$expect_pid" ]; then
+    kill -s "$signal" "$expect_pid" 2>/dev/null || true
+    wait "$expect_pid" 2>/dev/null || true
+  fi
+  ACTIVE_EXPECT_PID=""
+  exit $((128 + signal_number))
+}
+
+trap 'terminate_active_transport HUP 1' HUP
+trap 'terminate_active_transport INT 2' INT
+trap 'terminate_active_transport TERM 15' TERM
+
+prepare_expect_launch() {
+  PENDING_TRANSPORT_SIGNAL=""
+  trap 'PENDING_TRANSPORT_SIGNAL="HUP 1"' HUP
+  trap 'PENDING_TRANSPORT_SIGNAL="INT 2"' INT
+  trap 'PENDING_TRANSPORT_SIGNAL="TERM 15"' TERM
+}
+
+activate_expect() {
+  ACTIVE_EXPECT_PID="$1"
+  trap 'terminate_active_transport HUP 1' HUP
+  trap 'terminate_active_transport INT 2' INT
+  trap 'terminate_active_transport TERM 15' TERM
+  case "$PENDING_TRANSPORT_SIGNAL" in
+    "HUP 1") terminate_active_transport HUP 1 ;;
+    "INT 2") terminate_active_transport INT 2 ;;
+    "TERM 15") terminate_active_transport TERM 15 ;;
+  esac
+}
+
+wait_for_active_expect() {
+  local expect_pid="$1"
+  local status
+
+  if wait "$expect_pid"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "${ACTIVE_EXPECT_PID:-}" = "$expect_pid" ]; then
+    ACTIVE_EXPECT_PID=""
+  fi
+  return "$status"
+}
+
 encode_remote_argv() {
   local payload
   payload="$(printf '%s\0' "$@" | base64 | tr -d '\n')"
@@ -117,6 +174,7 @@ amika_ssh() {
   fi
   remote_command="$(encode_remote_argv "$@")"
   command -v expect >/dev/null 2>&1 || fail "expect is required for Amika PTY transport"
+  prepare_expect_launch
   AMIKA_EXPECT_COMMON="$EXPECT_TRANSPORT_PROCS" \
     AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
     expect -c '
@@ -138,7 +196,9 @@ amika_ssh() {
           exit 124
         }
       }
-    '
+    ' &
+  activate_expect "$!"
+  wait_for_active_expect "$ACTIVE_EXPECT_PID"
 }
 
 amika_ssh_secret_line() {
@@ -155,8 +215,8 @@ amika_ssh_secret_line() {
   remote_command="$(encode_remote_argv "$@")"
 
   while [ "$attempt" -le 3 ]; do
-    if printf '%s\n' "$secret" | \
-      AMIKA_EXPECT_COMMON="$EXPECT_TRANSPORT_PROCS" \
+    prepare_expect_launch
+    AMIKA_EXPECT_COMMON="$EXPECT_TRANSPORT_PROCS" \
       AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
       expect -c '
         eval $env(AMIKA_EXPECT_COMMON)
@@ -201,7 +261,9 @@ amika_ssh_secret_line() {
             exit 124
           }
         }
-      '; then
+      ' <<<"$secret" &
+    activate_expect "$!"
+    if wait_for_active_expect "$ACTIVE_EXPECT_PID"; then
       secret=""
       return 0
     else

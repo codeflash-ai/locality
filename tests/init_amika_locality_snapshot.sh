@@ -43,21 +43,40 @@ chmod +x "${fake_bin}/codex"
 setup_agent_root="${tmp_root}/setup-agent"
 setup_config="${setup_agent_root}/.codex/config.toml"
 mkdir -p "$(dirname "$setup_config")"
-cat > "$setup_config" <<'TOML'
+setup_config_text="$(cat <<'TOML'
 # Existing Codex settings must survive Azure setup.
-approval_policy = "never"
-model = "old-model"
+"approval_policy" = "never" # keep quoted root key
+"model" = "old-model" # keep target comment
+"literal.key" = 'preserved literal value'
 
-[model_providers.azure]
-name = "Old Azure name"
-base_url = "https://old.invalid/openai/v1"
-env_key = "OLD_AZURE_KEY"
-wire_api = "chat"
+["model_providers"."azure"] # keep quoted provider table
+"name" = "Old Azure name" # keep provider comment
+"base_url" = "https://old.invalid/openai/v1"
+"env_key" = "OLD_AZURE_KEY"
+"wire_api" = "chat"
 custom_setting = "preserved-provider-value"
 
 [features]
 web_search_request = true
+multiline_basic = """
+model = "not a real setting"
+[model_providers.azure]
+# this comment belongs to the string
+"""
+multiline_literal = '''
+wire_api = "also not a real setting"
+'''
+preserved_array = [
+  "first",
+  "second", # keep array comment
+]
+
+["quoted.table"]
+"quoted.key" = "preserved without a trailing newline"
 TOML
+)"
+printf '%s' "$setup_config_text" > "$setup_config"
+unset setup_config_text
 
 PATH="${fake_bin}:$PATH" \
   CODEX_HOME="${setup_agent_root}/.codex" \
@@ -75,13 +94,20 @@ import tomllib
 
 path = sys.argv[1]
 with open(path, "rb") as source:
-    config = tomllib.load(source)
+    contents = source.read()
+config = tomllib.loads(contents.decode("utf-8"))
 assert config["model"] == "merged-model"
 assert config["model_provider"] == "azure"
 assert config["model_reasoning_effort"] == "high"
 assert config["sandbox_mode"] == "workspace-write"
 assert config["approval_policy"] == "never"
 assert config["features"]["web_search_request"] is True
+assert config["literal.key"] == "preserved literal value"
+assert 'model = "not a real setting"' in config["features"]["multiline_basic"]
+assert '[model_providers.azure]' in config["features"]["multiline_basic"]
+assert 'wire_api = "also not a real setting"' in config["features"]["multiline_literal"]
+assert config["features"]["preserved_array"] == ["first", "second"]
+assert config["quoted.table"]["quoted.key"] == "preserved without a trailing newline"
 provider = config["model_providers"]["azure"]
 assert provider["name"] == "Azure OpenAI"
 assert provider["base_url"] == "https://merged.invalid/openai/v1"
@@ -89,8 +115,50 @@ assert provider["env_key"] == "AZURE_OPENAI_API_KEY"
 assert provider["wire_api"] == "responses"
 assert provider["custom_setting"] == "preserved-provider-value"
 assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+assert not contents.endswith((b"\n", b"\r"))
+text = contents.decode("utf-8")
+assert '# Existing Codex settings must survive Azure setup.' in text
+assert '"approval_policy" = "never" # keep quoted root key' in text
+assert '"model" = "merged-model" # keep target comment' in text
+assert '["model_providers"."azure"] # keep quoted provider table' in text
+assert '"name" = "Azure OpenAI" # keep provider comment' in text
+assert '''multiline_basic = """
+model = "not a real setting"
+[model_providers.azure]
+# this comment belongs to the string
+"""''' in text
+assert '''multiline_literal = \'\'\'
+wire_api = "also not a real setting"
+\'\'\'''' in text
+assert '''preserved_array = [
+  "first",
+  "second", # keep array comment
+]''' in text
 PY
-assert_contains "$setup_config" "# Existing Codex settings must survive Azure setup."
+
+inline_setup_root="${tmp_root}/inline-setup"
+inline_setup_config="${inline_setup_root}/config.toml"
+mkdir -p "$inline_setup_root"
+printf '%s' 'model = "old-model"
+model_providers = { azure = { name = "inline Azure" } }' > "$inline_setup_config"
+cp "$inline_setup_config" "${inline_setup_config}.expected"
+set +e
+inline_setup_output="$(
+  env -u AMIKA_AGENT_CWD \
+    PATH="${fake_bin}:$PATH" \
+    CODEX_HOME="$inline_setup_root" \
+    CODEX_MODEL="merged-model" \
+    CODEX_REASONING_EFFORT="high" \
+    AZURE_OPENAI_BASE_URL="https://merged.invalid/openai/v1" \
+    "$AZURE_SETUP_SCRIPT" 2>&1
+)"
+inline_setup_status=$?
+set -e
+[ "$inline_setup_status" -ne 0 ] || fail "inline Azure provider table should fail closed"
+cmp -s "$inline_setup_config" "${inline_setup_config}.expected" || \
+  fail "failed inline Azure provider merge changed the original config"
+grep -F -q -- 'refusing to modify inline Azure provider setting' <<<"$inline_setup_output" || \
+  fail "inline Azure provider failure did not explain why the merge was refused"
 
 cat > "${fake_bin}/amika" <<'SH'
 #!/usr/bin/env bash
@@ -134,7 +202,7 @@ if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "ssh" ]; then
     trap '' HUP INT TERM
     sleep 300 &
     blocking_child=$!
-    printf '%s %s\n' "$$" "$blocking_child" > "${FAKE_BLOCK_PID_FILE:?}"
+    printf '%s %s %s\n' "$PPID" "$$" "$blocking_child" > "${FAKE_BLOCK_PID_FILE:?}"
     wait "$blocking_child"
   fi
   case "$decoded_log" in
@@ -335,9 +403,9 @@ set -e
 : > "$fake_log"
 block_pid_file="${tmp_root}/blocked-child.pids"
 interrupt_output="${tmp_root}/interrupt.output"
-set +e
-printf '%s\n' "$profile_key" | \
-  PATH="${fake_bin}:$PATH" \
+interrupt_input="${tmp_root}/interrupt.input"
+printf '%s\n' "$profile_key" > "$interrupt_input"
+PATH="${fake_bin}:$PATH" \
   AZURE_OPENAI_API_KEY="$azure_key" \
   FAKE_AMIKA_LOG="$fake_log" \
   FAKE_PROFILE_KEY_INPUT="$profile_key_input" \
@@ -346,36 +414,38 @@ printf '%s\n' "$profile_key" | \
   FAKE_REPORT="$fake_report" \
   FAKE_BLOCK_MATCH='Locality_Linux_v' \
   FAKE_BLOCK_PID_FILE="$block_pid_file" \
-  "$SCRIPT" --api-url https://api.dev.locality.dev --name interrupted >"$interrupt_output" 2>&1 &
-interrupted_script_pid=$!
-set -e
+  "$SCRIPT" --api-url https://api.dev.locality.dev --name interrupted \
+    <"$interrupt_input" >"$interrupt_output" 2>&1 &
+public_script_pid=$!
 for _ in $(seq 1 100); do
   [ -s "$block_pid_file" ] && break
   sleep 0.05
 done
 [ -s "$block_pid_file" ] || fail "interruption fixture did not start the remote child"
-read -r blocked_amika_pid blocked_descendant_pid < "$block_pid_file"
-expect_pid="$(ps -o ppid= -p "$blocked_amika_pid" | tr -d '[:space:]')"
-[ -n "$expect_pid" ] || fail "could not find Expect wrapper for interruption fixture"
-kill -TERM "$expect_pid"
+read -r blocked_expect_pid blocked_amika_pid blocked_descendant_pid < "$block_pid_file"
+kill -TERM "$public_script_pid"
 set +e
-wait "$interrupted_script_pid"
+wait "$public_script_pid"
 interrupt_status=$?
 set -e
 [ "$interrupt_status" -eq 143 ] || \
-  fail "interrupted Expect wrapper should return 143, got ${interrupt_status}: $(cat "$interrupt_output")"
+  fail "TERM-interrupted public script should return 143, got ${interrupt_status}: $(cat "$interrupt_output")"
 for _ in $(seq 1 100); do
-  if ! kill -0 "$blocked_amika_pid" 2>/dev/null && \
+  if ! kill -0 "$blocked_expect_pid" 2>/dev/null && \
+     ! kill -0 "$blocked_amika_pid" 2>/dev/null && \
      ! kill -0 "$blocked_descendant_pid" 2>/dev/null; then
     break
   fi
   sleep 0.05
 done
+if kill -0 "$blocked_expect_pid" 2>/dev/null; then
+  fail "interrupted public script left Expect wrapper ${blocked_expect_pid} running"
+fi
 if kill -0 "$blocked_amika_pid" 2>/dev/null; then
-  fail "interrupted Expect wrapper left Amika child ${blocked_amika_pid} running"
+  fail "interrupted public script left Amika child ${blocked_amika_pid} running"
 fi
 if kill -0 "$blocked_descendant_pid" 2>/dev/null; then
-  fail "interrupted Expect wrapper left descendant ${blocked_descendant_pid} running"
+  fail "interrupted public script left descendant ${blocked_descendant_pid} running"
 fi
 
 : > "$fake_log"
