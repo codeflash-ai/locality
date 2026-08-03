@@ -73,14 +73,19 @@ Library callers cannot opt out accidentally: convenience sandbox, profile-key,
 session-credential, and generation-2 materialization APIs inspect the default
 state root, while `*_at_state_root` variants accept an explicit state root.
 
-For a remote Amika environment, the repository helper creates a sandbox or
-reuses an explicitly named started sandbox, checks out the current repository
-revision for scenario evidence, downloads the versioned Locality `v0.3.7` Linux
-package, verifies its pinned SHA-256, extracts the released `loc` binary without
-installing desktop dependencies, and streams a reusable Workspace Profile key
-from the Admin UI to `loc sandbox init` over standard input. After
+For a remote Amika environment, the repository helper creates a fresh sandbox,
+checks out the current repository revision for scenario evidence, downloads the
+versioned Locality `v0.3.7` Linux package, verifies its pinned SHA-256, extracts
+the released `loc` binary without installing desktop dependencies, and streams
+a reusable Workspace Profile key from the Admin UI to `loc sandbox init` over
+standard input. After
 materialization, the helper runs its inline Notion-only launch-gate scenario,
 prints the prompt, and prints `/home/amika/final_report.md`.
+
+The local machine needs `amika`, `git`, Python 3.11 or newer, and `expect` on `PATH`.
+Install Expect with `brew install expect` on macOS or `sudo apt-get install
+expect` on Debian/Ubuntu. Expect provides the PTY transport used to stream the
+credentials without putting them in arguments or logs.
 
 The helper uses the existing Azure Codex setup. Export the Azure key locally;
 the script streams it directly to the remote Codex process without placing it
@@ -105,22 +110,26 @@ unset LOCALITY_PROFILE_KEY
 The key remains reusable until it expires or is revoked. The helper creates a
 uniquely named sandbox, publishes the workspace at
 `/home/amika/locality-snapshot`, uses only `/home/amika` paths in the prompt,
-and leaves the sandbox running for inspection. Reuse an existing started
-sandbox only with an explicit name:
+and leaves the sandbox running for inspection. It refuses `--reuse`: repository
+cleanliness cannot make an existing sandbox a trusted boundary for a Workspace
+Profile key or Azure credential. A name collision fails before either
+credential is sent. The helper never deletes or replaces the colliding sandbox.
+If replacement is intended, make that destructive action separately and
+explicitly, then rerun the helper:
 
 ```bash
+amika sandbox delete --remote --force --delete-volumes saga-locality-snapshot
 printf '%s\n' "$LOCALITY_PROFILE_KEY" | \
   scripts/init-amika-locality-snapshot.sh \
     --api-url https://api.dev.locality.dev \
-    --name saga-locality-snapshot \
-    --reuse
+    --name saga-locality-snapshot
 ```
 
 Revoke the temporary Workspace Profile key in Admin after testing.
 An existing generation-2 root is owned by the exact Profile key bytes used to
-create it. Reuse therefore requires that same still-active key; creating a new
-key for the same Workspace Profile does not authorize refresh of the old root.
-After revocation, remove the old root and materialize a new one with the new key.
+create it. Creating a new key for the same Workspace Profile does not authorize
+refresh of that old root. After revocation, use a fresh sandbox and materialize
+a new root with the new key.
 
 ## Provider Connections
 

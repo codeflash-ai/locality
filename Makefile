@@ -189,7 +189,7 @@ audit-oauth-service: $(OAUTH_SERVICE_NODE_MODULES_STAMP) ## Audit OAuth service 
 	$(OAUTH_SERVICE_NPM) audit
 
 .PHONY: test
-test: test-rust ## Run the default test suite.
+test: test-rust test-init-amika-locality-snapshot ## Run the default test suite.
 
 .PHONY: test-rust
 test-rust: ## Run all Rust workspace tests.
@@ -237,6 +237,10 @@ test-launch-readiness-mcp-config: ## Validate launch-readiness Codex MCP isolati
 test-launch-readiness-wrappers: ## Validate launch-readiness wrapper defaults.
 	tests/launch_readiness_amika_split_wrapper.sh
 	tests/launch_readiness_aws_wrapper.sh
+	tests/init_amika_locality_snapshot.sh
+
+.PHONY: test-init-amika-locality-snapshot
+test-init-amika-locality-snapshot: ## Validate secure Amika snapshot initialization and interruption cleanup.
 	tests/init_amika_locality_snapshot.sh
 
 .PHONY: fmt

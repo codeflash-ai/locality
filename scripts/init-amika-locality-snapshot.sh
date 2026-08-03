@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: init-amika-locality-snapshot.sh --api-url <origin> [options]
 
-Creates or reuses a remote Amika sandbox, installs the verified Locality v0.3.7
+Creates a fresh remote Amika sandbox, installs the verified Locality v0.3.7
 CLI, and materializes a scoped workspace snapshot. It then runs one inline
 Notion-only scenario and prints both the prompt and generated report. The
 Workspace Profile key created in Admin is read from standard input and is never
@@ -14,7 +14,7 @@ passed in a command-line argument.
 Options:
   --api-url <origin>       Locality backend API origin (required).
   --name <name>            Amika sandbox name. Default: locality-snapshot-<UTC>.
-  --reuse                   Reuse the explicitly named, already-started sandbox.
+  --reuse                   Refused: credential-bearing sandboxes must be fresh.
   --model <model>          Model passed to codex exec.
                            Default: CODEX_MODEL or gpt-5.6-sol.
   --reasoning <effort>     Reasoning effort passed to codex exec.
@@ -39,6 +39,75 @@ encode_remote_argv() {
   printf 'python3 -c '\''import base64, os, sys; argv = [os.fsdecode(item) for item in base64.b64decode(sys.argv[1]).split(b"\\0")[:-1]]; os.execvp(argv[0], argv)'\'' %s' "$payload"
 }
 
+EXPECT_TRANSPORT_PROCS='
+  proc child_status {result} {
+    if {[llength $result] >= 6 && [lindex $result 4] eq "CHILDKILLED"} {
+      array set signal_number {
+        SIGHUP 1 SIGINT 2 SIGQUIT 3 SIGKILL 9 SIGPIPE 13 SIGTERM 15
+      }
+      set signal [lindex $result 5]
+      if {[info exists signal_number($signal)]} {
+        return [expr {128 + $signal_number($signal)}]
+      }
+      return 125
+    }
+    if {[lindex $result 2] != 0} {
+      return 125
+    }
+    return [lindex $result 3]
+  }
+
+  proc restore_terminal {} {
+    global terminal_state
+    if {$terminal_state ne ""} {
+      catch {exec stty $terminal_state < /dev/tty}
+    } else {
+      catch {exec stty sane < /dev/tty}
+    }
+  }
+
+  proc reap_child {{signal ""}} {
+    global child_active spawn_id
+    if {!$child_active} {
+      return
+    }
+    set child_pid ""
+    catch {set child_pid [exp_pid -i $spawn_id]}
+    if {$signal ne "" && [string is integer -strict $child_pid]} {
+      catch {exec kill -$signal -- -$child_pid}
+      after 1000
+      catch {exec kill -KILL -- -$child_pid}
+    }
+    catch {close -i $spawn_id}
+    catch {wait -i $spawn_id}
+    set child_active 0
+  }
+
+  proc terminate_for_signal {signal number} {
+    catch {set ::secret ""}
+    reap_child $signal
+    restore_terminal
+    exit [expr {128 + $number}]
+  }
+
+  proc initialize_transport {} {
+    global child_active terminal_state
+    set child_active 0
+    set terminal_state ""
+    catch {set terminal_state [exec stty -g < /dev/tty]}
+    trap {terminate_for_signal SIGHUP 1} SIGHUP
+    trap {terminate_for_signal SIGINT 2} SIGINT
+    trap {terminate_for_signal SIGTERM 15} SIGTERM
+  }
+
+  proc wait_for_child {} {
+    global child_active spawn_id
+    set result [wait -i $spawn_id]
+    set child_active 0
+    return $result
+  }
+'
+
 amika_ssh() {
   local sandbox="$1"
   local remote_command
@@ -48,34 +117,23 @@ amika_ssh() {
   fi
   remote_command="$(encode_remote_argv "$@")"
   command -v expect >/dev/null 2>&1 || fail "expect is required for Amika PTY transport"
-  AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
+  AMIKA_EXPECT_COMMON="$EXPECT_TRANSPORT_PROCS" \
+    AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
     expect -c '
-      proc child_status {result} {
-        if {[llength $result] >= 6 && [lindex $result 4] eq "CHILDKILLED"} {
-          array set signal_number {
-            SIGHUP 1 SIGINT 2 SIGQUIT 3 SIGKILL 9 SIGPIPE 13 SIGTERM 15
-          }
-          set signal [lindex $result 5]
-          if {[info exists signal_number($signal)]} {
-            return [expr {128 + $signal_number($signal)}]
-          }
-          return 125
-        }
-        if {[lindex $result 2] != 0} {
-          return 125
-        }
-        return [lindex $result 3]
-      }
+      eval $env(AMIKA_EXPECT_COMMON)
+      initialize_transport
       set timeout 1800
       spawn -noecho amika sandbox ssh -t $env(AMIKA_SANDBOX_NAME) -- $env(AMIKA_REMOTE_COMMAND)
+      set child_active 1
       expect {
         eof {
-          set result [wait]
+          set result [wait_for_child]
+          restore_terminal
           exit [child_status $result]
         }
         timeout {
-          catch {close}
-          catch {wait}
+          reap_child SIGTERM
+          restore_terminal
           puts stderr "Amika operation did not finish within 30 minutes"
           exit 124
         }
@@ -98,40 +156,30 @@ amika_ssh_secret_line() {
 
   while [ "$attempt" -le 3 ]; do
     if printf '%s\n' "$secret" | \
+      AMIKA_EXPECT_COMMON="$EXPECT_TRANSPORT_PROCS" \
       AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
       expect -c '
-        proc child_status {result} {
-          if {[llength $result] >= 6 && [lindex $result 4] eq "CHILDKILLED"} {
-            array set signal_number {
-              SIGHUP 1 SIGINT 2 SIGQUIT 3 SIGKILL 9 SIGPIPE 13 SIGTERM 15
-            }
-            set signal [lindex $result 5]
-            if {[info exists signal_number($signal)]} {
-              return [expr {128 + $signal_number($signal)}]
-            }
-            return 125
-          }
-          if {[lindex $result 2] != 0} {
-            return 125
-          }
-          return [lindex $result 3]
-        }
+        eval $env(AMIKA_EXPECT_COMMON)
+        initialize_transport
         set timeout 30
         if {[gets stdin secret] < 0} {
+          restore_terminal
           puts stderr "credential input closed before a secret was read"
           exit 65
         }
         spawn -noecho amika sandbox ssh -t $env(AMIKA_SANDBOX_NAME) -- $env(AMIKA_REMOTE_COMMAND)
+        set child_active 1
         expect {
           "__LOCALITY_STDIN_READY__" {}
           eof {
-            catch {wait}
+            catch {wait_for_child}
+            restore_terminal
             puts stderr "Amika SSH closed before requesting credential input"
             exit 75
           }
           timeout {
-            catch {close}
-            catch {wait}
+            reap_child SIGTERM
+            restore_terminal
             puts stderr "Amika SSH did not request credential input within 30 seconds"
             exit 75
           }
@@ -141,12 +189,14 @@ amika_ssh_secret_line() {
         set timeout 1800
         expect {
           eof {
-            set result [wait]
+            set result [wait_for_child]
+            restore_terminal
             exit [child_status $result]
           }
           timeout {
-            catch {close}
-            catch {wait}
+            set secret ""
+            reap_child SIGTERM
+            restore_terminal
             puts stderr "Amika credential operation did not finish within 30 minutes; it was not retried"
             exit 124
           }
@@ -170,7 +220,6 @@ amika_ssh_secret_line() {
 
 API_URL=""
 SANDBOX_NAME="locality-snapshot-$(date -u +%Y%m%d-%H%M%S)"
-SANDBOX_NAME_EXPLICIT=false
 REUSE_SANDBOX=false
 REMOTE_ROOT="/home/amika/locality-snapshot"
 LOC_RELEASE_VERSION="0.3.7"
@@ -193,7 +242,6 @@ while [ "$#" -gt 0 ]; do
     --name)
       [ "$#" -ge 2 ] || fail "--name requires a value"
       SANDBOX_NAME="$2"
-      SANDBOX_NAME_EXPLICIT=true
       shift 2
       ;;
     --reuse)
@@ -228,9 +276,8 @@ esac
 case "$SANDBOX_NAME" in
   *[!a-zA-Z0-9._-]*|'') fail "--name contains unsupported characters" ;;
 esac
-if [ "$REUSE_SANDBOX" = true ] && [ "$SANDBOX_NAME_EXPLICIT" != true ]; then
-  fail "--reuse requires an explicit --name"
-fi
+[ "$REUSE_SANDBOX" != true ] || \
+  fail "--reuse is refused because an existing sandbox is not a trusted credential boundary; choose a fresh --name"
 [ -n "$CODEX_MODEL" ] || fail "--model must not be empty"
 [ -n "$AZURE_OPENAI_API_KEY_VALUE" ] || fail "AZURE_OPENAI_API_KEY is required"
 case "$AZURE_OPENAI_BASE_URL" in
@@ -301,16 +348,13 @@ case "$PROFILE_KEY" in
   *[!0-9a-f]*) fail "Workspace Profile key must be 64 lowercase hexadecimal characters" ;;
 esac
 
-if [ "$REUSE_SANDBOX" = true ]; then
-  printf 'Reusing Amika sandbox %s...\n' "$SANDBOX_NAME"
-else
-  printf 'Creating Amika sandbox %s...\n' "$SANDBOX_NAME"
-  (cd "$REPO_ROOT" && amika sandbox create \
-    --remote \
-    --name "$SANDBOX_NAME" \
-    --no-git \
-    --yes >/dev/null)
-fi
+printf 'Creating fresh Amika sandbox %s (existing sandboxes are never reused or replaced)...\n' "$SANDBOX_NAME"
+(cd "$REPO_ROOT" && amika sandbox create \
+  --remote \
+  --name "$SANDBOX_NAME" \
+  --no-git \
+  --yes >/dev/null) || \
+  fail "could not create fresh sandbox ${SANDBOX_NAME}; no credentials were transferred (choose a new name or explicitly delete the old sandbox)"
 
 printf 'Installing released loc CLI v%s in %s...\n' "$LOC_RELEASE_VERSION" "$SANDBOX_NAME"
 amika_ssh "$SANDBOX_NAME" -- sh -c '
@@ -330,26 +374,6 @@ amika_ssh "$SANDBOX_NAME" -- sh -c '
   install -m 0755 "$work_dir/package/usr/bin/loc" "$HOME/.local/bin/loc"
   "$HOME/.local/bin/loc" sandbox init --help >/dev/null
 ' sh "$LOC_RELEASE_VERSION" "$LOC_RELEASE_DEB_SHA256"
-
-if [ "$REUSE_SANDBOX" = true ]; then
-  printf 'Checking reused sandbox evidence boundary before authorization...\n'
-  amika_ssh "$SANDBOX_NAME" -- sh -c '
-    set -eu
-    repo_dir=/home/amika/workspace/locality
-    if [ -e "$repo_dir" ]; then
-      test "$(git -C "$repo_dir" rev-parse --is-inside-work-tree)" = true
-      origin_url=$(git -C "$repo_dir" remote get-url origin)
-      case "$origin_url" in
-        https://github.com/codeflash-ai/locality|https://github.com/codeflash-ai/locality.git|git@github.com:codeflash-ai/locality.git) ;;
-        *) printf "unexpected Locality repository origin: %s\n" "$origin_url" >&2; exit 65 ;;
-      esac
-      test -z "$(git -C "$repo_dir" status --porcelain --untracked-files=all)" || {
-        printf "Locality evidence checkout is dirty; use a clean sandbox or remove the changes explicitly\n" >&2
-        exit 65
-      }
-    fi
-  ' sh
-fi
 
 printf 'Materializing scoped workspace at %s:%s...\n' "$SANDBOX_NAME" "$REMOTE_ROOT"
 amika_ssh_secret_line "$SANDBOX_NAME" "$PROFILE_KEY" -- sh -c '

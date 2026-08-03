@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="${ROOT}/scripts/init-amika-locality-snapshot.sh"
+AZURE_SETUP_SCRIPT="${ROOT}/experiment/locality-mcp-comparison/setup-codex-azure.sh"
 
 fail() {
   printf 'init Amika Locality snapshot test: %s\n' "$*" >&2
@@ -15,6 +16,14 @@ assert_contains() {
   grep -F -q -- "$needle" "$path" || fail "missing ${needle} in ${path}"
 }
 
+assert_not_contains() {
+  local path="$1"
+  local needle="$2"
+  if grep -F -q -- "$needle" "$path"; then
+    fail "unexpected ${needle} in ${path}"
+  fi
+}
+
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-init-amika-snapshot-test.XXXXXX")"
 trap 'rm -rf "$tmp_root"' EXIT
 fake_bin="${tmp_root}/bin"
@@ -24,6 +33,64 @@ azure_input="${tmp_root}/azure-key.input"
 prompt_input="${tmp_root}/scenario-prompt.input"
 fake_report="${tmp_root}/final_report.md"
 mkdir -p "$fake_bin"
+
+cat > "${fake_bin}/codex" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "${fake_bin}/codex"
+
+setup_agent_root="${tmp_root}/setup-agent"
+setup_config="${setup_agent_root}/.codex/config.toml"
+mkdir -p "$(dirname "$setup_config")"
+cat > "$setup_config" <<'TOML'
+# Existing Codex settings must survive Azure setup.
+approval_policy = "never"
+model = "old-model"
+
+[model_providers.azure]
+name = "Old Azure name"
+base_url = "https://old.invalid/openai/v1"
+env_key = "OLD_AZURE_KEY"
+wire_api = "chat"
+custom_setting = "preserved-provider-value"
+
+[features]
+web_search_request = true
+TOML
+
+PATH="${fake_bin}:$PATH" \
+  CODEX_HOME="${setup_agent_root}/.codex" \
+  AMIKA_AGENT_CWD="$setup_agent_root" \
+  CODEX_MODEL="merged-model" \
+  CODEX_REASONING_EFFORT="high" \
+  AZURE_OPENAI_BASE_URL="https://merged.invalid/openai/v1" \
+  "$AZURE_SETUP_SCRIPT" >/dev/null
+
+python3 - "$setup_config" <<'PY'
+import os
+import stat
+import sys
+import tomllib
+
+path = sys.argv[1]
+with open(path, "rb") as source:
+    config = tomllib.load(source)
+assert config["model"] == "merged-model"
+assert config["model_provider"] == "azure"
+assert config["model_reasoning_effort"] == "high"
+assert config["sandbox_mode"] == "workspace-write"
+assert config["approval_policy"] == "never"
+assert config["features"]["web_search_request"] is True
+provider = config["model_providers"]["azure"]
+assert provider["name"] == "Azure OpenAI"
+assert provider["base_url"] == "https://merged.invalid/openai/v1"
+assert provider["env_key"] == "AZURE_OPENAI_API_KEY"
+assert provider["wire_api"] == "responses"
+assert provider["custom_setting"] == "preserved-provider-value"
+assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+PY
+assert_contains "$setup_config" "# Existing Codex settings must survive Azure setup."
 
 cat > "${fake_bin}/amika" <<'SH'
 #!/usr/bin/env bash
@@ -36,6 +103,9 @@ done
 printf '\n' >> "$FAKE_AMIKA_LOG"
 
 if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "create" ]; then
+  if [ -n "${FAKE_CREATE_STATUS:-}" ]; then
+    exit "$FAKE_CREATE_STATUS"
+  fi
   printf 'created\n'
   exit 0
 fi
@@ -59,6 +129,13 @@ if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "ssh" ]; then
   printf 'remote %s\n' "$decoded_log" >> "$FAKE_AMIKA_LOG"
   if [ -n "${FAKE_SIGNAL_MATCH:-}" ] && grep -F -q -- "$FAKE_SIGNAL_MATCH" <<<"$decoded_log"; then
     kill -TERM "$$"
+  fi
+  if [ -n "${FAKE_BLOCK_MATCH:-}" ] && grep -F -q -- "$FAKE_BLOCK_MATCH" <<<"$decoded_log"; then
+    trap '' HUP INT TERM
+    sleep 300 &
+    blocking_child=$!
+    printf '%s %s\n' "$$" "$blocking_child" > "${FAKE_BLOCK_PID_FILE:?}"
+    wait "$blocking_child"
   fi
   case "$decoded_log" in
     *"--profile-key-stdin"*)
@@ -177,28 +254,42 @@ grep -F -q -- 'Verified report body.' <<<"$output" || \
   fail "terminal output did not include final_report.md"
 
 : > "$fake_log"
+set +e
 reuse_output="$(
+  PATH="${fake_bin}:$PATH" \
+    AZURE_OPENAI_API_KEY="$azure_key" \
+    FAKE_AMIKA_LOG="$fake_log" \
+    "$SCRIPT" \
+      --api-url https://api.dev.locality.dev \
+      --name existing-snapshot \
+      --reuse </dev/null 2>&1
+)"
+reuse_status=$?
+set -e
+[ "$reuse_status" -eq 2 ] || fail "--reuse should be refused with status 2"
+[ ! -s "$fake_log" ] || fail "refused --reuse contacted Amika"
+grep -F -q -- 'existing sandbox is not a trusted credential boundary' <<<"$reuse_output" || \
+  fail "refused --reuse did not explain the trust boundary"
+
+: > "$fake_log"
+set +e
+create_failure_output="$(
   printf '%s\n' "$profile_key" | \
     PATH="${fake_bin}:$PATH" \
     AZURE_OPENAI_API_KEY="$azure_key" \
     FAKE_AMIKA_LOG="$fake_log" \
-    FAKE_PROFILE_KEY_INPUT="$profile_key_input" \
-    FAKE_AZURE_INPUT="$azure_input" \
-    FAKE_PROMPT_INPUT="$prompt_input" \
-    FAKE_REPORT="$fake_report" \
+    FAKE_CREATE_STATUS=17 \
     "$SCRIPT" \
       --api-url https://api.dev.locality.dev \
-      --name existing-snapshot \
-      --reuse \
-      --model test-model \
-      --reasoning medium
+      --name colliding-snapshot 2>&1
 )"
-assert_contains "$fake_log" "sandbox ssh -t existing-snapshot"
-if grep -F -q -- 'sandbox create' "$fake_log"; then
-  fail "--reuse must not create another sandbox"
-fi
-grep -F -q -- 'Reusing Amika sandbox existing-snapshot' <<<"$reuse_output" || \
-  fail "reuse output did not identify the existing sandbox"
+create_failure_status=$?
+set -e
+[ "$create_failure_status" -eq 2 ] || fail "fresh sandbox creation failure should fail closed"
+assert_contains "$fake_log" "sandbox create --remote --name colliding-snapshot --no-git --yes"
+assert_not_contains "$fake_log" "sandbox ssh"
+grep -F -q -- 'no credentials were transferred' <<<"$create_failure_output" || \
+  fail "sandbox collision failure did not explain credential safety"
 
 : > "$fake_log"
 pre_sentinel_count="${tmp_root}/pre-sentinel.count"
@@ -216,7 +307,6 @@ retry_output="$(
     "$SCRIPT" \
       --api-url https://api.dev.locality.dev \
       --name retry-snapshot \
-      --reuse \
       --model test-model \
       --reasoning medium 2>&1
 )"
@@ -236,11 +326,57 @@ signal_output="$(
     FAKE_PROMPT_INPUT="$prompt_input" \
     FAKE_REPORT="$fake_report" \
     FAKE_SIGNAL_MATCH='Locality_Linux_v' \
-    "$SCRIPT" --api-url https://api.dev.locality.dev --name signaled --reuse 2>&1
+    "$SCRIPT" --api-url https://api.dev.locality.dev --name signaled 2>&1
 )"
 signal_status=$?
 set -e
 [ "$signal_status" -eq 143 ] || fail "signaled Amika child should return 143, got ${signal_status}: ${signal_output}"
+
+: > "$fake_log"
+block_pid_file="${tmp_root}/blocked-child.pids"
+interrupt_output="${tmp_root}/interrupt.output"
+set +e
+printf '%s\n' "$profile_key" | \
+  PATH="${fake_bin}:$PATH" \
+  AZURE_OPENAI_API_KEY="$azure_key" \
+  FAKE_AMIKA_LOG="$fake_log" \
+  FAKE_PROFILE_KEY_INPUT="$profile_key_input" \
+  FAKE_AZURE_INPUT="$azure_input" \
+  FAKE_PROMPT_INPUT="$prompt_input" \
+  FAKE_REPORT="$fake_report" \
+  FAKE_BLOCK_MATCH='Locality_Linux_v' \
+  FAKE_BLOCK_PID_FILE="$block_pid_file" \
+  "$SCRIPT" --api-url https://api.dev.locality.dev --name interrupted >"$interrupt_output" 2>&1 &
+interrupted_script_pid=$!
+set -e
+for _ in $(seq 1 100); do
+  [ -s "$block_pid_file" ] && break
+  sleep 0.05
+done
+[ -s "$block_pid_file" ] || fail "interruption fixture did not start the remote child"
+read -r blocked_amika_pid blocked_descendant_pid < "$block_pid_file"
+expect_pid="$(ps -o ppid= -p "$blocked_amika_pid" | tr -d '[:space:]')"
+[ -n "$expect_pid" ] || fail "could not find Expect wrapper for interruption fixture"
+kill -TERM "$expect_pid"
+set +e
+wait "$interrupted_script_pid"
+interrupt_status=$?
+set -e
+[ "$interrupt_status" -eq 143 ] || \
+  fail "interrupted Expect wrapper should return 143, got ${interrupt_status}: $(cat "$interrupt_output")"
+for _ in $(seq 1 100); do
+  if ! kill -0 "$blocked_amika_pid" 2>/dev/null && \
+     ! kill -0 "$blocked_descendant_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+if kill -0 "$blocked_amika_pid" 2>/dev/null; then
+  fail "interrupted Expect wrapper left Amika child ${blocked_amika_pid} running"
+fi
+if kill -0 "$blocked_descendant_pid" 2>/dev/null; then
+  fail "interrupted Expect wrapper left descendant ${blocked_descendant_pid} running"
+fi
 
 : > "$fake_log"
 post_sentinel_count="${tmp_root}/post-sentinel.count"
@@ -256,7 +392,7 @@ post_sentinel_output="$(
     FAKE_REPORT="$fake_report" \
     FAKE_PRE_SENTINEL_COUNT="$post_sentinel_count" \
     FAKE_POST_SENTINEL_STATUS=23 \
-    "$SCRIPT" --api-url https://api.dev.locality.dev --name post-sentinel --reuse 2>&1
+    "$SCRIPT" --api-url https://api.dev.locality.dev --name post-sentinel 2>&1
 )"
 post_sentinel_status=$?
 set -e
@@ -305,21 +441,5 @@ set -e
 [ ! -s "$fake_log" ] || fail "empty Workspace Profile key should fail before creating a sandbox"
 grep -F -q -- 'Workspace Profile key must be 64 lowercase hexadecimal characters' <<<"$invalid_output" || \
   fail "empty Workspace Profile key error was not actionable"
-
-: > "$fake_log"
-set +e
-implicit_reuse_output="$(
-  printf '%s\n' "$profile_key" | \
-    PATH="${fake_bin}:$PATH" \
-    AZURE_OPENAI_API_KEY="$azure_key" \
-    FAKE_AMIKA_LOG="$fake_log" \
-    "$SCRIPT" --api-url https://api.dev.locality.dev --reuse 2>&1
-)"
-implicit_reuse_status=$?
-set -e
-[ "$implicit_reuse_status" -eq 2 ] || fail "--reuse without --name should return usage status 2"
-[ ! -s "$fake_log" ] || fail "invalid --reuse should fail before contacting Amika"
-grep -F -q -- '--reuse requires an explicit --name' <<<"$implicit_reuse_output" || \
-  fail "invalid --reuse error was not actionable"
 
 printf 'init Amika Locality snapshot tests passed\n'
