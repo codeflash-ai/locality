@@ -7804,6 +7804,12 @@ fn create_desktop_remount_quiesced(
     let (store, mount_report, preserved) = run_quiesced_workspace_remount(&mut runtime, || {
         let mut store = SqliteStateStore::open(state_root.to_path_buf())
             .map_err(|error| format!("Could not reopen Locality state for remount: {error}"))?;
+        loc_cli::hosted_workspace::revalidate_connector_mount_placement_at_state_root(
+            state_root,
+            &options.mount_id,
+            &options.root,
+        )
+        .map_err(|error| format!("Could not validate workspace path: {error}"))?;
         let preparation =
             plan_existing_workspace_mount_for_remount(&mut store, state_root, &options.mount_id)?
                 .ok_or_else(|| {
@@ -8135,6 +8141,15 @@ where
     F: FnMut() -> Result<(), String>,
 {
     let Some(preparation) = remount_preparation else {
+        let _path_lock =
+            locality_platform::DaemonRemountCoordinatorLock::try_acquire(state_root)
+                .map_err(|error| format!("Could not acquire workspace path lock: {error}"))?;
+        loc_cli::hosted_workspace::revalidate_connector_mount_placement_at_state_root(
+            state_root,
+            &options.mount_id,
+            &options.root,
+        )
+        .map_err(|error| format!("Could not validate workspace path: {error}"))?;
         return run_mount(store, options)
             .map(|report| (report, None))
             .map_err(|error| error.message());

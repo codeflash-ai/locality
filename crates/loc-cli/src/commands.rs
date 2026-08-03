@@ -4229,6 +4229,18 @@ fn run_cli_coordinated_mount(
             || existing.projection != options.projection
     });
     if !source_changed {
+        let _path_lock = locality_platform::DaemonRemountCoordinatorLock::try_acquire(state_root)
+            .map_err(|error| {
+            MountError::Store(StoreError::InvalidState(format!(
+                "could not acquire workspace path lock: {error}"
+            )))
+        })?;
+        crate::hosted_workspace::revalidate_connector_mount_placement_at_state_root(
+            state_root,
+            &options.mount_id,
+            &options.root,
+        )
+        .map_err(|error| MountError::Store(StoreError::InvalidState(error.to_string())))?;
         return run_mount(store, options);
     }
 
@@ -4274,6 +4286,12 @@ fn run_cli_coordinated_mount(
     let mut runtime = CliQuiescedRemountRuntime::new(state_root, &mount_id);
     let cleanup_failure = Rc::clone(&runtime.cleanup_failure);
     run_quiesced_workspace_remount(&mut runtime, || {
+        crate::hosted_workspace::revalidate_connector_mount_placement_at_state_root(
+            state_root,
+            &options.mount_id,
+            &options.root,
+        )
+        .map_err(|error| error.to_string())?;
         if !uses_virtual_filesystem {
             return run_mount(store, options).map_err(|error| error.message());
         }

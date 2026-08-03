@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod file_provider;
 pub mod generation_http;
 pub mod history;
+pub mod hosted_workspace;
 pub mod info;
 pub mod inspect;
 pub mod local_oauth;

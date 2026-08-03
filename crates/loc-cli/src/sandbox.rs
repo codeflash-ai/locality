@@ -40,10 +40,11 @@ use localityd::replica_materializer::{
 };
 use localityd::workspace_archive::WorkspaceArchiveLimits;
 use localityd::workspace_materializer::{
-    PublishedWorkspace, WorkspaceMaterializationError, WorkspaceMaterializationLimits,
-    WorkspaceOwnershipCapability, WorkspacePublicationCheckpoint, WorkspacePublicationHooks,
-    materialize_workspace_archive_durable_with_hooks,
+    PublishedWorkspace, StagedWorkspaceMaterialization, WorkspaceMaterializationError,
+    WorkspaceMaterializationLimits, WorkspaceOwnershipCapability, WorkspacePublicationCheckpoint,
+    WorkspacePublicationHooks, materialize_workspace_archive_durable_with_hooks,
     recover_and_verify_workspace_publication_state, recover_workspace_publication,
+    stage_workspace_archive,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
@@ -187,7 +188,7 @@ impl SandboxProfileKey {
         &self.0
     }
 
-    fn ownership_capability(&self) -> WorkspaceOwnershipCapability {
+    pub(crate) fn ownership_capability(&self) -> WorkspaceOwnershipCapability {
         let mut secret = [0_u8; 32];
         for (output, pair) in secret.iter_mut().zip(self.0.as_bytes().chunks_exact(2)) {
             *output = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
@@ -302,7 +303,7 @@ impl SandboxContentEncodingPreference {
         }
     }
 
-    fn required_encoding(self) -> Option<ReplicaArchiveEncoding> {
+    pub(crate) fn required_encoding(self) -> Option<ReplicaArchiveEncoding> {
         match self {
             Self::Automatic => None,
             Self::Identity => Some(ReplicaArchiveEncoding::Identity),
@@ -888,7 +889,7 @@ enum SandboxCredential {
     Session(SessionCapability),
 }
 
-enum WorkspaceProfileNegotiation {
+pub(crate) enum WorkspaceProfileNegotiation {
     Generation1(SessionCapability),
     Generation2 {
         session: WorkspaceProfileSessionV2,
@@ -1140,7 +1141,7 @@ fn run_generation2_workspace_init(
     Ok(report(root, &capability, encoding, summary))
 }
 
-fn workspace_limits_for_offer(
+pub(crate) fn workspace_limits_for_offer(
     offer: &WorkspaceExportOfferV2,
 ) -> Result<WorkspaceMaterializationLimits, SandboxInitError> {
     let sealed = offer.offer();
@@ -1213,7 +1214,45 @@ fn materialize_workspace_export_response(
     }
 }
 
-fn replica_encoding_for_protocol(encoding: TarContentEncoding) -> ReplicaArchiveEncoding {
+/// Consume and validate a generation-2 export into a complete sibling staging
+/// directory without acquiring any workspace publication/path lock.
+pub(crate) fn stage_workspace_export_response(
+    response: Response,
+    encoding: ReplicaArchiveEncoding,
+    root: &Path,
+    limits: WorkspaceMaterializationLimits,
+    session: &WorkspaceProfileSessionV2,
+    offer: &WorkspaceExportOfferV2,
+) -> Result<StagedWorkspaceMaterialization, SandboxInitError> {
+    let (body, mut producer) =
+        spawn_export_read_ahead(response).map_err(|error| SandboxInitError::Http {
+            operation: "workspace export read-ahead setup",
+            detail: error.to_string(),
+        })?;
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(encoding, body),
+        root,
+        limits,
+        session,
+        offer,
+    )
+    .map_err(|error| SandboxInitError::Materialization(error.to_string()))?;
+    match producer.join() {
+        Ok(ReadAheadProducerOutcome::CleanEof) => Ok(staged),
+        Ok(ReadAheadProducerOutcome::ConsumerClosed | ReadAheadProducerOutcome::ErrorDelivered) => {
+            Err(SandboxInitError::Materialization(
+                "workspace export transport ended without a clean EOF".to_string(),
+            ))
+        }
+        Err(()) => Err(SandboxInitError::Materialization(
+            "workspace export read-ahead worker panicked".to_string(),
+        )),
+    }
+}
+
+pub(crate) fn replica_encoding_for_protocol(
+    encoding: TarContentEncoding,
+) -> ReplicaArchiveEncoding {
     match encoding {
         TarContentEncoding::Identity => ReplicaArchiveEncoding::Identity,
         TarContentEncoding::Zstd => ReplicaArchiveEncoding::Zstd,
@@ -1662,7 +1701,7 @@ fn validate_status<'a>(
     })
 }
 
-fn export_attempt_request(
+pub(crate) fn export_attempt_request(
     capability: &SessionCapability,
     preference: SandboxContentEncodingPreference,
     limits: &ExportAttemptLimits,
@@ -1925,14 +1964,14 @@ fn report(
     }
 }
 
-struct SandboxHttpClient {
+pub(crate) struct SandboxHttpClient {
     client: Client,
     export_client: Client,
     api_url: reqwest::Url,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FreshnessWaitAvailability {
+pub(crate) enum FreshnessWaitAvailability {
     Completed,
     Unavailable,
 }
@@ -1981,7 +2020,7 @@ fn parse_sandbox_api_url(api_url: &str) -> Result<reqwest::Url, SandboxInitError
 }
 
 impl SandboxHttpClient {
-    fn new(api_url: &str) -> Result<Self, SandboxInitError> {
+    pub(crate) fn new(api_url: &str) -> Result<Self, SandboxInitError> {
         Self::new_with_read_timeout(api_url, HTTP_READ_TIMEOUT)
     }
 
@@ -2132,7 +2171,7 @@ impl SandboxHttpClient {
         unreachable!("profile session attempt loop always returns")
     }
 
-    fn create_workspace_profile_session_negotiated(
+    pub(crate) fn create_workspace_profile_session_negotiated(
         &self,
         profile_key: &SandboxProfileKey,
     ) -> Result<WorkspaceProfileNegotiation, SandboxInitError> {
@@ -2175,7 +2214,7 @@ impl SandboxHttpClient {
         })
     }
 
-    fn workspace_session_status(
+    pub(crate) fn workspace_session_status(
         &self,
         session: &WorkspaceProfileSessionV2,
         capabilities: &WorkspaceClientCapabilitiesV2,
@@ -2200,7 +2239,7 @@ impl SandboxHttpClient {
         })
     }
 
-    fn wait_for_workspace_freshness(
+    pub(crate) fn wait_for_workspace_freshness(
         &self,
         session: &WorkspaceProfileSessionV2,
         capabilities: &WorkspaceClientCapabilitiesV2,
@@ -2391,7 +2430,7 @@ impl SandboxHttpClient {
         unreachable!("freshness wait request loop always returns")
     }
 
-    fn create_workspace_export_attempt(
+    pub(crate) fn create_workspace_export_attempt(
         &self,
         session: &WorkspaceProfileSessionV2,
         status: &WorkspaceSessionStatusV2,
@@ -2422,7 +2461,7 @@ impl SandboxHttpClient {
         )
     }
 
-    fn open_workspace_export_attempt(
+    pub(crate) fn open_workspace_export_attempt(
         &self,
         session: &WorkspaceProfileSessionV2,
         offer: &WorkspaceExportOfferV2,
