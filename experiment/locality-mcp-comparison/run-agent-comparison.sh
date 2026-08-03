@@ -405,36 +405,6 @@ amika_table_state() {
   '
 }
 
-load_amika_sandbox_table() {
-  local table
-  local command_rc
-
-  if table="$(amika sandbox list --remote)"; then
-    printf '%s\n' "$table"
-    return 0
-  else
-    command_rc=$?
-  fi
-
-  printf 'Amika remote sandbox preflight failed (amika sandbox list --remote exited %s)\n' "$command_rc" >&2
-  return "$command_rc"
-}
-
-load_amika_snapshot_table() {
-  local table
-  local command_rc
-
-  if table="$(amika snapshot list)"; then
-    printf '%s\n' "$table"
-    return 0
-  else
-    command_rc=$?
-  fi
-
-  printf 'Amika snapshot preflight failed (amika snapshot list exited %s)\n' "$command_rc" >&2
-  return "$command_rc"
-}
-
 validate_positive_integer() {
   local name="$1"
   local value="$2"
@@ -479,8 +449,11 @@ preflight_amika_environment() {
   local snapshot_table
   local name
   local state
+  local deadline
 
-  sandbox_table="$(load_amika_sandbox_table)" || return $?
+  deadline="$(new_amika_lifecycle_deadline)"
+  load_amika_sandbox_table_until "$deadline" preflight || return $?
+  sandbox_table="$AMIKA_SANDBOX_TABLE_RESULT"
   for name in "$LOCALITY_SANDBOX" "$MCP_SANDBOX"; do
     state="$(amika_table_state "$name" "$sandbox_table")"
     if [ -n "$state" ]; then
@@ -489,7 +462,9 @@ preflight_amika_environment() {
     fi
   done
 
-  snapshot_table="$(load_amika_snapshot_table)" || return $?
+  deadline="$(new_amika_lifecycle_deadline)"
+  load_amika_snapshot_table_until "$deadline" || return $?
+  snapshot_table="$AMIKA_SNAPSHOT_TABLE_RESULT"
   for name in "$LOCALITY_SNAPSHOT" "$MCP_SNAPSHOT"; do
     state="$(amika_table_state "$name" "$snapshot_table")"
     if [ -z "$state" ]; then
@@ -863,6 +838,7 @@ run_managed_command_until() {
 
 load_amika_sandbox_table_until() {
   local deadline="$1"
+  local purpose="${2:-lifecycle}"
   local output_file
   local command_rc
 
@@ -875,10 +851,36 @@ load_amika_sandbox_table_until() {
     command_rc=$?
   fi
   rm -f "$output_file"
-  if [ "$command_rc" -eq 124 ]; then
+  if [ "$purpose" = "preflight" ] && [ "$command_rc" -eq 124 ]; then
+    printf 'Amika remote sandbox preflight timed out\n' >&2
+  elif [ "$purpose" = "preflight" ]; then
+    printf 'Amika remote sandbox preflight failed (amika sandbox list --remote exited %s)\n' "$command_rc" >&2
+  elif [ "$command_rc" -eq 124 ]; then
     printf 'Amika sandbox lifecycle list timed out\n' >&2
   else
     printf 'Amika sandbox lifecycle list failed (amika sandbox list --remote exited %s)\n' "$command_rc" >&2
+  fi
+  return "$command_rc"
+}
+
+load_amika_snapshot_table_until() {
+  local deadline="$1"
+  local output_file
+  local command_rc
+
+  output_file="$(mktemp "${TMPDIR:-/tmp}/amika-snapshot-list.XXXXXX")"
+  if run_managed_command_until "$deadline" amika snapshot list > "$output_file"; then
+    AMIKA_SNAPSHOT_TABLE_RESULT="$(< "$output_file")"
+    rm -f "$output_file"
+    return 0
+  else
+    command_rc=$?
+  fi
+  rm -f "$output_file"
+  if [ "$command_rc" -eq 124 ]; then
+    printf 'Amika snapshot preflight timed out\n' >&2
+  else
+    printf 'Amika snapshot preflight failed (amika snapshot list exited %s)\n' "$command_rc" >&2
   fi
   return "$command_rc"
 }

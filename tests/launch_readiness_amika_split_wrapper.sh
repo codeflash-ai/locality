@@ -182,6 +182,9 @@ case "${1:-}:${2:-}" in
       printf 'fake remote sandbox list failure\n' >&2
       exit "$FAKE_AMIKA_SANDBOX_LIST_RC"
     fi
+    if [ "${FAKE_AMIKA_BLOCK_PREFLIGHT_LIST:-0}" = "1" ]; then
+      block_operation_if_requested preflight-list
+    fi
     if [ "${FAKE_AMIKA_BLOCK_LIST_AFTER_CREATE:-0}" = "1" ] && compgen -G "$state_dir/*.state" >/dev/null; then
       block_operation_if_requested list
     fi
@@ -223,6 +226,9 @@ existing-box stopped remote - - Test 2026-08-02T00:00:00Z}"
     if [ "$#" -ne 2 ]; then
       printf 'unexpected fake amika command: %s\n' "$*" >&2
       exit 2
+    fi
+    if [ "${FAKE_AMIKA_BLOCK_SNAPSHOT_LIST:-0}" = "1" ]; then
+      block_operation_if_requested snapshot-list
     fi
     if [ -n "${FAKE_AMIKA_SNAPSHOT_TABLE_PATH:-}" ]; then
       cat "$FAKE_AMIKA_SNAPSHOT_TABLE_PATH"
@@ -1022,6 +1028,93 @@ fi
 assert_contains "$delayed_signal_log" "amika sandbox delete --remote --force launch-readiness-delayed-signal-locality"
 if [ -e "$delayed_signal_state/launch-readiness-delayed-signal-locality.state" ]; then
   fail "delayed sandbox registration leaked after signal cleanup"
+fi
+
+blocked_preflight_log="${tmp_root}/blocked-preflight-amika.log"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$blocked_preflight_log" \
+  FAKE_AMIKA_STATE_DIR="${tmp_root}/blocked-preflight-state" \
+  FAKE_AMIKA_BLOCK_OPERATION=preflight-list \
+  FAKE_AMIKA_BLOCK_PREFLIGHT_LIST=1 \
+  FAKE_AMIKA_ACTIVITY_DIR="${tmp_root}/blocked-preflight-activity" \
+  AMIKA_READINESS_TIMEOUT_SECONDS=1 \
+  AMIKA_READINESS_POLL_SECONDS=1 \
+  RUN_ID="blocked-preflight" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/blocked-preflight-out" \
+  python3 "$deadline_runner" 5 "${tmp_root}/blocked-preflight.out" "${tmp_root}/blocked-preflight.err" \
+    "$WRAPPER" --scenario scenario2
+blocked_preflight_rc=$?
+set -e
+if [ "$blocked_preflight_rc" -eq 125 ]; then
+  fail "initial sandbox preflight listing exceeded the lifecycle deadline"
+fi
+if [ "$blocked_preflight_rc" -eq 0 ]; then
+  fail "blocked initial sandbox preflight listing should fail"
+fi
+assert_not_contains "$blocked_preflight_log" "--scenario"
+if [ -e "${tmp_root}/blocked-preflight-state/launch-readiness-blocked-preflight-locality.state" ] ||
+  [ -e "${tmp_root}/blocked-preflight-state/launch-readiness-blocked-preflight-mcp.state" ]; then
+  fail "blocked initial sandbox preflight leaked a registered sandbox"
+fi
+
+blocked_snapshot_log="${tmp_root}/blocked-snapshot-amika.log"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$blocked_snapshot_log" \
+  FAKE_AMIKA_STATE_DIR="${tmp_root}/blocked-snapshot-state" \
+  FAKE_AMIKA_BLOCK_OPERATION=snapshot-list \
+  FAKE_AMIKA_BLOCK_SNAPSHOT_LIST=1 \
+  FAKE_AMIKA_ACTIVITY_DIR="${tmp_root}/blocked-snapshot-activity" \
+  AMIKA_READINESS_TIMEOUT_SECONDS=1 \
+  AMIKA_READINESS_POLL_SECONDS=1 \
+  RUN_ID="blocked-snapshot" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/blocked-snapshot-out" \
+  python3 "$deadline_runner" 5 "${tmp_root}/blocked-snapshot.out" "${tmp_root}/blocked-snapshot.err" \
+    "$WRAPPER" --scenario scenario2
+blocked_snapshot_rc=$?
+set -e
+if [ "$blocked_snapshot_rc" -eq 125 ]; then
+  fail "snapshot preflight listing exceeded the lifecycle deadline"
+fi
+if [ "$blocked_snapshot_rc" -eq 0 ]; then
+  fail "blocked snapshot preflight listing should fail"
+fi
+assert_not_contains "$blocked_snapshot_log" "--scenario"
+if [ -e "${tmp_root}/blocked-snapshot-state/launch-readiness-blocked-snapshot-locality.state" ] ||
+  [ -e "${tmp_root}/blocked-snapshot-state/launch-readiness-blocked-snapshot-mcp.state" ]; then
+  fail "blocked snapshot preflight leaked a registered sandbox"
+fi
+
+blocked_create_log="${tmp_root}/blocked-create-amika.log"
+blocked_create_state="${tmp_root}/blocked-create-state"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$blocked_create_log" \
+  FAKE_AMIKA_STATE_DIR="$blocked_create_state" \
+  FAKE_AMIKA_BLOCK_OPERATION=create \
+  FAKE_AMIKA_ACTIVITY_DIR="${tmp_root}/blocked-create-activity" \
+  AMIKA_CREATE_ATTEMPTS=1 \
+  AMIKA_READINESS_TIMEOUT_SECONDS=1 \
+  AMIKA_READINESS_POLL_SECONDS=1 \
+  RUN_ID="blocked-create" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/blocked-create-out" \
+  python3 "$deadline_runner" 5 "${tmp_root}/blocked-create.out" "${tmp_root}/blocked-create.err" \
+    "$WRAPPER" --scenario scenario2
+blocked_create_rc=$?
+set -e
+if [ "$blocked_create_rc" -eq 125 ]; then
+  fail "sandbox create exceeded the lifecycle deadline"
+fi
+if [ "$blocked_create_rc" -eq 0 ]; then
+  fail "blocked sandbox create should fail provisioning"
+fi
+assert_not_contains "$blocked_create_log" "--scenario"
+if [ -e "$blocked_create_state/launch-readiness-blocked-create-locality.state" ]; then
+  fail "blocked sandbox create leaked a registered sandbox"
 fi
 
 blocked_list_log="${tmp_root}/blocked-list-amika.log"
