@@ -23,6 +23,18 @@ assert_not_contains() {
   fi
 }
 
+assert_file_equals() {
+  local path="$1"
+  local expected="$2"
+  local actual
+
+  actual="$(cat "$path")"
+  if [ "$actual" != "$expected" ]; then
+    printf 'expected %s to contain exactly:\n%s\nactual:\n%s\n' "$path" "$expected" "$actual" >&2
+    fail "unexpected contents in ${path}"
+  fi
+}
+
 assert_line_before() {
   local path="$1"
   local first="$2"
@@ -403,6 +415,19 @@ for arg in "$@"; do
   logged_command="${logged_command} ${quoted_arg}"
 done
 printf '%s\n' "$logged_command" >> "${FAKE_AMIKA_LOG:?}"
+
+case " $* " in
+  *"/artifacts/locality/"*)
+    if [ -n "${FAKE_RSYNC_FAIL_LOCALITY_RC:-}" ]; then
+      exit "$FAKE_RSYNC_FAIL_LOCALITY_RC"
+    fi
+    ;;
+  *"/artifacts/notion-mcp/"*)
+    if [ -n "${FAKE_RSYNC_FAIL_MCP_RC:-}" ]; then
+      exit "$FAKE_RSYNC_FAIL_MCP_RC"
+    fi
+    ;;
+esac
 SH
 chmod +x "${fake_bin}/rsync"
 
@@ -548,7 +573,7 @@ help_out="${tmp_root}/help.out"
 "$WRAPPER" --help > "$help_out"
 assert_contains "$help_out" "LOCALITY_SNAPSHOT=locality-snapshot"
 assert_contains "$help_out" "MCP_SNAPSHOT=mcp-snapshot"
-assert_contains "$help_out" "Created Amika sandboxes are deleted automatically after artifact collection."
+assert_contains "$help_out" "If either copy fails, both are retained and exact"
 
 run_default_out="${tmp_root}/default-out"
 concurrency_dir="${tmp_root}/concurrency"
@@ -895,17 +920,43 @@ assert_occurrences "$delete_failure_log" "amika sandbox create --remote --no-git
 
 no_sync_log="${tmp_root}/no-sync-amika.log"
 no_sync_err="${tmp_root}/no-sync.err"
+no_sync_out="${tmp_root}/no-sync-out"
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$no_sync_log" \
   RUN_ID="no-sync" \
   SYNC_ARTIFACTS=0 \
-  LOCAL_OUT_DIR="${tmp_root}/no-sync-out" \
+  LOCAL_OUT_DIR="$no_sync_out" \
   "$WRAPPER" --scenario scenario2 >/dev/null 2>"$no_sync_err"
 assert_contains "$no_sync_err" "SYNC_ARTIFACTS=0; ephemeral Amika sandboxes will be deleted without retaining remote artifacts"
 assert_contains "$no_sync_log" "amika sandbox delete --remote --force launch-readiness-no-sync-locality launch-readiness-no-sync-mcp"
+assert_file_equals "$no_sync_out/launch-readiness-no-sync-locality/locality-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=0\nsync_attempted=0\nsync_rc=0'
+assert_file_equals "$no_sync_out/launch-readiness-no-sync-mcp/notion-mcp-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=0\nsync_attempted=0\nsync_rc=0'
+
+setup_failure_log="${tmp_root}/setup-failure.log"
+setup_failure_call_dir="${tmp_root}/setup-failure-calls"
+setup_failure_out="${tmp_root}/setup-failure-out"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$setup_failure_log" \
+  FAKE_AMIKA_FAIL_SSH_CALL=1 \
+  FAKE_AMIKA_FAIL_SSH_CALL_RC=46 \
+  FAKE_AMIKA_CALL_DIR="$setup_failure_call_dir" \
+  RUN_ID="setup-failure" \
+  SYNC_ARTIFACTS=1 \
+  LOCAL_OUT_DIR="$setup_failure_out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/setup-failure.err"
+setup_failure_rc=$?
+set -e
+if [ "$setup_failure_rc" -ne 46 ]; then
+  fail "setup failure 46 should win and skip later phases, got ${setup_failure_rc}"
+fi
+assert_not_contains "$setup_failure_log" "rsync -az --delete"
+assert_file_equals "$setup_failure_out/launch-readiness-setup-failure-locality/locality-pipeline-status.env" $'setup_rc=46\nbenchmark_rc=0\nsync_attempted=0\nsync_rc=0'
+assert_file_equals "$setup_failure_out/launch-readiness-setup-failure-mcp/notion-mcp-pipeline-status.env" $'setup_rc=46\nbenchmark_rc=0\nsync_attempted=0\nsync_rc=0'
 
 sync_after_failure_log="${tmp_root}/sync-after-failure.log"
 sync_after_failure_call_dir="${tmp_root}/sync-after-failure-calls"
+sync_after_failure_out="${tmp_root}/sync-after-failure-out"
 set +e
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$sync_after_failure_log" \
@@ -914,7 +965,7 @@ PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_CALL_DIR="$sync_after_failure_call_dir" \
   RUN_ID="sync-after-failure" \
   SYNC_ARTIFACTS=1 \
-  LOCAL_OUT_DIR="${tmp_root}/sync-after-failure-out" \
+  LOCAL_OUT_DIR="$sync_after_failure_out" \
   "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/sync-after-failure.err"
 sync_after_failure_rc=$?
 set -e
@@ -923,6 +974,85 @@ if [ "$sync_after_failure_rc" -ne 47 ]; then
 fi
 assert_contains "$sync_after_failure_log" "rsync -az --delete"
 assert_line_before "$sync_after_failure_log" "rsync -az --delete" "amika sandbox delete --remote --force launch-readiness-sync-after-failure-locality launch-readiness-sync-after-failure-mcp"
+assert_file_equals "$sync_after_failure_out/launch-readiness-sync-after-failure-locality/locality-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=47\nsync_attempted=1\nsync_rc=0'
+assert_file_equals "$sync_after_failure_out/launch-readiness-sync-after-failure-mcp/notion-mcp-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=47\nsync_attempted=1\nsync_rc=0'
+
+sync_failure_log="${tmp_root}/sync-failure.log"
+sync_failure_err="${tmp_root}/sync-failure.err"
+sync_failure_out="${tmp_root}/sync-failure-out"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$sync_failure_log" \
+  FAKE_RSYNC_FAIL_LOCALITY_RC=31 \
+  RUN_ID="sync-failure" \
+  SYNC_ARTIFACTS=1 \
+  LOCAL_OUT_DIR="$sync_failure_out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"$sync_failure_err"
+sync_failure_rc=$?
+set -e
+if [ "$sync_failure_rc" -ne 31 ]; then
+  fail "Locality artifact sync failure should return 31, got ${sync_failure_rc}"
+fi
+assert_not_contains "$sync_failure_log" "amika sandbox delete"
+assert_occurrences "$sync_failure_log" "--scenario" 2
+assert_contains "$sync_failure_err" "Retaining Amika sandboxes because artifact sync failed"
+assert_contains "$sync_failure_err" "launch-readiness-sync-failure-locality"
+assert_contains "$sync_failure_err" "launch-readiness-sync-failure-mcp"
+assert_contains "$sync_failure_err" "/home/amika/workspace/locality-launch-readiness-sync-failure/target/launch-readiness-sync-failure-locality"
+assert_contains "$sync_failure_err" "/home/amika/workspace/locality-launch-readiness-sync-failure/target/launch-readiness-sync-failure-mcp"
+assert_contains "$sync_failure_err" "amika sandbox ssh launch-readiness-sync-failure-locality"
+assert_contains "$sync_failure_err" "amika sandbox ssh launch-readiness-sync-failure-mcp"
+assert_contains "$sync_failure_err" "amika sandbox ssh --print launch-readiness-sync-failure-locality"
+assert_contains "$sync_failure_err" "amika sandbox delete --remote --force launch-readiness-sync-failure-locality launch-readiness-sync-failure-mcp"
+assert_file_equals "$sync_failure_out/launch-readiness-sync-failure-locality/locality-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=0\nsync_attempted=1\nsync_rc=31'
+assert_file_equals "$sync_failure_out/launch-readiness-sync-failure-mcp/notion-mcp-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=0\nsync_attempted=1\nsync_rc=0'
+assert_contains "$sync_failure_out/amika-lifecycle.log" "pipeline_status strategy=locality setup_rc=0 benchmark_rc=0 sync_attempted=1 sync_rc=31"
+assert_contains "$sync_failure_out/amika-lifecycle.log" "retained_sandboxes locality=launch-readiness-sync-failure-locality mcp=launch-readiness-sync-failure-mcp"
+assert_contains "$sync_failure_out/amika-lifecycle.log" 'amika\ sandbox\ ssh\ launch-readiness-sync-failure-locality'
+
+benchmark_and_sync_failure_log="${tmp_root}/benchmark-and-sync-failure.log"
+benchmark_and_sync_failure_calls="${tmp_root}/benchmark-and-sync-failure-calls"
+benchmark_and_sync_failure_out="${tmp_root}/benchmark-and-sync-failure-out"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$benchmark_and_sync_failure_log" \
+  FAKE_AMIKA_FAIL_SSH_CALL=2 \
+  FAKE_AMIKA_FAIL_SSH_CALL_RC=47 \
+  FAKE_AMIKA_CALL_DIR="$benchmark_and_sync_failure_calls" \
+  FAKE_RSYNC_FAIL_LOCALITY_RC=31 \
+  RUN_ID="benchmark-and-sync-failure" \
+  SYNC_ARTIFACTS=1 \
+  LOCAL_OUT_DIR="$benchmark_and_sync_failure_out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/benchmark-and-sync-failure.err"
+benchmark_and_sync_failure_rc=$?
+set -e
+if [ "$benchmark_and_sync_failure_rc" -ne 47 ]; then
+  fail "benchmark failure 47 should win over sync failure 31, got ${benchmark_and_sync_failure_rc}"
+fi
+assert_not_contains "$benchmark_and_sync_failure_log" "amika sandbox delete"
+assert_contains "${tmp_root}/benchmark-and-sync-failure.err" "Retaining Amika sandboxes because artifact sync failed"
+assert_file_equals "$benchmark_and_sync_failure_out/launch-readiness-benchmark-and-sync-failure-locality/locality-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=47\nsync_attempted=1\nsync_rc=31'
+assert_file_equals "$benchmark_and_sync_failure_out/launch-readiness-benchmark-and-sync-failure-mcp/notion-mcp-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=47\nsync_attempted=1\nsync_rc=0'
+
+both_sync_failure_log="${tmp_root}/both-sync-failure.log"
+both_sync_failure_out="${tmp_root}/both-sync-failure-out"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$both_sync_failure_log" \
+  FAKE_RSYNC_FAIL_LOCALITY_RC=31 \
+  FAKE_RSYNC_FAIL_MCP_RC=32 \
+  RUN_ID="both-sync-failure" \
+  SYNC_ARTIFACTS=1 \
+  LOCAL_OUT_DIR="$both_sync_failure_out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/both-sync-failure.err"
+both_sync_failure_rc=$?
+set -e
+if [ "$both_sync_failure_rc" -ne 31 ]; then
+  fail "the first strategy sync failure should return 31, got ${both_sync_failure_rc}"
+fi
+assert_not_contains "$both_sync_failure_log" "amika sandbox delete"
+assert_file_equals "$both_sync_failure_out/launch-readiness-both-sync-failure-locality/locality-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=0\nsync_attempted=1\nsync_rc=31'
+assert_file_equals "$both_sync_failure_out/launch-readiness-both-sync-failure-mcp/notion-mcp-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=0\nsync_attempted=1\nsync_rc=32'
 
 ssh_provider_amika_log="${tmp_root}/ssh-provider-amika.log"
 ssh_provider_transport_log="${tmp_root}/ssh-provider-transport.log"
@@ -1197,6 +1327,7 @@ assert_contains "$readiness_deadline_log" "amika sandbox delete --remote --force
 forced_tty_log="${tmp_root}/forced-tty-amika.log"
 forced_tty_transport_log="${tmp_root}/forced-tty-transport.log"
 forced_tty_transcript="${tmp_root}/forced-tty-extract.transcript"
+forced_tty_out="${tmp_root}/forced-tty-extract-out"
 set +e
 PATH="${forced_tty_bin}:${fake_bin}:$PATH" \
   REAL_TAR="$real_tar" \
@@ -1207,7 +1338,7 @@ PATH="${forced_tty_bin}:${fake_bin}:$PATH" \
   RUN_ID="forced-tty-extract" \
   AMIKA_SSH_FORCE_TTY=1 \
   SYNC_ARTIFACTS=1 \
-  LOCAL_OUT_DIR="${tmp_root}/forced-tty-extract-out" \
+  LOCAL_OUT_DIR="$forced_tty_out" \
   python3 "$pty_runner" "$forced_tty_transcript" "$WRAPPER" --scenario scenario2
 forced_tty_rc=$?
 set -e
@@ -1215,7 +1346,10 @@ if [ "$forced_tty_rc" -ne 37 ]; then
   fail "forced-TTY artifact extraction failure should return 37, got ${forced_tty_rc}"
 fi
 assert_contains "$forced_tty_transcript" "pipeline failed with exit code 37"
-assert_contains "$forced_tty_log" "amika sandbox delete --remote --force launch-readiness-forced-tty-extract-locality launch-readiness-forced-tty-extract-mcp"
+assert_contains "$forced_tty_transcript" "Retaining Amika sandboxes because artifact sync failed"
+assert_not_contains "$forced_tty_log" "amika sandbox delete"
+assert_file_equals "$forced_tty_out/launch-readiness-forced-tty-extract-locality/locality-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=0\nsync_attempted=1\nsync_rc=37'
+assert_file_equals "$forced_tty_out/launch-readiness-forced-tty-extract-mcp/notion-mcp-pipeline-status.env" $'setup_rc=0\nbenchmark_rc=0\nsync_attempted=1\nsync_rc=37'
 
 custom_log="${tmp_root}/custom-amika.log"
 custom_out="${tmp_root}/custom-out"

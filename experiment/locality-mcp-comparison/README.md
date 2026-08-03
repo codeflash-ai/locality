@@ -59,6 +59,29 @@ export LOCALITY_SNAPSHOT=my-locality-snapshot
 export MCP_SNAPSHOT=my-mcp-snapshot
 ```
 
+The wrapper always uses the two exact configured names. It never selects a
+fallback snapshot. Its Amika v0.12.1 preflight parses the supported table output
+from `amika sandbox list --remote` and `amika snapshot list`, rejects target-name
+collisions, and requires both snapshots to be present in `active` state before
+creating anything. The remote sandbox list is also the authentication and
+control-plane check; `amika auth status` alone is not sufficient.
+
+Provisioning retries only control-plane and readiness operations. A create that
+returns nonzero can still register a sandbox; when that happens, the wrapper
+records it as owned, deletes it, waits for the name to disappear, and retries the
+same snapshot. A successful create is not usable until its table state is
+`started` and `amika sandbox ssh <name> -- true` succeeds. These positive-integer
+settings control that behavior:
+
+```bash
+AMIKA_CREATE_ATTEMPTS=3
+AMIKA_READINESS_TIMEOUT_SECONDS=180
+AMIKA_READINESS_POLL_SECONDS=3
+```
+
+Codex benchmark execution is always single-shot. The wrapper never retries a
+benchmark after it begins.
+
 The wrapper creates run-specific sandboxes named
 `launch-readiness-<UTC_RUN_ID>-locality` and
 `launch-readiness-<UTC_RUN_ID>-mcp`. `LOCALITY_SANDBOX` and `MCP_SANDBOX`
@@ -226,10 +249,81 @@ snapshot, and prepares a clean detached worktree in each sandbox from
 `BENCHMARK_REF` and runs both strategy pipelines concurrently:
 `run-launch-readiness-benchmark.sh --strategy locality` in the Locality sandbox
 and `run-launch-readiness-benchmark.sh --strategy notion-mcp` in the MCP
-sandbox. It collects artifacts before deleting the sandboxes and also deletes
-owned sandboxes after failures or signals. Set `SYNC_ARTIFACTS=0` only when
-remote-only outputs can be intentionally discarded: because the sandboxes are
-ephemeral, cleanup removes those outputs.
+sandbox. Each pipeline atomically writes a status record under its local sandbox
+log directory:
+
+```text
+setup_rc=<integer>
+benchmark_rc=<integer>
+sync_attempted=0|1
+sync_rc=<integer>
+```
+
+The final exit status uses setup, benchmark, artifact-sync, then cleanup
+precedence. With the default `SYNC_ARTIFACTS=1`, successful artifact copies
+delete both sandboxes even if a benchmark failed. If either artifact copy fails,
+both sandboxes are retained as one recovery environment and the wrapper prints
+commands to SSH to each one, inspect its remote output path, retry both `rsync`
+operations into the existing local artifact directories, and delete the pair
+after recovery. The same commands and phase outcomes are recorded in
+`amika-lifecycle.log`.
+
+Set `SYNC_ARTIFACTS=0` only when remote-only outputs can be intentionally
+discarded. The wrapper prints a warning and deletes both ephemeral sandboxes.
+Provisioning failures and signals also clean up every sandbox owned by the
+current invocation. A pipeline setup failure cleans up the pair unless the other
+pipeline attempted and failed artifact sync, in which case paired retention
+still wins.
+
+## Refresh The Exact Locality Snapshot
+
+Snapshot replacement is a deliberate rollout, never an automatic benchmark
+fallback. First record whether `aseem-locality` is stopped or started. Start it
+only if necessary, wait for `started` plus SSH readiness, and verify without
+changing its contents that `~/workspace/locality`, `loc`, Codex, and the expected
+hydrated Locality roots are present.
+
+```bash
+amika sandbox start --remote aseem-locality # only when initially stopped
+amika sandbox ssh aseem-locality -- true
+```
+
+Create uniquely named candidate and probe names from one refresh id. Capture the
+candidate in `full` mode—`scrub_and_delete` would remove injected state and
+delete the source sandbox—then fork and validate the candidate:
+
+```bash
+refresh_id="$(date -u +%Y%m%dT%H%M%SZ)"
+candidate="locality-snapshot-candidate-$refresh_id"
+candidate_probe="locality-snapshot-candidate-probe-$refresh_id"
+final_probe="locality-snapshot-final-probe-$refresh_id"
+
+amika snapshot create --no-interactive --mode full --name "$candidate" \
+  --sandbox aseem-locality --description "Validated launch-readiness candidate $refresh_id"
+amika sandbox create --remote --no-git --snapshot "$candidate" --name "$candidate_probe"
+```
+
+Wait for the candidate probe and repeat the source prerequisite checks, then
+delete it with `amika sandbox delete --remote --force "$candidate_probe"`. If
+validation fails, retain the candidate for diagnosis and
+do not touch `locality-snapshot`. Only after it passes, replace and probe the
+exact final name:
+
+```bash
+amika snapshot delete --force locality-snapshot
+amika snapshot create --no-interactive --mode full --name locality-snapshot \
+  --sandbox aseem-locality --description "Validated launch-readiness snapshot $refresh_id"
+amika sandbox create --remote --no-git --snapshot locality-snapshot --name "$final_probe"
+```
+
+Wait for and validate the final probe, delete it with `amika sandbox delete
+--remote --force "$final_probe"`, and confirm `amika snapshot list` reports
+`locality-snapshot active`. Only then delete the candidate with `amika snapshot
+delete --force "$candidate"`. If final capture or validation fails, retain the
+verified candidate for recovery but report the exact-snapshot outage; do not
+configure a fallback. Finally, if the source was initially stopped, restore it
+with `amika sandbox stop --remote aseem-locality` and confirm the final state
+matches the recorded initial state.
 
 Hooks are enabled by default. The runner installs a benchmark-owned `hooks.json`
 into each per-strategy `CODEX_HOME` and starts Codex with

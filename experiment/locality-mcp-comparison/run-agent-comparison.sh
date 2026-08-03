@@ -42,6 +42,11 @@ Environment:
   AMIKA_SANDBOX_FLAGS            Optional flags passed to amika sandbox ssh.
   AMIKA_SSH_FORCE_TTY            Use direct ssh -tt for unhealthy sandboxes
                                   that reject non-interactive exec. Default: 0.
+  AMIKA_CREATE_ATTEMPTS          Create/readiness attempts per sandbox. Default: 3.
+  AMIKA_READINESS_TIMEOUT_SECONDS
+                                  Readiness deadline per lifecycle operation.
+                                  Default: 180.
+  AMIKA_READINESS_POLL_SECONDS   Readiness polling interval. Default: 3.
   LOCALITY_SSH_TARGET            SSH target for Locality when REMOTE_PROVIDER=ssh.
                                   Example: ubuntu@203.0.113.10.
   MCP_SSH_TARGET                 SSH target for MCP when REMOTE_PROVIDER=ssh.
@@ -65,8 +70,9 @@ Environment:
   SYNC_LOCAL_EXPERIMENT          Copy this local comparison harness into each
                                   remote worktree before running. Default: 0.
   SYNC_ARTIFACTS                 Copy remote OUT_DIRs back locally. Default: 1.
-                                  Setting 0 discards remote-only outputs when
-                                  ephemeral Amika sandboxes are deleted.
+                                  A failed copy retains both Amika sandboxes.
+                                  Setting 0 warns, then deletes the sandboxes
+                                  and discards remote-only outputs.
 
 MCP credentials can also live in the MCP sandbox under:
   ~/.config/locality-launch-readiness/mcp/{linear-api-key,notion-token,slack-bot-token,slack-team-id,slack-channel-ids}
@@ -74,9 +80,11 @@ MCP credentials can also live in the MCP sandbox under:
 For REMOTE_PROVIDER=amika, both named sandboxes are created from their snapshots.
 The wrapper refuses to reuse an existing sandbox with either name. Overrides set
 the names of newly created sandboxes; they do not select reusable sandboxes.
-Created Amika sandboxes are deleted automatically after artifact collection.
-They are also deleted after failures and signals. With SYNC_ARTIFACTS=0, that
-cleanup intentionally discards remote-only outputs.
+Created Amika sandboxes are deleted after both artifact copies succeed, even
+when a benchmark failed. If either copy fails, both are retained and exact
+recovery commands are printed. Setup failures and signals clean up owned
+sandboxes. With SYNC_ARTIFACTS=0, cleanup intentionally discards remote-only
+outputs.
 
 Any remaining arguments are passed to run-launch-readiness-benchmark.sh.
 This wrapper owns split strategy execution; --compare-mcp is accepted as a no-op
@@ -94,6 +102,7 @@ LOCALITY_SNAPSHOT="${LOCALITY_SNAPSHOT:-locality-snapshot}"
 MCP_SNAPSHOT="${MCP_SNAPSHOT:-mcp-snapshot}"
 declare -a CREATED_AMIKA_SANDBOXES=()
 PENDING_AMIKA_SANDBOX=""
+RETAIN_AMIKA_SANDBOXES=0
 REMOTE_PROVIDER="${REMOTE_PROVIDER:-amika}"
 REMOTE_HOME="${REMOTE_HOME:-}"
 if [ -z "$REMOTE_HOME" ]; then
@@ -1156,7 +1165,7 @@ REMOTE_SYNC_PREP
   ssh_target="$(remote_ssh_target "$sandbox")"
   if ! command -v rsync >/dev/null 2>&1; then
     echo "rsync is required when SYNC_LOCAL_EXPERIMENT=1" >&2
-    exit 127
+    return 127
   fi
   if [ "$REMOTE_PROVIDER" = "ssh" ]; then
     rsync -az --delete -e "$(remote_rsync_ssh_command)" "$SCRIPT_DIR/" "$ssh_target:$remote_dir/"
@@ -1452,17 +1461,84 @@ run_strategy_pipeline() {
   local sandbox="$1"
   local strategy="$2"
   local remote_out_dir="$3"
-  local run_rc=0
+  local local_dir="$LOCAL_OUT_DIR/$sandbox"
+  local status_file="$local_dir/$strategy-pipeline-status.env"
+  local status_tmp
+  local setup_rc=0
+  local benchmark_rc=0
+  local sync_attempted=0
   local sync_rc=0
 
-  prepare_worktree "$sandbox" || return $?
-  sync_local_experiment "$sandbox" || return $?
-  run_launch_strategy_with_args "$sandbox" "$strategy" "$remote_out_dir" || run_rc=$?
-  sync_artifacts "$sandbox" "$strategy" "$remote_out_dir" || sync_rc=$?
-  if [ "$run_rc" -ne 0 ]; then
-    return "$run_rc"
+  mkdir -p "$local_dir"
+  prepare_worktree "$sandbox" || setup_rc=$?
+  if [ "$setup_rc" -eq 0 ]; then
+    sync_local_experiment "$sandbox" || setup_rc=$?
+  fi
+  if [ "$setup_rc" -eq 0 ]; then
+    run_launch_strategy_with_args "$sandbox" "$strategy" "$remote_out_dir" || benchmark_rc=$?
+    if [ "$SYNC_ARTIFACTS" = "1" ]; then
+      sync_attempted=1
+      sync_artifacts "$sandbox" "$strategy" "$remote_out_dir" || sync_rc=$?
+    fi
+  fi
+
+  status_tmp="$(mktemp "$local_dir/.$strategy-pipeline-status.env.XXXXXX")"
+  {
+    printf 'setup_rc=%s\n' "$setup_rc"
+    printf 'benchmark_rc=%s\n' "$benchmark_rc"
+    printf 'sync_attempted=%s\n' "$sync_attempted"
+    printf 'sync_rc=%s\n' "$sync_rc"
+  } > "$status_tmp"
+  mv "$status_tmp" "$status_file"
+
+  if [ "$setup_rc" -ne 0 ]; then
+    return "$setup_rc"
+  fi
+  if [ "$benchmark_rc" -ne 0 ]; then
+    return "$benchmark_rc"
   fi
   return "$sync_rc"
+}
+
+read_pipeline_status() {
+  local file="$1"
+  local prefix="$2"
+  local key
+  local value
+  local setup_rc=""
+  local benchmark_rc=""
+  local sync_attempted=""
+  local sync_rc=""
+
+  if [ ! -f "$file" ]; then
+    echo "pipeline status file is missing: $file" >&2
+    return 1
+  fi
+  while IFS='=' read -r key value; do
+    case "$key" in
+      setup_rc) setup_rc="$value" ;;
+      benchmark_rc) benchmark_rc="$value" ;;
+      sync_attempted) sync_attempted="$value" ;;
+      sync_rc) sync_rc="$value" ;;
+      *)
+        echo "unexpected pipeline status field in $file: $key" >&2
+        return 1
+        ;;
+    esac
+  done < "$file"
+
+  if ! [[ "$setup_rc" =~ ^[0-9]+$ ]] ||
+    ! [[ "$benchmark_rc" =~ ^[0-9]+$ ]] ||
+    ! [[ "$sync_attempted" =~ ^[01]$ ]] ||
+    ! [[ "$sync_rc" =~ ^[0-9]+$ ]]; then
+    echo "invalid pipeline status record: $file" >&2
+    return 1
+  fi
+
+  printf -v "${prefix}_setup_rc" '%s' "$setup_rc"
+  printf -v "${prefix}_benchmark_rc" '%s' "$benchmark_rc"
+  printf -v "${prefix}_sync_attempted" '%s' "$sync_attempted"
+  printf -v "${prefix}_sync_rc" '%s' "$sync_rc"
 }
 
 wait_for_strategy_pipeline() {
@@ -1586,6 +1662,9 @@ cleanup_amika_sandboxes_on_exit() {
 
   trap - EXIT INT TERM
   set +e
+  if [ "$RETAIN_AMIKA_SANDBOXES" -eq 1 ]; then
+    exit "$original_rc"
+  fi
   reconcile_pending_amika_sandbox || cleanup_rc=$?
   cleanup_amika_sandboxes
   current_cleanup_rc=$?
@@ -1605,6 +1684,62 @@ cleanup_amika_sandboxes_on_exit() {
     exit "$original_rc"
   fi
   exit "$cleanup_rc"
+}
+
+escape_double_quoted_shell_text() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
+  printf '%s' "$value"
+}
+
+amika_recovery_rsync_command() {
+  local sandbox="$1"
+  local remote_out_dir="$2"
+  local local_artifact_dir="$3"
+  local sandbox_q
+  local remote_out_dir_dq
+  local local_artifact_dir_q
+
+  printf -v sandbox_q '%q' "$sandbox"
+  remote_out_dir_dq="$(escape_double_quoted_shell_text "$remote_out_dir")"
+  printf -v local_artifact_dir_q '%q' "$local_artifact_dir"
+  printf 'rsync -az --delete "$(amika sandbox ssh --print %s):%s/" %s/' \
+    "$sandbox_q" "$remote_out_dir_dq" "$local_artifact_dir_q"
+}
+
+record_amika_recovery_line() {
+  local line="$1"
+  printf '%s\n' "$line" >&2
+  printf 'recovery=%q\n' "$line" >> "$AMIKA_LIFECYCLE_LOG"
+}
+
+print_amika_recovery_instructions() {
+  local locality_ssh
+  local mcp_ssh
+  local locality_rsync
+  local mcp_rsync
+  local delete_command
+
+  printf -v locality_ssh 'amika sandbox ssh %q' "$LOCALITY_SANDBOX"
+  printf -v mcp_ssh 'amika sandbox ssh %q' "$MCP_SANDBOX"
+  locality_rsync="$(amika_recovery_rsync_command "$LOCALITY_SANDBOX" "$LOCALITY_REMOTE_OUT_DIR" "$LOCAL_OUT_DIR/artifacts/locality")"
+  mcp_rsync="$(amika_recovery_rsync_command "$MCP_SANDBOX" "$MCP_REMOTE_OUT_DIR" "$LOCAL_OUT_DIR/artifacts/notion-mcp")"
+  printf -v delete_command 'amika sandbox delete --remote --force %q %q' "$LOCALITY_SANDBOX" "$MCP_SANDBOX"
+
+  record_amika_recovery_line "Retaining Amika sandboxes because artifact sync failed"
+  record_amika_recovery_line "Locality sandbox: $LOCALITY_SANDBOX"
+  record_amika_recovery_line "Locality remote artifact directory: $LOCALITY_REMOTE_OUT_DIR"
+  record_amika_recovery_line "  $locality_ssh"
+  record_amika_recovery_line "  $locality_rsync"
+  record_amika_recovery_line "MCP sandbox: $MCP_SANDBOX"
+  record_amika_recovery_line "MCP remote artifact directory: $MCP_REMOTE_OUT_DIR"
+  record_amika_recovery_line "  $mcp_ssh"
+  record_amika_recovery_line "  $mcp_rsync"
+  record_amika_recovery_line "Delete both sandboxes after recovery:"
+  record_amika_recovery_line "  $delete_command"
 }
 
 write_artifacts_manifest() {
@@ -1673,12 +1808,58 @@ wait_for_strategy_pipeline "$locality_pipeline_pid" "locality" || locality_pipel
 wait_for_strategy_pipeline "$mcp_pipeline_pid" "notion-mcp" || mcp_pipeline_rc=$?
 trap - INT TERM
 
-if [ "$locality_pipeline_rc" -ne 0 ] || [ "$mcp_pipeline_rc" -ne 0 ]; then
-  echo "Launch-readiness strategy pipelines failed: locality=$locality_pipeline_rc notion-mcp=$mcp_pipeline_rc" >&2
-  if [ "$locality_pipeline_rc" -ne 0 ]; then
-    exit "$locality_pipeline_rc"
+locality_setup_rc=0
+locality_benchmark_rc=0
+locality_sync_attempted=0
+locality_sync_rc=0
+mcp_setup_rc=0
+mcp_benchmark_rc=0
+mcp_sync_attempted=0
+mcp_sync_rc=0
+locality_status_read_rc=0
+mcp_status_read_rc=0
+read_pipeline_status \
+  "$LOCAL_OUT_DIR/$LOCALITY_SANDBOX/locality-pipeline-status.env" \
+  locality || locality_status_read_rc=$?
+read_pipeline_status \
+  "$LOCAL_OUT_DIR/$MCP_SANDBOX/notion-mcp-pipeline-status.env" \
+  mcp || mcp_status_read_rc=$?
+
+printf 'pipeline_status strategy=locality setup_rc=%s benchmark_rc=%s sync_attempted=%s sync_rc=%s\n' \
+  "$locality_setup_rc" "$locality_benchmark_rc" "$locality_sync_attempted" "$locality_sync_rc" >> "$AMIKA_LIFECYCLE_LOG"
+printf 'pipeline_status strategy=notion-mcp setup_rc=%s benchmark_rc=%s sync_attempted=%s sync_rc=%s\n' \
+  "$mcp_setup_rc" "$mcp_benchmark_rc" "$mcp_sync_attempted" "$mcp_sync_rc" >> "$AMIKA_LIFECYCLE_LOG"
+
+if [ "$REMOTE_PROVIDER" = "amika" ] && [ "$SYNC_ARTIFACTS" = "1" ] &&
+  { { [ "$locality_sync_attempted" -eq 1 ] && [ "$locality_sync_rc" -ne 0 ]; } ||
+    { [ "$mcp_sync_attempted" -eq 1 ] && [ "$mcp_sync_rc" -ne 0 ]; }; }; then
+  RETAIN_AMIKA_SANDBOXES=1
+  printf 'retained_sandboxes locality=%q mcp=%q\n' "$LOCALITY_SANDBOX" "$MCP_SANDBOX" >> "$AMIKA_LIFECYCLE_LOG"
+  print_amika_recovery_instructions
+fi
+
+operation_rc=0
+for phase_rc in \
+  "$locality_setup_rc" "$mcp_setup_rc" \
+  "$locality_benchmark_rc" "$mcp_benchmark_rc" \
+  "$locality_sync_rc" "$mcp_sync_rc"; do
+  if [ "$phase_rc" -ne 0 ]; then
+    operation_rc="$phase_rc"
+    break
   fi
-  exit "$mcp_pipeline_rc"
+done
+if [ "$operation_rc" -eq 0 ] && [ "$locality_status_read_rc" -ne 0 ]; then
+  operation_rc="$locality_pipeline_rc"
+  [ "$operation_rc" -ne 0 ] || operation_rc="$locality_status_read_rc"
+fi
+if [ "$operation_rc" -eq 0 ] && [ "$mcp_status_read_rc" -ne 0 ]; then
+  operation_rc="$mcp_pipeline_rc"
+  [ "$operation_rc" -ne 0 ] || operation_rc="$mcp_status_read_rc"
+fi
+
+if [ "$operation_rc" -ne 0 ]; then
+  echo "Launch-readiness strategy pipelines failed: locality=$locality_pipeline_rc notion-mcp=$mcp_pipeline_rc" >&2
+  exit "$operation_rc"
 fi
 
 if [ "$SYNC_ARTIFACTS" = "1" ]; then
