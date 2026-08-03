@@ -2099,6 +2099,71 @@ fn prepare_gmail_draft_create_keeps_subject_and_recipients_as_properties() {
 }
 
 #[test]
+fn prepare_gmail_send_create_keeps_subject_and_recipients_as_properties() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("gmail");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("gmail-folder:send"),
+                EntityKind::Directory,
+                "send",
+                "send",
+            )
+            .with_hydration(HydrationState::Stub)
+            .with_remote_edited_at("folder:send"),
+        )
+        .expect("save send folder");
+    let send_path = fixture.write_raw(
+        "send/reply.md",
+        "---\nloc:\n  type: page\n  connector: gmail\ntitle: Reply\nsubject: Reply subject\nto: [\"ann@example.com\"]\ncc: [\"copy@example.com\"]\nbcc: []\n---\nBody\n",
+    );
+
+    let prepared = prepare_push(
+        &store,
+        &job(send_path),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::ConfirmPlan);
+    let plan = prepared.pipeline.plan.expect("plan");
+    match &plan.operations[0] {
+        PushOperation::CreateEntity {
+            parent_id,
+            parent_kind,
+            title,
+            properties,
+            body,
+            source_path,
+            ..
+        } => {
+            assert_eq!(parent_id, &RemoteId::new("gmail-folder:send"));
+            assert_eq!(parent_kind, &Some(EntityKind::Directory));
+            assert_eq!(title, "Reply");
+            assert_eq!(body, "Body\n");
+            assert_eq!(source_path, &PathBuf::from("send/reply.md"));
+            assert_eq!(
+                properties.get("subject"),
+                Some(&PropertyValue::String("Reply subject".to_string()))
+            );
+            assert_eq!(
+                properties.get("to"),
+                Some(&PropertyValue::List(vec!["ann@example.com".to_string()]))
+            );
+            assert_eq!(
+                properties.get("cc"),
+                Some(&PropertyValue::List(vec!["copy@example.com".to_string()]))
+            );
+            assert_eq!(properties.get("bcc"), Some(&PropertyValue::List(vec![])));
+        }
+        operation => panic!("unexpected operation: {operation:?}"),
+    }
+}
+
+#[test]
 fn prepare_gmail_draft_create_accepts_subject_without_title() {
     let fixture = PrepareFixture::new();
     let mut store = fixture.store("gmail");
