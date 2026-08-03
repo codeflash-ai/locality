@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="${ROOT}/scripts/init-amika-locality-snapshot.sh"
+AZURE_SETUP_SCRIPT="${ROOT}/experiment/locality-mcp-comparison/setup-codex-azure.sh"
 
 fail() {
   printf 'init Amika Locality snapshot test: %s\n' "$*" >&2
@@ -15,6 +16,14 @@ assert_contains() {
   grep -F -q -- "$needle" "$path" || fail "missing ${needle} in ${path}"
 }
 
+assert_not_contains() {
+  local path="$1"
+  local needle="$2"
+  if grep -F -q -- "$needle" "$path"; then
+    fail "unexpected ${needle} in ${path}"
+  fi
+}
+
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-init-amika-snapshot-test.XXXXXX")"
 trap 'rm -rf "$tmp_root"' EXIT
 fake_bin="${tmp_root}/bin"
@@ -25,10 +34,188 @@ prompt_input="${tmp_root}/scenario-prompt.input"
 fake_report="${tmp_root}/final_report.md"
 mkdir -p "$fake_bin"
 
+cat > "${fake_bin}/codex" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "${fake_bin}/codex"
+
+setup_agent_root="${tmp_root}/setup-agent"
+setup_config="${setup_agent_root}/.codex/config.toml"
+mkdir -p "$(dirname "$setup_config")"
+setup_config_text="$(cat <<'TOML'
+# Existing Codex settings must survive Azure setup.
+"approval_policy" = "never" # keep quoted root key
+"model" = "old-model" # keep target comment
+"literal.key" = 'preserved literal value'
+
+["model_providers"."azure"] # keep quoted provider table
+"name" = "Old Azure name" # keep provider comment
+"base_url" = "https://old.invalid/openai/v1"
+"env_key" = "OLD_AZURE_KEY"
+"wire_api" = "chat"
+custom_setting = "preserved-provider-value"
+
+[features]
+web_search_request = true
+multiline_basic = """
+model = "not a real setting"
+[model_providers.azure]
+# this comment belongs to the string
+"""
+multiline_literal = '''
+wire_api = "also not a real setting"
+'''
+preserved_array = [
+  "first",
+  "second", # keep array comment
+]
+
+["quoted.table"]
+"quoted.key" = "preserved without a trailing newline"
+TOML
+)"
+printf '%s' "$setup_config_text" > "$setup_config"
+unset setup_config_text
+
+PATH="${fake_bin}:$PATH" \
+  CODEX_HOME="${setup_agent_root}/.codex" \
+  AMIKA_AGENT_CWD="$setup_agent_root" \
+  CODEX_MODEL="merged-model" \
+  CODEX_REASONING_EFFORT="high" \
+  AZURE_OPENAI_BASE_URL="https://merged.invalid/openai/v1" \
+  "$AZURE_SETUP_SCRIPT" >/dev/null
+
+python3 - "$setup_config" <<'PY'
+import os
+import stat
+import sys
+import tomllib
+
+path = sys.argv[1]
+with open(path, "rb") as source:
+    contents = source.read()
+config = tomllib.loads(contents.decode("utf-8"))
+assert config["model"] == "merged-model"
+assert config["model_provider"] == "azure"
+assert config["model_reasoning_effort"] == "high"
+assert config["sandbox_mode"] == "workspace-write"
+assert config["approval_policy"] == "never"
+assert config["features"]["web_search_request"] is True
+assert config["literal.key"] == "preserved literal value"
+assert 'model = "not a real setting"' in config["features"]["multiline_basic"]
+assert '[model_providers.azure]' in config["features"]["multiline_basic"]
+assert 'wire_api = "also not a real setting"' in config["features"]["multiline_literal"]
+assert config["features"]["preserved_array"] == ["first", "second"]
+assert config["quoted.table"]["quoted.key"] == "preserved without a trailing newline"
+provider = config["model_providers"]["azure"]
+assert provider["name"] == "Azure OpenAI"
+assert provider["base_url"] == "https://merged.invalid/openai/v1"
+assert provider["env_key"] == "AZURE_OPENAI_API_KEY"
+assert provider["wire_api"] == "responses"
+assert provider["custom_setting"] == "preserved-provider-value"
+assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+assert not contents.endswith((b"\n", b"\r"))
+text = contents.decode("utf-8")
+assert '# Existing Codex settings must survive Azure setup.' in text
+assert '"approval_policy" = "never" # keep quoted root key' in text
+assert '"model" = "merged-model" # keep target comment' in text
+assert '["model_providers"."azure"] # keep quoted provider table' in text
+assert '"name" = "Azure OpenAI" # keep provider comment' in text
+assert '''multiline_basic = """
+model = "not a real setting"
+[model_providers.azure]
+# this comment belongs to the string
+"""''' in text
+assert '''multiline_literal = \'\'\'
+wire_api = "also not a real setting"
+\'\'\'''' in text
+assert '''preserved_array = [
+  "first",
+  "second", # keep array comment
+]''' in text
+PY
+
+inline_setup_root="${tmp_root}/inline-setup"
+inline_setup_config="${inline_setup_root}/config.toml"
+mkdir -p "$inline_setup_root"
+printf '%s' 'model = "old-model"
+model_providers = { azure = { name = "inline Azure" } }' > "$inline_setup_config"
+cp "$inline_setup_config" "${inline_setup_config}.expected"
+set +e
+inline_setup_output="$(
+  env -u AMIKA_AGENT_CWD \
+    PATH="${fake_bin}:$PATH" \
+    CODEX_HOME="$inline_setup_root" \
+    CODEX_MODEL="merged-model" \
+    CODEX_REASONING_EFFORT="high" \
+    AZURE_OPENAI_BASE_URL="https://merged.invalid/openai/v1" \
+    "$AZURE_SETUP_SCRIPT" 2>&1
+)"
+inline_setup_status=$?
+set -e
+[ "$inline_setup_status" -ne 0 ] || fail "inline Azure provider table should fail closed"
+cmp -s "$inline_setup_config" "${inline_setup_config}.expected" || \
+  fail "failed inline Azure provider merge changed the original config"
+grep -F -q -- 'refusing to modify inline Azure provider setting' <<<"$inline_setup_output" || \
+  fail "inline Azure provider failure did not explain why the merge was refused"
+
+nested_setup_root="${tmp_root}/nested-setup"
+nested_setup_config="${nested_setup_root}/config.toml"
+mkdir -p "$nested_setup_root"
+nested_setup_text="$(cat <<'TOML'
+["model_providers"."azure"."http_headers"] # nested provider comment
+"x-preserved" = "nested-value"
+TOML
+)"
+printf '%s' "$nested_setup_text" > "$nested_setup_config"
+unset nested_setup_text
+env -u AMIKA_AGENT_CWD \
+  PATH="${fake_bin}:$PATH" \
+  CODEX_HOME="$nested_setup_root" \
+  CODEX_MODEL="nested-model" \
+  CODEX_REASONING_EFFORT="medium" \
+  AZURE_OPENAI_BASE_URL="https://nested.invalid/openai/v1" \
+  "$AZURE_SETUP_SCRIPT" >/dev/null
+
+python3 - "$nested_setup_config" <<'PY'
+import sys
+import tomllib
+
+path = sys.argv[1]
+with open(path, "rb") as source:
+    contents = source.read()
+config = tomllib.loads(contents.decode("utf-8"))
+provider = config["model_providers"]["azure"]
+assert config["model"] == "nested-model"
+assert config["model_provider"] == "azure"
+assert config["model_reasoning_effort"] == "medium"
+assert provider["name"] == "Azure OpenAI"
+assert provider["base_url"] == "https://nested.invalid/openai/v1"
+assert provider["env_key"] == "AZURE_OPENAI_API_KEY"
+assert provider["wire_api"] == "responses"
+assert provider["http_headers"] == {"x-preserved": "nested-value"}
+text = contents.decode("utf-8")
+assert not contents.endswith((b"\n", b"\r"))
+assert '''["model_providers"."azure"."http_headers"] # nested provider comment
+"x-preserved" = "nested-value"''' in text
+assert text.index("[model_providers.azure]") < text.index('["model_providers"."azure"."http_headers"]')
+PY
+
 cat > "${fake_bin}/amika" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
+for secret_name in PROFILE_KEY LOCALITY_PROFILE_KEY AMIKA_SECRET_LINE \
+  AZURE_OPENAI_API_KEY_VALUE AZURE_OPENAI_API_KEY; do
+  if [ -n "${!secret_name+x}" ]; then
+    if [ -n "${FAKE_CHILD_ENV_CHECK_FILE:-}" ]; then
+      printf 'leaked %s\n' "$secret_name" > "$FAKE_CHILD_ENV_CHECK_FILE"
+    fi
+    printf '%s environment leak\n' "$secret_name" >&2
+    exit 90
+  fi
+done
 printf 'amika' >> "${FAKE_AMIKA_LOG:?}"
 for arg in "$@"; do
   printf ' %q' "$arg" >> "$FAKE_AMIKA_LOG"
@@ -36,25 +223,67 @@ done
 printf '\n' >> "$FAKE_AMIKA_LOG"
 
 if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "create" ]; then
+  if [ -n "${FAKE_CREATE_BLOCK_PID_FILE:-}" ]; then
+    printf '%s\n' "$$" > "$FAKE_CREATE_BLOCK_PID_FILE"
+    if [ "${FAKE_CREATE_IGNORE_SIGNALS:-false}" = true ]; then
+      trap '' HUP INT TERM
+    fi
+    exec sleep 300
+  fi
+  if [ -n "${FAKE_CREATE_STATUS:-}" ]; then
+    exit "$FAKE_CREATE_STATUS"
+  fi
   printf 'created\n'
   exit 0
 fi
 
 if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "ssh" ]; then
-  case " $* " in
-    *" --profile-key-stdin "*)
+  last_arg=""
+  for arg in "$@"; do
+    last_arg="$arg"
+  done
+  encoded="${last_arg##* }"
+  decoded="$(printf '%s' "$encoded" | base64 -d | tr '\0' '\n')"
+  decoded_log="$(printf '%s' "$encoded" | base64 -d | tr '\0' ' ')"
+  printf 'remote %s\n' "$decoded_log" >> "$FAKE_AMIKA_LOG"
+  if [ -n "${FAKE_SIGNAL_MATCH:-}" ] && grep -F -q -- "$FAKE_SIGNAL_MATCH" <<<"$decoded_log"; then
+    kill -TERM "$$"
+  fi
+  if [ -n "${FAKE_BLOCK_MATCH:-}" ] && grep -F -q -- "$FAKE_BLOCK_MATCH" <<<"$decoded_log"; then
+    trap '' HUP INT TERM
+    sleep 300 &
+    blocking_child=$!
+    printf '%s %s %s\n' "$PPID" "$$" "$blocking_child" > "${FAKE_BLOCK_PID_FILE:?}"
+    wait "$blocking_child"
+  fi
+  case "$decoded_log" in
+    *"--profile-key-stdin"*)
+      failures="${FAKE_PRE_SENTINEL_FAILURES:-0}"
+      count=0
+      if [ -n "${FAKE_PRE_SENTINEL_COUNT:-}" ] && [ -f "$FAKE_PRE_SENTINEL_COUNT" ]; then
+        count="$(cat "$FAKE_PRE_SENTINEL_COUNT")"
+      fi
+      count=$((count + 1))
+      if [ -n "${FAKE_PRE_SENTINEL_COUNT:-}" ]; then
+        printf '%s\n' "$count" > "$FAKE_PRE_SENTINEL_COUNT"
+      fi
+      if [ "$count" -le "$failures" ]; then
+        exit 255
+      fi
+      printf '__LOCALITY_STDIN_READY__\n'
       IFS= read -r token
       printf '%s\n' "$token" > "${FAKE_PROFILE_KEY_INPUT:?}"
+      if [ -n "${FAKE_POST_SENTINEL_STATUS:-}" ]; then
+        exit "$FAKE_POST_SENTINEL_STATUS"
+      fi
       printf '{"ok":true,"command":"sandbox_init","root":"/workspace/scoped"}\n'
       ;;
     *"base64 -d > /home/amika/scenario-prompt.md"*)
-      last_arg=""
-      for arg in "$@"; do
-        last_arg="$arg"
-      done
-      printf '%s' "$last_arg" | base64 -d > "${FAKE_PROMPT_INPUT:?}"
+      prompt_base64="$(printf '%s\n' "$decoded" | tail -n 1)"
+      printf '%s' "$prompt_base64" | base64 -d > "${FAKE_PROMPT_INPUT:?}"
       ;;
     *"codex exec"*)
+      printf '__LOCALITY_STDIN_READY__\n'
       IFS= read -r azure_key
       printf '%s\n' "$azure_key" > "${FAKE_AZURE_INPUT:?}"
       printf '# Fake Launch Gate Memo\n\nVerified report body.\n' > "${FAKE_REPORT:?}"
@@ -74,8 +303,187 @@ exit 2
 SH
 chmod +x "${fake_bin}/amika"
 
-profile_key="$(printf 'a%.0s' {1..64})"
+cat > "${fake_bin}/date" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+for secret_name in PROFILE_KEY LOCALITY_PROFILE_KEY AMIKA_SECRET_LINE \
+  AZURE_OPENAI_API_KEY_VALUE AZURE_OPENAI_API_KEY; do
+  if [ -n "${!secret_name+x}" ]; then
+    printf 'leaked %s\n' "$secret_name" > "${FAKE_CHILD_ENV_CHECK_FILE:?}"
+    exit 90
+  fi
+done
+printf '20260803-000000\n'
+SH
+chmod +x "${fake_bin}/date"
+
+profile_key="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 azure_key="test-azure-key"
+
+: > "$fake_log"
+child_env_check="${tmp_root}/child-env-check"
+set +e
+allexport_output="$(
+  printf '%s\n' "$profile_key" | \
+    env \
+      PROFILE_KEY="inherited-exported-profile-key" \
+      LOCALITY_PROFILE_KEY="inherited-documented-profile-key" \
+      AMIKA_SECRET_LINE="inherited-legacy-secret" \
+      AZURE_OPENAI_API_KEY_VALUE="inherited-exported-azure-key" \
+      AZURE_OPENAI_API_KEY="$azure_key" \
+      PATH="${fake_bin}:$PATH" \
+      FAKE_AMIKA_LOG="$fake_log" \
+      FAKE_CHILD_ENV_CHECK_FILE="$child_env_check" \
+      FAKE_CREATE_STATUS=17 \
+      bash -a "$SCRIPT" \
+        --api-url https://api.dev.locality.dev 2>&1
+)"
+allexport_status=$?
+set -e
+[ "$allexport_status" -eq 2 ] || fail "allexport fixture should stop at sandbox creation"
+[ ! -e "$child_env_check" ] || \
+  fail "secret shell variables leaked to a child under allexport: $(cat "$child_env_check")"
+if grep -F -q -- 'environment leak' <<<"$allexport_output"; then
+  fail "inherited exported secret variables leaked to a child"
+fi
+
+tty_bin="${tmp_root}/tty-bin"
+tty_stty_log="${tmp_root}/tty-stty.log"
+tty_restored="${tmp_root}/tty-restored"
+mkdir -p "$tty_bin"
+cat > "${tty_bin}/stty" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FAKE_STTY_LOG:?}"
+"${REAL_STTY:?}" "$@"
+stty_status=$?
+case "${1:-}" in
+  -g|-echo) ;;
+  *)
+    if [ "$stty_status" -eq 0 ]; then
+      printf 'restored\n' > "${FAKE_STTY_RESTORED:?}"
+    fi
+    ;;
+esac
+exit "$stty_status"
+SH
+chmod +x "${tty_bin}/stty"
+
+: > "$fake_log"
+set +e
+TTY_TEST_PATH="${tty_bin}:${fake_bin}:$PATH" \
+  TTY_TEST_SCRIPT="$SCRIPT" \
+  TTY_TEST_AZURE_KEY="$azure_key" \
+  TTY_TEST_AMIKA_LOG="$fake_log" \
+  TTY_TEST_STTY_LOG="$tty_stty_log" \
+  TTY_TEST_RESTORED="$tty_restored" \
+  TTY_TEST_REAL_STTY="$(command -v stty)" \
+  expect -c '
+    set timeout 10
+    spawn -noecho env \
+      PATH=$env(TTY_TEST_PATH) \
+      AZURE_OPENAI_API_KEY=$env(TTY_TEST_AZURE_KEY) \
+      FAKE_AMIKA_LOG=$env(TTY_TEST_AMIKA_LOG) \
+      FAKE_STTY_LOG=$env(TTY_TEST_STTY_LOG) \
+      FAKE_STTY_RESTORED=$env(TTY_TEST_RESTORED) \
+      REAL_STTY=$env(TTY_TEST_REAL_STTY) \
+      $env(TTY_TEST_SCRIPT) \
+        --api-url https://api.dev.locality.dev \
+        --name interrupted-read
+    set public_script_pid [exp_pid]
+    set echo_disabled 0
+    for {set attempt 0} {$attempt < 100} {incr attempt} {
+      after 50
+      if {[file exists $env(TTY_TEST_STTY_LOG)]} {
+        set handle [open $env(TTY_TEST_STTY_LOG) r]
+        set log [read $handle]
+        close $handle
+        if {[string first "-echo\n" $log] >= 0} {
+          set echo_disabled 1
+          break
+        }
+      }
+    }
+    if {!$echo_disabled} {
+      catch {exec kill -TERM $public_script_pid}
+      catch {expect eof}
+      catch {wait}
+      exit 124
+    }
+    exec kill -TERM $public_script_pid
+    expect eof
+    set result [wait]
+    if {[lindex $result 2] != 0} {
+      exit 125
+    }
+    exit [lindex $result 3]
+  ' >/dev/null 2>&1
+tty_interrupt_status=$?
+set -e
+[ "$tty_interrupt_status" -eq 143 ] || \
+  fail "TERM-interrupted public script credential read should return 143, got ${tty_interrupt_status}"
+[ -s "$tty_restored" ] || \
+  fail "credential read interruption did not restore the saved terminal state: $(cat "$tty_stty_log")"
+grep -F -x -q -- '-g' "$tty_stty_log" || fail "credential read did not capture terminal state"
+grep -F -x -q -- '-echo' "$tty_stty_log" || fail "credential read did not disable terminal echo"
+[ ! -s "$fake_log" ] || fail "credential read interruption contacted Amika"
+
+: > "$fake_log"
+: > "$tty_stty_log"
+TTY_TEST_PATH="${tty_bin}:${fake_bin}:$PATH" \
+  TTY_TEST_SCRIPT="$SCRIPT" \
+  TTY_TEST_AZURE_KEY="$azure_key" \
+  TTY_TEST_AMIKA_LOG="$fake_log" \
+  TTY_TEST_STTY_LOG="$tty_stty_log" \
+  TTY_TEST_RESTORED="$tty_restored" \
+  TTY_TEST_REAL_STTY="$(command -v stty)" \
+  TTY_TEST_PROFILE_KEY="$profile_key" \
+  expect -c '
+    set timeout 10
+    spawn -noecho env \
+      PATH=$env(TTY_TEST_PATH) \
+      AZURE_OPENAI_API_KEY=$env(TTY_TEST_AZURE_KEY) \
+      FAKE_AMIKA_LOG=$env(TTY_TEST_AMIKA_LOG) \
+      FAKE_STTY_LOG=$env(TTY_TEST_STTY_LOG) \
+      FAKE_STTY_RESTORED=$env(TTY_TEST_RESTORED) \
+      REAL_STTY=$env(TTY_TEST_REAL_STTY) \
+      FAKE_CREATE_STATUS=17 \
+      $env(TTY_TEST_SCRIPT) \
+        --api-url https://api.dev.locality.dev \
+        --name delayed-read
+    set echo_disabled 0
+    for {set attempt 0} {$attempt < 100} {incr attempt} {
+      after 50
+      if {[file exists $env(TTY_TEST_STTY_LOG)]} {
+        set handle [open $env(TTY_TEST_STTY_LOG) r]
+        set log [read $handle]
+        close $handle
+        if {[string first "-echo\n" $log] >= 0} {
+          set echo_disabled 1
+          break
+        }
+      }
+    }
+    if {!$echo_disabled} {
+      catch {exec kill -TERM [exp_pid]}
+      catch {expect eof}
+      catch {wait}
+      exit 124
+    }
+    set key $env(TTY_TEST_PROFILE_KEY)
+    send -- [string range $key 0 31]
+    after 1200
+    send -- "[string range $key 32 end]\r"
+    expect eof
+    set result [wait]
+    if {[lindex $result 2] != 0 || [lindex $result 3] != 2} {
+      exit 125
+    }
+  ' >/dev/null 2>&1 || fail "delayed terminal key input was not preserved across polling timeouts"
+assert_contains "$fake_log" "sandbox create --remote --name delayed-read --no-git --yes"
+grep -F -q -- "$profile_key" "$fake_log" && fail "delayed terminal key leaked to Amika arguments"
+
 output="$(
   printf '%s\n' "$profile_key" | \
     PATH="${fake_bin}:$PATH" \
@@ -92,8 +500,8 @@ output="$(
       --reasoning medium
 )"
 
-assert_contains "$fake_log" "sandbox create --remote --name test-snapshot --yes"
-assert_contains "$fake_log" "sandbox ssh test-snapshot"
+assert_contains "$fake_log" "sandbox create --remote --name test-snapshot --no-git --yes"
+assert_contains "$fake_log" "sandbox ssh -t test-snapshot"
 assert_contains "$fake_log" "Locality_Linux_v"
 assert_contains "$fake_log" "0.3.7"
 assert_contains "$fake_log" "692b05460839ba44b85cd1e6b3b6969ad4a3f62f3e81f420c4651159ad7ef195"
@@ -107,12 +515,19 @@ assert_contains "$fake_log" "sandbox init"
 assert_contains "$fake_log" "--api-url https://api.dev.locality.dev"
 assert_contains "$fake_log" "--root /home/amika/locality-snapshot"
 assert_contains "$fake_log" "--profile-key-stdin"
+assert_contains "$fake_log" "--profile"
 assert_contains "$fake_log" "/home/amika/scenario-prompt.md"
 assert_contains "$fake_log" "setup-codex-azure.sh"
+assert_contains "$fake_log" 'AMIKA_AGENT_CWD="$HOME"'
 assert_contains "$fake_log" "codex exec"
 assert_contains "$fake_log" '< /dev/null'
 assert_contains "$fake_log" "test-model medium /home/amika/locality-snapshot"
 assert_contains "$fake_log" "cat /home/amika/final_report.md"
+assert_contains "$fake_log" "status --porcelain --untracked-files=all"
+profile_exchange_line="$(grep -n -m1 -- '--profile-key-stdin' "$fake_log" | cut -d: -f1)"
+repo_prepare_line="$(grep -n -m1 -- 'git clone https://github.com/codeflash-ai/locality.git' "$fake_log" | cut -d: -f1)"
+[ "$profile_exchange_line" -lt "$repo_prepare_line" ] || \
+  fail "scenario repository must be prepared only after profile authorization succeeds"
 if grep -F -q -- "$profile_key" "$fake_log"; then
   fail "Workspace Profile key leaked into Amika arguments"
 fi
@@ -135,6 +550,266 @@ grep -F -q -- '===== /home/amika/final_report.md =====' <<<"$output" || \
   fail "terminal output did not include the report heading"
 grep -F -q -- 'Verified report body.' <<<"$output" || \
   fail "terminal output did not include final_report.md"
+
+: > "$fake_log"
+set +e
+reuse_output="$(
+  PATH="${fake_bin}:$PATH" \
+    AZURE_OPENAI_API_KEY="$azure_key" \
+    FAKE_AMIKA_LOG="$fake_log" \
+    "$SCRIPT" \
+      --api-url https://api.dev.locality.dev \
+      --name existing-snapshot \
+      --reuse </dev/null 2>&1
+)"
+reuse_status=$?
+set -e
+[ "$reuse_status" -eq 2 ] || fail "--reuse should be refused with status 2"
+[ ! -s "$fake_log" ] || fail "refused --reuse contacted Amika"
+grep -F -q -- 'existing sandbox is not a trusted credential boundary' <<<"$reuse_output" || \
+  fail "refused --reuse did not explain the trust boundary"
+
+: > "$fake_log"
+set +e
+create_failure_output="$(
+  printf '%s\n' "$profile_key" | \
+    PATH="${fake_bin}:$PATH" \
+    AZURE_OPENAI_API_KEY="$azure_key" \
+    FAKE_AMIKA_LOG="$fake_log" \
+    FAKE_CREATE_STATUS=17 \
+    "$SCRIPT" \
+      --api-url https://api.dev.locality.dev \
+      --name colliding-snapshot 2>&1
+)"
+create_failure_status=$?
+set -e
+[ "$create_failure_status" -eq 2 ] || fail "fresh sandbox creation failure should fail closed"
+assert_contains "$fake_log" "sandbox create --remote --name colliding-snapshot --no-git --yes"
+assert_not_contains "$fake_log" "sandbox ssh"
+grep -F -q -- 'no credentials were transferred' <<<"$create_failure_output" || \
+  fail "sandbox collision failure did not explain credential safety"
+
+real_expect="$(command -v expect)"
+run_create_interruption() {
+  local signal="$1"
+  local expected_status="$2"
+  local block_pid_file="${tmp_root}/create-block-${signal}.pid"
+  local input="${tmp_root}/create-interrupt-${signal}.input"
+  local output="${tmp_root}/create-interrupt-${signal}.output"
+  local ignore_signals=false
+  local interrupt_status
+  local blocked_create_pid
+
+  if [ "$signal" = TERM ]; then
+    ignore_signals=true
+  fi
+  : > "$fake_log"
+  printf '%s\n' "$profile_key" > "$input"
+  set +e
+  CREATE_TEST_PATH="${fake_bin}:$PATH" \
+    CREATE_TEST_SCRIPT="$SCRIPT" \
+    CREATE_TEST_INPUT="$input" \
+    CREATE_TEST_SIGNAL="$signal" \
+    CREATE_TEST_AZURE_KEY="$azure_key" \
+    CREATE_TEST_AMIKA_LOG="$fake_log" \
+    CREATE_TEST_BLOCK_PID_FILE="$block_pid_file" \
+    CREATE_TEST_IGNORE_SIGNALS="$ignore_signals" \
+    "$real_expect" -c '
+      set timeout 10
+      spawn -noecho env \
+        PATH=$env(CREATE_TEST_PATH) \
+        AZURE_OPENAI_API_KEY=$env(CREATE_TEST_AZURE_KEY) \
+        FAKE_AMIKA_LOG=$env(CREATE_TEST_AMIKA_LOG) \
+        FAKE_CREATE_BLOCK_PID_FILE=$env(CREATE_TEST_BLOCK_PID_FILE) \
+        FAKE_CREATE_IGNORE_SIGNALS=$env(CREATE_TEST_IGNORE_SIGNALS) \
+        sh -c {exec "$1" --api-url https://api.dev.locality.dev --name "interrupted-create-$3" < "$2"} \
+        sh $env(CREATE_TEST_SCRIPT) $env(CREATE_TEST_INPUT) $env(CREATE_TEST_SIGNAL)
+      set public_script_pid [exp_pid]
+      set child_started 0
+      for {set attempt 0} {$attempt < 100} {incr attempt} {
+        after 50
+        if {[file exists $env(CREATE_TEST_BLOCK_PID_FILE)] && [file size $env(CREATE_TEST_BLOCK_PID_FILE)] > 0} {
+          set child_started 1
+          break
+        }
+      }
+      if {!$child_started} {
+        catch {exec kill -KILL $public_script_pid}
+        catch {expect eof}
+        catch {wait}
+        exit 124
+      }
+      exec kill -$env(CREATE_TEST_SIGNAL) $public_script_pid
+      expect {
+        eof {}
+        timeout {
+          catch {exec kill -KILL $public_script_pid}
+          catch {expect eof}
+          catch {wait}
+          exit 124
+        }
+      }
+      set result [wait]
+      if {[lindex $result 2] != 0} {
+        exit 125
+      }
+      exit [lindex $result 3]
+    ' >"$output" 2>&1
+  interrupt_status=$?
+  set -e
+  [ "$interrupt_status" -eq "$expected_status" ] || \
+    fail "${signal}-interrupted public script sandbox creation should return ${expected_status}, got ${interrupt_status}: $(cat "$output")"
+  [ -s "$block_pid_file" ] || fail "${signal} sandbox creation interruption fixture did not start"
+  blocked_create_pid="$(cat "$block_pid_file")"
+  if kill -0 "$blocked_create_pid" 2>/dev/null; then
+    fail "${signal}-interrupted public script left sandbox creation child ${blocked_create_pid} running"
+  fi
+  assert_contains "$fake_log" "sandbox create --remote --name interrupted-create-${signal} --no-git --yes"
+  assert_not_contains "$fake_log" "sandbox ssh"
+}
+
+run_create_interruption HUP 129
+run_create_interruption INT 130
+run_create_interruption TERM 143
+
+: > "$fake_log"
+pre_sentinel_count="${tmp_root}/pre-sentinel.count"
+retry_output="$(
+  printf '%s\n' "$profile_key" | \
+    PATH="${fake_bin}:$PATH" \
+    AZURE_OPENAI_API_KEY="$azure_key" \
+    FAKE_AMIKA_LOG="$fake_log" \
+    FAKE_PROFILE_KEY_INPUT="$profile_key_input" \
+    FAKE_AZURE_INPUT="$azure_input" \
+    FAKE_PROMPT_INPUT="$prompt_input" \
+    FAKE_REPORT="$fake_report" \
+    FAKE_PRE_SENTINEL_FAILURES=1 \
+    FAKE_PRE_SENTINEL_COUNT="$pre_sentinel_count" \
+    "$SCRIPT" \
+      --api-url https://api.dev.locality.dev \
+      --name retry-snapshot \
+      --model test-model \
+      --reasoning medium 2>&1
+)"
+[ "$(cat "$pre_sentinel_count")" -eq 2 ] || fail "pre-sentinel transport failure was not retried exactly once"
+grep -F -q -- 'retrying (1/3)' <<<"$retry_output" || fail "pre-sentinel retry was not explained"
+[ "$(cat "$profile_key_input")" = "$profile_key" ] || fail "retry did not stream the Workspace Profile key"
+
+: > "$fake_log"
+set +e
+signal_output="$(
+  printf '%s\n' "$profile_key" | \
+    PATH="${fake_bin}:$PATH" \
+    AZURE_OPENAI_API_KEY="$azure_key" \
+    FAKE_AMIKA_LOG="$fake_log" \
+    FAKE_PROFILE_KEY_INPUT="$profile_key_input" \
+    FAKE_AZURE_INPUT="$azure_input" \
+    FAKE_PROMPT_INPUT="$prompt_input" \
+    FAKE_REPORT="$fake_report" \
+    FAKE_SIGNAL_MATCH='Locality_Linux_v' \
+    "$SCRIPT" --api-url https://api.dev.locality.dev --name signaled 2>&1
+)"
+signal_status=$?
+set -e
+[ "$signal_status" -eq 143 ] || fail "signaled Amika child should return 143, got ${signal_status}: ${signal_output}"
+
+: > "$fake_log"
+block_pid_file="${tmp_root}/blocked-child.pids"
+interrupt_output="${tmp_root}/interrupt.output"
+interrupt_input="${tmp_root}/interrupt.input"
+printf '%s\n' "$profile_key" > "$interrupt_input"
+PATH="${fake_bin}:$PATH" \
+  AZURE_OPENAI_API_KEY="$azure_key" \
+  FAKE_AMIKA_LOG="$fake_log" \
+  FAKE_PROFILE_KEY_INPUT="$profile_key_input" \
+  FAKE_AZURE_INPUT="$azure_input" \
+  FAKE_PROMPT_INPUT="$prompt_input" \
+  FAKE_REPORT="$fake_report" \
+  FAKE_BLOCK_MATCH='Locality_Linux_v' \
+  FAKE_BLOCK_PID_FILE="$block_pid_file" \
+  "$SCRIPT" --api-url https://api.dev.locality.dev --name interrupted \
+    <"$interrupt_input" >"$interrupt_output" 2>&1 &
+public_script_pid=$!
+for _ in $(seq 1 100); do
+  [ -s "$block_pid_file" ] && break
+  sleep 0.05
+done
+[ -s "$block_pid_file" ] || fail "interruption fixture did not start the remote child"
+read -r blocked_expect_pid blocked_amika_pid blocked_descendant_pid < "$block_pid_file"
+kill -TERM "$public_script_pid"
+set +e
+wait "$public_script_pid"
+interrupt_status=$?
+set -e
+[ "$interrupt_status" -eq 143 ] || \
+  fail "TERM-interrupted public script should return 143, got ${interrupt_status}: $(cat "$interrupt_output")"
+for _ in $(seq 1 100); do
+  if ! kill -0 "$blocked_expect_pid" 2>/dev/null && \
+     ! kill -0 "$blocked_amika_pid" 2>/dev/null && \
+     ! kill -0 "$blocked_descendant_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+if kill -0 "$blocked_expect_pid" 2>/dev/null; then
+  fail "interrupted public script left Expect wrapper ${blocked_expect_pid} running"
+fi
+if kill -0 "$blocked_amika_pid" 2>/dev/null; then
+  fail "interrupted public script left Amika child ${blocked_amika_pid} running"
+fi
+if kill -0 "$blocked_descendant_pid" 2>/dev/null; then
+  fail "interrupted public script left descendant ${blocked_descendant_pid} running"
+fi
+
+: > "$fake_log"
+post_sentinel_count="${tmp_root}/post-sentinel.count"
+set +e
+post_sentinel_output="$(
+  printf '%s\n' "$profile_key" | \
+    PATH="${fake_bin}:$PATH" \
+    AZURE_OPENAI_API_KEY="$azure_key" \
+    FAKE_AMIKA_LOG="$fake_log" \
+    FAKE_PROFILE_KEY_INPUT="$profile_key_input" \
+    FAKE_AZURE_INPUT="$azure_input" \
+    FAKE_PROMPT_INPUT="$prompt_input" \
+    FAKE_REPORT="$fake_report" \
+    FAKE_PRE_SENTINEL_COUNT="$post_sentinel_count" \
+    FAKE_POST_SENTINEL_STATUS=23 \
+    "$SCRIPT" --api-url https://api.dev.locality.dev --name post-sentinel 2>&1
+)"
+post_sentinel_status=$?
+set -e
+[ "$post_sentinel_status" -eq 23 ] || fail "post-sentinel failure should preserve status 23"
+[ "$(cat "$post_sentinel_count")" -eq 1 ] || fail "post-sentinel failure must not retry"
+if grep -F -q -- 'credential transport closed' <<<"$post_sentinel_output"; then
+  fail "post-sentinel failure was incorrectly classified as retryable transport"
+fi
+
+: > "$fake_log"
+post_sentinel_75_count="${tmp_root}/post-sentinel-75.count"
+set +e
+post_sentinel_75_output="$(
+  printf '%s\n' "$profile_key" | \
+    PATH="${fake_bin}:$PATH" \
+    AZURE_OPENAI_API_KEY="$azure_key" \
+    FAKE_AMIKA_LOG="$fake_log" \
+    FAKE_PROFILE_KEY_INPUT="$profile_key_input" \
+    FAKE_AZURE_INPUT="$azure_input" \
+    FAKE_PROMPT_INPUT="$prompt_input" \
+    FAKE_REPORT="$fake_report" \
+    FAKE_PRE_SENTINEL_COUNT="$post_sentinel_75_count" \
+    FAKE_POST_SENTINEL_STATUS=75 \
+    "$SCRIPT" --api-url https://api.dev.locality.dev --name post-sentinel-75 2>&1
+)"
+post_sentinel_75_status=$?
+set -e
+[ "$post_sentinel_75_status" -eq 75 ] || \
+  fail "post-sentinel child status 75 should be preserved, got ${post_sentinel_75_status}"
+[ "$(cat "$post_sentinel_75_count")" -eq 1 ] || \
+  fail "post-sentinel child status 75 replayed the credential"
+if grep -F -q -- 'credential transport closed' <<<"$post_sentinel_75_output"; then
+  fail "post-sentinel child status 75 was incorrectly classified as pre-delivery transport failure"
+fi
 
 : > "$fake_log"
 set +e
@@ -173,7 +848,7 @@ invalid_status=$?
 set -e
 [ "$invalid_status" -eq 2 ] || fail "empty Workspace Profile key should return usage status 2"
 [ ! -s "$fake_log" ] || fail "empty Workspace Profile key should fail before creating a sandbox"
-grep -F -q -- 'Workspace Profile key must not be empty' <<<"$invalid_output" || \
+grep -F -q -- 'Workspace Profile key must be 64 lowercase hexadecimal characters' <<<"$invalid_output" || \
   fail "empty Workspace Profile key error was not actionable"
 
 printf 'init Amika Locality snapshot tests passed\n'
