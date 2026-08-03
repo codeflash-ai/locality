@@ -429,6 +429,61 @@ grep -F -x -q -- '-g' "$tty_stty_log" || fail "credential read did not capture t
 grep -F -x -q -- '-echo' "$tty_stty_log" || fail "credential read did not disable terminal echo"
 [ ! -s "$fake_log" ] || fail "credential read interruption contacted Amika"
 
+: > "$fake_log"
+: > "$tty_stty_log"
+TTY_TEST_PATH="${tty_bin}:${fake_bin}:$PATH" \
+  TTY_TEST_SCRIPT="$SCRIPT" \
+  TTY_TEST_AZURE_KEY="$azure_key" \
+  TTY_TEST_AMIKA_LOG="$fake_log" \
+  TTY_TEST_STTY_LOG="$tty_stty_log" \
+  TTY_TEST_RESTORED="$tty_restored" \
+  TTY_TEST_REAL_STTY="$(command -v stty)" \
+  TTY_TEST_PROFILE_KEY="$profile_key" \
+  expect -c '
+    set timeout 10
+    spawn -noecho env \
+      PATH=$env(TTY_TEST_PATH) \
+      AZURE_OPENAI_API_KEY=$env(TTY_TEST_AZURE_KEY) \
+      FAKE_AMIKA_LOG=$env(TTY_TEST_AMIKA_LOG) \
+      FAKE_STTY_LOG=$env(TTY_TEST_STTY_LOG) \
+      FAKE_STTY_RESTORED=$env(TTY_TEST_RESTORED) \
+      REAL_STTY=$env(TTY_TEST_REAL_STTY) \
+      FAKE_CREATE_STATUS=17 \
+      $env(TTY_TEST_SCRIPT) \
+        --api-url https://api.dev.locality.dev \
+        --name delayed-read
+    set echo_disabled 0
+    for {set attempt 0} {$attempt < 100} {incr attempt} {
+      after 50
+      if {[file exists $env(TTY_TEST_STTY_LOG)]} {
+        set handle [open $env(TTY_TEST_STTY_LOG) r]
+        set log [read $handle]
+        close $handle
+        if {[string first "-echo\n" $log] >= 0} {
+          set echo_disabled 1
+          break
+        }
+      }
+    }
+    if {!$echo_disabled} {
+      catch {exec kill -TERM [exp_pid]}
+      catch {expect eof}
+      catch {wait}
+      exit 124
+    }
+    set key $env(TTY_TEST_PROFILE_KEY)
+    send -- [string range $key 0 31]
+    after 1200
+    send -- "[string range $key 32 end]\r"
+    expect eof
+    set result [wait]
+    if {[lindex $result 2] != 0 || [lindex $result 3] != 2} {
+      exit 125
+    }
+  ' >/dev/null 2>&1 || fail "delayed terminal key input was not preserved across polling timeouts"
+assert_contains "$fake_log" "sandbox create --remote --name delayed-read --no-git --yes"
+grep -F -q -- "$profile_key" "$fake_log" && fail "delayed terminal key leaked to Amika arguments"
+
 output="$(
   printf '%s\n' "$profile_key" | \
     PATH="${fake_bin}:$PATH" \

@@ -50,11 +50,31 @@ restore_terminal_state() {
   local saved_state="${TERMINAL_STATE:-}"
 
   if [ "${TERMINAL_STATE_ACTIVE:-false}" != true ]; then
-    return
+    return 0
   fi
   TERMINAL_STATE_ACTIVE=false
   TERMINAL_STATE=""
   stty "$saved_state" < /dev/tty 2>/dev/null || stty echo < /dev/tty 2>/dev/null || true
+}
+
+read_profile_key_from_terminal() {
+  local chunk
+  local status
+
+  PROFILE_KEY=""
+  while true; do
+    chunk=""
+    if IFS= read -r -t 1 chunk; then
+      PROFILE_KEY+="$chunk"
+      return 0
+    else
+      status=$?
+    fi
+    PROFILE_KEY+="$chunk"
+    if [ "$status" -le 128 ]; then
+      return "$status"
+    fi
+  done
 }
 
 cleanup_delivery_marker() {
@@ -77,17 +97,17 @@ forward_and_reap_active_child() {
   fi
   ACTIVE_CHILD_PID=""
   kill -s "$signal" "$child_pid" 2>/dev/null || true
-  if wait_for_child_exit "$child_pid" 50; then
+  if wait_for_child_exit "$child_pid" 200; then
     return
   fi
   if [ "$signal" != TERM ]; then
     kill -TERM "$child_pid" 2>/dev/null || true
-    if wait_for_child_exit "$child_pid" 25; then
+    if wait_for_child_exit "$child_pid" 100; then
       return
     fi
   fi
   kill -KILL "$child_pid" 2>/dev/null || true
-  if ! wait_for_child_exit "$child_pid" 50; then
+  if ! wait_for_child_exit "$child_pid" 200; then
     printf 'init Amika Locality snapshot: could not reap child %s after SIGKILL\n' "$child_pid" >&2
   fi
 }
@@ -529,7 +549,7 @@ if [ -t 0 ]; then
   TERMINAL_STATE="$(stty -g < /dev/tty)" || fail "could not read terminal state"
   TERMINAL_STATE_ACTIVE=true
   stty -echo < /dev/tty || fail "could not disable terminal echo"
-  IFS= read -r PROFILE_KEY || {
+  read_profile_key_from_terminal || {
     restore_terminal_state
     fail "read the Workspace Profile key from standard input"
   }
