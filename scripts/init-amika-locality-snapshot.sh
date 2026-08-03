@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set +a
+unset PROFILE_KEY AZURE_OPENAI_API_KEY_VALUE
 
 usage() {
   cat <<'EOF'
@@ -70,7 +72,42 @@ forward_and_reap_active_child() {
   fi
   ACTIVE_CHILD_PID=""
   kill -s "$signal" "$child_pid" 2>/dev/null || true
-  wait "$child_pid" 2>/dev/null || true
+  if wait_for_child_exit "$child_pid" 200; then
+    return
+  fi
+  if [ "$signal" != TERM ]; then
+    kill -TERM "$child_pid" 2>/dev/null || true
+    if wait_for_child_exit "$child_pid" 100; then
+      return
+    fi
+  fi
+  kill -KILL "$child_pid" 2>/dev/null || true
+  if ! wait_for_child_exit "$child_pid" 200; then
+    printf 'init Amika Locality snapshot: could not reap child %s after SIGKILL\n' "$child_pid" >&2
+  fi
+}
+
+wait_for_child_exit() {
+  local child_pid="$1"
+  local attempts="$2"
+  local state
+
+  while [ "$attempts" -gt 0 ]; do
+    if ! kill -0 "$child_pid" 2>/dev/null; then
+      wait "$child_pid" 2>/dev/null || true
+      return 0
+    fi
+    state="$(ps -o stat= -p "$child_pid" 2>/dev/null || true)"
+    case "$state" in
+      ''|*Z*)
+        wait "$child_pid" 2>/dev/null || true
+        return 0
+        ;;
+    esac
+    attempts=$((attempts - 1))
+    sleep 0.01
+  done
+  return 1
 }
 
 cleanup_on_exit() {
@@ -221,9 +258,11 @@ amika_ssh() {
   remote_command="$(encode_remote_argv "$@")"
   command -v expect >/dev/null 2>&1 || fail "expect is required for Amika PTY transport"
   prepare_child_launch
-  AMIKA_EXPECT_COMMON="$EXPECT_TRANSPORT_PROCS" \
-    AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
-    expect -c '
+  (
+    trap - HUP INT TERM
+    AMIKA_EXPECT_COMMON="$EXPECT_TRANSPORT_PROCS" \
+      AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
+      exec expect -c '
       eval $env(AMIKA_EXPECT_COMMON)
       initialize_transport
       set timeout 1800
@@ -242,7 +281,8 @@ amika_ssh() {
           exit 124
         }
       }
-    ' &
+    '
+  ) &
   activate_child "$!"
   wait_for_active_child "$ACTIVE_CHILD_PID"
 }
@@ -267,10 +307,12 @@ amika_ssh_secret_line() {
 
   while [ "$attempt" -le 3 ]; do
     prepare_child_launch
-    AMIKA_EXPECT_COMMON="$EXPECT_TRANSPORT_PROCS" \
-      AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
-      AMIKA_DELIVERY_MARKER="$delivery_marker" \
-      expect -c '
+    (
+      trap - HUP INT TERM
+      AMIKA_EXPECT_COMMON="$EXPECT_TRANSPORT_PROCS" \
+        AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
+        AMIKA_DELIVERY_MARKER="$delivery_marker" \
+        exec expect -c '
         eval $env(AMIKA_EXPECT_COMMON)
         initialize_transport
         set timeout 30
@@ -323,7 +365,8 @@ amika_ssh_secret_line() {
             exit 124
           }
         }
-      ' <<<"$secret" &
+      '
+    ) <<<"$secret" &
     activate_child "$!"
     if wait_for_active_child "$ACTIVE_CHILD_PID"; then
       secret=""
@@ -353,6 +396,7 @@ create_amika_sandbox() {
 
   prepare_child_launch
   (
+    trap - HUP INT TERM
     cd "$REPO_ROOT"
     exec amika sandbox create \
       --remote \
@@ -374,6 +418,7 @@ CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 AZURE_OPENAI_BASE_URL="${AZURE_OPENAI_BASE_URL:-https://aseem-mp32maxp-eastus2.openai.azure.com/openai/v1}"
 AZURE_OPENAI_API_KEY_VALUE="${AZURE_OPENAI_API_KEY:-}"
+export -n AZURE_OPENAI_API_KEY_VALUE
 unset AZURE_OPENAI_API_KEY
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -491,6 +536,7 @@ if [ -t 0 ]; then
 else
   IFS= read -r PROFILE_KEY || fail "read the Workspace Profile key from standard input"
 fi
+export -n PROFILE_KEY
 [ "${#PROFILE_KEY}" -eq 64 ] || fail "Workspace Profile key must be 64 lowercase hexadecimal characters"
 case "$PROFILE_KEY" in
   *[!0-9a-f]*) fail "Workspace Profile key must be 64 lowercase hexadecimal characters" ;;

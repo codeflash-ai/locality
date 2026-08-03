@@ -160,9 +160,64 @@ cmp -s "$inline_setup_config" "${inline_setup_config}.expected" || \
 grep -F -q -- 'refusing to modify inline Azure provider setting' <<<"$inline_setup_output" || \
   fail "inline Azure provider failure did not explain why the merge was refused"
 
+nested_setup_root="${tmp_root}/nested-setup"
+nested_setup_config="${nested_setup_root}/config.toml"
+mkdir -p "$nested_setup_root"
+nested_setup_text="$(cat <<'TOML'
+["model_providers"."azure"."http_headers"] # nested provider comment
+"x-preserved" = "nested-value"
+TOML
+)"
+printf '%s' "$nested_setup_text" > "$nested_setup_config"
+unset nested_setup_text
+env -u AMIKA_AGENT_CWD \
+  PATH="${fake_bin}:$PATH" \
+  CODEX_HOME="$nested_setup_root" \
+  CODEX_MODEL="nested-model" \
+  CODEX_REASONING_EFFORT="medium" \
+  AZURE_OPENAI_BASE_URL="https://nested.invalid/openai/v1" \
+  "$AZURE_SETUP_SCRIPT" >/dev/null
+
+python3 - "$nested_setup_config" <<'PY'
+import sys
+import tomllib
+
+path = sys.argv[1]
+with open(path, "rb") as source:
+    contents = source.read()
+config = tomllib.loads(contents.decode("utf-8"))
+provider = config["model_providers"]["azure"]
+assert config["model"] == "nested-model"
+assert config["model_provider"] == "azure"
+assert config["model_reasoning_effort"] == "medium"
+assert provider["name"] == "Azure OpenAI"
+assert provider["base_url"] == "https://nested.invalid/openai/v1"
+assert provider["env_key"] == "AZURE_OPENAI_API_KEY"
+assert provider["wire_api"] == "responses"
+assert provider["http_headers"] == {"x-preserved": "nested-value"}
+text = contents.decode("utf-8")
+assert not contents.endswith((b"\n", b"\r"))
+assert '''["model_providers"."azure"."http_headers"] # nested provider comment
+"x-preserved" = "nested-value"''' in text
+assert text.index("[model_providers.azure]") < text.index('["model_providers"."azure"."http_headers"]')
+PY
+
 cat > "${fake_bin}/amika" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+
+for secret_name in PROFILE_KEY AZURE_OPENAI_API_KEY_VALUE AZURE_OPENAI_API_KEY AMIKA_SECRET_LINE; do
+  if [ -n "${!secret_name+x}" ]; then
+    if [ -n "${FAKE_CHILD_ENV_CHECK_FILE:-}" ]; then
+      printf 'leaked %s\n' "$secret_name" > "$FAKE_CHILD_ENV_CHECK_FILE"
+    fi
+    printf '%s environment leak\n' "$secret_name" >&2
+    exit 90
+  fi
+done
+if [ -n "${FAKE_CHILD_ENV_CHECK_FILE:-}" ]; then
+  printf 'clean\n' > "$FAKE_CHILD_ENV_CHECK_FILE"
+fi
 
 printf 'amika' >> "${FAKE_AMIKA_LOG:?}"
 for arg in "$@"; do
@@ -173,6 +228,9 @@ printf '\n' >> "$FAKE_AMIKA_LOG"
 if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "create" ]; then
   if [ -n "${FAKE_CREATE_BLOCK_PID_FILE:-}" ]; then
     printf '%s\n' "$$" > "$FAKE_CREATE_BLOCK_PID_FILE"
+    if [ "${FAKE_CREATE_IGNORE_SIGNALS:-false}" = true ]; then
+      trap '' HUP INT TERM
+    fi
     exec sleep 300
   fi
   if [ -n "${FAKE_CREATE_STATUS:-}" ]; then
@@ -183,14 +241,6 @@ if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "create" ]; then
 fi
 
 if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "ssh" ]; then
-  [ -z "${AMIKA_SECRET_LINE:-}" ] || {
-    printf 'secret environment leak\n' >&2
-    exit 90
-  }
-  [ -z "${AZURE_OPENAI_API_KEY:-}" ] || {
-    printf 'Azure key environment leak\n' >&2
-    exit 91
-  }
   last_arg=""
   for arg in "$@"; do
     last_arg="$arg"
@@ -258,6 +308,32 @@ chmod +x "${fake_bin}/amika"
 
 profile_key="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 azure_key="test-azure-key"
+
+: > "$fake_log"
+child_env_check="${tmp_root}/child-env-check"
+set +e
+allexport_output="$(
+  printf '%s\n' "$profile_key" | \
+    env \
+      PROFILE_KEY="inherited-exported-profile-key" \
+      AZURE_OPENAI_API_KEY_VALUE="inherited-exported-azure-key" \
+      AZURE_OPENAI_API_KEY="$azure_key" \
+      PATH="${fake_bin}:$PATH" \
+      FAKE_AMIKA_LOG="$fake_log" \
+      FAKE_CHILD_ENV_CHECK_FILE="$child_env_check" \
+      FAKE_CREATE_STATUS=17 \
+      bash -a "$SCRIPT" \
+        --api-url https://api.dev.locality.dev \
+        --name allexport-secrets 2>&1
+)"
+allexport_status=$?
+set -e
+[ "$allexport_status" -eq 2 ] || fail "allexport fixture should stop at sandbox creation"
+[ "$(cat "$child_env_check")" = clean ] || \
+  fail "secret shell variables leaked to a child under allexport: $(cat "$child_env_check")"
+if grep -F -q -- 'environment leak' <<<"$allexport_output"; then
+  fail "inherited exported secret variables leaked to a child"
+fi
 
 tty_bin="${tmp_root}/tty-bin"
 tty_stty_log="${tmp_root}/tty-stty.log"
@@ -445,42 +521,88 @@ assert_not_contains "$fake_log" "sandbox ssh"
 grep -F -q -- 'no credentials were transferred' <<<"$create_failure_output" || \
   fail "sandbox collision failure did not explain credential safety"
 
-: > "$fake_log"
-create_block_pid_file="${tmp_root}/create-block.pid"
-create_interrupt_input="${tmp_root}/create-interrupt.input"
-create_interrupt_output="${tmp_root}/create-interrupt.output"
-printf '%s\n' "$profile_key" > "$create_interrupt_input"
-PATH="${fake_bin}:$PATH" \
-  AZURE_OPENAI_API_KEY="$azure_key" \
-  FAKE_AMIKA_LOG="$fake_log" \
-  FAKE_CREATE_BLOCK_PID_FILE="$create_block_pid_file" \
-  "$SCRIPT" --api-url https://api.dev.locality.dev --name interrupted-create \
-    <"$create_interrupt_input" >"$create_interrupt_output" 2>&1 &
-create_public_script_pid=$!
-for _ in $(seq 1 100); do
-  [ -s "$create_block_pid_file" ] && break
-  sleep 0.05
-done
-[ -s "$create_block_pid_file" ] || fail "sandbox creation interruption fixture did not start"
-blocked_create_pid="$(cat "$create_block_pid_file")"
-kill -TERM "$create_public_script_pid"
-set +e
-wait "$create_public_script_pid"
-create_interrupt_status=$?
-set -e
-[ "$create_interrupt_status" -eq 143 ] || \
-  fail "TERM-interrupted public script sandbox creation should return 143, got ${create_interrupt_status}: $(cat "$create_interrupt_output")"
-for _ in $(seq 1 100); do
-  if ! kill -0 "$blocked_create_pid" 2>/dev/null; then
-    break
+real_expect="$(command -v expect)"
+run_create_interruption() {
+  local signal="$1"
+  local expected_status="$2"
+  local block_pid_file="${tmp_root}/create-block-${signal}.pid"
+  local input="${tmp_root}/create-interrupt-${signal}.input"
+  local output="${tmp_root}/create-interrupt-${signal}.output"
+  local ignore_signals=false
+  local interrupt_status
+  local blocked_create_pid
+
+  if [ "$signal" = TERM ]; then
+    ignore_signals=true
   fi
-  sleep 0.05
-done
-if kill -0 "$blocked_create_pid" 2>/dev/null; then
-  fail "interrupted public script left sandbox creation child ${blocked_create_pid} running"
-fi
-assert_contains "$fake_log" "sandbox create --remote --name interrupted-create --no-git --yes"
-assert_not_contains "$fake_log" "sandbox ssh"
+  : > "$fake_log"
+  printf '%s\n' "$profile_key" > "$input"
+  set +e
+  CREATE_TEST_PATH="${fake_bin}:$PATH" \
+    CREATE_TEST_SCRIPT="$SCRIPT" \
+    CREATE_TEST_INPUT="$input" \
+    CREATE_TEST_SIGNAL="$signal" \
+    CREATE_TEST_AZURE_KEY="$azure_key" \
+    CREATE_TEST_AMIKA_LOG="$fake_log" \
+    CREATE_TEST_BLOCK_PID_FILE="$block_pid_file" \
+    CREATE_TEST_IGNORE_SIGNALS="$ignore_signals" \
+    "$real_expect" -c '
+      set timeout 10
+      spawn -noecho env \
+        PATH=$env(CREATE_TEST_PATH) \
+        AZURE_OPENAI_API_KEY=$env(CREATE_TEST_AZURE_KEY) \
+        FAKE_AMIKA_LOG=$env(CREATE_TEST_AMIKA_LOG) \
+        FAKE_CREATE_BLOCK_PID_FILE=$env(CREATE_TEST_BLOCK_PID_FILE) \
+        FAKE_CREATE_IGNORE_SIGNALS=$env(CREATE_TEST_IGNORE_SIGNALS) \
+        sh -c {exec "$1" --api-url https://api.dev.locality.dev --name "interrupted-create-$3" < "$2"} \
+        sh $env(CREATE_TEST_SCRIPT) $env(CREATE_TEST_INPUT) $env(CREATE_TEST_SIGNAL)
+      set public_script_pid [exp_pid]
+      set child_started 0
+      for {set attempt 0} {$attempt < 100} {incr attempt} {
+        after 50
+        if {[file exists $env(CREATE_TEST_BLOCK_PID_FILE)] && [file size $env(CREATE_TEST_BLOCK_PID_FILE)] > 0} {
+          set child_started 1
+          break
+        }
+      }
+      if {!$child_started} {
+        catch {exec kill -KILL $public_script_pid}
+        catch {expect eof}
+        catch {wait}
+        exit 124
+      }
+      exec kill -$env(CREATE_TEST_SIGNAL) $public_script_pid
+      expect {
+        eof {}
+        timeout {
+          catch {exec kill -KILL $public_script_pid}
+          catch {expect eof}
+          catch {wait}
+          exit 124
+        }
+      }
+      set result [wait]
+      if {[lindex $result 2] != 0} {
+        exit 125
+      }
+      exit [lindex $result 3]
+    ' >"$output" 2>&1
+  interrupt_status=$?
+  set -e
+  [ "$interrupt_status" -eq "$expected_status" ] || \
+    fail "${signal}-interrupted public script sandbox creation should return ${expected_status}, got ${interrupt_status}: $(cat "$output")"
+  [ -s "$block_pid_file" ] || fail "${signal} sandbox creation interruption fixture did not start"
+  blocked_create_pid="$(cat "$block_pid_file")"
+  if kill -0 "$blocked_create_pid" 2>/dev/null; then
+    fail "${signal}-interrupted public script left sandbox creation child ${blocked_create_pid} running"
+  fi
+  assert_contains "$fake_log" "sandbox create --remote --name interrupted-create-${signal} --no-git --yes"
+  assert_not_contains "$fake_log" "sandbox ssh"
+}
+
+run_create_interruption HUP 129
+run_create_interruption INT 130
+run_create_interruption TERM 143
 
 : > "$fake_log"
 pre_sentinel_count="${tmp_root}/pre-sentinel.count"

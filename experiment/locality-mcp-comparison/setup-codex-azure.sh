@@ -326,23 +326,39 @@ if missing_provider:
             and azure_path[:len(item["context"])] == item["context"]
         ]
         if not provider_children:
-            raise SystemExit(f"refusing to extend inline Azure provider table in {path}")
-        context = max((item["context"] for item in provider_children), key=len)
-        if context:
-            context_headers = [
+            nested_provider_tables = [
                 header for header in headers
-                if header["path"] == context and not header["array"]
+                if not header["array"]
+                and len(header["path"]) > len(azure_path)
+                and header["path"][:len(azure_path)] == azure_path
             ]
-            if len(context_headers) != 1:
-                raise SystemExit(f"refusing to extend ambiguous Azure provider context in {path}")
-            insertion_position = context_headers[0]["section_end"]
+            if not nested_provider_tables:
+                raise SystemExit(f"refusing to extend inline Azure provider table in {path}")
+            first_nested_table = min(nested_provider_tables, key=lambda header: header["start"])
+            add_group(first_nested_table["start"], [
+                "[model_providers.azure]",
+                *(
+                    f"{key} = {json.dumps(provider_values[key], ensure_ascii=False)}"
+                    for key in missing_provider
+                ),
+            ])
         else:
-            insertion_position = first_header
-        relative_provider = azure_path[len(context):]
-        add_group(insertion_position, [
-            f"{'.'.join((*relative_provider, key))} = {json.dumps(provider_values[key], ensure_ascii=False)}"
-            for key in missing_provider
-        ])
+            context = max((item["context"] for item in provider_children), key=len)
+            if context:
+                context_headers = [
+                    header for header in headers
+                    if header["path"] == context and not header["array"]
+                ]
+                if len(context_headers) != 1:
+                    raise SystemExit(f"refusing to extend ambiguous Azure provider context in {path}")
+                insertion_position = context_headers[0]["section_end"]
+            else:
+                insertion_position = first_header
+            relative_provider = azure_path[len(context):]
+            add_group(insertion_position, [
+                f"{'.'.join((*relative_provider, key))} = {json.dumps(provider_values[key], ensure_ascii=False)}"
+                for key in missing_provider
+            ])
 
 newline = "\r\n" if "\r\n" in text else "\n"
 for position, groups in insertions.items():
