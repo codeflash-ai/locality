@@ -4337,6 +4337,40 @@ mod tests {
     }
 
     #[test]
+    fn gmail_send_folder_accepts_virtual_create() {
+        let mount_id = MountId::new("gmail-main");
+        let content_root = temp_root("loc-gmail-send-create").join("content/gmail-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "gmail"))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("gmail-folder:send"),
+                kind: EntityKind::Directory,
+                title: "send".to_string(),
+                path: "send".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: Some("folder:send".to_string()),
+            })
+            .expect("save send folder");
+
+        let report = create_virtual_fs_file(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "gmail-folder:send",
+            "reply.md",
+        )
+        .expect("send create");
+
+        assert_eq!(report.item.path, "send/reply.md");
+        assert_eq!(report.item.entity_kind, Some(EntityKind::Page));
+    }
+
+    #[test]
     fn gmail_draft_folder_rejects_nested_directory_create_without_mutation_or_file() {
         let mount_id = MountId::new("gmail-main");
         let state_root = temp_root("loc-gmail-draft-nested-dir-create");
@@ -4417,9 +4451,11 @@ mod tests {
             .expect("save mount");
         for (remote_id, title, path) in [
             ("gmail-folder:draft", "draft", "draft"),
+            ("gmail-folder:send", "send", "send"),
             ("gmail-folder:inbox", "inbox", "inbox"),
             ("gmail-folder:sent", "sent", "sent"),
             ("gmail-folder:draft/nested", "nested", "draft/nested"),
+            ("gmail-folder:send/nested", "nested", "send/nested"),
         ] {
             store
                 .save_entity(EntityRecord {
@@ -4454,6 +4490,12 @@ mod tests {
                 .read_only
         );
         assert!(
+            !virtual_fs_item(&store, &mount_id, "gmail-folder:send")
+                .expect("send item")
+                .item
+                .read_only
+        );
+        assert!(
             virtual_fs_item(&store, &mount_id, "gmail-folder:inbox")
                 .expect("inbox item")
                 .item
@@ -4468,6 +4510,12 @@ mod tests {
         assert!(
             virtual_fs_item(&store, &mount_id, "gmail-folder:draft/nested")
                 .expect("nested draft folder item")
+                .item
+                .read_only
+        );
+        assert!(
+            virtual_fs_item(&store, &mount_id, "gmail-folder:send/nested")
+                .expect("nested send folder item")
                 .item
                 .read_only
         );

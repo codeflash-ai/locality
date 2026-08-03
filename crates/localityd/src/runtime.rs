@@ -5777,11 +5777,11 @@ mod tests {
     };
 
     fn reconciled_gmail_send_response() -> DaemonResponse {
-        let draft_folder_id = RemoteId::new("gmail-folder:draft");
+        let send_folder_id = RemoteId::new("gmail-folder:send");
         let sent_folder_id = RemoteId::new("gmail-folder:sent");
         let sent_message_id = RemoteId::new("gmail-message:sent-1");
-        let operation_id = PushOperationId("create-gmail-draft".to_string());
-        let push_id = PushId("push-gmail-draft".to_string());
+        let operation_id = PushOperationId("create-gmail-send".to_string());
+        let push_id = PushId("push-gmail-send".to_string());
         let apply_effect = JournalApplyEffect::CreatedEntity {
             operation_id,
             operation_index: 0,
@@ -5791,15 +5791,15 @@ mod tests {
         let pipeline = PushPipelineResult {
             validation: ValidationReport::clean(),
             plan: Some(PushPlan::new(
-                vec![draft_folder_id.clone()],
+                vec![send_folder_id.clone()],
                 vec![PushOperation::CreateEntity {
-                    parent_id: draft_folder_id,
+                    parent_id: send_folder_id,
                     parent_kind: Some(EntityKind::Directory),
                     parent_workspace: false,
                     title: "Test message".to_string(),
                     properties: BTreeMap::new(),
                     body: "Body".to_string(),
-                    source_path: "draft/test-message.md".into(),
+                    source_path: "send/test-message.md".into(),
                 }],
             )),
             guardrail: GuardrailDecision::Proceed,
@@ -5816,9 +5816,9 @@ mod tests {
             completed_stages: Vec::new(),
         };
         DaemonResponse::ok(PushJobReport {
-            target_path: "/tmp/gmail-main/draft/test-message.md".into(),
+            target_path: "/tmp/gmail-main/send/test-message.md".into(),
             mount_id: MountId::new("gmail-main"),
-            entity_id: RemoteId::new("local:gmail-draft"),
+            entity_id: RemoteId::new("local:gmail-send"),
             pipeline,
             readable_diff: None,
             action: PushJobAction::Reconciled,
@@ -5833,9 +5833,9 @@ mod tests {
         store
             .append_journal(
                 JournalEntry::new(
-                    PushId("push-gmail-draft".to_string()),
+                    PushId("push-gmail-send".to_string()),
                     MountId::new("gmail-main"),
-                    vec![RemoteId::new("gmail-folder:draft")],
+                    vec![RemoteId::new("gmail-folder:send")],
                     PushPlan::new(Vec::new(), Vec::new()),
                     JournalStatus::Reconciled,
                 )
@@ -5843,7 +5843,7 @@ mod tests {
                     JournalMetadata::default().with_local_projection_items(vec![
                         JournalLocalProjectionItem {
                             operation_index: 0,
-                            local_id: "local:gmail-draft".to_string(),
+                            local_id: "local:gmail-send".to_string(),
                         },
                     ]),
                 ),
@@ -5852,7 +5852,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciled_gmail_send_refreshes_draft_and_sent_file_provider_containers() {
+    fn reconciled_gmail_send_refreshes_send_and_sent_file_provider_containers() {
         let mut store = InMemoryStateStore::new();
         store
             .save_mount(
@@ -5875,10 +5875,10 @@ mod tests {
             vec![ProjectionRefreshRequest {
                 mount_id: "gmail-main".to_string(),
                 container_identifiers: vec![
-                    "gmail-folder:draft".to_string(),
+                    "gmail-folder:send".to_string(),
                     "gmail-folder:sent".to_string(),
                 ],
-                local_item_identifiers: vec!["local:gmail-draft".to_string()],
+                local_item_identifiers: vec!["local:gmail-send".to_string()],
             }]
         );
     }
@@ -5905,24 +5905,24 @@ mod tests {
     }
 
     #[test]
-    fn gmail_file_provider_refresh_removes_local_draft_before_signaling_containers() {
+    fn gmail_file_provider_refresh_removes_local_send_before_signaling_containers() {
         let mut actions = Vec::new();
 
         refresh_macos_file_provider_after_gmail_push_with(
             &ProjectionRefreshRequest {
                 mount_id: "gmail-main".to_string(),
                 container_identifiers: vec![
-                    "gmail-folder:draft".to_string(),
+                    "gmail-folder:send".to_string(),
                     "gmail-folder:sent".to_string(),
                 ],
-                local_item_identifiers: vec!["local:gmail-draft".to_string()],
+                local_item_identifiers: vec!["local:gmail-send".to_string()],
             },
             |action, identifier| {
                 actions.push((action.to_string(), identifier.to_string()));
                 Ok(())
             },
         )
-        .expect("remove draft and signal containers");
+        .expect("remove send item and signal containers");
 
         assert_eq!(actions.len(), 3);
         assert_eq!(actions[0].0, "remove");
