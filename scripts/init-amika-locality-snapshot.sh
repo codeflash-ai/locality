@@ -77,17 +77,17 @@ forward_and_reap_active_child() {
   fi
   ACTIVE_CHILD_PID=""
   kill -s "$signal" "$child_pid" 2>/dev/null || true
-  if wait_for_child_exit "$child_pid" 200; then
+  if wait_for_child_exit "$child_pid" 50; then
     return
   fi
   if [ "$signal" != TERM ]; then
     kill -TERM "$child_pid" 2>/dev/null || true
-    if wait_for_child_exit "$child_pid" 100; then
+    if wait_for_child_exit "$child_pid" 25; then
       return
     fi
   fi
   kill -KILL "$child_pid" 2>/dev/null || true
-  if ! wait_for_child_exit "$child_pid" 200; then
+  if ! wait_for_child_exit "$child_pid" 50; then
     printf 'init Amika Locality snapshot: could not reap child %s after SIGKILL\n' "$child_pid" >&2
   fi
 }
