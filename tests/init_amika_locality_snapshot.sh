@@ -206,7 +206,8 @@ cat > "${fake_bin}/amika" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-for secret_name in PROFILE_KEY AZURE_OPENAI_API_KEY_VALUE AZURE_OPENAI_API_KEY AMIKA_SECRET_LINE; do
+for secret_name in PROFILE_KEY LOCALITY_PROFILE_KEY AMIKA_SECRET_LINE \
+  AZURE_OPENAI_API_KEY_VALUE AZURE_OPENAI_API_KEY; do
   if [ -n "${!secret_name+x}" ]; then
     if [ -n "${FAKE_CHILD_ENV_CHECK_FILE:-}" ]; then
       printf 'leaked %s\n' "$secret_name" > "$FAKE_CHILD_ENV_CHECK_FILE"
@@ -215,10 +216,6 @@ for secret_name in PROFILE_KEY AZURE_OPENAI_API_KEY_VALUE AZURE_OPENAI_API_KEY A
     exit 90
   fi
 done
-if [ -n "${FAKE_CHILD_ENV_CHECK_FILE:-}" ]; then
-  printf 'clean\n' > "$FAKE_CHILD_ENV_CHECK_FILE"
-fi
-
 printf 'amika' >> "${FAKE_AMIKA_LOG:?}"
 for arg in "$@"; do
   printf ' %q' "$arg" >> "$FAKE_AMIKA_LOG"
@@ -306,6 +303,21 @@ exit 2
 SH
 chmod +x "${fake_bin}/amika"
 
+cat > "${fake_bin}/date" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+for secret_name in PROFILE_KEY LOCALITY_PROFILE_KEY AMIKA_SECRET_LINE \
+  AZURE_OPENAI_API_KEY_VALUE AZURE_OPENAI_API_KEY; do
+  if [ -n "${!secret_name+x}" ]; then
+    printf 'leaked %s\n' "$secret_name" > "${FAKE_CHILD_ENV_CHECK_FILE:?}"
+    exit 90
+  fi
+done
+printf '20260803-000000\n'
+SH
+chmod +x "${fake_bin}/date"
+
 profile_key="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 azure_key="test-azure-key"
 
@@ -316,6 +328,8 @@ allexport_output="$(
   printf '%s\n' "$profile_key" | \
     env \
       PROFILE_KEY="inherited-exported-profile-key" \
+      LOCALITY_PROFILE_KEY="inherited-documented-profile-key" \
+      AMIKA_SECRET_LINE="inherited-legacy-secret" \
       AZURE_OPENAI_API_KEY_VALUE="inherited-exported-azure-key" \
       AZURE_OPENAI_API_KEY="$azure_key" \
       PATH="${fake_bin}:$PATH" \
@@ -323,13 +337,12 @@ allexport_output="$(
       FAKE_CHILD_ENV_CHECK_FILE="$child_env_check" \
       FAKE_CREATE_STATUS=17 \
       bash -a "$SCRIPT" \
-        --api-url https://api.dev.locality.dev \
-        --name allexport-secrets 2>&1
+        --api-url https://api.dev.locality.dev 2>&1
 )"
 allexport_status=$?
 set -e
 [ "$allexport_status" -eq 2 ] || fail "allexport fixture should stop at sandbox creation"
-[ "$(cat "$child_env_check")" = clean ] || \
+[ ! -e "$child_env_check" ] || \
   fail "secret shell variables leaked to a child under allexport: $(cat "$child_env_check")"
 if grep -F -q -- 'environment leak' <<<"$allexport_output"; then
   fail "inherited exported secret variables leaked to a child"
