@@ -479,7 +479,7 @@ fn loopback_identity_bootstrap_sends_only_sealed_requests_and_materializes() {
     assert_eq!(bootstrap.headers.get("accept").unwrap(), "application/json");
     assert_eq!(
         bootstrap.headers.get("user-agent").unwrap(),
-        "locality-loc/0.3.6"
+        concat!("locality-loc/", env!("CARGO_PKG_VERSION"))
     );
     assert_eq!(
         bootstrap.headers.get("content-type").unwrap(),
