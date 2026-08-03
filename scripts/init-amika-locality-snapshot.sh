@@ -50,12 +50,28 @@ amika_ssh() {
   command -v expect >/dev/null 2>&1 || fail "expect is required for Amika PTY transport"
   AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
     expect -c '
+      proc child_status {result} {
+        if {[llength $result] >= 6 && [lindex $result 4] eq "CHILDKILLED"} {
+          array set signal_number {
+            SIGHUP 1 SIGINT 2 SIGQUIT 3 SIGKILL 9 SIGPIPE 13 SIGTERM 15
+          }
+          set signal [lindex $result 5]
+          if {[info exists signal_number($signal)]} {
+            return [expr {128 + $signal_number($signal)}]
+          }
+          return 125
+        }
+        if {[lindex $result 2] != 0} {
+          return 125
+        }
+        return [lindex $result 3]
+      }
       set timeout 1800
       spawn -noecho amika sandbox ssh -t $env(AMIKA_SANDBOX_NAME) -- $env(AMIKA_REMOTE_COMMAND)
       expect {
         eof {
           set result [wait]
-          exit [lindex $result 3]
+          exit [child_status $result]
         }
         timeout {
           catch {close}
@@ -84,6 +100,22 @@ amika_ssh_secret_line() {
     if printf '%s\n' "$secret" | \
       AMIKA_SANDBOX_NAME="$sandbox" AMIKA_REMOTE_COMMAND="$remote_command" \
       expect -c '
+        proc child_status {result} {
+          if {[llength $result] >= 6 && [lindex $result 4] eq "CHILDKILLED"} {
+            array set signal_number {
+              SIGHUP 1 SIGINT 2 SIGQUIT 3 SIGKILL 9 SIGPIPE 13 SIGTERM 15
+            }
+            set signal [lindex $result 5]
+            if {[info exists signal_number($signal)]} {
+              return [expr {128 + $signal_number($signal)}]
+            }
+            return 125
+          }
+          if {[lindex $result 2] != 0} {
+            return 125
+          }
+          return [lindex $result 3]
+        }
         set timeout 30
         if {[gets stdin secret] < 0} {
           puts stderr "credential input closed before a secret was read"
@@ -110,7 +142,7 @@ amika_ssh_secret_line() {
         expect {
           eof {
             set result [wait]
-            exit [lindex $result 3]
+            exit [child_status $result]
           }
           timeout {
             catch {close}
@@ -276,6 +308,7 @@ else
   (cd "$REPO_ROOT" && amika sandbox create \
     --remote \
     --name "$SANDBOX_NAME" \
+    --no-git \
     --yes >/dev/null)
 fi
 
@@ -297,6 +330,26 @@ amika_ssh "$SANDBOX_NAME" -- sh -c '
   install -m 0755 "$work_dir/package/usr/bin/loc" "$HOME/.local/bin/loc"
   "$HOME/.local/bin/loc" sandbox init --help >/dev/null
 ' sh "$LOC_RELEASE_VERSION" "$LOC_RELEASE_DEB_SHA256"
+
+if [ "$REUSE_SANDBOX" = true ]; then
+  printf 'Checking reused sandbox evidence boundary before authorization...\n'
+  amika_ssh "$SANDBOX_NAME" -- sh -c '
+    set -eu
+    repo_dir=/home/amika/workspace/locality
+    if [ -e "$repo_dir" ]; then
+      test "$(git -C "$repo_dir" rev-parse --is-inside-work-tree)" = true
+      origin_url=$(git -C "$repo_dir" remote get-url origin)
+      case "$origin_url" in
+        https://github.com/codeflash-ai/locality|https://github.com/codeflash-ai/locality.git|git@github.com:codeflash-ai/locality.git) ;;
+        *) printf "unexpected Locality repository origin: %s\n" "$origin_url" >&2; exit 65 ;;
+      esac
+      test -z "$(git -C "$repo_dir" status --porcelain --untracked-files=all)" || {
+        printf "Locality evidence checkout is dirty; use a clean sandbox or remove the changes explicitly\n" >&2
+        exit 65
+      }
+    fi
+  ' sh
+fi
 
 printf 'Materializing scoped workspace at %s:%s...\n' "$SANDBOX_NAME" "$REMOTE_ROOT"
 amika_ssh_secret_line "$SANDBOX_NAME" "$PROFILE_KEY" -- sh -c '
@@ -329,7 +382,7 @@ amika_ssh "$SANDBOX_NAME" -- sh -c '
   if [ ! -e "$repo_dir" ]; then
     git clone https://github.com/codeflash-ai/locality.git "$repo_dir"
   fi
-  test -d "$repo_dir/.git"
+  test "$(git -C "$repo_dir" rev-parse --is-inside-work-tree)" = true
   origin_url=$(git -C "$repo_dir" remote get-url origin)
   case "$origin_url" in
     https://github.com/codeflash-ai/locality|https://github.com/codeflash-ai/locality.git|git@github.com:codeflash-ai/locality.git) ;;
@@ -352,7 +405,12 @@ amika_ssh "$SANDBOX_NAME" -- sh -c '
   AZURE_OPENAI_BASE_URL="$azure_base_url" \
     CODEX_MODEL="$model" \
     CODEX_REASONING_EFFORT="$reasoning" \
+    AMIKA_AGENT_CWD="$HOME" \
     bash /home/amika/workspace/locality/experiment/locality-mcp-comparison/setup-codex-azure.sh
+  test -z "$(git -C /home/amika/workspace/locality status --porcelain --untracked-files=all)" || {
+    printf "Codex setup dirtied the Locality evidence checkout\n" >&2
+    exit 65
+  }
 ' sh "$AZURE_OPENAI_BASE_URL" "$CODEX_MODEL" "$CODEX_REASONING_EFFORT"
 
 PROMPT_BASE64="$(printf '%s\n' "$EFFECTIVE_PROMPT" | base64 | tr -d '\n')"
@@ -401,6 +459,13 @@ amika_ssh_secret_line "$SANDBOX_NAME" "$AZURE_OPENAI_API_KEY_VALUE" -- sh -c '
 ' sh "$CODEX_MODEL" "$CODEX_REASONING_EFFORT" "$REMOTE_ROOT"
 AZURE_OPENAI_API_KEY_VALUE=""
 unset AZURE_OPENAI_API_KEY_VALUE
+
+amika_ssh "$SANDBOX_NAME" -- sh -c '
+  test -z "$(git -C /home/amika/workspace/locality status --porcelain --untracked-files=all)" || {
+    printf "scenario modified the Locality evidence checkout\n" >&2
+    exit 65
+  }
+' sh
 
 printf '\n===== /home/amika/final_report.md =====\n'
 amika_ssh "$SANDBOX_NAME" -- cat /home/amika/final_report.md

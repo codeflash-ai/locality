@@ -57,6 +57,9 @@ if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "ssh" ]; then
   decoded="$(printf '%s' "$encoded" | base64 -d | tr '\0' '\n')"
   decoded_log="$(printf '%s' "$encoded" | base64 -d | tr '\0' ' ')"
   printf 'remote %s\n' "$decoded_log" >> "$FAKE_AMIKA_LOG"
+  if [ -n "${FAKE_SIGNAL_MATCH:-}" ] && grep -F -q -- "$FAKE_SIGNAL_MATCH" <<<"$decoded_log"; then
+    kill -TERM "$$"
+  fi
   case "$decoded_log" in
     *"--profile-key-stdin"*)
       failures="${FAKE_PRE_SENTINEL_FAILURES:-0}"
@@ -74,6 +77,9 @@ if [ "${1:-}" = "sandbox" ] && [ "${2:-}" = "ssh" ]; then
       printf '__LOCALITY_STDIN_READY__\n'
       IFS= read -r token
       printf '%s\n' "$token" > "${FAKE_PROFILE_KEY_INPUT:?}"
+      if [ -n "${FAKE_POST_SENTINEL_STATUS:-}" ]; then
+        exit "$FAKE_POST_SENTINEL_STATUS"
+      fi
       printf '{"ok":true,"command":"sandbox_init","root":"/workspace/scoped"}\n'
       ;;
     *"base64 -d > /home/amika/scenario-prompt.md"*)
@@ -119,7 +125,7 @@ output="$(
       --reasoning medium
 )"
 
-assert_contains "$fake_log" "sandbox create --remote --name test-snapshot --yes"
+assert_contains "$fake_log" "sandbox create --remote --name test-snapshot --no-git --yes"
 assert_contains "$fake_log" "sandbox ssh -t test-snapshot"
 assert_contains "$fake_log" "Locality_Linux_v"
 assert_contains "$fake_log" "0.3.7"
@@ -137,10 +143,12 @@ assert_contains "$fake_log" "--profile-key-stdin"
 assert_contains "$fake_log" "--profile"
 assert_contains "$fake_log" "/home/amika/scenario-prompt.md"
 assert_contains "$fake_log" "setup-codex-azure.sh"
+assert_contains "$fake_log" 'AMIKA_AGENT_CWD="$HOME"'
 assert_contains "$fake_log" "codex exec"
 assert_contains "$fake_log" '< /dev/null'
 assert_contains "$fake_log" "test-model medium /home/amika/locality-snapshot"
 assert_contains "$fake_log" "cat /home/amika/final_report.md"
+assert_contains "$fake_log" "status --porcelain --untracked-files=all"
 profile_exchange_line="$(grep -n -m1 -- '--profile-key-stdin' "$fake_log" | cut -d: -f1)"
 repo_prepare_line="$(grep -n -m1 -- 'git clone https://github.com/codeflash-ai/locality.git' "$fake_log" | cut -d: -f1)"
 [ "$profile_exchange_line" -lt "$repo_prepare_line" ] || \
@@ -215,6 +223,48 @@ retry_output="$(
 [ "$(cat "$pre_sentinel_count")" -eq 2 ] || fail "pre-sentinel transport failure was not retried exactly once"
 grep -F -q -- 'retrying (1/3)' <<<"$retry_output" || fail "pre-sentinel retry was not explained"
 [ "$(cat "$profile_key_input")" = "$profile_key" ] || fail "retry did not stream the Workspace Profile key"
+
+: > "$fake_log"
+set +e
+signal_output="$(
+  printf '%s\n' "$profile_key" | \
+    PATH="${fake_bin}:$PATH" \
+    AZURE_OPENAI_API_KEY="$azure_key" \
+    FAKE_AMIKA_LOG="$fake_log" \
+    FAKE_PROFILE_KEY_INPUT="$profile_key_input" \
+    FAKE_AZURE_INPUT="$azure_input" \
+    FAKE_PROMPT_INPUT="$prompt_input" \
+    FAKE_REPORT="$fake_report" \
+    FAKE_SIGNAL_MATCH='Locality_Linux_v' \
+    "$SCRIPT" --api-url https://api.dev.locality.dev --name signaled --reuse 2>&1
+)"
+signal_status=$?
+set -e
+[ "$signal_status" -eq 143 ] || fail "signaled Amika child should return 143, got ${signal_status}: ${signal_output}"
+
+: > "$fake_log"
+post_sentinel_count="${tmp_root}/post-sentinel.count"
+set +e
+post_sentinel_output="$(
+  printf '%s\n' "$profile_key" | \
+    PATH="${fake_bin}:$PATH" \
+    AZURE_OPENAI_API_KEY="$azure_key" \
+    FAKE_AMIKA_LOG="$fake_log" \
+    FAKE_PROFILE_KEY_INPUT="$profile_key_input" \
+    FAKE_AZURE_INPUT="$azure_input" \
+    FAKE_PROMPT_INPUT="$prompt_input" \
+    FAKE_REPORT="$fake_report" \
+    FAKE_PRE_SENTINEL_COUNT="$post_sentinel_count" \
+    FAKE_POST_SENTINEL_STATUS=23 \
+    "$SCRIPT" --api-url https://api.dev.locality.dev --name post-sentinel --reuse 2>&1
+)"
+post_sentinel_status=$?
+set -e
+[ "$post_sentinel_status" -eq 23 ] || fail "post-sentinel failure should preserve status 23"
+[ "$(cat "$post_sentinel_count")" -eq 1 ] || fail "post-sentinel failure must not retry"
+if grep -F -q -- 'credential transport closed' <<<"$post_sentinel_output"; then
+  fail "post-sentinel failure was incorrectly classified as retryable transport"
+fi
 
 : > "$fake_log"
 set +e
