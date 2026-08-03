@@ -57,8 +57,9 @@ use crate::generation_delivery::{
 use crate::hosted_workspace::{
     CanonicalApiOrigin, HOSTED_WORKSPACE_ATTACHMENT_COMPONENT_VERSION, HostedWorkspaceAttachment,
     HostedWorkspaceCredentialRef, HostedWorkspaceIdentity, HostedWorkspaceMountMapping,
-    HostedWorkspaceTransitionKind, PendingHostedWorkspaceTransition,
+    HostedWorkspaceTransitionKind, PendingHostedWorkspaceCleanup, PendingHostedWorkspaceTransition,
     PreparedHostedWorkspaceTransition, committed_attachment, prepare_pending_transition,
+    relocation_cleanup,
 };
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -84,7 +85,7 @@ use crate::workspace_binding::{
 use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 28;
+const SCHEMA_VERSION: i64 = 29;
 const ENTITY_SEARCH_COMPONENT_VERSION: i64 = 2;
 const JOURNALS_COMPONENT_VERSION: i64 = 3;
 const VIRTUAL_MUTATIONS_COMPONENT_VERSION: i64 = 4;
@@ -214,7 +215,7 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
         min_reader_version: HOSTED_WORKSPACE_ATTACHMENT_COMPONENT_VERSION as i64,
         required: true,
         rebuildable: false,
-        data_json: "{\"identity\":\"canonical_api_origin+profile_id\",\"credential_storage\":\"reference_only\",\"mount_mapping\":\"stable_local_id\",\"publication\":\"whole_workspace\"}",
+        data_json: "{\"identity\":\"canonical_api_origin+profile_id\",\"credential_storage\":\"reference_only\",\"mount_mapping\":\"stable_local_id\",\"publication\":\"whole_workspace\",\"relocation_cleanup\":\"durable_v1\"}",
     },
     StateComponentDefinition {
         component_id: "durable:metadata_discovery",
@@ -2663,6 +2664,22 @@ impl HostedWorkspaceRepository for SqliteStateStore {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let identity = prepared.identity().clone();
+        let cleanup_pending: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM hosted_workspace_pending_cleanups
+                 WHERE api_origin = ?1 AND profile_id = ?2
+             )",
+            params![
+                identity.api_origin().as_str(),
+                identity.profile_id().as_str()
+            ],
+            |row| row.get(0),
+        )?;
+        if cleanup_pending {
+            return Err(StoreError::InvalidState(
+                "hosted workspace attachment still has pending relocation cleanup".to_string(),
+            ));
+        }
         let attachment = hosted_workspace_attachment_from_connection(&transaction, &identity)?;
         let mappings = hosted_workspace_mappings_from_connection(&transaction, &identity)?;
         let mut reserved = BTreeSet::new();
@@ -2755,6 +2772,9 @@ impl HostedWorkspaceRepository for SqliteStateStore {
                 UNION ALL
                 SELECT 1 FROM hosted_workspace_pending_transitions
                  WHERE target_root = ?1 AND (api_origin != ?2 OR profile_id != ?3)
+                UNION ALL
+                SELECT 1 FROM hosted_workspace_pending_cleanups
+                 WHERE root = ?1 AND (api_origin != ?2 OR profile_id != ?3)
              )",
             params![
                 path_to_text(pending.prepared().target_root()),
@@ -2875,6 +2895,41 @@ impl HostedWorkspaceRepository for SqliteStateStore {
             .collect()
     }
 
+    fn get_pending_hosted_workspace_cleanup(
+        &self,
+        identity: &HostedWorkspaceIdentity,
+    ) -> StoreResult<Option<PendingHostedWorkspaceCleanup>> {
+        let connection = self.connection()?;
+        pending_hosted_workspace_cleanup_from_connection(&connection, identity)
+    }
+
+    fn list_pending_hosted_workspace_cleanups(
+        &self,
+    ) -> StoreResult<Vec<PendingHostedWorkspaceCleanup>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT api_origin, profile_id
+             FROM hosted_workspace_pending_cleanups ORDER BY api_origin, profile_id",
+        )?;
+        let identities = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        identities
+            .into_iter()
+            .map(|(origin, profile_id)| {
+                let identity = hosted_workspace_identity(origin, profile_id)?;
+                pending_hosted_workspace_cleanup_from_connection(&connection, &identity)?
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(
+                            "hosted workspace cleanup disappeared while listing".to_string(),
+                        )
+                    })
+            })
+            .collect()
+    }
+
     fn commit_hosted_workspace_transition(
         &mut self,
         transition_id: &str,
@@ -2905,6 +2960,23 @@ impl HostedWorkspaceRepository for SqliteStateStore {
         }
         let current = hosted_workspace_attachment_from_connection(&transaction, &identity)?;
         let attachment = committed_attachment(&pending, current.as_ref(), committed_at)?;
+        let cleanup = relocation_cleanup(&pending, current.as_ref())?;
+        let existing_cleanup: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM hosted_workspace_pending_cleanups
+                 WHERE api_origin = ?1 AND profile_id = ?2
+             )",
+            params![
+                identity.api_origin().as_str(),
+                identity.profile_id().as_str()
+            ],
+            |row| row.get(0),
+        )?;
+        if existing_cleanup {
+            return Err(StoreError::InvalidState(
+                "hosted workspace attachment already has pending relocation cleanup".to_string(),
+            ));
+        }
         ensure_hosted_transition_mount_ids_available(&transaction, &pending)?;
         transaction.execute(
             "INSERT INTO hosted_workspace_attachments (
@@ -2963,6 +3035,25 @@ impl HostedWorkspaceRepository for SqliteStateStore {
                 ],
             )?;
         }
+        if let Some(cleanup) = cleanup {
+            transaction.execute(
+                "INSERT INTO hosted_workspace_pending_cleanups (
+                    cleanup_id, api_origin, profile_id, credential_ref, root,
+                    profile_revision, layout_version, layout_digest, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    cleanup.cleanup_id(),
+                    cleanup.identity().api_origin().as_str(),
+                    cleanup.identity().profile_id().as_str(),
+                    cleanup.credential_ref().as_str(),
+                    path_to_text(cleanup.root()),
+                    cleanup.profile_revision() as i64,
+                    cleanup.layout_version() as i64,
+                    cleanup.layout_digest().as_str(),
+                    cleanup.created_at(),
+                ],
+            )?;
+        }
         let deleted = transaction.execute(
             "DELETE FROM hosted_workspace_pending_transitions WHERE transition_id = ?1",
             params![transition_id],
@@ -2989,6 +3080,92 @@ impl HostedWorkspaceRepository for SqliteStateStore {
         }
         Ok(())
     }
+
+    fn complete_hosted_workspace_cleanup(&mut self, cleanup_id: &str) -> StoreResult<()> {
+        let connection = self.connection()?;
+        let deleted = connection.execute(
+            "DELETE FROM hosted_workspace_pending_cleanups WHERE cleanup_id = ?1",
+            params![cleanup_id],
+        )?;
+        if deleted != 1 {
+            return Err(StoreError::InvalidState(
+                "hosted workspace relocation cleanup was not found".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+type PendingHostedWorkspaceCleanupRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+);
+
+fn pending_hosted_workspace_cleanup_from_connection(
+    connection: &Connection,
+    identity: &HostedWorkspaceIdentity,
+) -> StoreResult<Option<PendingHostedWorkspaceCleanup>> {
+    let row = connection
+        .query_row(
+            "SELECT cleanup_id, api_origin, profile_id, credential_ref, root,
+                    profile_revision, layout_version, layout_digest, created_at
+             FROM hosted_workspace_pending_cleanups
+             WHERE api_origin = ?1 AND profile_id = ?2",
+            params![
+                identity.api_origin().as_str(),
+                identity.profile_id().as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row): Option<PendingHostedWorkspaceCleanupRow> = row else {
+        return Ok(None);
+    };
+    let parsed_identity = hosted_workspace_identity(row.1, row.2)?;
+    if &parsed_identity != identity {
+        return Err(StoreError::InvalidState(
+            "hosted workspace cleanup identity is inconsistent".to_string(),
+        ));
+    }
+    PendingHostedWorkspaceCleanup::new(
+        row.0,
+        parsed_identity,
+        HostedWorkspaceCredentialRef::new(row.3)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        PathBuf::from(row.4),
+        u64::try_from(row.5).map_err(|_| {
+            StoreError::InvalidState(
+                "hosted workspace cleanup profile revision is invalid".to_string(),
+            )
+        })?,
+        u16::try_from(row.6).map_err(|_| {
+            StoreError::InvalidState(
+                "hosted workspace cleanup layout version is invalid".to_string(),
+            )
+        })?,
+        LayoutDigest::new(row.7).map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        row.8,
+    )
+    .map(Some)
 }
 
 type HostedWorkspaceAttachmentRow = (String, String, String, String, i64, i64, String, String);
@@ -6463,6 +6640,23 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
                 ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS hosted_workspace_pending_cleanups (
+            cleanup_id TEXT PRIMARY KEY,
+            api_origin TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            credential_ref TEXT NOT NULL,
+            root TEXT NOT NULL,
+            profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+            layout_version INTEGER NOT NULL CHECK (layout_version > 0),
+            layout_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (api_origin, profile_id),
+            UNIQUE (root),
+            FOREIGN KEY (api_origin, profile_id)
+                REFERENCES hosted_workspace_attachments(api_origin, profile_id)
+                ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS discovery_projection_transactions (
             transaction_id TEXT PRIMARY KEY,
             mount_id TEXT NOT NULL,
@@ -7248,6 +7442,15 @@ fn state_component_issue_allows_schema_migration(
             if user_version < SCHEMA_VERSION && component_id == "durable:workspace_bindings"
     ) || matches!(
         issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
+            found: 1,
+            current,
+        } if component_id == "durable:hosted_workspaces"
+            && *current == HOSTED_WORKSPACE_ATTACHMENT_COMPONENT_VERSION as i64
+            && user_version < SCHEMA_VERSION
+    ) || matches!(
+        issue,
         StateCompatibilityIssue::MissingComponent { component_id }
             if user_version < SCHEMA_VERSION && component_id == "durable:hosted_workspaces"
     )
@@ -7361,6 +7564,21 @@ fn create_hosted_workspace_tables(connection: &Connection) -> StoreResult<()> {
             UNIQUE (transition_id, target_collision_key),
             FOREIGN KEY (transition_id)
                 REFERENCES hosted_workspace_pending_transitions(transition_id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS hosted_workspace_pending_cleanups (
+            cleanup_id TEXT PRIMARY KEY,
+            api_origin TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            credential_ref TEXT NOT NULL,
+            root TEXT NOT NULL,
+            profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+            layout_version INTEGER NOT NULL CHECK (layout_version > 0),
+            layout_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (api_origin, profile_id),
+            UNIQUE (root),
+            FOREIGN KEY (api_origin, profile_id)
+                REFERENCES hosted_workspace_attachments(api_origin, profile_id) ON DELETE CASCADE
         );",
     )?;
     Ok(())
@@ -7372,6 +7590,7 @@ fn validate_hosted_workspace_storage(connection: &Connection) -> StoreResult<()>
         "hosted_workspace_mount_mappings",
         "hosted_workspace_pending_transitions",
         "hosted_workspace_pending_mounts",
+        "hosted_workspace_pending_cleanups",
     ] {
         if !table_exists(connection, table)? {
             return Err(StoreError::StateCompatibility(format!(
@@ -7391,6 +7610,20 @@ fn validate_hosted_workspace_storage(connection: &Connection) -> StoreResult<()>
     if mapping_owner_count != 0 {
         return Err(StoreError::InvalidState(
             "hosted workspace storage contains orphan mappings".to_string(),
+        ));
+    }
+    let cleanup_owner_count: i64 = connection.query_row(
+        "SELECT COUNT(*)
+         FROM hosted_workspace_pending_cleanups c
+         LEFT JOIN hosted_workspace_attachments a
+           ON a.api_origin = c.api_origin AND a.profile_id = c.profile_id
+         WHERE a.profile_id IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if cleanup_owner_count != 0 {
+        return Err(StoreError::InvalidState(
+            "hosted workspace storage contains orphan relocation cleanups".to_string(),
         ));
     }
     Ok(())

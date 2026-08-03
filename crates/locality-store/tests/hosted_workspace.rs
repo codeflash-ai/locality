@@ -100,6 +100,89 @@ fn sqlite_repository_preserves_stable_mapping_and_atomic_profile_set_across_rest
     );
 }
 
+#[test]
+fn relocation_commit_atomically_records_old_root_cleanup_in_memory_and_sqlite() {
+    assert_relocation_cleanup(
+        InMemoryStateStore::new(),
+        Path::new("/tmp/locality-hosted-memory-old"),
+        Path::new("/tmp/locality-hosted-memory-new"),
+    );
+
+    let fixture = Fixture::new("relocation-cleanup");
+    let old_root = fixture.root.join("OldLocality");
+    let new_root = fixture.root.join("NewLocality");
+    assert_relocation_cleanup(fixture.open(), &old_root, &new_root);
+    let reopened = fixture.open();
+    assert!(
+        reopened
+            .list_pending_hosted_workspace_cleanups()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+fn assert_relocation_cleanup<S>(mut store: S, old_root: &Path, new_root: &Path)
+where
+    S: HostedWorkspaceRepository,
+{
+    let hosted_identity = identity("https://api.example.com", PROFILE_ID);
+    store
+        .begin_hosted_workspace_transition(transition(
+            "attach-before-relocate",
+            hosted_identity.clone(),
+            old_root,
+            1,
+            DIGEST_A,
+            &[("mount", "local", "docs")],
+        ))
+        .unwrap();
+    store
+        .commit_hosted_workspace_transition("attach-before-relocate", "2026-08-03T00:00:01Z")
+        .unwrap();
+    store
+        .begin_hosted_workspace_transition(transition(
+            "relocate",
+            hosted_identity.clone(),
+            new_root,
+            2,
+            DIGEST_B,
+            &[("mount", "local", "docs")],
+        ))
+        .unwrap();
+    let relocated = store
+        .commit_hosted_workspace_transition("relocate", "2026-08-03T00:00:02Z")
+        .unwrap();
+    assert_eq!(relocated.root(), new_root);
+    let cleanup = store
+        .get_pending_hosted_workspace_cleanup(&hosted_identity)
+        .unwrap()
+        .expect("relocation cleanup");
+    assert_eq!(cleanup.cleanup_id(), "relocate");
+    assert_eq!(cleanup.root(), old_root);
+    assert_eq!(cleanup.profile_revision(), 1);
+    assert_eq!(cleanup.layout_digest().as_str(), DIGEST_A);
+    assert!(matches!(
+        store.begin_hosted_workspace_transition(transition(
+            "refresh-before-cleanup",
+            hosted_identity.clone(),
+            new_root,
+            3,
+            DIGEST_A,
+            &[("mount", "local", "docs")],
+        )),
+        Err(StoreError::InvalidState(message)) if message.contains("pending relocation cleanup")
+    ));
+    store
+        .complete_hosted_workspace_cleanup(cleanup.cleanup_id())
+        .unwrap();
+    assert!(
+        store
+            .get_pending_hosted_workspace_cleanup(&hosted_identity)
+            .unwrap()
+            .is_none()
+    );
+}
+
 fn assert_repository_lifecycle<S>(mut store: S, root: &Path)
 where
     S: HostedWorkspaceRepository + MountRepository,
@@ -602,7 +685,8 @@ fn schema_27_migrates_additively_and_preserves_connector_mounts() {
     let connection = Connection::open(fixture.state_root.join("state.sqlite3")).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE hosted_workspace_pending_mounts;
+            "DROP TABLE hosted_workspace_pending_cleanups;
+             DROP TABLE hosted_workspace_pending_mounts;
              DROP TABLE hosted_workspace_pending_transitions;
              DROP TABLE hosted_workspace_mount_mappings;
              DROP TABLE hosted_workspace_attachments;
@@ -614,7 +698,7 @@ fn schema_27_migrates_additively_and_preserves_connector_mounts() {
     drop(connection);
 
     let migrated = fixture.open();
-    assert_eq!(SqliteStateStore::current_schema_version(), 28);
+    assert_eq!(SqliteStateStore::current_schema_version(), 29);
     assert_eq!(
         migrated.load_mounts().unwrap()[0].mount_id.as_str(),
         "notion-main"
@@ -633,7 +717,71 @@ fn schema_27_migrates_additively_and_preserves_connector_mounts() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(component, 1);
+    assert_eq!(component, 2);
+}
+
+#[test]
+fn schema_28_adds_durable_relocation_cleanup_without_losing_attachments() {
+    let fixture = Fixture::new("schema-28-cleanup");
+    let hosted_identity = identity("https://api.example.com", PROFILE_ID);
+    let mut store = fixture.open();
+    store
+        .begin_hosted_workspace_transition(transition(
+            "schema-28-attachment",
+            hosted_identity.clone(),
+            &fixture.workspace_root,
+            1,
+            DIGEST_A,
+            &[("mount", "local", "docs")],
+        ))
+        .unwrap();
+    store
+        .commit_hosted_workspace_transition("schema-28-attachment", "2026-08-03T00:00:00Z")
+        .unwrap();
+    drop(store);
+
+    let connection = Connection::open(fixture.state_root.join("state.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE hosted_workspace_pending_cleanups;
+             UPDATE state_components
+                SET version = 1, min_reader_version = 1,
+                    data_json = '{\"identity\":\"canonical_api_origin+profile_id\",\"credential_storage\":\"reference_only\",\"mount_mapping\":\"stable_local_id\",\"publication\":\"whole_workspace\"}'
+              WHERE component_id = 'durable:hosted_workspaces';
+             UPDATE state_components SET version = 28 WHERE component_id = 'core:schema';
+             PRAGMA user_version = 28;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let migrated = fixture.open();
+    assert_eq!(SqliteStateStore::current_schema_version(), 29);
+    assert_eq!(
+        migrated
+            .get_hosted_workspace_attachment(&hosted_identity)
+            .unwrap()
+            .unwrap()
+            .root(),
+        fixture.workspace_root
+    );
+    let raw = Connection::open(&migrated.db_path).unwrap();
+    let table_count: i64 = raw
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'hosted_workspace_pending_cleanups'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let component: i64 = raw
+        .query_row(
+            "SELECT version FROM state_components WHERE component_id = 'durable:hosted_workspaces'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_count, 1);
+    assert_eq!(component, 2);
 }
 
 #[test]

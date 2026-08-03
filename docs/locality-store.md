@@ -85,6 +85,9 @@
   or committing a transition validates global local-mount-ID reservations;
   commit updates the attachment and complete active mapping set in one SQLite
   transaction while retaining inactive mapping history.
+- SQLite schema v29 / hosted-workspaces component v2 adds the post-commit
+  relocation-cleanup intent. It is written atomically with the attachment CAS
+  and removed only after exact old-generation cleanup succeeds.
 - Workspace-binding component v4 adds stable local workspace identity plus a
   separate trusted host-root/projection record, layout sequence, and durable
   remount-recovery outcome without a schema-version bump. Opening released
@@ -182,7 +185,9 @@ read-only hosted profile, not a connector mount adapter. It stores:
 - one durable mapping history row per portable mount ID, including its stable
   local `MountId`, current target, first/last-seen revisions, and active flag;
 - one compare-and-swap pending attach/refresh/relocate transition with the
-  complete proposed mount set and captured base state.
+  complete proposed mount set and captured base state; and
+- one durable relocation-cleanup intent containing the exact old root,
+  credential reference, profile revision, and layout identity.
 
 Pending preparation is idempotent only for the exact transition payload.
 Revision downgrade and reinterpretation of an existing revision fail closed.
@@ -195,9 +200,12 @@ perform the inverse check. New local IDs are deterministic hashes of canonical
 API origin, hosted profile ID, and portable mount ID. Removed mapping rows remain
 durable so reappearance reuses the same local identity.
 
-No profile key, session capability, export URL, archive bytes, or absolute
-server placement is stored in these tables. Filesystem staging/publication is a
-coordinator responsibility; the repository records its crash-recoverable
+For relocation, commit writes the new attachment/mapping set and old-root
+cleanup intent in the same transaction. A further transition is blocked until
+the coordinator proves exact ownership/identity-bound cleanup and completes the
+intent. No profile key, session capability, export URL, archive bytes, or
+absolute server placement is stored in these tables. Filesystem publication is
+a coordinator responsibility; the repository records its crash-recoverable
 intent and final atomic mount-set outcome.
 
 ## Generation Delivery Transactions
@@ -329,6 +337,8 @@ The first schema keeps high-value lookup fields relational and stores complex co
 - `hosted_workspace_pending_transitions` and
   `hosted_workspace_pending_mounts`: complete crash-recoverable proposed
   attachment state committed as one mount-set transaction;
+- `hosted_workspace_pending_cleanups`: exact old-root cleanup intent retained
+  across crashes after a relocation commit;
 - `entities`: mount id, remote id, kind, title, projected path, hydration, content hash, remote edit time;
 - `entity_search_fts`: legacy derived full-text index over entity titles/paths
   and observed remote titles/paths. It is rebuildable and stores no credential

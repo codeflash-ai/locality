@@ -13,6 +13,7 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use hmac::{Hmac, Mac};
 use locality_protocol::workspace_api_v2::{WorkspaceExportOfferV2, WorkspaceProfileSessionV2};
 use locality_protocol::workspace_export_v2::WorkspaceExportTerminalControlV2;
+use locality_protocol::workspace_layout::{LayoutDigest, WorkspaceProfileId};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
@@ -271,6 +272,16 @@ pub struct WorkspacePublicationReceipt {
     ownership_marker_identity: GenerationIdentity,
     ownership_marker_nonce: String,
     ownership_tag: String,
+}
+
+/// Exact portable identity expected for an owned published generation.
+/// Absolute paths and export URLs are intentionally excluded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspacePublicationExpectation {
+    pub profile_id: WorkspaceProfileId,
+    pub profile_revision: u64,
+    pub layout_version: u16,
+    pub layout_digest: LayoutDigest,
 }
 
 /// Secret capability that authorizes replacement and cleanup of one caller's
@@ -982,6 +993,107 @@ pub fn recover_and_verify_workspace_publication_state(
     Ok(true)
 }
 
+/// Remove an obsolete whole-workspace publication only when its durable
+/// receipt, filesystem generation identity, ownership marker, secret-derived
+/// authentication tag, and portable profile identity all match exactly.
+///
+/// The operation is idempotent for a fully absent root/receipt pair. A root
+/// without its exact receipt, a substituted generation, or changed ownership
+/// marker is left untouched and reported as a recovery conflict.
+pub fn remove_owned_workspace_publication(
+    destination: &Path,
+    expected: &WorkspacePublicationExpectation,
+    ownership: &WorkspaceOwnershipCapability,
+) -> Result<(), WorkspaceMaterializationError> {
+    let paths = PublicationPaths::new(destination)?;
+    let lock = paths.acquire_lock()?;
+    if publication_entry_exists(&lock, &paths, &paths.journal_name, &paths.journal)? {
+        recover_workspace_publication_locked(destination, ownership, &paths, &lock)?;
+    }
+    let generation = generation_identity_if_exists_locked(&lock, &paths, &paths.destination_name)?;
+    let receipt = load_workspace_publication_receipt_locked(&paths, &lock)?;
+    match (generation, receipt) {
+        (None, None) => {
+            paths.verify_visible_parent(&lock)?;
+            Ok(())
+        }
+        (None, Some(receipt)) => {
+            validate_receipt_authentication(
+                &receipt,
+                &paths.destination_name,
+                ownership,
+                "orphaned cleanup receipt",
+            )?;
+            validate_receipt_expectation(&receipt, expected)?;
+            remove_receipt_if_present(&paths, &lock)
+        }
+        (Some(_), None) => Err(WorkspaceMaterializationError::RecoveryConflict(
+            "obsolete workspace root has no durable ownership receipt".to_string(),
+        )),
+        (Some(generation), Some(receipt)) => {
+            validate_receipt_binding(
+                &receipt,
+                generation,
+                &generation_marker_binding_locked(&lock, &paths, &paths.destination_name)?,
+                &paths.destination_name,
+                ownership,
+                "obsolete workspace generation",
+            )?;
+            validate_receipt_expectation(&receipt, expected)?;
+            #[cfg(not(unix))]
+            verify_tree_read_only(destination)?;
+            remove_generation_locked(&lock, &paths, &paths.destination_name, generation, &receipt)?;
+            remove_receipt_if_present(&paths, &lock)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn verify_tree_read_only(path: &Path) -> Result<(), WorkspaceMaterializationError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| WorkspaceMaterializationError::Journal {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if metadata.file_type().is_symlink() || !metadata.permissions().readonly() {
+        return Err(WorkspaceMaterializationError::RecoveryConflict(
+            "workspace cleanup refuses locally writable or modified content".to_string(),
+        ));
+    }
+    if metadata.is_dir() {
+        for entry in
+            fs::read_dir(path).map_err(|source| WorkspaceMaterializationError::Journal {
+                path: path.to_path_buf(),
+                source,
+            })?
+        {
+            let entry = entry.map_err(|source| WorkspaceMaterializationError::Journal {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            verify_tree_read_only(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_receipt_expectation(
+    receipt: &WorkspacePublicationReceipt,
+    expected: &WorkspacePublicationExpectation,
+) -> Result<(), WorkspaceMaterializationError> {
+    let metadata = &receipt.terminal_control.metadata;
+    if metadata.profile_id() != &expected.profile_id
+        || metadata.profile_revision() != expected.profile_revision
+        || metadata.layout_version() != expected.layout_version
+        || metadata.layout_digest() != &expected.layout_digest
+    {
+        return Err(WorkspaceMaterializationError::RecoveryConflict(
+            "workspace cleanup receipt does not match the durable relocation base".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 struct PublicationPaths {
     parent: PathBuf,
     destination_name: String,
@@ -1150,6 +1262,26 @@ fn validate_receipt_binding(
     {
         return Err(WorkspaceMaterializationError::RecoveryConflict(format!(
             "{context} is not authenticated for the published filesystem generation"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_receipt_authentication(
+    receipt: &WorkspacePublicationReceipt,
+    destination_name: &str,
+    ownership: &WorkspaceOwnershipCapability,
+    context: &str,
+) -> Result<(), WorkspaceMaterializationError> {
+    if receipt.version != PUBLICATION_STATE_VERSION
+        || !authentication_tag_matches(
+            &receipt.ownership_tag,
+            &receipt_authentication_bytes(receipt, destination_name)?,
+            ownership,
+        )
+    {
+        return Err(WorkspaceMaterializationError::RecoveryConflict(format!(
+            "{context} ownership authentication failed"
         )));
     }
     Ok(())
@@ -1550,6 +1682,34 @@ fn remove_journal_if_present(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(WorkspaceMaterializationError::Journal {
             path: paths.journal.clone(),
+            source,
+        }),
+    }
+}
+
+fn remove_receipt_if_present(
+    paths: &PublicationPaths,
+    lock: &WorkspacePublicationLock,
+) -> Result<(), WorkspaceMaterializationError> {
+    #[cfg(unix)]
+    let result = rustix::fs::unlinkat(
+        lock.parent_directory(),
+        &paths.receipt_name,
+        AtFlags::empty(),
+    )
+    .map_err(io::Error::from);
+    #[cfg(not(unix))]
+    let result = fs::remove_file(&paths.receipt);
+    match result {
+        Ok(()) => sync_publication_parent(lock, &paths.parent).map_err(|source| {
+            WorkspaceMaterializationError::Journal {
+                path: paths.parent.clone(),
+                source,
+            }
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(WorkspaceMaterializationError::Journal {
+            path: paths.receipt.clone(),
             source,
         }),
     }

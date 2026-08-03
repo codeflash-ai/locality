@@ -13,7 +13,8 @@ use locality_core::shadow::ShadowDocument;
 use crate::error::{StoreError, StoreResult};
 use crate::hosted_workspace::{
     HostedWorkspaceAttachment, HostedWorkspaceIdentity, HostedWorkspaceMountMapping,
-    PendingHostedWorkspaceTransition, PreparedHostedWorkspaceTransition,
+    PendingHostedWorkspaceCleanup, PendingHostedWorkspaceTransition,
+    PreparedHostedWorkspaceTransition,
 };
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -62,6 +63,15 @@ pub trait HostedWorkspaceRepository {
         &self,
     ) -> StoreResult<Vec<PendingHostedWorkspaceTransition>>;
 
+    fn get_pending_hosted_workspace_cleanup(
+        &self,
+        identity: &HostedWorkspaceIdentity,
+    ) -> StoreResult<Option<PendingHostedWorkspaceCleanup>>;
+
+    fn list_pending_hosted_workspace_cleanups(
+        &self,
+    ) -> StoreResult<Vec<PendingHostedWorkspaceCleanup>>;
+
     /// Compare-and-swap the attachment and the complete active mount set in
     /// one transaction, then remove the pending transition.
     fn commit_hosted_workspace_transition(
@@ -73,6 +83,10 @@ pub trait HostedWorkspaceRepository {
     /// Only safe before publication. Filesystem-aware coordinators keep a
     /// pending transition after publication until recovery can prove outcome.
     fn cancel_hosted_workspace_transition(&mut self, transition_id: &str) -> StoreResult<()>;
+
+    /// Complete only after the owning coordinator has removed the exact old
+    /// receipt-authenticated generation (or proved it was already removed).
+    fn complete_hosted_workspace_cleanup(&mut self, cleanup_id: &str) -> StoreResult<()>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

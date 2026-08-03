@@ -117,7 +117,8 @@ use crate::history::{
 };
 use crate::hosted_workspace::{
     HostedWorkspaceAttachOptions, HostedWorkspaceAttachReport, HostedWorkspaceListReport,
-    list_hosted_workspace_attachments_at_state_root, run_hosted_workspace_attach_at_state_root,
+    HostedWorkspaceOperation, list_hosted_workspace_attachments_at_state_root,
+    run_hosted_workspace_operation_at_state_root,
 };
 use crate::info::{InfoError, InfoOptions, InfoReport, run_info};
 use crate::inspect::{InspectError, InspectOptions, InspectReport, run_inspect};
@@ -240,7 +241,7 @@ enum LocalityCommand {
     },
     #[command(
         name = "hosted-workspace",
-        about = "Attach, refresh, or list durable hosted workspaces"
+        about = "Attach, refresh, relocate, or list durable hosted workspaces"
     )]
     HostedWorkspace {
         #[command(subcommand)]
@@ -309,6 +310,8 @@ enum HostedWorkspaceCommand {
     Attach(HostedWorkspaceAttachArgs),
     #[command(about = "Refresh an existing read-only hosted workspace")]
     Refresh(HostedWorkspaceAttachArgs),
+    #[command(about = "Relocate an existing hosted workspace to an absent destination")]
+    Relocate(HostedWorkspaceAttachArgs),
     #[command(about = "List durable hosted workspace attachments")]
     List,
 }
@@ -1639,6 +1642,10 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     args.push("refresh".to_string());
                     push_hosted_workspace_args(&mut args, options);
                 }
+                HostedWorkspaceCommand::Relocate(options) => {
+                    args.push("relocate".to_string());
+                    push_hosted_workspace_args(&mut args, options);
+                }
                 HostedWorkspaceCommand::List => args.push("list".to_string()),
             }
         }
@@ -1796,13 +1803,37 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
 
 fn hosted_workspace(command: HostedWorkspaceCommand, json: bool) -> i32 {
     match command {
-        HostedWorkspaceCommand::Attach(options) => {
-            hosted_workspace_attach("hosted-workspace attach", options, json)
-        }
-        HostedWorkspaceCommand::Refresh(options) => {
-            hosted_workspace_attach("hosted-workspace refresh", options, json)
-        }
+        HostedWorkspaceCommand::Attach(options) => hosted_workspace_attach(
+            "hosted-workspace attach",
+            options,
+            HostedWorkspaceOperation::Attach,
+            json,
+        ),
+        HostedWorkspaceCommand::Refresh(options) => hosted_workspace_attach(
+            "hosted-workspace refresh",
+            options,
+            HostedWorkspaceOperation::Refresh,
+            json,
+        ),
+        HostedWorkspaceCommand::Relocate(options) => hosted_workspace_attach(
+            "hosted-workspace relocate",
+            options,
+            HostedWorkspaceOperation::Relocate,
+            json,
+        ),
         HostedWorkspaceCommand::List => {
+            if let Err(error) =
+                crate::hosted_workspace::recover_hosted_workspace_attachments_at_state_root(
+                    &default_state_root(),
+                )
+            {
+                return hosted_workspace_command_error(
+                    "hosted-workspace list",
+                    json,
+                    error.code(),
+                    error.to_string(),
+                );
+            }
             match list_hosted_workspace_attachments_at_state_root(&default_state_root()) {
                 Ok(report) => {
                     if json {
@@ -1826,6 +1857,7 @@ fn hosted_workspace(command: HostedWorkspaceCommand, json: bool) -> i32 {
 fn hosted_workspace_attach(
     command: &'static str,
     options: HostedWorkspaceAttachArgs,
+    operation: HostedWorkspaceOperation,
     json: bool,
 ) -> i32 {
     let credential_ref =
@@ -1899,7 +1931,7 @@ fn hosted_workspace_attach(
             return hosted_workspace_command_error(command, json, error.code(), error.to_string());
         }
     }
-    let attach = run_hosted_workspace_attach_at_state_root(
+    let attach = run_hosted_workspace_operation_at_state_root(
         HostedWorkspaceAttachOptions {
             api_url: options.api_url,
             root: PathBuf::from(options.root),
@@ -1909,6 +1941,7 @@ fn hosted_workspace_attach(
                 .map_or(SandboxContentEncodingPreference::Automatic, Into::into),
         },
         &state_root,
+        Some(operation),
     );
     match attach {
         Ok(report) => {
@@ -12668,6 +12701,29 @@ mod tests {
                 command: HostedWorkspaceCommand::List
             })
         ));
+        let cli = parse_cli([
+            "hosted-workspace",
+            "relocate",
+            "--api-url",
+            "https://api.example.com",
+            "--root",
+            "/tmp/Relocated",
+            "--credential-ref",
+            "hosted-workspace:team",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "hosted-workspace",
+                "relocate",
+                "--api-url",
+                "https://api.example.com",
+                "--root",
+                "/tmp/Relocated",
+                "--credential-ref",
+                "hosted-workspace:team",
+            ]
+        );
     }
 
     #[test]

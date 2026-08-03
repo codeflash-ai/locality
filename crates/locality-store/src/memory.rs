@@ -23,8 +23,9 @@ use crate::discovery::{
 use crate::error::{StoreError, StoreResult};
 use crate::hosted_workspace::{
     HostedWorkspaceAttachment, HostedWorkspaceIdentity, HostedWorkspaceMountMapping,
-    PendingHostedWorkspaceTransition, PreparedHostedWorkspaceTransition, committed_attachment,
-    prepare_pending_transition,
+    PendingHostedWorkspaceCleanup, PendingHostedWorkspaceTransition,
+    PreparedHostedWorkspaceTransition, committed_attachment, prepare_pending_transition,
+    relocation_cleanup,
 };
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -84,6 +85,8 @@ pub struct InMemoryStateStore {
     >,
     pending_hosted_workspace_transitions:
         BTreeMap<HostedWorkspaceIdentity, PendingHostedWorkspaceTransition>,
+    pending_hosted_workspace_cleanups:
+        BTreeMap<HostedWorkspaceIdentity, PendingHostedWorkspaceCleanup>,
     workspace_bindings: BTreeMap<MountId, WorkspaceBinding>,
     workspace_host_bindings: BTreeMap<WorkspaceId, WorkspaceHostBinding>,
     workspace_remount_recoveries: BTreeMap<String, (MountId, WorkspaceRemountRecoveryOutcome)>,
@@ -220,6 +223,14 @@ impl HostedWorkspaceRepository for InMemoryStateStore {
         prepared: PreparedHostedWorkspaceTransition,
     ) -> StoreResult<PendingHostedWorkspaceTransition> {
         let identity = prepared.identity().clone();
+        if self
+            .pending_hosted_workspace_cleanups
+            .contains_key(&identity)
+        {
+            return Err(StoreError::InvalidState(
+                "hosted workspace attachment still has pending relocation cleanup".to_string(),
+            ));
+        }
         let existing_mappings = self.list_hosted_workspace_mount_mappings(&identity)?;
         let mut reserved = self.mounts.keys().cloned().collect::<BTreeSet<_>>();
         reserved.extend(
@@ -313,6 +324,26 @@ impl HostedWorkspaceRepository for InMemoryStateStore {
             .collect())
     }
 
+    fn get_pending_hosted_workspace_cleanup(
+        &self,
+        identity: &HostedWorkspaceIdentity,
+    ) -> StoreResult<Option<PendingHostedWorkspaceCleanup>> {
+        Ok(self
+            .pending_hosted_workspace_cleanups
+            .get(identity)
+            .cloned())
+    }
+
+    fn list_pending_hosted_workspace_cleanups(
+        &self,
+    ) -> StoreResult<Vec<PendingHostedWorkspaceCleanup>> {
+        Ok(self
+            .pending_hosted_workspace_cleanups
+            .values()
+            .cloned()
+            .collect())
+    }
+
     fn commit_hosted_workspace_transition(
         &mut self,
         transition_id: &str,
@@ -326,11 +357,17 @@ impl HostedWorkspaceRepository for InMemoryStateStore {
             .ok_or_else(|| {
                 StoreError::InvalidState("hosted workspace transition was not found".to_string())
             })?;
-        let attachment = committed_attachment(
-            &pending,
-            self.hosted_workspace_attachments.get(&identity),
-            committed_at,
-        )?;
+        let current = self.hosted_workspace_attachments.get(&identity);
+        let attachment = committed_attachment(&pending, current, committed_at)?;
+        let cleanup = relocation_cleanup(&pending, current)?;
+        if self
+            .pending_hosted_workspace_cleanups
+            .contains_key(&identity)
+        {
+            return Err(StoreError::InvalidState(
+                "hosted workspace attachment already has pending relocation cleanup".to_string(),
+            ));
+        }
         for mapping in pending.prepared().mounts() {
             let reserved_by_connector = self.mounts.contains_key(mapping.local_mount_id());
             let reserved_by_attachment =
@@ -370,6 +407,10 @@ impl HostedWorkspaceRepository for InMemoryStateStore {
         }
         self.hosted_workspace_attachments
             .insert(identity.clone(), attachment.clone());
+        if let Some(cleanup) = cleanup {
+            self.pending_hosted_workspace_cleanups
+                .insert(identity.clone(), cleanup);
+        }
         if self
             .pending_hosted_workspace_transitions
             .remove(&identity)
@@ -393,6 +434,21 @@ impl HostedWorkspaceRepository for InMemoryStateStore {
                 StoreError::InvalidState("hosted workspace transition was not found".to_string())
             })?;
         self.pending_hosted_workspace_transitions.remove(&identity);
+        Ok(())
+    }
+
+    fn complete_hosted_workspace_cleanup(&mut self, cleanup_id: &str) -> StoreResult<()> {
+        let identity = self
+            .pending_hosted_workspace_cleanups
+            .iter()
+            .find(|(_, cleanup)| cleanup.cleanup_id() == cleanup_id)
+            .map(|(identity, _)| identity.clone())
+            .ok_or_else(|| {
+                StoreError::InvalidState(
+                    "hosted workspace relocation cleanup was not found".to_string(),
+                )
+            })?;
+        self.pending_hosted_workspace_cleanups.remove(&identity);
         Ok(())
     }
 }

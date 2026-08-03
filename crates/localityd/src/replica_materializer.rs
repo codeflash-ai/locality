@@ -1553,6 +1553,38 @@ fn preflight_directory_contents(directory: &OwnedFd, expected_device: u64) -> io
 }
 
 #[cfg(unix)]
+fn verify_directory_contents_read_only(
+    directory: &OwnedFd,
+    expected_device: u64,
+) -> io::Result<()> {
+    let entries = Dir::read_from(directory)?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let metadata = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if metadata.st_dev as u64 != expected_device || metadata.st_mode & 0o222 != 0 {
+            return Err(io::Error::other(
+                "workspace cleanup refuses locally writable or modified content",
+            ));
+        }
+        if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
+            let child = open_cleanup_directory_at(directory, name)?;
+            let opened = rustix::fs::fstat(&child)?;
+            if !same_file_identity(&metadata, &opened) {
+                return Err(io::Error::other(
+                    "workspace cleanup entry changed during read-only validation",
+                ));
+            }
+            verify_directory_contents_read_only(&child, expected_device)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn remove_directory_contents(directory: &OwnedFd, expected_device: u64) -> io::Result<()> {
     rustix::fs::fchmod(directory, Mode::from_raw_mode(0o700))?;
     let entries = Dir::read_from(directory)?;
@@ -2050,6 +2082,11 @@ pub(crate) fn remove_workspace_generation_at(
             "workspace generation identity changed before cleanup",
         ));
     }
+    if opened.st_mode & 0o222 != 0 {
+        return Err(io::Error::other(
+            "workspace cleanup refuses a locally writable or modified generation",
+        ));
+    }
     verify_open_generation_file(&root, marker_name, expected_marker, expected_marker_content)?;
     let parent_identity = rustix::fs::fstat(parent)?;
     if opened.st_dev != parent_identity.st_dev {
@@ -2057,6 +2094,7 @@ pub(crate) fn remove_workspace_generation_at(
             "workspace cleanup refuses a cross-filesystem generation",
         ));
     }
+    verify_directory_contents_read_only(&root, expected.device)?;
     preflight_directory_contents(&root, expected.device)?;
     verify_open_generation_file(&root, marker_name, expected_marker, expected_marker_content)?;
     remove_directory_contents(&root, expected.device)?;

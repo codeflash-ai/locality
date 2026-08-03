@@ -10,7 +10,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use loc_cli::hosted_workspace::{
-    HostedWorkspaceAttachOptions, run_hosted_workspace_attach_at_state_root,
+    HostedWorkspaceAttachOptions,
+    recover_hosted_workspace_attachments_with_credentials_at_state_root,
+    run_hosted_workspace_attach_at_state_root, run_hosted_workspace_relocate_at_state_root,
 };
 use loc_cli::sandbox::{
     SandboxBootstrapToken, SandboxContentEncodingPreference, SandboxInitError, SandboxInitOptions,
@@ -1198,13 +1200,13 @@ fn generation2_profile_waits_for_freshness_before_export() {
 }
 
 #[test]
-fn durable_hosted_workspace_attach_and_refresh_keep_stable_local_mount_ids() {
+fn durable_hosted_workspace_attach_refresh_and_relocate_keep_stable_local_mount_ids() {
     const CHILD_ENV: &str = "LOCALITY_HOSTED_WORKSPACE_TEST_CHILD";
     if std::env::var(CHILD_ENV).as_deref() != Ok("1") {
         let output = Command::new(std::env::current_exe().expect("current test executable"))
             .args([
                 "--exact",
-                "durable_hosted_workspace_attach_and_refresh_keep_stable_local_mount_ids",
+                "durable_hosted_workspace_attach_refresh_and_relocate_keep_stable_local_mount_ids",
                 "--nocapture",
             ])
             .env(CHILD_ENV, "1")
@@ -1240,6 +1242,10 @@ fn durable_hosted_workspace_attach_and_refresh_keep_stable_local_mount_ids() {
         ResponseFixture::json(&session).with_status("201 Created"),
         ResponseFixture::json(&status),
         ResponseFixture::json(&offer),
+        ResponseFixture::export("zstd", compressed.clone()),
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&status),
+        ResponseFixture::json(&offer),
         ResponseFixture::export("zstd", compressed),
     ]);
     let options = HostedWorkspaceAttachOptions {
@@ -1266,10 +1272,10 @@ fn durable_hosted_workspace_attach_and_refresh_keep_stable_local_mount_ids() {
     assert!(store.load_mounts().unwrap().is_empty());
     drop(store);
 
-    let refreshed = run_hosted_workspace_attach_at_state_root(options, &state_root)
+    let refreshed = run_hosted_workspace_attach_at_state_root(options.clone(), &state_root)
         .expect("refresh hosted workspace");
     assert_eq!(refreshed.profile_revision, attached.profile_revision);
-    let store = SqliteStateStore::open(state_root).unwrap();
+    let store = SqliteStateStore::open(state_root.clone()).unwrap();
     let refreshed_mappings = store
         .list_hosted_workspace_mount_mappings(&identity)
         .unwrap();
@@ -1277,6 +1283,47 @@ fn durable_hosted_workspace_attach_and_refresh_keep_stable_local_mount_ids() {
     assert!(
         store
             .get_pending_hosted_workspace_transition(&identity)
+            .unwrap()
+            .is_none()
+    );
+    drop(store);
+
+    let relocated_root = directory.0.join("RelocatedLocality");
+    let relocated = run_hosted_workspace_relocate_at_state_root(
+        HostedWorkspaceAttachOptions {
+            root: relocated_root.clone(),
+            ..options
+        },
+        &state_root,
+    )
+    .expect("relocate hosted workspace");
+    assert_eq!(relocated.root, relocated_root.display().to_string());
+    assert!(
+        !root.exists(),
+        "owned old root is cleaned after relocation commit"
+    );
+    assert_eq!(
+        fs::read(relocated_root.join("Sales/README.md")).unwrap(),
+        b"Public\n"
+    );
+    let store = SqliteStateStore::open(state_root).unwrap();
+    assert_eq!(
+        store
+            .get_hosted_workspace_attachment(&identity)
+            .unwrap()
+            .unwrap()
+            .root(),
+        relocated_root
+    );
+    assert_eq!(
+        store
+            .list_hosted_workspace_mount_mappings(&identity)
+            .unwrap(),
+        first_mappings
+    );
+    assert!(
+        store
+            .get_pending_hosted_workspace_cleanup(&identity)
             .unwrap()
             .is_none()
     );
@@ -1288,11 +1335,135 @@ fn durable_hosted_workspace_attach_and_refresh_keep_stable_local_mount_ids() {
     ]
     .into_iter()
     .cycle()
-    .take(8)
+    .take(12)
     {
         assert_eq!(server.request().path, expected_path);
     }
     server.assert_no_request();
+}
+
+#[test]
+fn relocation_preserves_dirty_old_root_and_recovery_finishes_identity_bound_cleanup() {
+    const CHILD_ENV: &str = "LOCALITY_HOSTED_WORKSPACE_RELOCATION_RECOVERY_CHILD";
+    if std::env::var(CHILD_ENV).as_deref() != Ok("1") {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "relocation_preserves_dirty_old_root_and_recovery_finishes_identity_bound_cleanup",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("LOCALITY_CREDENTIAL_STORE", "file")
+            .output()
+            .expect("run isolated file-credential relocation recovery test");
+        assert!(
+            output.status.success(),
+            "isolated relocation recovery test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let directory = TestDirectory::new("hosted-relocation-recovery");
+    let state_root = directory.0.join("state");
+    let old_root = directory.root();
+    let new_root = directory.0.join("Relocated");
+    let credential_ref =
+        HostedWorkspaceCredentialRef::new("hosted-workspace:relocation-recovery").unwrap();
+    let credentials = FileCredentialStore::new(&state_root);
+    credentials
+        .put(credential_ref.as_str(), &"a".repeat(64))
+        .expect("store fixture profile key");
+    let (session, offer, tar) = workspace_v2_fixture();
+    let compressed = zstd::stream::encode_all(tar.as_slice(), 1).expect("compress workspace tar");
+    let status: Value = serde_json::from_slice(WORKSPACE_SESSION_STATUS_V2_GOLDEN_JSON)
+        .expect("workspace status fixture");
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&status),
+        ResponseFixture::json(&offer),
+        ResponseFixture::export("zstd", compressed.clone()),
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&status),
+        ResponseFixture::json(&offer),
+        ResponseFixture::export("zstd", compressed),
+    ]);
+    let options = HostedWorkspaceAttachOptions {
+        api_url: server.api_url.clone(),
+        root: old_root.clone(),
+        credential_ref,
+        content_encoding: SandboxContentEncodingPreference::Zstd,
+    };
+    run_hosted_workspace_attach_at_state_root(options.clone(), &state_root)
+        .expect("attach hosted workspace");
+
+    let dirty = old_root.join("Sales/README.md");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dirty, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = fs::metadata(&dirty).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&dirty, permissions).unwrap();
+    }
+    let error = run_hosted_workspace_relocate_at_state_root(
+        HostedWorkspaceAttachOptions {
+            root: new_root.clone(),
+            ..options
+        },
+        &state_root,
+    )
+    .expect_err("dirty old root must block cleanup after relocation commit");
+    assert!(error.to_string().contains("writable or modified"));
+    assert!(dirty.exists(), "dirty old content is preserved");
+    assert!(new_root.join("Sales/README.md").exists());
+    let identity = HostedWorkspaceIdentity::new(
+        CanonicalApiOrigin::new(&server.api_url).unwrap(),
+        session.profile_id().clone(),
+    );
+    let store = SqliteStateStore::open(state_root.clone()).unwrap();
+    assert_eq!(
+        store
+            .get_hosted_workspace_attachment(&identity)
+            .unwrap()
+            .unwrap()
+            .root(),
+        new_root
+    );
+    assert!(
+        store
+            .get_pending_hosted_workspace_cleanup(&identity)
+            .unwrap()
+            .is_some(),
+        "post-commit cleanup remains durable"
+    );
+    drop(store);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dirty, fs::Permissions::from_mode(0o444)).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = fs::metadata(&dirty).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&dirty, permissions).unwrap();
+    }
+    recover_hosted_workspace_attachments_with_credentials_at_state_root(&state_root, &credentials)
+        .expect("recover post-commit relocation cleanup");
+    assert!(!old_root.exists());
+    let store = SqliteStateStore::open(state_root).unwrap();
+    assert!(
+        store
+            .get_pending_hosted_workspace_cleanup(&identity)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

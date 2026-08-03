@@ -51,11 +51,7 @@ use loc_cli::push::{
     PushOptions, PushReport, push_report_exit_code, run_push_with_daemon_at_state_root,
 };
 use loc_cli::restore::{RestoreOptions, run_restore};
-use loc_cli::sandbox::{
-    SandboxContentEncodingPreference, SandboxInitOptions, SandboxInitReport, SandboxProfileKey,
-    resolve_sandbox_init_options_at_state_root, run_sandbox_init_with_profile_key_at_state_root,
-    validate_sandbox_api_url,
-};
+use loc_cli::sandbox::{SandboxContentEncodingPreference, SandboxProfileKey};
 use loc_cli::search::{
     SearchOptions, SearchResult, is_notion_url_host, notion_id_from_url,
     run_search_with_access_roots, source_url_host,
@@ -111,9 +107,10 @@ use locality_slack::{
 };
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
-    ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository, FreshnessStateRecord,
-    FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, JournalRepository,
-    MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState,
+    ConnectionRecord, ConnectionRepository, CredentialError, CredentialStore, EntityRecord,
+    EntityRepository, FreshnessStateRecord, FreshnessStateRepository, HostedWorkspaceCredentialRef,
+    HydrationJobRecord, HydrationJobRepository, JournalRepository, MountConfig,
+    MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState,
     MountLiveModeStateChangeError, MountRepository, ProjectionMode, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, SqliteStateStore, StoreError,
     VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
@@ -484,10 +481,11 @@ struct WorkspaceMountOnboardingRequest {
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PortableWorkspaceMaterializationRequest {
+struct HostedWorkspaceMutationRequest {
     api_url: String,
     root: String,
-    profile_key: String,
+    credential_ref: String,
+    profile_key: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1400,6 +1398,17 @@ async fn choose_mount_folder(
 async fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
     match tauri::async_runtime::spawn_blocking(|| {
         let state_root = default_state_root();
+        if let Err(error) =
+            loc_cli::hosted_workspace::recover_hosted_workspace_attachments_at_state_root(
+                &state_root,
+            )
+        {
+            desktop_log(
+                "warn",
+                "hosted_workspace.recovery_required",
+                error.to_string(),
+            );
+        }
         ensure_virtual_projection_domains_for_state(&state_root)
             .and_then(|_| ensure_daemon_running(&state_root))
             .and_then(|_| reload_daemon_mounts(&state_root))
@@ -1468,54 +1477,127 @@ async fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
     .await
 }
 
-#[tauri::command]
-async fn materialize_portable_workspace(
-    request: PortableWorkspaceMaterializationRequest,
-) -> Result<SandboxInitReport, String> {
+fn hosted_workspace_options_at_state_root(
+    request: &HostedWorkspaceMutationRequest,
+    state_root: &Path,
+    require_profile_key: bool,
+) -> Result<loc_cli::hosted_workspace::HostedWorkspaceAttachOptions, String> {
+    let credentials = open_credential_store(state_root);
+    hosted_workspace_options_with_credentials(request, credentials.as_ref(), require_profile_key)
+}
+
+fn hosted_workspace_options_with_credentials(
+    request: &HostedWorkspaceMutationRequest,
+    credentials: &dyn CredentialStore,
+    require_profile_key: bool,
+) -> Result<loc_cli::hosted_workspace::HostedWorkspaceAttachOptions, String> {
+    let root = PathBuf::from(&request.root);
+    if !root.is_absolute() {
+        return Err("Hosted workspace root must be an absolute path".to_string());
+    }
+    let credential_ref = HostedWorkspaceCredentialRef::new(request.credential_ref.clone())
+        .map_err(|error| format!("Hosted workspace credential reference is invalid: {error}"))?;
+    match request.profile_key.as_deref() {
+        Some(profile_key) => {
+            SandboxProfileKey::new(profile_key)
+                .map_err(|error| format!("Hosted workspace credential is invalid: {error}"))?;
+            match credentials.get(credential_ref.as_str()) {
+                Ok(existing) if existing != profile_key => {
+                    return Err(
+                        "Hosted workspace credential reference names a different profile key"
+                            .to_string(),
+                    );
+                }
+                Ok(_) => {}
+                Err(CredentialError::NotFound(_)) => credentials
+                    .put(credential_ref.as_str(), profile_key)
+                    .map_err(|error| error.to_string())?,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        None if require_profile_key => {
+            return Err("Hosted workspace attach requires a Workspace Profile key".to_string());
+        }
+        None => {}
+    }
+    Ok(loc_cli::hosted_workspace::HostedWorkspaceAttachOptions {
+        api_url: request.api_url.clone(),
+        root,
+        credential_ref,
+        content_encoding: SandboxContentEncodingPreference::Automatic,
+    })
+}
+
+async fn run_hosted_workspace_desktop_command(
+    request: HostedWorkspaceMutationRequest,
+    operation: loc_cli::hosted_workspace::HostedWorkspaceOperation,
+) -> Result<loc_cli::hosted_workspace::HostedWorkspaceAttachReport, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state_root = default_state_root();
-        let (options, profile_key) =
-            portable_workspace_options_at_state_root(request, &state_root)?;
-        run_sandbox_init_with_profile_key_at_state_root(
+        let options = hosted_workspace_options_at_state_root(
+            &request,
+            &state_root,
+            operation == loc_cli::hosted_workspace::HostedWorkspaceOperation::Attach,
+        )?;
+        loc_cli::hosted_workspace::run_hosted_workspace_operation_at_state_root(
             options,
             &state_root,
-            profile_key,
-            SandboxContentEncodingPreference::Automatic,
+            Some(operation),
         )
-        .map_err(|error| format!("Portable workspace materialization failed: {error}"))
+        .map_err(|error| format!("Hosted workspace {operation:?} failed: {error}"))
     })
     .await
-    .map_err(|error| format!("Portable workspace worker failed: {error}"))?
+    .map_err(|error| format!("Hosted workspace worker failed: {error}"))?
 }
 
-#[cfg(test)]
-fn portable_workspace_options(
-    request: PortableWorkspaceMaterializationRequest,
-) -> Result<(SandboxInitOptions, SandboxProfileKey), String> {
-    portable_workspace_options_at_state_root(request, &default_state_root())
-}
-
-fn portable_workspace_options_at_state_root(
-    request: PortableWorkspaceMaterializationRequest,
-    state_root: &Path,
-) -> Result<(SandboxInitOptions, SandboxProfileKey), String> {
-    validate_sandbox_api_url(&request.api_url)
-        .map_err(|error| format!("Portable workspace API URL is invalid: {error}"))?;
-    let root = PathBuf::from(request.root);
-    if !root.is_absolute() {
-        return Err("Portable workspace root must be an absolute path".to_string());
-    }
-    let profile_key = SandboxProfileKey::new(request.profile_key)
-        .map_err(|error| format!("Portable workspace credential is invalid: {error}"))?;
-    let options = resolve_sandbox_init_options_at_state_root(
-        SandboxInitOptions {
-            api_url: request.api_url,
-            root,
-        },
-        state_root,
+#[tauri::command]
+async fn attach_hosted_workspace(
+    request: HostedWorkspaceMutationRequest,
+) -> Result<loc_cli::hosted_workspace::HostedWorkspaceAttachReport, String> {
+    run_hosted_workspace_desktop_command(
+        request,
+        loc_cli::hosted_workspace::HostedWorkspaceOperation::Attach,
     )
-    .map_err(|error| format!("Portable workspace root is unsafe: {error}"))?;
-    Ok((options, profile_key))
+    .await
+}
+
+#[tauri::command]
+async fn refresh_hosted_workspace(
+    request: HostedWorkspaceMutationRequest,
+) -> Result<loc_cli::hosted_workspace::HostedWorkspaceAttachReport, String> {
+    run_hosted_workspace_desktop_command(
+        request,
+        loc_cli::hosted_workspace::HostedWorkspaceOperation::Refresh,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn relocate_hosted_workspace(
+    request: HostedWorkspaceMutationRequest,
+) -> Result<loc_cli::hosted_workspace::HostedWorkspaceAttachReport, String> {
+    run_hosted_workspace_desktop_command(
+        request,
+        loc_cli::hosted_workspace::HostedWorkspaceOperation::Relocate,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn list_hosted_workspaces()
+-> Result<loc_cli::hosted_workspace::HostedWorkspaceListReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        loc_cli::hosted_workspace::recover_hosted_workspace_attachments_at_state_root(
+            &default_state_root(),
+        )
+        .map_err(|error| format!("Hosted workspace recovery failed: {error}"))?;
+        loc_cli::hosted_workspace::list_hosted_workspace_attachments_at_state_root(
+            &default_state_root(),
+        )
+        .map_err(|error| format!("Hosted workspace list failed: {error}"))
+    })
+    .await
+    .map_err(|error| format!("Hosted workspace worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -14029,8 +14111,8 @@ mod tests {
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
         ConnectionRecord, ConnectionRepository, ConnectorProfileId, EntityRecord, EntityRepository,
-        FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, JournalRepository,
-        LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig, MountLiveModeRecord,
+        FileCredentialStore, FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore,
+        JournalRepository, LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig, MountLiveModeRecord,
         MountLiveModeRepository, MountLiveModeState, MountRepository, ProjectionMode,
         RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
         StoreResult, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
@@ -14098,83 +14180,81 @@ mod tests {
     }
 
     #[test]
-    fn portable_workspace_invoke_boundary_rejects_invalid_urls_and_relative_roots() {
-        for api_url in [
-            "https://workspace.example.test/api",
-            "https://user@workspace.example.test",
-            "https://workspace.example.test?tenant=7",
-            "https://workspace.example.test#fragment",
-            "http://workspace.example.test",
-        ] {
-            let error =
-                super::portable_workspace_options(super::PortableWorkspaceMaterializationRequest {
-                    api_url: api_url.to_string(),
-                    root: std::env::temp_dir().join("Locality").display().to_string(),
-                    profile_key: "a".repeat(64),
-                })
-                .expect_err("invalid Desktop API URL must fail before invocation");
-            assert!(error.contains("API URL is invalid"), "{api_url}: {error}");
-        }
-
-        let error =
-            super::portable_workspace_options(super::PortableWorkspaceMaterializationRequest {
+    fn hosted_workspace_invoke_boundary_rejects_relative_roots_and_invalid_credentials() {
+        let credentials = FileCredentialStore::new(std::env::temp_dir().join("unused"));
+        let error = super::hosted_workspace_options_with_credentials(
+            &super::HostedWorkspaceMutationRequest {
                 api_url: "https://workspace.example.test".to_string(),
                 root: "relative/Locality".to_string(),
-                profile_key: "a".repeat(64),
-            })
-            .expect_err("relative Desktop root must fail before invocation");
+                credential_ref: "hosted-workspace:desktop".to_string(),
+                profile_key: Some("a".repeat(64)),
+            },
+            &credentials,
+            true,
+        )
+        .expect_err("relative Desktop root must fail before invocation");
         assert!(error.contains("absolute path"));
-    }
 
-    #[test]
-    fn portable_workspace_invoke_boundary_accepts_https_and_loopback_http() {
-        let temp = TestTempDir::new("portable-workspace-valid-root");
-        let state_root = temp.path().join("state");
-        for api_url in [
-            "https://workspace.example.test",
-            "http://127.0.0.1:8080",
-            "http://127.1:8080",
+        let temp = TestTempDir::new("hosted-workspace-invalid-request");
+        let credentials = FileCredentialStore::new(temp.path());
+        for (credential_ref, profile_key, expected) in [
+            (
+                "plain-reference",
+                Some("a".repeat(64)),
+                "reference is invalid",
+            ),
+            (
+                "hosted-workspace:desktop",
+                Some("secret".to_string()),
+                "credential is invalid",
+            ),
+            (
+                "hosted-workspace:desktop",
+                None,
+                "requires a Workspace Profile key",
+            ),
         ] {
-            let (options, _) = super::portable_workspace_options_at_state_root(
-                super::PortableWorkspaceMaterializationRequest {
-                    api_url: api_url.to_string(),
+            let error = super::hosted_workspace_options_with_credentials(
+                &super::HostedWorkspaceMutationRequest {
+                    api_url: "https://workspace.example.test".to_string(),
                     root: temp.path().join("Locality").display().to_string(),
-                    profile_key: "a".repeat(64),
+                    credential_ref: credential_ref.to_string(),
+                    profile_key,
                 },
-                &state_root,
+                &credentials,
+                true,
             )
-            .expect("valid Desktop workspace request");
-            assert_eq!(options.api_url, api_url);
-            assert!(options.root.is_absolute());
+            .expect_err("invalid Desktop hosted request must fail");
+            assert!(error.contains(expected), "{error}");
         }
     }
 
     #[test]
-    fn portable_workspace_invoke_boundary_rejects_active_desktop_root() {
-        let temp = TestTempDir::new("portable-workspace-active-root");
-        let state_root = temp.path().join("state");
-        let active_root = temp.path().join("Locality/notion");
-        fs::create_dir_all(&active_root).expect("create active Desktop root");
-        let mut store = SqliteStateStore::open(state_root.clone()).expect("open state");
-        store
-            .save_mount(
-                MountConfig::new(MountId::new("notion"), "notion", &active_root)
-                    .projection(ProjectionMode::MacosFileProvider),
-            )
-            .expect("save Desktop mount");
-        drop(store);
+    fn hosted_workspace_invoke_boundary_stores_and_reuses_the_opaque_reference() {
+        let temp = TestTempDir::new("hosted-workspace-valid-request");
+        let credentials = FileCredentialStore::new(temp.path());
+        let request = super::HostedWorkspaceMutationRequest {
+            api_url: "https://workspace.example.test".to_string(),
+            root: temp.path().join("Locality").display().to_string(),
+            credential_ref: "hosted-workspace:desktop".to_string(),
+            profile_key: Some("a".repeat(64)),
+        };
+        let options =
+            super::hosted_workspace_options_with_credentials(&request, &credentials, true)
+                .expect("valid Desktop hosted request");
+        assert_eq!(options.api_url, request.api_url);
+        assert_eq!(options.credential_ref.as_str(), "hosted-workspace:desktop");
+        assert_eq!(
+            locality_store::CredentialStore::get(&credentials, "hosted-workspace:desktop").unwrap(),
+            "a".repeat(64)
+        );
 
-        let error = super::portable_workspace_options_at_state_root(
-            super::PortableWorkspaceMaterializationRequest {
-                api_url: "https://workspace.example.test".to_string(),
-                root: active_root.join("sandbox").display().to_string(),
-                profile_key: "a".repeat(64),
-            },
-            &state_root,
-        )
-        .expect_err("active Desktop root must not receive sandbox publication");
-
-        assert!(error.contains("overlaps active mount `notion`"), "{error}");
+        let refresh = super::HostedWorkspaceMutationRequest {
+            profile_key: None,
+            ..request
+        };
+        super::hosted_workspace_options_with_credentials(&refresh, &credentials, false)
+            .expect("refresh may reuse the stored credential");
     }
 
     #[cfg(unix)]
@@ -21888,7 +21968,10 @@ fn main() {
             ensure_runtime_ready,
             ensure_terminal_cli_available,
             create_workspace_mount,
-            materialize_portable_workspace,
+            attach_hosted_workspace,
+            refresh_hosted_workspace,
+            relocate_hosted_workspace,
+            list_hosted_workspaces,
             create_desktop_mount,
             connect_granola,
             connect_linear,

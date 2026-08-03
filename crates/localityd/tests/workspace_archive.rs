@@ -40,11 +40,12 @@ use localityd::workspace_archive::{
 use localityd::workspace_materializer::{
     PublishedWorkspace, StagedWorkspaceMaterialization, WorkspaceMaterializationError,
     WorkspaceMaterializationLimits, WorkspaceOwnershipCapability, WorkspacePublicationCheckpoint,
-    WorkspacePublicationHooks, load_workspace_publication_receipt,
+    WorkspacePublicationExpectation, WorkspacePublicationHooks, load_workspace_publication_receipt,
     materialize_workspace_archive_durable as materialize_workspace_archive_durable_secure,
     publish_staged_workspace_with_hooks as publish_staged_workspace_with_hooks_secure,
     recover_and_verify_workspace_publication_state,
-    recover_workspace_publication as recover_workspace_publication_secure, stage_workspace_archive,
+    recover_workspace_publication as recover_workspace_publication_secure,
+    remove_owned_workspace_publication, stage_workspace_archive,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -2121,6 +2122,90 @@ fn reissued_same_profile_secret_recovers_but_rotated_key_fails_closed() {
         )
         .expect("a reissued key with the same profile secret recovers ownership")
     );
+}
+
+#[test]
+fn obsolete_publication_cleanup_requires_exact_identity_ownership_and_clean_tree() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("owned-relocation-cleanup");
+    materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("publish obsolete generation");
+    let expected = WorkspacePublicationExpectation {
+        profile_id: contract.session.profile_id().clone(),
+        profile_revision: contract.session.profile_revision(),
+        layout_version: contract.session.session_layout().layout_version(),
+        layout_digest: contract.session.session_layout().layout_digest().clone(),
+    };
+
+    let wrong_revision = WorkspacePublicationExpectation {
+        profile_revision: expected.profile_revision + 1,
+        ..expected.clone()
+    };
+    let error =
+        remove_owned_workspace_publication(&directory.root(), &wrong_revision, &test_ownership())
+            .expect_err("changed portable identity must preserve the old root");
+    assert!(error.to_string().contains("does not match"));
+    assert!(directory.root().join("Sales/README.md").exists());
+
+    let error = remove_owned_workspace_publication(
+        &directory.root(),
+        &expected,
+        &WorkspaceOwnershipCapability::new([0x6b; 32]),
+    )
+    .expect_err("wrong ownership must preserve the old root");
+    assert!(error.to_string().contains("authenticated"));
+    assert!(directory.root().join("Sales/README.md").exists());
+
+    let dirty = directory.root().join("Sales/README.md");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dirty, fs::Permissions::from_mode(0o644))
+            .expect("make obsolete file locally writable");
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = fs::metadata(&dirty).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&dirty, permissions).unwrap();
+    }
+    let error = remove_owned_workspace_publication(&directory.root(), &expected, &test_ownership())
+        .expect_err("locally writable content must be preserved for review");
+    assert!(error.to_string().contains("writable or modified"));
+    assert!(dirty.exists());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dirty, fs::Permissions::from_mode(0o444))
+            .expect("restore immutable file mode");
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = fs::metadata(&dirty).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&dirty, permissions).unwrap();
+    }
+    remove_owned_workspace_publication(&directory.root(), &expected, &test_ownership())
+        .expect("remove exact clean obsolete generation");
+    assert!(!directory.root().exists());
+    assert!(
+        load_workspace_publication_receipt(&directory.root())
+            .expect("load absent cleanup receipt")
+            .is_none()
+    );
+    remove_owned_workspace_publication(&directory.root(), &expected, &test_ownership())
+        .expect("cleanup replay is idempotent");
 }
 
 #[test]

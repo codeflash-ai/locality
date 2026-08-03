@@ -5963,6 +5963,7 @@ function SettingsView({
   const [localSettings, setLocalSettings] = useState(snapshot.settings);
   const [portableApiUrl, setPortableApiUrl] = useState("");
   const [portableRoot, setPortableRoot] = useState("");
+  const [portableCredentialRef, setPortableCredentialRef] = useState("hosted-workspace:desktop");
   const [portableProfileKey, setPortableProfileKey] = useState("");
   const [portableWorkspaceState, setPortableWorkspaceState] = useState<
     "idle" | "materializing" | "success" | "error"
@@ -6152,6 +6153,7 @@ function SettingsView({
     const validation = validatePortableWorkspaceForm({
       apiUrl: portableApiUrl,
       root: portableRoot,
+      credentialRef: portableCredentialRef,
       profileKey: portableProfileKey,
     });
     if (!validation.ok) {
@@ -6160,18 +6162,18 @@ function SettingsView({
       return;
     }
     setPortableWorkspaceState("materializing");
-    setPortableWorkspaceMessage("Negotiating and materializing the hosted workspace…");
+    setPortableWorkspaceMessage("Negotiating and attaching the hosted workspace…");
     try {
       const fallback: PortableWorkspaceReport = {
         ok: true,
+        api_origin: validation.request.apiUrl,
+        profile_id: "018f4f6e-9f2c-7b1a-8c3d-4e5f60718293",
+        profile_revision: 1,
         root: validation.request.root,
-        session_id: "demo-session",
-        content_encoding: "identity",
-        entries: 0,
+        mount_count: 0,
         files: 0,
         directories: 0,
         materialized_bytes: 0,
-        decoded_bytes: 0,
       };
       const report = await invokePortableWorkspace(
         (command, args) => callCommand<PortableWorkspaceReport>(command, args, fallback),
@@ -6189,7 +6191,7 @@ function SettingsView({
   const settingsSections: Array<{ id: SettingsSection; label: string; description: string }> = [
     { id: "general", label: "General", description: "Startup and desktop behavior" },
     { id: "sources", label: "Sources", description: "Connected workspaces and local folders" },
-    { id: "hosted", label: "Hosted (preview)", description: "Manual portable materializer" },
+    { id: "hosted", label: "Hosted", description: "Durable hosted workspace attachment" },
     { id: "sync", label: "Sync", description: "Live Mode and review policy" },
     { id: "activity", label: "Activity", description: "Recent events and debug queue" },
     { id: "agents", label: "Agents", description: "Local agent instructions" },
@@ -6275,9 +6277,9 @@ function SettingsView({
 
           {settingsSection === "hosted" && (
             <section className="panel settings-section-panel portable-workspace-panel">
-              <PanelTitle title="Hosted materializer preview" />
+              <PanelTitle title="Hosted workspace" />
               <p className="quiet-note">
-                Manually materialize or recover a generation-2 workspace. This preview is not yet bound to Desktop sources, mounts, or stored credentials.
+                Attach a generation-2 workspace durably. Desktop and the loc CLI share the same attachment, refresh, recovery, and relocation coordinator.
               </p>
               <div className="portable-workspace-fields">
                 <label className="source-inline-field">
@@ -6297,6 +6299,15 @@ function SettingsView({
                     placeholder="/mnt/locality"
                     disabled={portableWorkspaceState === "materializing"}
                     onChange={(event) => setPortableRoot(event.target.value)}
+                  />
+                </label>
+                <label className="source-inline-field">
+                  <span>Credential reference</span>
+                  <input
+                    value={portableCredentialRef}
+                    placeholder="hosted-workspace:desktop"
+                    disabled={portableWorkspaceState === "materializing"}
+                    onChange={(event) => setPortableCredentialRef(event.target.value)}
                   />
                 </label>
                 <label className="source-inline-field portable-workspace-key-field">
@@ -6322,7 +6333,7 @@ function SettingsView({
                 disabled={portableWorkspaceState === "materializing"}
                 onClick={() => void materializePortableWorkspace()}
               >
-                {portableWorkspaceState === "materializing" ? "Materializing" : "Materialize Workspace"}
+                {portableWorkspaceState === "materializing" ? "Attaching" : "Attach Workspace"}
               </PrimaryButton>
               {portableWorkspaceMessage && (
                 <p

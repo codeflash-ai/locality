@@ -15,7 +15,7 @@ use url::Url;
 
 use crate::{StoreError, StoreResult};
 
-pub const HOSTED_WORKSPACE_ATTACHMENT_COMPONENT_VERSION: u32 = 1;
+pub const HOSTED_WORKSPACE_ATTACHMENT_COMPONENT_VERSION: u32 = 2;
 pub const HOSTED_WORKSPACE_LAYOUT_VERSION: u16 = 1;
 
 /// Canonical tuple member used with a hosted profile ID as durable identity.
@@ -462,6 +462,87 @@ pub struct PendingHostedWorkspaceTransition {
     base_root: Option<PathBuf>,
 }
 
+/// Durable post-commit cleanup intent created atomically with a relocation.
+///
+/// The old root remains reserved until the filesystem coordinator proves that
+/// the exact receipt-authenticated generation was removed and completes this
+/// record. The old credential reference keeps recovery bound to the same
+/// secret-store authority as the published generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingHostedWorkspaceCleanup {
+    cleanup_id: String,
+    identity: HostedWorkspaceIdentity,
+    credential_ref: HostedWorkspaceCredentialRef,
+    root: PathBuf,
+    profile_revision: u64,
+    layout_version: u16,
+    layout_digest: LayoutDigest,
+    created_at: String,
+}
+
+impl PendingHostedWorkspaceCleanup {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        cleanup_id: impl Into<String>,
+        identity: HostedWorkspaceIdentity,
+        credential_ref: HostedWorkspaceCredentialRef,
+        root: impl Into<PathBuf>,
+        profile_revision: u64,
+        layout_version: u16,
+        layout_digest: LayoutDigest,
+        created_at: impl Into<String>,
+    ) -> StoreResult<Self> {
+        let cleanup = Self {
+            cleanup_id: cleanup_id.into(),
+            identity,
+            credential_ref,
+            root: root.into(),
+            profile_revision,
+            layout_version,
+            layout_digest,
+            created_at: created_at.into(),
+        };
+        validate_transition_id(&cleanup.cleanup_id)?;
+        validate_host_root(&cleanup.root)?;
+        validate_profile_revision(cleanup.profile_revision)?;
+        validate_layout_version(cleanup.layout_version)?;
+        validate_timestamp(&cleanup.created_at)?;
+        Ok(cleanup)
+    }
+
+    pub fn cleanup_id(&self) -> &str {
+        &self.cleanup_id
+    }
+
+    pub fn identity(&self) -> &HostedWorkspaceIdentity {
+        &self.identity
+    }
+
+    pub fn credential_ref(&self) -> &HostedWorkspaceCredentialRef {
+        &self.credential_ref
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn profile_revision(&self) -> u64 {
+        self.profile_revision
+    }
+
+    pub fn layout_version(&self) -> u16 {
+        self.layout_version
+    }
+
+    pub fn layout_digest(&self) -> &LayoutDigest {
+        &self.layout_digest
+    }
+
+    pub fn created_at(&self) -> &str {
+        &self.created_at
+    }
+}
+
 impl PendingHostedWorkspaceTransition {
     pub(crate) fn new(
         prepared: PreparedHostedWorkspaceTransition,
@@ -561,6 +642,12 @@ pub(crate) fn prepare_pending_transition(
     let (kind, base_profile_revision, base_layout_digest, base_root) = match attachment {
         None => (HostedWorkspaceTransitionKind::Attach, None, None, None),
         Some(current) => {
+            if prepared.credential_ref() != current.credential_ref() {
+                return Err(StoreError::InvalidState(
+                    "hosted workspace credential reference cannot change during refresh or relocation"
+                        .to_string(),
+                ));
+            }
             if prepared.profile_revision() < current.profile_revision() {
                 return Err(StoreError::InvalidState(
                     "hosted workspace profile revision cannot move backward".to_string(),
@@ -591,7 +678,6 @@ pub(crate) fn prepare_pending_transition(
                     .collect::<Vec<_>>();
                 if prepared.layout_version() != current.layout_version()
                     || prepared.layout_digest() != current.layout_digest()
-                    || prepared.target_root() != current.root()
                     || proposed_mounts != current_mounts
                 {
                     return Err(StoreError::InvalidState(
@@ -650,6 +736,38 @@ pub(crate) fn committed_attachment(
         prepared.layout_digest().clone(),
         committed_at.into(),
     )
+}
+
+pub(crate) fn relocation_cleanup(
+    pending: &PendingHostedWorkspaceTransition,
+    current: Option<&HostedWorkspaceAttachment>,
+) -> StoreResult<Option<PendingHostedWorkspaceCleanup>> {
+    if pending.kind() != HostedWorkspaceTransitionKind::Relocate {
+        return Ok(None);
+    }
+    let current = current.ok_or_else(|| {
+        StoreError::InvalidState(
+            "hosted workspace relocation has no active attachment to clean up".to_string(),
+        )
+    })?;
+    if Some(current.root()) != pending.base_root()
+        || current.root() == pending.prepared().target_root()
+    {
+        return Err(StoreError::InvalidState(
+            "hosted workspace relocation cleanup does not match its captured base root".to_string(),
+        ));
+    }
+    PendingHostedWorkspaceCleanup::new(
+        pending.prepared().transition_id(),
+        current.identity().clone(),
+        current.credential_ref().clone(),
+        current.root(),
+        current.profile_revision(),
+        current.layout_version(),
+        current.layout_digest().clone(),
+        pending.prepared().created_at(),
+    )
+    .map(Some)
 }
 
 fn validate_identifier(label: &str, value: &str, max: usize) -> StoreResult<()> {

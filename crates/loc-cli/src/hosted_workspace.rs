@@ -15,14 +15,15 @@ use locality_protocol::{SandboxSessionState, SessionCapability, SessionErrorCode
 use locality_store::{
     CanonicalApiOrigin, CredentialError, CredentialStore, HostedWorkspaceCredentialRef,
     HostedWorkspaceIdentity, HostedWorkspaceMountMapping, HostedWorkspaceRepository,
-    LegacyWorkspaceMount, SqliteStateStore, StoreError, WorkspaceHostBindingResolver,
-    open_credential_store,
+    HostedWorkspaceTransitionKind, LegacyWorkspaceMount, SqliteStateStore, StoreError,
+    WorkspaceHostBindingResolver, open_credential_store,
 };
 use localityd::workspace_materializer::{
     PublishedWorkspace, StagedWorkspaceMaterialization, WorkspaceMaterializationError,
-    WorkspaceOwnershipCapability, WorkspacePublicationCheckpoint, WorkspacePublicationHooks,
-    load_workspace_publication_receipt, publish_staged_workspace_with_hooks,
-    recover_and_verify_workspace_publication_state,
+    WorkspaceOwnershipCapability, WorkspacePublicationCheckpoint, WorkspacePublicationExpectation,
+    WorkspacePublicationHooks, load_workspace_publication_receipt,
+    publish_staged_workspace_with_hooks, recover_and_verify_workspace_publication_state,
+    remove_owned_workspace_publication,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -39,6 +40,13 @@ pub struct HostedWorkspaceAttachOptions {
     pub root: PathBuf,
     pub credential_ref: HostedWorkspaceCredentialRef,
     pub content_encoding: SandboxContentEncodingPreference,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostedWorkspaceOperation {
+    Attach,
+    Refresh,
+    Relocate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -163,8 +171,44 @@ pub fn run_hosted_workspace_attach_at_state_root(
     options: HostedWorkspaceAttachOptions,
     state_root: &Path,
 ) -> Result<HostedWorkspaceAttachReport, HostedWorkspaceAttachError> {
+    run_hosted_workspace_operation_at_state_root(options, state_root, None)
+}
+
+pub fn run_hosted_workspace_refresh_at_state_root(
+    options: HostedWorkspaceAttachOptions,
+    state_root: &Path,
+) -> Result<HostedWorkspaceAttachReport, HostedWorkspaceAttachError> {
+    run_hosted_workspace_operation_at_state_root(
+        options,
+        state_root,
+        Some(HostedWorkspaceOperation::Refresh),
+    )
+}
+
+pub fn run_hosted_workspace_relocate_at_state_root(
+    options: HostedWorkspaceAttachOptions,
+    state_root: &Path,
+) -> Result<HostedWorkspaceAttachReport, HostedWorkspaceAttachError> {
+    run_hosted_workspace_operation_at_state_root(
+        options,
+        state_root,
+        Some(HostedWorkspaceOperation::Relocate),
+    )
+}
+
+pub fn run_hosted_workspace_operation_at_state_root(
+    options: HostedWorkspaceAttachOptions,
+    state_root: &Path,
+    operation: Option<HostedWorkspaceOperation>,
+) -> Result<HostedWorkspaceAttachReport, HostedWorkspaceAttachError> {
     let mut root = absolute_normalized_root(&options.root)?;
     validate_destination_parent(&root)?;
+    if operation == Some(HostedWorkspaceOperation::Relocate) && root.exists() {
+        return Err(HostedWorkspaceAttachError::InvalidPlacement(format!(
+            "hosted workspace relocation destination `{}` must be absent",
+            root.display()
+        )));
+    }
     let api_origin = CanonicalApiOrigin::new(&options.api_url)
         .map_err(|error| HostedWorkspaceAttachError::InvalidPlacement(error.to_string()))?;
     let credentials = open_credential_store(state_root);
@@ -185,18 +229,48 @@ pub fn run_hosted_workspace_attach_at_state_root(
     recover_hosted_workspace_identity_at_state_root(state_root, &identity, &profile_key)?;
 
     let mut store = SqliteStateStore::open(state_root.to_path_buf())?;
-    if let Some(existing) = store.get_hosted_workspace_attachment(&identity)? {
-        if !locality_store::host_paths_equivalent(
-            locality_store::WorkspaceHostPlatform::current(),
-            existing.root(),
-            &root,
-        ) {
+    let existing = store.get_hosted_workspace_attachment(&identity)?;
+    match (operation, existing.as_ref()) {
+        (Some(HostedWorkspaceOperation::Attach), Some(_)) => {
             return Err(HostedWorkspaceAttachError::InvalidPlacement(
-                "hosted workspace relocation is not enabled by this attach/refresh coordinator"
+                "hosted workspace profile is already attached; use refresh or relocate".to_string(),
+            ));
+        }
+        (Some(HostedWorkspaceOperation::Refresh), None) => {
+            return Err(HostedWorkspaceAttachError::InvalidPlacement(
+                "hosted workspace profile is not attached; use attach first".to_string(),
+            ));
+        }
+        (Some(HostedWorkspaceOperation::Relocate), None) => {
+            return Err(HostedWorkspaceAttachError::InvalidPlacement(
+                "hosted workspace profile is not attached; use attach first".to_string(),
+            ));
+        }
+        (Some(HostedWorkspaceOperation::Relocate), Some(existing))
+            if locality_store::host_paths_equivalent(
+                locality_store::WorkspaceHostPlatform::current(),
+                existing.root(),
+                &root,
+            ) =>
+        {
+            return Err(HostedWorkspaceAttachError::InvalidPlacement(
+                "hosted workspace relocation destination must differ from the active root"
                     .to_string(),
             ));
         }
-        root = existing.root().to_path_buf();
+        (Some(HostedWorkspaceOperation::Refresh), Some(existing)) | (None, Some(existing)) => {
+            if !locality_store::host_paths_equivalent(
+                locality_store::WorkspaceHostPlatform::current(),
+                existing.root(),
+                &root,
+            ) {
+                return Err(HostedWorkspaceAttachError::InvalidPlacement(
+                    "hosted workspace root changed; use the explicit relocate workflow".to_string(),
+                ));
+            }
+            root = existing.root().to_path_buf();
+        }
+        _ => {}
     }
     let mappings = mappings_for_session(&store, &identity, &session)?;
     let transition_id = random_local_id("hosted-transition")?;
@@ -377,6 +451,12 @@ fn commit_staged_hosted_workspace(
         .map_err(|error| HostedWorkspaceAttachError::Lock(error.to_string()))?;
     revalidate_hosted_workspace_placement(store, identity, root)?;
     revalidate_pending_transition(store, pending)?;
+    if pending.kind() == HostedWorkspaceTransitionKind::Relocate && root.exists() {
+        return Err(HostedWorkspaceAttachError::InvalidPlacement(format!(
+            "hosted workspace relocation destination `{}` is no longer absent",
+            root.display()
+        )));
+    }
     validate_receipt_metadata_against_pending(
         &staged.validated().terminal_control.metadata,
         pending,
@@ -394,6 +474,8 @@ fn commit_staged_hosted_workspace(
             "publication completed without committing attachment state".to_string(),
         ));
     }
+    drop(hooks);
+    complete_pending_cleanup(store, identity, ownership)?;
     Ok(published)
 }
 
@@ -409,7 +491,13 @@ impl WorkspacePublicationHooks for HostedWorkspacePublicationHooks<'_> {
     fn before_publication(&mut self) -> io::Result<()> {
         revalidate_hosted_workspace_placement(self.store, self.identity, self.root)
             .map_err(io::Error::other)?;
-        revalidate_pending_transition(self.store, self.pending).map_err(io::Error::other)
+        revalidate_pending_transition(self.store, self.pending).map_err(io::Error::other)?;
+        if self.pending.kind() == HostedWorkspaceTransitionKind::Relocate && self.root.exists() {
+            return Err(io::Error::other(
+                "hosted workspace relocation destination is no longer absent",
+            ));
+        }
+        Ok(())
     }
 
     fn checkpoint(&mut self, checkpoint: WorkspacePublicationCheckpoint) -> io::Result<()> {
@@ -457,6 +545,9 @@ pub fn recover_hosted_workspace_attachments_with_credentials_at_state_root(
             transition.prepared().identity().clone(),
             transition.prepared().credential_ref().clone(),
         );
+    }
+    for cleanup in store.list_pending_hosted_workspace_cleanups()? {
+        identities.insert(cleanup.identity().clone(), cleanup.credential_ref().clone());
     }
     for (identity, credential_ref) in identities {
         let secret = match credentials.get(credential_ref.as_str()) {
@@ -508,6 +599,7 @@ fn recover_hosted_workspace_identity_locked(
                 .map(|attachment| attachment.root().to_path_buf())
         })
     else {
+        complete_pending_cleanup(store, identity, &key.ownership_capability())?;
         return Ok(());
     };
     let _path_lock = locality_platform::DaemonRemountCoordinatorLock::try_acquire(state_root)
@@ -521,11 +613,13 @@ fn recover_hosted_workspace_identity_locked(
                 "attached workspace root is not bound to a durable publication receipt".to_string(),
             ));
         }
+        complete_pending_cleanup(store, identity, &key.ownership_capability())?;
         return Ok(());
     };
     if !verified {
-        if attachment.is_none() && !root.exists() {
+        if !root.exists() {
             store.cancel_hosted_workspace_transition(pending.prepared().transition_id())?;
+            complete_pending_cleanup(store, identity, &key.ownership_capability())?;
             return Ok(());
         }
         return Err(HostedWorkspaceAttachError::Recovery(
@@ -548,6 +642,7 @@ fn recover_hosted_workspace_identity_locked(
             pending.prepared().transition_id(),
             &now_timestamp(),
         )?;
+        complete_pending_cleanup(store, identity, &key.ownership_capability())?;
         return Ok(());
     }
     let current_matches = attachment.as_ref().is_some_and(|current| {
@@ -559,11 +654,34 @@ fn recover_hosted_workspace_identity_locked(
     });
     if current_matches {
         store.cancel_hosted_workspace_transition(pending.prepared().transition_id())?;
+        complete_pending_cleanup(store, identity, &key.ownership_capability())?;
         return Ok(());
     }
     Err(HostedWorkspaceAttachError::Recovery(
         "published receipt matches neither pending nor active attachment state".to_string(),
     ))
+}
+
+fn complete_pending_cleanup(
+    store: &mut SqliteStateStore,
+    identity: &HostedWorkspaceIdentity,
+    ownership: &WorkspaceOwnershipCapability,
+) -> Result<(), HostedWorkspaceAttachError> {
+    let Some(cleanup) = store.get_pending_hosted_workspace_cleanup(identity)? else {
+        return Ok(());
+    };
+    remove_owned_workspace_publication(
+        cleanup.root(),
+        &WorkspacePublicationExpectation {
+            profile_id: identity.profile_id().clone(),
+            profile_revision: cleanup.profile_revision(),
+            layout_version: cleanup.layout_version(),
+            layout_digest: cleanup.layout_digest().clone(),
+        },
+        ownership,
+    )?;
+    store.complete_hosted_workspace_cleanup(cleanup.cleanup_id())?;
+    Ok(())
 }
 
 fn revalidate_hosted_workspace_placement(
@@ -593,6 +711,18 @@ fn revalidate_hosted_workspace_placement(
             active.push(LegacyWorkspaceMount::new(
                 MountId::new(format!("pending-hosted-workspace-{index}")),
                 pending.prepared().target_root(),
+            ));
+        }
+    }
+    for (index, cleanup) in store
+        .list_pending_hosted_workspace_cleanups()?
+        .into_iter()
+        .enumerate()
+    {
+        if cleanup.identity() != identity || cleanup.root() != root {
+            active.push(LegacyWorkspaceMount::new(
+                MountId::new(format!("cleanup-hosted-workspace-{index}")),
+                cleanup.root(),
             ));
         }
     }
@@ -664,6 +794,16 @@ pub fn revalidate_connector_mount_placement_at_state_root(
         active.push(LegacyWorkspaceMount::new(
             MountId::new(format!("pending-hosted-workspace-{index}")),
             pending.prepared().target_root(),
+        ));
+    }
+    for (index, cleanup) in store
+        .list_pending_hosted_workspace_cleanups()?
+        .into_iter()
+        .enumerate()
+    {
+        active.push(LegacyWorkspaceMount::new(
+            MountId::new(format!("cleanup-hosted-workspace-{index}")),
+            cleanup.root(),
         ));
     }
     WorkspaceHostBindingResolver::current()
@@ -907,6 +1047,65 @@ mod tests {
 
         let error = revalidate_pending_transition(&store, &expected).unwrap_err();
         assert_eq!(error.code(), "hosted_workspace_recovery_required");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn relocation_prepublication_revalidation_rejects_raced_destination_creation() {
+        let root = std::env::temp_dir().join(random_local_id("relocation-race").unwrap());
+        let state_root = root.join("state");
+        let old_root = root.join("OldWorkspace");
+        let new_root = root.join("NewWorkspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut store = SqliteStateStore::open(state_root.clone()).unwrap();
+        let initial = store
+            .begin_hosted_workspace_transition(prepared(
+                "initial",
+                7,
+                "sha256:6d739ad2748910520e4df1d680e9ea78a94230d0751e6346d3f5d3c57b9259b5",
+                &old_root,
+            ))
+            .unwrap();
+        let identity = initial.prepared().identity().clone();
+        store
+            .commit_hosted_workspace_transition("initial", "2026-08-03T00:00:01Z")
+            .unwrap();
+        let pending = store
+            .begin_hosted_workspace_transition(prepared(
+                "relocate",
+                8,
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                &new_root,
+            ))
+            .unwrap();
+        assert_eq!(pending.kind(), HostedWorkspaceTransitionKind::Relocate);
+        std::fs::create_dir(&new_root).unwrap();
+        let mut hooks = HostedWorkspacePublicationHooks {
+            store: &mut store,
+            identity: &identity,
+            pending: &pending,
+            root: &new_root,
+            committed: false,
+        };
+        let error = hooks
+            .before_publication()
+            .expect_err("raced destination must block relocation publication");
+        assert!(error.to_string().contains("no longer absent"));
+        drop(hooks);
+        assert_eq!(
+            store
+                .get_hosted_workspace_attachment(&identity)
+                .unwrap()
+                .unwrap()
+                .root(),
+            old_root
+        );
+        assert!(
+            store
+                .get_pending_hosted_workspace_transition(&identity)
+                .unwrap()
+                .is_some()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

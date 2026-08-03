@@ -46,7 +46,7 @@ pub use hosted_workspace::{
     CanonicalApiOrigin, CanonicalApiOriginError, HOSTED_WORKSPACE_ATTACHMENT_COMPONENT_VERSION,
     HOSTED_WORKSPACE_LAYOUT_VERSION, HostedWorkspaceAttachment, HostedWorkspaceCredentialRef,
     HostedWorkspaceCredentialRefError, HostedWorkspaceIdentity, HostedWorkspaceMountMapping,
-    HostedWorkspaceTransitionKind, PendingHostedWorkspaceTransition,
+    HostedWorkspaceTransitionKind, PendingHostedWorkspaceCleanup, PendingHostedWorkspaceTransition,
     PreparedHostedWorkspaceTransition,
 };
 pub use live_mode::{
