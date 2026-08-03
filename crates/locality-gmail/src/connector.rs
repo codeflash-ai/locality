@@ -1232,7 +1232,7 @@ mod tests {
     use crate::settings::GmailMountSettings;
 
     #[test]
-    fn enumerate_projects_three_folders_and_recent_inbox_sent_draft_messages() {
+    fn enumerate_projects_four_folders_and_recent_inbox_sent_draft_messages() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
 
@@ -1258,13 +1258,17 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path == std::path::PathBuf::from("draft"))
         );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path == std::path::PathBuf::from("send"))
+        );
         assert!(entries.iter().any(|entry| entry.path.starts_with("inbox/")));
         assert!(entries.iter().any(|entry| entry.path.starts_with("sent/")));
         assert!(entries.iter().any(|entry| entry.path.starts_with("draft/")));
-        assert_eq!(
-            api.calls.lock().expect("calls").list_max_results,
-            vec![100, 100, 100]
-        );
+        assert!(!entries.iter().any(|entry| entry.path.starts_with("send/")));
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.list_max_results, vec![100, 100, 100]);
     }
 
     #[test]
@@ -1451,6 +1455,22 @@ mod tests {
     }
 
     #[test]
+    fn list_children_for_send_folder_is_empty_staging_surface() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
+
+        let result = connector
+            .list_children(ListChildrenRequest {
+                mount_id: MountId::new("gmail-main"),
+                container: ChildContainer::DirectoryChildren(RemoteId::new("gmail-folder:send")),
+                parent_path: "send".into(),
+            })
+            .expect("list send");
+
+        assert!(result.entries.is_empty());
+    }
+
+    #[test]
     fn list_children_for_thread_page_returns_message_files() {
         let api = Arc::new(FakeGmailApi::default());
         let settings = crate::settings::GmailMountSettings::default()
@@ -1634,6 +1654,7 @@ mod tests {
                 std::path::PathBuf::from("mail/inbox"),
                 std::path::PathBuf::from("mail/sent"),
                 std::path::PathBuf::from("mail/draft"),
+                std::path::PathBuf::from("mail/send"),
             ]
         );
     }
@@ -1873,6 +1894,227 @@ mod tests {
         assert!(mime.contains("Message-ID: <"));
         assert!(mime.contains("@locality.local>\r\n"));
         assert!(mime.contains("\r\n\r\nBody\r\nSecond line\r\n"));
+    }
+
+    #[test]
+    fn apply_create_entity_sends_message_from_send_folder() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("gmail-folder:send")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("gmail-folder:send"),
+                parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
+                title: "Hello".to_string(),
+                properties: std::collections::BTreeMap::from([
+                    (
+                        "to".to_string(),
+                        PropertyValue::List(vec!["ann@example.com".to_string()]),
+                    ),
+                    (
+                        "subject".to_string(),
+                        PropertyValue::String("Explicit subject".to_string()),
+                    ),
+                ]),
+                body: "Body\nSecond line\n".to_string(),
+                source_path: "send/hello.md".into(),
+            }],
+        );
+
+        let result = connector
+            .apply(locality_connector::ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("gmail-main"),
+                plan: &plan,
+                operation_ids: &[PushOperationId("op-1".to_string())],
+                remote_preconditions: &[] as &[RemotePrecondition],
+                local_root: None,
+            })
+            .expect("apply");
+
+        assert_eq!(result.changed_remote_ids, vec![RemoteId::new("sent-msg-1")]);
+        assert!(matches!(
+            result.effects.as_slice(),
+            [locality_core::journal::JournalApplyEffect::CreatedEntity { parent_id, entity_id, .. }]
+                if parent_id == &RemoteId::new("gmail-folder:sent")
+                    && entity_id == &RemoteId::new("sent-msg-1")
+        ));
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.created_drafts, 0);
+        assert!(calls.sent_drafts.is_empty());
+        assert_eq!(calls.sent_messages, 1);
+        let raw = calls.sent_message_raw.last().expect("sent message raw");
+        let mime = String::from_utf8(
+            URL_SAFE_NO_PAD
+                .decode(raw.as_bytes())
+                .expect("decode raw mime"),
+        )
+        .expect("utf8 mime");
+        assert!(mime.contains("To: ann@example.com\r\n"));
+        assert!(mime.contains("Subject: Explicit subject\r\n"));
+        assert!(mime.contains("Message-ID: <"));
+        assert!(mime.contains("@locality.local>\r\n"));
+        assert!(mime.contains("\r\n\r\nBody\r\nSecond line\r\n"));
+    }
+
+    #[test]
+    fn apply_create_entity_recovers_existing_sent_message_for_send_folder_without_duplicate() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let push_id = PushId("push-1".to_string());
+        let operation_id = PushOperationId("op-1".to_string());
+        let message_id = super::locality_message_id(&push_id, &operation_id);
+        api.calls.lock().expect("calls").sent_search_results.insert(
+            format!("rfc822msgid:<{message_id}>"),
+            "sent-msg-previous".to_string(),
+        );
+        let plan = PushPlan::new(
+            vec![RemoteId::new("gmail-folder:send")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("gmail-folder:send"),
+                parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
+                title: "Hello".to_string(),
+                properties: std::collections::BTreeMap::from([
+                    (
+                        "to".to_string(),
+                        PropertyValue::List(vec!["ann@example.com".to_string()]),
+                    ),
+                    (
+                        "subject".to_string(),
+                        PropertyValue::String("Explicit subject".to_string()),
+                    ),
+                ]),
+                body: "Body\n".to_string(),
+                source_path: "send/hello.md".into(),
+            }],
+        );
+
+        let result = connector
+            .apply(locality_connector::ApplyPlanRequest {
+                push_id: &push_id,
+                mount_id: &MountId::new("gmail-main"),
+                plan: &plan,
+                operation_ids: std::slice::from_ref(&operation_id),
+                remote_preconditions: &[] as &[RemotePrecondition],
+                local_root: None,
+            })
+            .expect("apply");
+
+        assert_eq!(
+            result.changed_remote_ids,
+            vec![RemoteId::new("sent-msg-previous")]
+        );
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.created_drafts, 0);
+        assert_eq!(calls.sent_messages, 0);
+        assert_eq!(
+            calls.list_queries,
+            vec![format!("rfc822msgid:<{message_id}>")]
+        );
+    }
+
+    #[test]
+    fn apply_create_entity_recovers_sent_message_after_send_error() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let push_id = PushId("push-1".to_string());
+        let operation_id = PushOperationId("op-1".to_string());
+        let message_id = super::locality_message_id(&push_id, &operation_id);
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.send_message_error = Some(LocalityError::Io(
+                "gmail message send timed out".to_string(),
+            ));
+            calls.sent_search_results_after_send.insert(
+                format!("rfc822msgid:<{message_id}>"),
+                "sent-msg-recovered".to_string(),
+            );
+        }
+        let plan = PushPlan::new(
+            vec![RemoteId::new("gmail-folder:send")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("gmail-folder:send"),
+                parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
+                title: "Hello".to_string(),
+                properties: std::collections::BTreeMap::from([
+                    (
+                        "to".to_string(),
+                        PropertyValue::List(vec!["ann@example.com".to_string()]),
+                    ),
+                    (
+                        "subject".to_string(),
+                        PropertyValue::String("Explicit subject".to_string()),
+                    ),
+                ]),
+                body: "Body\n".to_string(),
+                source_path: "send/hello.md".into(),
+            }],
+        );
+
+        let result = connector
+            .apply(locality_connector::ApplyPlanRequest {
+                push_id: &push_id,
+                mount_id: &MountId::new("gmail-main"),
+                plan: &plan,
+                operation_ids: std::slice::from_ref(&operation_id),
+                remote_preconditions: &[] as &[RemotePrecondition],
+                local_root: None,
+            })
+            .expect("apply");
+
+        assert_eq!(
+            result.changed_remote_ids,
+            vec![RemoteId::new("sent-msg-recovered")]
+        );
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.created_drafts, 0);
+        assert_eq!(calls.sent_messages, 1);
+    }
+
+    #[test]
+    fn apply_create_entity_rejects_nested_send_source_path() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("gmail-folder:send")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("gmail-folder:send"),
+                parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
+                title: "Hello".to_string(),
+                properties: std::collections::BTreeMap::from([
+                    (
+                        "to".to_string(),
+                        PropertyValue::List(vec!["ann@example.com".to_string()]),
+                    ),
+                    (
+                        "subject".to_string(),
+                        PropertyValue::String("Nested source".to_string()),
+                    ),
+                ]),
+                body: "Body\n".to_string(),
+                source_path: "send/nested/hello.md".into(),
+            }],
+        );
+
+        let error = connector
+            .apply(locality_connector::ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("gmail-main"),
+                plan: &plan,
+                operation_ids: &[PushOperationId("op-1".to_string())],
+                remote_preconditions: &[] as &[RemotePrecondition],
+                local_root: None,
+            })
+            .expect_err("nested send source should be unsupported");
+
+        assert!(matches!(error, LocalityError::Unsupported(_)));
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.created_drafts, 0);
+        assert_eq!(calls.sent_messages, 0);
     }
 
     #[test]
@@ -2201,11 +2443,14 @@ mod tests {
         sent_search_results: std::collections::BTreeMap<String, String>,
         sent_search_results_after_send: std::collections::BTreeMap<String, String>,
         send_error: Option<LocalityError>,
+        send_message_error: Option<LocalityError>,
         sent_search_error_after_send: Option<LocalityError>,
         message_labels: std::collections::BTreeMap<String, Vec<String>>,
         created_drafts: usize,
         created_draft_raw: Vec<String>,
         sent_drafts: Vec<String>,
+        sent_messages: usize,
+        sent_message_raw: Vec<String>,
     }
 
     impl GmailApi for FakeGmailApi {
