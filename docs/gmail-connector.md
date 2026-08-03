@@ -16,10 +16,13 @@ The connector projects a fixed mailbox shape:
     inbox/
     sent/
     draft/
+    send/
 ```
 
-`inbox/` and `sent/` are read-only. `draft/` is the local write surface for
-outbound mail.
+`inbox/` and `sent/` are read-only message folders. `draft/` contains unsent
+Gmail drafts and is the local write surface for creating another unsent Gmail UI
+draft. `send/` is the reviewed direct-send surface: a Markdown file created
+directly under `send/` is sent through Gmail when pushed.
 
 ## OAuth
 
@@ -66,11 +69,12 @@ CLI overrides:
 
 ## Projection And Pull
 
-By default, Pull enumerates the recent 100 inbox messages and recent 100 sent
-messages and recent 100 Gmail drafts. The `draft/` folder is the local staging surface
-for new Gmail drafts. When pushed, a local draft becomes an unsent Gmail draft
-and is visible in the Gmail UI; drafts created in Gmail are pulled into this
-folder too.
+By default, Pull enumerates the recent 100 inbox messages, recent 100 sent
+messages, and recent 100 Gmail drafts. The `draft/` folder contains unsent
+Gmail drafts: drafts created in Gmail are pulled there, and a local Markdown
+file pushed from `draft/` becomes another unsent Gmail draft. The `send/` folder
+is local-only outbound staging for reviewed direct sends; pushing a direct child
+under `send/` sends the message and reconciles the result under `sent/`.
 
 Gmail mounts can be registered with a date window:
 
@@ -81,8 +85,9 @@ Gmail mounts can be registered with a date window:
 ```
 
 Date-window mounts use Gmail search query dates and page through all matching
-messages for `inbox/` and `sent/` instead of stopping after the first recent 100
-results.
+messages for `inbox/`, `sent/`, and `draft/` instead of stopping after the
+first recent 100 results. `send/` is not pulled from remote history; it remains
+local outbound staging for reviewed direct sends.
 
 Message view is the default projection:
 
@@ -93,6 +98,8 @@ gmail-main/
   sent/
     1720900100000-reply-msg-2.md
   draft/
+    1720900200000-unsent-follow-up-draft-msg-3.md
+  send/
 ```
 
 Thread view is opt-in:
@@ -111,10 +118,12 @@ gmail-main/
       1720900000000-quarterly-update-msg-1.md
   sent/
   draft/
+  send/
 ```
 
 Inbox, sent, and thread content is read-only. Creating a Markdown file directly
-under `draft/` creates an unsent Gmail draft when pushed.
+under `draft/` creates an unsent Gmail draft when pushed. Creating a Markdown
+file directly under `send/` sends the message when pushed.
 
 ## Attachments
 
@@ -128,28 +137,42 @@ thread and writes them under:
 ```
 
 Rendered message frontmatter includes attachment filename, MIME type, size,
-Gmail attachment ID, and the local path. Draft sends still reject `attachment`
-or `attachments` frontmatter; outbound attachments require a separate design.
+Gmail attachment ID, and the local path. Draft creation and direct send still
+reject `attachment` or `attachments` frontmatter; outbound attachments require a
+separate design.
 
 ## Write Policy
 
 `inbox/` and `sent/` are read-only. File Provider and source write policy should
-reject edits and deletes there.
+reject edits, creates, and deletes there:
 
-Creating a Markdown file directly under `draft/` is writable:
+```text
+inbox/reply.md
+sent/follow-up.md
+```
+
+Creating a Markdown file directly under `draft/` creates an unsent Gmail draft:
 
 ```text
 draft/reply.md
 ```
 
-Nested draft files are rejected:
+Creating a Markdown file directly under `send/` is a reviewed direct send:
+
+```text
+send/reply.md
+```
+
+Nested outbound paths are rejected for both draft creation and direct send:
 
 ```text
 draft/replies/reply.md
+send/replies/reply.md
 ```
 
-Draft frontmatter requires `to` and either `subject` or `title`. `cc` and `bcc`
-are optional. Recipients may be a scalar string or a list.
+Outbound frontmatter for both `draft/` and `send/` requires `to` and either
+`subject` or `title`. `cc` and `bcc` are optional. Recipients may be a scalar
+string or a list.
 
 ```markdown
 ---
@@ -162,22 +185,28 @@ subject: Follow up
 Thanks for the notes. I will follow up here.
 ```
 
-`loc push` for a Gmail draft creates an unsent Gmail draft. Send it from the
-Gmail UI after review. Attachments are not supported for Gmail draft creation
-in v1; `attachment` or `attachments` frontmatter is rejected.
+`loc push` for a Gmail file under `draft/` creates an unsent Gmail draft. Send
+that draft later from the Gmail UI after review. `loc push` for a Gmail file
+under `send/` directly sends the message after Locality review and push
+approval. Attachments are not supported for Gmail outbound mail in v1;
+`attachment` or `attachments` frontmatter is rejected for both paths.
 
 On macOS File Provider mounts, the push journal remembers the temporary local
-draft identifier before sending. Once Gmail apply and read-back both succeed,
-Locality removes that exact File Provider item and signals both the `draft/` and
-`sent/` containers. Remote or unconfirmed item deletion remains blocked. This
-does not require the user to run `loc pull` or refresh Finder.
+`send/` item identifier before sending. Once Gmail apply and read-back both
+succeed, Locality removes that exact File Provider item and signals both the
+`send/` and `sent/` containers. Remote or unconfirmed item deletion remains
+blocked. Pushing from `draft/` remains unsent Gmail draft creation and signals
+the `draft/` container. This does not require the user to run `loc pull` or
+refresh Finder.
 
 ## Live E2E
 
 `tests/live_gmail_vfs_roundtrip.sh` exercises the live Gmail API, CLI
 mount/pull/diff/push, daemon, and Linux FUSE projection. It creates an unsent
 Gmail draft through the mounted `draft/` folder, verifies the draft projection,
-and deletes the Gmail draft through Gmail API cleanup.
+and deletes the Gmail draft through Gmail API cleanup. Direct-send behavior uses
+the same outbound document shape under `send/` and is covered by the send-folder
+push and File Provider reconciliation tests.
 
 Use a stored `connection:gmail-live` credential and a recipient address:
 
@@ -224,4 +253,12 @@ Review and create a Gmail UI draft:
 ./target/debug/loc status "$HOME/Locality/gmail-main/draft/reply.md"
 ./target/debug/loc diff "$HOME/Locality/gmail-main/draft/reply.md"
 ./target/debug/loc push "$HOME/Locality/gmail-main/draft/reply.md"
+```
+
+Review and directly send a Gmail message:
+
+```bash
+./target/debug/loc status "$HOME/Locality/gmail-main/send/reply.md"
+./target/debug/loc diff "$HOME/Locality/gmail-main/send/reply.md"
+./target/debug/loc push "$HOME/Locality/gmail-main/send/reply.md"
 ```
