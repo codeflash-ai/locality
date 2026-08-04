@@ -107,6 +107,24 @@ fn mount_writes_linear_source_guidance() {
 }
 
 #[test]
+fn mount_writes_gmail_attachment_guidance() {
+    let fixture = MountFixture::new("loc-cli-mount-gmail-guidance");
+    let mut store = InMemoryStateStore::new();
+
+    fixture.mount_with_connector(&mut store, "gmail");
+
+    let agents = read_to_string(fixture.agents_file());
+    assert!(agents.contains("# Locality Gmail Mount"));
+    assert!(agents.contains("Gmail facts:"));
+    assert!(agents.contains("hydrate the message or thread Markdown"));
+    assert!(agents.contains("YAML frontmatter under `gmail.attachments`"));
+    assert!(agents.contains("`filename`, `mime_type`, `size`, `attachment_id`, and `path`"));
+    assert!(agents.contains(".loc/gmail/attachments/..."));
+    assert!(agents.contains("use the frontmatter path exactly"));
+    assert!(agents.contains("Gmail draft creation does not support outbound attachments yet"));
+}
+
+#[test]
 fn mount_preserves_custom_agent_guidance() {
     let fixture = MountFixture::new("loc-cli-mount-custom-guidance");
     fs::create_dir_all(&fixture.root).expect("create mount root");
