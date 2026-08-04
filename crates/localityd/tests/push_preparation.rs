@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::LocalityError;
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
-use locality_core::planner::{PropertyValue, PushOperation};
+use locality_core::planner::{GuardrailDecision, PropertyValue, PushOperation};
 use locality_core::push::PushPipelineAction;
 use locality_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use locality_core::validation::ValidationReport;
@@ -2168,6 +2168,201 @@ fn prepare_gmail_send_create_keeps_subject_and_recipients_as_properties() {
 }
 
 #[test]
+fn prepare_gmail_draft_update_plans_properties_and_body_without_create() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("gmail");
+    save_gmail_folder(&fixture, &mut store, "gmail-folder:draft", "draft", "draft");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("gmail-draft:draft-1"),
+                EntityKind::Page,
+                "Original",
+                "draft/Original.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save draft");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("gmail-draft:draft-1"),
+                "Original body.\n",
+                8,
+                [RemoteId::new("body-1")],
+            )
+            .expect("shadow")
+            .with_frontmatter(&gmail_draft_frontmatter(
+                "gmail-draft:draft-1",
+                "Original",
+                "Original subject",
+                &["ann@example.com"],
+            )),
+        )
+        .expect("save shadow");
+    let draft_path = fixture.write_raw(
+        "draft/Original.md",
+        &gmail_draft_document(
+            "gmail-draft:draft-1",
+            "Original",
+            "Edited subject",
+            &["beth@example.com"],
+            "Edited body.\n",
+        ),
+    );
+
+    let prepared = prepare_push(
+        &store,
+        &job(draft_path),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare draft update");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::ConfirmPlan);
+    assert_eq!(prepared.pipeline.guardrail, GuardrailDecision::Proceed);
+    assert!(prepared.pipeline.validation.is_clean());
+    let plan = prepared.pipeline.plan.expect("plan");
+    assert!(
+        !plan
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+    );
+    assert!(plan.operations.iter().any(|operation| matches!(
+        operation,
+        PushOperation::UpdateProperties {
+            entity_id,
+            properties,
+        } if entity_id == &RemoteId::new("gmail-draft:draft-1")
+            && properties == &BTreeMap::from([
+                (
+                    "subject".to_string(),
+                    PropertyValue::String("Edited subject".to_string()),
+                ),
+                (
+                    "to".to_string(),
+                    PropertyValue::List(vec!["beth@example.com".to_string()]),
+                ),
+            ])
+    )));
+    assert!(plan.operations.iter().any(|operation| matches!(
+        operation,
+        PushOperation::UpdateEntityBody { entity_id, body }
+            if entity_id == &RemoteId::new("gmail-draft:draft-1")
+                && body == "Edited body.\n"
+    )));
+}
+
+#[test]
+fn prepare_gmail_draft_move_to_outbox_with_edits_orders_move_properties_and_body() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.virtual_store("gmail");
+    save_gmail_folder(&fixture, &mut store, "gmail-folder:draft", "draft", "draft");
+    save_gmail_folder(
+        &fixture,
+        &mut store,
+        "gmail-folder:outbox",
+        "outbox",
+        "outbox",
+    );
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("gmail-draft:draft-1"),
+                EntityKind::Page,
+                "Original",
+                "outbox/Send Now.md",
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save moved draft");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("gmail-draft:draft-1"),
+                "Original body.\n",
+                8,
+                [RemoteId::new("body-1")],
+            )
+            .expect("shadow")
+            .with_frontmatter(&gmail_draft_frontmatter(
+                "gmail-draft:draft-1",
+                "Original",
+                "Original subject",
+                &["ann@example.com"],
+            )),
+        )
+        .expect("save shadow");
+    let cache = fixture.write_virtual_page(
+        "outbox/Send Now.md",
+        &gmail_draft_document(
+            "gmail-draft:draft-1",
+            "Send Now",
+            "Send now subject",
+            &["ann@example.com"],
+            "Edited body before sending.\n",
+        ),
+    );
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:draft-1-to-outbox".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(RemoteId::new("gmail-draft:draft-1")),
+            parent_remote_id: Some(RemoteId::new("gmail-folder:outbox")),
+            original_path: Some(PathBuf::from("draft/Original.md")),
+            projected_path: PathBuf::from("outbox/Send Now.md"),
+            title: "Send Now".to_string(),
+            content_path: Some(cache),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save move");
+    fs::create_dir_all(fixture.root.join("outbox")).expect("visible outbox folder");
+
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("outbox/Send Now.md")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare moved draft");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::ConfirmPlan);
+    assert_eq!(prepared.pipeline.guardrail, GuardrailDecision::Proceed);
+    assert!(prepared.pipeline.validation.is_clean());
+    let plan = prepared.pipeline.plan.expect("plan");
+    assert_eq!(
+        plan.operations,
+        vec![
+            PushOperation::MoveEntity {
+                entity_id: RemoteId::new("gmail-draft:draft-1"),
+                new_parent_id: RemoteId::new("gmail-folder:outbox"),
+                new_parent_kind: EntityKind::Directory,
+                new_title: "Send Now".to_string(),
+                projected_path: PathBuf::from("outbox/Send Now.md"),
+            },
+            PushOperation::UpdateProperties {
+                entity_id: RemoteId::new("gmail-draft:draft-1"),
+                properties: BTreeMap::from([(
+                    "subject".to_string(),
+                    PropertyValue::String("Send now subject".to_string()),
+                )]),
+            },
+            PushOperation::UpdateEntityBody {
+                entity_id: RemoteId::new("gmail-draft:draft-1"),
+                body: "Edited body before sending.\n".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
 fn prepare_gmail_draft_create_accepts_subject_without_title() {
     let fixture = PrepareFixture::new();
     let mut store = fixture.store("gmail");
@@ -2856,6 +3051,52 @@ fn canonical_markdown(remote_id: &str, body: &str) -> String {
     format!(
         "---\nloc:\n  id: {remote_id}\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\n{body}"
     )
+}
+
+fn gmail_draft_document(
+    remote_id: &str,
+    title: &str,
+    subject: &str,
+    to: &[&str],
+    body: &str,
+) -> String {
+    format!(
+        "---\n{}---\n{body}",
+        gmail_draft_frontmatter(remote_id, title, subject, to)
+    )
+}
+
+fn gmail_draft_frontmatter(remote_id: &str, title: &str, subject: &str, to: &[&str]) -> String {
+    let recipients = to
+        .iter()
+        .map(|recipient| format!("\"{recipient}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "loc:\n  id: {remote_id}\n  type: page\n  connector: gmail\n  synced_at: now\n  remote_edited_at: now\ntitle: {title}\nsubject: {subject}\nto: [{recipients}]\ncc: []\nbcc: []\n"
+    )
+}
+
+fn save_gmail_folder(
+    fixture: &PrepareFixture,
+    store: &mut InMemoryStateStore,
+    remote_id: &str,
+    title: &str,
+    path: &str,
+) {
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new(remote_id),
+                EntityKind::Directory,
+                title,
+                path,
+            )
+            .with_hydration(HydrationState::Stub)
+            .with_remote_edited_at(format!("folder:{path}")),
+        )
+        .expect("save Gmail folder");
 }
 
 fn markdown_href(path: &Path) -> String {
