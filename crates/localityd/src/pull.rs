@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use locality_connector::{ChildContainer, EnumerateRequest, ListChildrenRequest};
-use locality_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
+use locality_core::canonical::{
+    ParsedCanonicalDocument, parse_canonical_markdown, render_canonical_markdown,
+};
 use locality_core::conflict::{
     has_unresolved_conflict_markers, local_version_from_conflict_markers,
     render_inline_conflict_markdown_with_base,
@@ -1368,11 +1370,12 @@ fn repair_gmail_draft_projection_after_identity_repair(
         Err(_) => return Ok(()),
     };
     if parsed.document.is_stub()
-        && parsed.remote_id()
-            == repair
-                .retired_legacy
-                .as_ref()
-                .map(|legacy| &legacy.remote_id)
+        && legacy_stub_frontmatter_has_no_local_drift(
+            &parsed,
+            entry,
+            replacement_frontmatter,
+            repair,
+        )
     {
         write_atomic(&path, stub_markdown(entry)?)?;
         return Ok(());
@@ -1392,6 +1395,35 @@ fn repair_gmail_draft_projection_after_identity_repair(
             parsed.document.body,
         )),
     )
+}
+
+fn legacy_stub_frontmatter_has_no_local_drift(
+    parsed: &ParsedCanonicalDocument,
+    entry: &TreeEntry,
+    replacement_frontmatter: &str,
+    repair: &crate::gmail::GmailDraftIdentityRepair,
+) -> bool {
+    let Some(legacy) = repair.retired_legacy.as_ref() else {
+        return false;
+    };
+    if parsed.remote_id() != Some(&legacy.remote_id) {
+        return false;
+    }
+
+    let expected = render_canonical_markdown(&CanonicalDocument::new(
+        replacement_frontmatter.to_string(),
+        format!("{}\n", CanonicalDocument::STUB_MARKER),
+    ));
+    let Ok(expected) = parse_canonical_markdown(&expected) else {
+        return false;
+    };
+
+    let mut actual_frontmatter = parsed.frontmatter.clone();
+    let Some(loc) = actual_frontmatter.loc.as_mut() else {
+        return false;
+    };
+    loc.id = Some(entry.remote_id.clone());
+    actual_frontmatter == expected.frontmatter
 }
 
 #[derive(Debug)]
@@ -3610,6 +3642,65 @@ mod tests {
         ));
         write_atomic(&fixture.root.join(draft_path), locally_edited_stub.clone())
             .expect("write locally edited stub");
+        let mut draft_entry = tree_entry(
+            &fixture.mount_id,
+            &draft_remote_id,
+            "Hello",
+            draft_path,
+            HydrationState::Stub,
+        );
+        draft_entry.stub_frontmatter = Some(gmail_draft_frontmatter(&draft_remote_id));
+        let source = FakePullSource::new(vec![draft_entry], Vec::new());
+
+        super::pull_mount_root(&mut store, &source, &mount, fixture.root.clone(), None)
+            .expect("pull root");
+
+        let after =
+            std::fs::read_to_string(fixture.root.join(draft_path)).expect("read projection");
+        assert_eq!(after, locally_edited_stub);
+        assert!(
+            store
+                .get_entity(&fixture.mount_id, &legacy_message_id)
+                .expect("legacy lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_entity(&fixture.mount_id, &draft_remote_id)
+                .expect("draft lookup")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn pull_gmail_draft_does_not_rewrite_frontmatter_edited_stub_projection() {
+        let fixture = PullFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(fixture.mount_id.clone(), "gmail", fixture.root.clone());
+        store.save_mount(mount.clone()).expect("save mount");
+        let draft_path = "draft/1720900000000-hello-draft-msg-1.md";
+        let legacy_message_id = RemoteId::new("draft-msg-1");
+        let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    fixture.mount_id.clone(),
+                    legacy_message_id.clone(),
+                    EntityKind::Page,
+                    "Hello",
+                    draft_path,
+                )
+                .with_hydration(HydrationState::Stub),
+            )
+            .expect("save legacy draft");
+        let edited_frontmatter = gmail_draft_frontmatter(&legacy_message_id)
+            .replace("subject: Hello\n", "subject: Edited locally\n");
+        let locally_edited_stub = render_canonical_markdown(&CanonicalDocument::new(
+            edited_frontmatter,
+            format!("{}\n", CanonicalDocument::STUB_MARKER),
+        ));
+        write_atomic(&fixture.root.join(draft_path), locally_edited_stub.clone())
+            .expect("write frontmatter-edited stub");
         let mut draft_entry = tree_entry(
             &fixture.mount_id,
             &draft_remote_id,
