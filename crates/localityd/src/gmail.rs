@@ -344,7 +344,7 @@ pub(crate) fn validate_gmail_changed_frontmatter(
             Some(1),
             "Gmail inbox and sent items are read-only",
             Some(
-                "create a new Markdown file directly under draft/ for an unsent Gmail draft or send/ to send after review"
+                "create a new Markdown file directly under draft/ for an unsent Gmail draft or outbox/ to send after review"
                     .to_string(),
             ),
         ));
@@ -362,8 +362,8 @@ pub(crate) fn validate_gmail_create_frontmatter(
             "gmail_create_outside_outbound_folder",
             context.relative_path,
             Some(1),
-            "Gmail creates are only supported directly inside draft/ or send/",
-            Some("move the new email Markdown file directly under draft/ or send/".to_string()),
+            "Gmail creates are only supported directly inside draft/ or outbox/",
+            Some("move the new email Markdown file directly under draft/ or outbox/".to_string()),
         ));
     }
 
@@ -465,7 +465,7 @@ fn is_direct_outbound_child(path: &Path) -> bool {
     let mut components = path.components();
     matches!(
         components.next(),
-        Some(Component::Normal(component)) if component == "draft" || component == "send"
+        Some(Component::Normal(component)) if component == "draft" || component == "outbox"
     ) && matches!(components.next(), Some(Component::Normal(_)))
         && components.next().is_none()
 }

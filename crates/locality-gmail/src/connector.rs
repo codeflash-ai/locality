@@ -40,7 +40,7 @@ const GMAIL_PAGE_SIZE: u32 = 100;
 const INBOX_FOLDER_ID: &str = "gmail-folder:inbox";
 const SENT_FOLDER_ID: &str = "gmail-folder:sent";
 const DRAFT_FOLDER_ID: &str = "gmail-folder:draft";
-const SEND_FOLDER_ID: &str = "gmail-folder:send";
+const OUTBOX_FOLDER_ID: &str = "gmail-folder:outbox";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct GmailConfig {
@@ -247,7 +247,7 @@ impl Connector for GmailConnector {
                 )?
             }
             ChildContainer::DirectoryChildren(remote_id)
-                if remote_id.as_str() == SEND_FOLDER_ID =>
+                if remote_id.as_str() == OUTBOX_FOLDER_ID =>
             {
                 Vec::new()
             }
@@ -608,8 +608,8 @@ fn folder_specs() -> [FolderSpec; 4] {
             title: "draft",
         },
         FolderSpec {
-            id: SEND_FOLDER_ID,
-            title: "send",
+            id: OUTBOX_FOLDER_ID,
+            title: "outbox",
         },
     ]
 }
@@ -1097,8 +1097,8 @@ fn outbound_target_from_create(
     match parent_id.as_str() {
         DRAFT_FOLDER_ID if is_direct_child_of(source_path, "draft") => Ok(OutboundTarget::Draft),
         DRAFT_FOLDER_ID => Err(LocalityError::Unsupported("gmail draft source path")),
-        SEND_FOLDER_ID if is_direct_child_of(source_path, "send") => Ok(OutboundTarget::Send),
-        SEND_FOLDER_ID => Err(LocalityError::Unsupported("gmail send source path")),
+        OUTBOX_FOLDER_ID if is_direct_child_of(source_path, "outbox") => Ok(OutboundTarget::Send),
+        OUTBOX_FOLDER_ID => Err(LocalityError::Unsupported("gmail outbox source path")),
         _ => Err(LocalityError::Unsupported("gmail create parent")),
     }
 }
@@ -1323,7 +1323,7 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .any(|entry| entry.path == std::path::PathBuf::from("send"))
+                .any(|entry| entry.path == std::path::PathBuf::from("outbox"))
         );
         assert!(entries.iter().any(|entry| entry.path.starts_with("inbox/")));
         assert!(entries.iter().any(|entry| entry.path.starts_with("sent/")));
@@ -1331,8 +1331,8 @@ mod tests {
         assert!(
             !entries
                 .iter()
-                .any(|entry| entry.path != std::path::PathBuf::from("send")
-                    && entry.path.starts_with("send"))
+                .any(|entry| entry.path != std::path::PathBuf::from("outbox")
+                    && entry.path.starts_with("outbox"))
         );
         let calls = api.calls.lock().expect("calls");
         assert_eq!(calls.list_max_results, vec![100, 100, 100]);
@@ -1522,17 +1522,17 @@ mod tests {
     }
 
     #[test]
-    fn list_children_for_send_folder_is_empty_staging_surface() {
+    fn list_children_for_outbox_folder_is_empty_staging_surface() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
 
         let result = connector
             .list_children(ListChildrenRequest {
                 mount_id: MountId::new("gmail-main"),
-                container: ChildContainer::DirectoryChildren(RemoteId::new("gmail-folder:send")),
-                parent_path: "send".into(),
+                container: ChildContainer::DirectoryChildren(RemoteId::new("gmail-folder:outbox")),
+                parent_path: "outbox".into(),
             })
-            .expect("list send");
+            .expect("list outbox");
 
         assert!(result.entries.is_empty());
     }
@@ -1721,7 +1721,7 @@ mod tests {
                 std::path::PathBuf::from("mail/inbox"),
                 std::path::PathBuf::from("mail/sent"),
                 std::path::PathBuf::from("mail/draft"),
-                std::path::PathBuf::from("mail/send"),
+                std::path::PathBuf::from("mail/outbox"),
             ]
         );
     }
@@ -1965,13 +1965,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_create_entity_sends_message_from_send_folder() {
+    fn apply_create_entity_sends_message_from_outbox_folder() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
         let plan = PushPlan::new(
-            vec![RemoteId::new("gmail-folder:send")],
+            vec![RemoteId::new("gmail-folder:outbox")],
             vec![PushOperation::CreateEntity {
-                parent_id: RemoteId::new("gmail-folder:send"),
+                parent_id: RemoteId::new("gmail-folder:outbox"),
                 parent_kind: Some(EntityKind::Directory),
                 parent_workspace: false,
                 title: "Hello".to_string(),
@@ -1986,7 +1986,7 @@ mod tests {
                     ),
                 ]),
                 body: "Body\nSecond line\n".to_string(),
-                source_path: "send/hello.md".into(),
+                source_path: "outbox/hello.md".into(),
             }],
         );
 
@@ -2027,7 +2027,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_create_entity_recovers_existing_sent_message_for_send_folder_without_duplicate() {
+    fn apply_create_entity_recovers_existing_sent_message_for_outbox_folder_without_duplicate() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
         let push_id = PushId("push-1".to_string());
@@ -2038,9 +2038,9 @@ mod tests {
             "sent-msg-previous".to_string(),
         );
         let plan = PushPlan::new(
-            vec![RemoteId::new("gmail-folder:send")],
+            vec![RemoteId::new("gmail-folder:outbox")],
             vec![PushOperation::CreateEntity {
-                parent_id: RemoteId::new("gmail-folder:send"),
+                parent_id: RemoteId::new("gmail-folder:outbox"),
                 parent_kind: Some(EntityKind::Directory),
                 parent_workspace: false,
                 title: "Hello".to_string(),
@@ -2055,7 +2055,7 @@ mod tests {
                     ),
                 ]),
                 body: "Body\n".to_string(),
-                source_path: "send/hello.md".into(),
+                source_path: "outbox/hello.md".into(),
             }],
         );
 
@@ -2101,9 +2101,9 @@ mod tests {
             );
         }
         let plan = PushPlan::new(
-            vec![RemoteId::new("gmail-folder:send")],
+            vec![RemoteId::new("gmail-folder:outbox")],
             vec![PushOperation::CreateEntity {
-                parent_id: RemoteId::new("gmail-folder:send"),
+                parent_id: RemoteId::new("gmail-folder:outbox"),
                 parent_kind: Some(EntityKind::Directory),
                 parent_workspace: false,
                 title: "Hello".to_string(),
@@ -2118,7 +2118,7 @@ mod tests {
                     ),
                 ]),
                 body: "Body\n".to_string(),
-                source_path: "send/hello.md".into(),
+                source_path: "outbox/hello.md".into(),
             }],
         );
 
@@ -2147,9 +2147,9 @@ mod tests {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
         let plan = PushPlan::new(
-            vec![RemoteId::new("gmail-folder:send")],
+            vec![RemoteId::new("gmail-folder:outbox")],
             vec![PushOperation::CreateEntity {
-                parent_id: RemoteId::new("gmail-folder:send"),
+                parent_id: RemoteId::new("gmail-folder:outbox"),
                 parent_kind: Some(EntityKind::Directory),
                 parent_workspace: false,
                 title: "Hello".to_string(),
@@ -2164,7 +2164,7 @@ mod tests {
                     ),
                 ]),
                 body: "Body\n".to_string(),
-                source_path: "send/nested/hello.md".into(),
+                source_path: "outbox/nested/hello.md".into(),
             }],
         );
 
@@ -2177,7 +2177,7 @@ mod tests {
                 remote_preconditions: &[] as &[RemotePrecondition],
                 local_root: None,
             })
-            .expect_err("nested send source should be unsupported");
+            .expect_err("nested outbox source should be unsupported");
 
         assert!(matches!(error, LocalityError::Unsupported(_)));
         let calls = api.calls.lock().expect("calls");

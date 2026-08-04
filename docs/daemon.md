@@ -314,10 +314,10 @@ reading or writing the new root; existing current-root files are never
 overwritten.
 
 Before a virtual Gmail direct-send item is pushed, its source file lives under
-`send/` and its temporary File Provider identifier is stored in the durable push
+`outbox/` and its temporary File Provider identifier is stored in the durable push
 journal. After the send and read-back reconcile, the daemon removes that exact
-user-visible `send/` File Provider item on a background thread and then signals
-the source `send/` and destination `sent/` enumerators. The extension accepts
+user-visible `outbox/` File Provider item on a background thread and then signals
+the source `outbox/` and destination `sent/` enumerators. The extension accepts
 deletion of a temporary `local:` item that reconciliation has already removed
 from daemon state, while remote and unconfirmed deletes remain blocked. Unsent
 Gmail draft pushes remain under the `draft/` path and reconcile as Gmail drafts,

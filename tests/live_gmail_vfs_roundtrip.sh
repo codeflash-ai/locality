@@ -88,16 +88,16 @@ wait_for_projected_mount_root() {
 
 wait_for_outbound_dirs() {
   local draft_dir="$mount_root/draft"
-  local send_dir="$mount_root/send"
+  local outbox_dir="$mount_root/outbox"
   local attempts="${LOCALITY_GMAIL_LIVE_DRAFT_WAIT_ATTEMPTS:-80}"
   local attempt
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if [[ -d "$draft_dir" && -d "$send_dir" ]]; then
+    if [[ -d "$draft_dir" && -d "$outbox_dir" ]]; then
       return 0
     fi
     sleep 0.25
   done
-  live_fail "Gmail draft/ and send/ directories did not appear under the mount"
+  live_fail "Gmail draft/ and outbox/ directories did not appear under the mount"
 }
 
 projected_gmail_draft_matches_message() {
@@ -556,7 +556,7 @@ delete_created_gmail_draft required
 if [[ "${LOCALITY_LIVE_GMAIL_SEND:-0}" == "1" ]]; then
   send_subject="Locality live Gmail send $unique"
   send_marker="Locality live Gmail direct send marker $unique"
-  send_path="$mount_root/send/locality-live-gmail-send-$unique.md"
+  send_path="$mount_root/outbox/locality-live-gmail-outbox-$unique.md"
 
   step="creating Gmail direct send through Linux FUSE"
   printf -- '---\nto:\n  - "%s"\nsubject: "%s"\n---\n%s\n' \

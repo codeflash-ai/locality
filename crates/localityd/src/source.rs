@@ -317,11 +317,11 @@ pub fn source_create_decision_for_parent_path(
         };
     }
     if mount.connector == "gmail" {
-        return if matches!(parent_path.to_str(), Some("draft" | "send")) {
+        return if matches!(parent_path.to_str(), Some("draft" | "outbox")) {
             SourceWriteDecision::Writable
         } else {
             SourceWriteDecision::ReadOnly {
-                reason: "Gmail creates are only supported directly inside draft/ or send/",
+                reason: "Gmail creates are only supported directly inside draft/ or outbox/",
             }
         };
     }
@@ -363,7 +363,7 @@ pub fn source_move_decision_for_parent_path(
     }
     if mount.connector == "gmail" {
         return SourceWriteDecision::ReadOnly {
-            reason: "Gmail moves are not supported; create a new file directly under draft/ or send/",
+            reason: "Gmail moves are not supported; create a new file directly under draft/ or outbox/",
         };
     }
     if mount.connector == GRANOLA_CONNECTOR_ID {
@@ -611,20 +611,20 @@ fn gmail_write_decision_for_path(relative_path: &Path) -> SourceWriteDecision {
         std::path::Component::Normal(value) => value.to_str(),
         _ => None,
     }) {
-        Some("draft" | "send") => match components.next() {
+        Some("draft" | "outbox") => match components.next() {
             None => SourceWriteDecision::Writable,
             Some(std::path::Component::Normal(_)) if components.next().is_none() => {
                 SourceWriteDecision::Writable
             }
             _ => SourceWriteDecision::ReadOnly {
-                reason: "Gmail writes are only supported directly under draft/ or send/",
+                reason: "Gmail writes are only supported directly under draft/ or outbox/",
             },
         },
         Some("inbox") | Some("sent") => SourceWriteDecision::ReadOnly {
             reason: "Gmail inbox and sent items are read-only",
         },
         _ => SourceWriteDecision::ReadOnly {
-            reason: "Gmail writes are only supported directly under draft/ or send/",
+            reason: "Gmail writes are only supported directly under draft/ or outbox/",
         },
     }
 }
@@ -754,12 +754,12 @@ fn gmail_mount_guidance() -> String {
     format!(
         "{}\n\
 Gmail facts:\n\
-- This mount projects Gmail inbox/, sent/, draft/, and send/ folders.\n\
+- This mount projects Gmail inbox/, sent/, draft/, and outbox/ folders.\n\
 - inbox/ and sent/ are read-only mailbox history.\n\
 - Create a Markdown file directly under draft/ to create an unsent Gmail draft.\n\
-- Create a Markdown file directly under send/ to send immediately after explicit review and push.\n\
+- Create a Markdown file directly under outbox/ to send immediately after explicit review and push.\n\
 - Both outbound folders require `to` frontmatter and either `subject` or `title` frontmatter.\n\
-- Use send/ only when the user explicitly asks to send mail now; otherwise use draft/ for review in Gmail.\n",
+- Use outbox/ only when the user explicitly asks to send mail now; otherwise use draft/ for review in Gmail.\n",
         generic_mount_guidance("Gmail")
     )
 }

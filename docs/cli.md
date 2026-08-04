@@ -86,7 +86,7 @@ Google Docs mounts use Google Docs document access plus Drive `drive.file` and D
 
 Gmail OAuth uses `openid`, `email`, `profile`, `https://www.googleapis.com/auth/gmail.readonly`, and `https://www.googleapis.com/auth/gmail.compose`. No broader Gmail account scope is required.
 
-`loc mount gmail <path>` registers a Gmail mount. If `--connection` is omitted, the daemon resolves the mount through the only active Gmail connection at runtime; with multiple active Gmail connections, pass `--connection <id>`. When `--mount-id` is omitted, Locality uses `gmail-main` when available. Gmail mounts project `inbox/`, `sent/`, `draft/`, and `send/` folders. `inbox/` and `sent/` are read-only; create a Markdown file directly under `draft/` to create an unsent Gmail UI draft on push, or directly under `send/` only for reviewed direct sends.
+`loc mount gmail <path>` registers a Gmail mount. If `--connection` is omitted, the daemon resolves the mount through the only active Gmail connection at runtime; with multiple active Gmail connections, pass `--connection <id>`. When `--mount-id` is omitted, Locality uses `gmail-main` when available. Gmail mounts project `inbox/`, `sent/`, `draft/`, and `outbox/` folders. `inbox/` and `sent/` are read-only; create a Markdown file directly under `draft/` to create an unsent Gmail UI draft on push, or directly under `outbox/` only for reviewed direct sends.
 
 Gmail mount options:
 
@@ -644,9 +644,9 @@ dirty skip instead.
 For Gmail mounts, pull enumerates the recent 100 inbox messages, recent 100 sent
 messages, and recent 100 Gmail drafts by default. Date-window mounts page
 through all matching inbox messages, sent messages, and Gmail drafts. `draft/`
-contains unsent Gmail drafts from Gmail and local draft-create pushes. `send/`
+contains unsent Gmail drafts from Gmail and local draft-create pushes. `outbox/`
 is not pulled from remote history; it is a local-only reviewed direct-send
-staging folder, and successful pushes from `send/` reconcile to `sent/`.
+staging folder, and successful pushes from `outbox/` reconcile to `sent/`.
 
 The JSON report includes `via`, `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty` counts. `via` is `daemon` when the Unix socket handled the job and `cli` when the command executed directly.
 
@@ -860,8 +860,8 @@ The JSON report has the same validation, plan, degradation, guardrail, and stage
 Reports also include `via`, `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector now applies the supported block and page-property write subset, local file-like media updates, block moves, and new database-row creation through the live API. Connector capability preflight runs before journaling, so unsupported operations return `unsupported_operations` without appending a journal. Once a journaled push starts, the daemon performs connector metadata checks and verifies the current Remote Tree render still matches the Synced Tree shadow before applying Local Tree edits.
 
 For Gmail, `loc push` supports creating a new Markdown file directly under
-`draft/` or `send/`. Push from `draft/` creates an unsent Gmail draft; send it
-later from the Gmail UI. Push from `send/` directly sends the message and should
+`draft/` or `outbox/`. Push from `draft/` creates an unsent Gmail draft; send it
+later from the Gmail UI. Push from `outbox/` directly sends the message and should
 be used only after review when the user intends to send now. Gmail outbound
 files require `to` frontmatter and either `subject` or `title`; `cc` and `bcc`
 are optional. Nested outbound paths and edits or deletes in `inbox/` and

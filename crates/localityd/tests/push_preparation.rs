@@ -1360,12 +1360,12 @@ fn prepare_stale_pending_move_rechecks_source_and_mount_write_policy() {
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
-            RemoteId::new("gmail-folder:send"),
+            RemoteId::new("gmail-folder:outbox"),
             EntityKind::Directory,
-            "send",
-            "send",
+            "outbox",
+            "outbox",
         ))
-        .expect("save send folder");
+        .expect("save outbox folder");
     store
         .save_entity(
             EntityRecord::new(
@@ -1373,7 +1373,7 @@ fn prepare_stale_pending_move_rechecks_source_and_mount_write_policy() {
                 RemoteId::new("draft-1"),
                 EntityKind::Page,
                 "Draft subject",
-                "send/ENG-1.md",
+                "outbox/ENG-1.md",
             )
             .with_hydration(HydrationState::Dirty),
         )
@@ -1396,19 +1396,19 @@ fn prepare_stale_pending_move_rechecks_source_and_mount_write_policy() {
             local_id: "move:draft-1-to-send".to_string(),
             mutation_kind: VirtualMutationKind::Move,
             target_remote_id: Some(RemoteId::new("draft-1")),
-            parent_remote_id: Some(RemoteId::new("gmail-folder:send")),
+            parent_remote_id: Some(RemoteId::new("gmail-folder:outbox")),
             original_path: Some(PathBuf::from("draft/ENG-1.md")),
-            projected_path: PathBuf::from("send/ENG-1.md"),
+            projected_path: PathBuf::from("outbox/ENG-1.md"),
             title: "Draft subject".to_string(),
             content_path: None,
             created_at: "2026-06-12T00:00:00Z".to_string(),
             updated_at: "2026-06-12T00:00:00Z".to_string(),
         })
         .expect("save stale outbound move");
-    fs::create_dir_all(fixture.root.join("send")).expect("visible send folder");
+    fs::create_dir_all(fixture.root.join("outbox")).expect("visible outbox folder");
     let prepared = prepare_push(
         &store,
-        &job(fixture.root.join("send")),
+        &job(fixture.root.join("outbox")),
         Some(&fixture.state_root),
         &LocalSourceValidator,
     )
@@ -1418,7 +1418,7 @@ fn prepare_stale_pending_move_rechecks_source_and_mount_write_policy() {
     assert!(prepared.pipeline.validation.issues.iter().any(|issue| {
         issue.code == "source_move_parent_read_only"
             && issue.message
-                == "Gmail moves are not supported; create a new file directly under draft/ or send/"
+                == "Gmail moves are not supported; create a new file directly under draft/ or outbox/"
     }));
 
     let (fixture, mut store) = linear_move_store(None, true);
@@ -2106,17 +2106,17 @@ fn prepare_gmail_send_create_keeps_subject_and_recipients_as_properties() {
         .save_entity(
             EntityRecord::new(
                 fixture.mount_id.clone(),
-                RemoteId::new("gmail-folder:send"),
+                RemoteId::new("gmail-folder:outbox"),
                 EntityKind::Directory,
-                "send",
-                "send",
+                "outbox",
+                "outbox",
             )
             .with_hydration(HydrationState::Stub)
-            .with_remote_edited_at("folder:send"),
+            .with_remote_edited_at("folder:outbox"),
         )
-        .expect("save send folder");
+        .expect("save outbox folder");
     let send_path = fixture.write_raw(
-        "send/reply.md",
+        "outbox/reply.md",
         "---\nloc:\n  type: page\n  connector: gmail\ntitle: Reply\nsubject: Reply subject\nto: [\"ann@example.com\"]\ncc: [\"copy@example.com\"]\nbcc: []\n---\nBody\n",
     );
 
@@ -2140,11 +2140,11 @@ fn prepare_gmail_send_create_keeps_subject_and_recipients_as_properties() {
             source_path,
             ..
         } => {
-            assert_eq!(parent_id, &RemoteId::new("gmail-folder:send"));
+            assert_eq!(parent_id, &RemoteId::new("gmail-folder:outbox"));
             assert_eq!(parent_kind, &Some(EntityKind::Directory));
             assert_eq!(title, "Reply");
             assert_eq!(body, "Body\n");
-            assert_eq!(source_path, &PathBuf::from("send/reply.md"));
+            assert_eq!(source_path, &PathBuf::from("outbox/reply.md"));
             assert_eq!(
                 properties.get("subject"),
                 Some(&PropertyValue::String("Reply subject".to_string()))

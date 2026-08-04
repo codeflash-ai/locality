@@ -1151,7 +1151,7 @@ fn daemon_push_reconciles_gmail_draft_create_to_draft_folder() {
 fn daemon_push_reconciles_gmail_send_create_to_sent_folder() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
-    let source_path = Path::new("send/reply.md");
+    let source_path = Path::new("outbox/reply.md");
     let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
     let cache_path =
         virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
@@ -1162,7 +1162,7 @@ fn daemon_push_reconciles_gmail_send_create_to_sent_folder() {
     )
     .expect("cache file");
 
-    let send_folder_id = RemoteId::new("gmail-folder:send");
+    let outbox_folder_id = RemoteId::new("gmail-folder:outbox");
     let sent_folder_id = RemoteId::new("gmail-folder:sent");
     let created_remote_id = RemoteId::new("gmail-message:sent-1");
     let mut store = InMemoryStateStore::new();
@@ -1175,12 +1175,12 @@ fn daemon_push_reconciles_gmail_send_create_to_sent_folder() {
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
-            send_folder_id.clone(),
+            outbox_folder_id.clone(),
             EntityKind::Directory,
-            "send",
-            "send",
+            "outbox",
+            "outbox",
         ))
-        .expect("save send folder");
+        .expect("save outbox folder");
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
@@ -1193,11 +1193,11 @@ fn daemon_push_reconciles_gmail_send_create_to_sent_folder() {
     store
         .save_virtual_mutation(virtual_mutation(
             &fixture.mount_id,
-            "local:gmail-send",
+            "local:gmail-outbox",
             VirtualMutationKind::Create,
             None,
-            Some(send_folder_id),
-            "send/reply.md",
+            Some(outbox_folder_id),
+            "outbox/reply.md",
             Some(cache_path),
         ))
         .expect("save mutation");
@@ -1207,7 +1207,7 @@ fn daemon_push_reconciles_gmail_send_create_to_sent_folder() {
             rendered_entity("gmail-message:sent-1", "Body."),
         )
         .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
-            operation_id: PushOperationId("create-gmail-send".to_string()),
+            operation_id: PushOperationId("create-gmail-outbox".to_string()),
             operation_index: 0,
             parent_id: sent_folder_id,
             entity_id: created_remote_id.clone(),
@@ -1767,7 +1767,7 @@ fn auto_save_push_blocks_google_calendar_draft_create_without_applying() {
 fn auto_save_push_blocks_gmail_direct_send_without_applying() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
-    let source_path = Path::new("send/reply.md");
+    let source_path = Path::new("outbox/reply.md");
     let cache_path =
         virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
     fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
@@ -1777,7 +1777,7 @@ fn auto_save_push_blocks_gmail_direct_send_without_applying() {
     )
     .expect("cache file");
 
-    let send_folder_id = RemoteId::new("gmail-folder:send");
+    let outbox_folder_id = RemoteId::new("gmail-folder:outbox");
     let sent_folder_id = RemoteId::new("gmail-folder:sent");
     let created_remote_id = RemoteId::new("gmail-message:sent-1");
     let mut store = InMemoryStateStore::new();
@@ -1790,20 +1790,20 @@ fn auto_save_push_blocks_gmail_direct_send_without_applying() {
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
-            send_folder_id.clone(),
+            outbox_folder_id.clone(),
             EntityKind::Directory,
-            "send",
-            "send",
+            "outbox",
+            "outbox",
         ))
-        .expect("save send folder");
+        .expect("save outbox folder");
     store
         .save_virtual_mutation(virtual_mutation(
             &fixture.mount_id,
-            "local:gmail-send",
+            "local:gmail-outbox",
             VirtualMutationKind::Create,
             None,
-            Some(send_folder_id),
-            "send/reply.md",
+            Some(outbox_folder_id),
+            "outbox/reply.md",
             Some(cache_path),
         ))
         .expect("save mutation");
@@ -1817,7 +1817,7 @@ fn auto_save_push_blocks_gmail_direct_send_without_applying() {
         .expect("save enrollment");
     let source =
         FakePushSource::default().with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
-            operation_id: PushOperationId("create-gmail-send".to_string()),
+            operation_id: PushOperationId("create-gmail-outbox".to_string()),
             operation_index: 0,
             parent_id: sent_folder_id,
             entity_id: created_remote_id,
@@ -1861,7 +1861,7 @@ fn auto_save_push_blocks_gmail_direct_send_without_applying() {
 fn daemon_push_resumes_failed_gmail_send_reconciliation_without_reapplying() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
-    let source_path = Path::new("send/reply.md");
+    let source_path = Path::new("outbox/reply.md");
     let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
     let cache_path =
         virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
@@ -1872,7 +1872,7 @@ fn daemon_push_resumes_failed_gmail_send_reconciliation_without_reapplying() {
     )
     .expect("cache file");
 
-    let send_folder_id = RemoteId::new("gmail-folder:send");
+    let outbox_folder_id = RemoteId::new("gmail-folder:outbox");
     let sent_folder_id = RemoteId::new("gmail-folder:sent");
     let created_remote_id = RemoteId::new("gmail-message:sent-1");
     let mut store = InMemoryStateStore::new();
@@ -1885,12 +1885,12 @@ fn daemon_push_resumes_failed_gmail_send_reconciliation_without_reapplying() {
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
-            send_folder_id.clone(),
+            outbox_folder_id.clone(),
             EntityKind::Directory,
-            "send",
-            "send",
+            "outbox",
+            "outbox",
         ))
-        .expect("save send folder");
+        .expect("save outbox folder");
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
@@ -1903,11 +1903,11 @@ fn daemon_push_resumes_failed_gmail_send_reconciliation_without_reapplying() {
     store
         .save_virtual_mutation(virtual_mutation(
             &fixture.mount_id,
-            "local:gmail-send",
+            "local:gmail-outbox",
             VirtualMutationKind::Create,
             None,
-            Some(send_folder_id),
-            "send/reply.md",
+            Some(outbox_folder_id),
+            "outbox/reply.md",
             Some(cache_path),
         ))
         .expect("save mutation");
@@ -1918,7 +1918,7 @@ fn daemon_push_resumes_failed_gmail_send_reconciliation_without_reapplying() {
         )
         .with_created_fetch_failures(created_remote_id.clone(), 1)
         .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
-            operation_id: PushOperationId("create-gmail-send".to_string()),
+            operation_id: PushOperationId("create-gmail-outbox".to_string()),
             operation_index: 0,
             parent_id: sent_folder_id,
             entity_id: created_remote_id.clone(),
@@ -1979,7 +1979,7 @@ fn daemon_push_resumes_failed_gmail_send_reconciliation_without_reapplying() {
 fn daemon_push_resumes_applied_gmail_send_reconciliation_without_reapplying() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
-    let source_path = Path::new("send/reply.md");
+    let source_path = Path::new("outbox/reply.md");
     let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
     let cache_path =
         virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
@@ -1990,7 +1990,7 @@ fn daemon_push_resumes_applied_gmail_send_reconciliation_without_reapplying() {
     )
     .expect("cache file");
 
-    let send_folder_id = RemoteId::new("gmail-folder:send");
+    let outbox_folder_id = RemoteId::new("gmail-folder:outbox");
     let sent_folder_id = RemoteId::new("gmail-folder:sent");
     let created_remote_id = RemoteId::new("gmail-message:sent-1");
     let mut store = InMemoryStateStore::new();
@@ -2003,12 +2003,12 @@ fn daemon_push_resumes_applied_gmail_send_reconciliation_without_reapplying() {
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
-            send_folder_id.clone(),
+            outbox_folder_id.clone(),
             EntityKind::Directory,
-            "send",
-            "send",
+            "outbox",
+            "outbox",
         ))
-        .expect("save send folder");
+        .expect("save outbox folder");
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
@@ -2021,11 +2021,11 @@ fn daemon_push_resumes_applied_gmail_send_reconciliation_without_reapplying() {
     store
         .save_virtual_mutation(virtual_mutation(
             &fixture.mount_id,
-            "local:gmail-send",
+            "local:gmail-outbox",
             VirtualMutationKind::Create,
             None,
-            Some(send_folder_id.clone()),
-            "send/reply.md",
+            Some(outbox_folder_id.clone()),
+            "outbox/reply.md",
             Some(cache_path),
         ))
         .expect("save mutation");
@@ -2040,9 +2040,9 @@ fn daemon_push_resumes_applied_gmail_send_reconciliation_without_reapplying() {
         PropertyValue::List(vec!["user@example.com".to_string()]),
     );
     let plan = PushPlan::new(
-        vec![send_folder_id],
+        vec![outbox_folder_id],
         vec![PushOperation::CreateEntity {
-            parent_id: RemoteId::new("gmail-folder:send"),
+            parent_id: RemoteId::new("gmail-folder:outbox"),
             parent_kind: Some(EntityKind::Directory),
             parent_workspace: false,
             title: "Reply".to_string(),
@@ -2051,9 +2051,9 @@ fn daemon_push_resumes_applied_gmail_send_reconciliation_without_reapplying() {
             source_path: source_path.to_path_buf(),
         }],
     );
-    let push_id = PushId("push-already-applied-gmail-send".to_string());
+    let push_id = PushId("push-already-applied-gmail-outbox".to_string());
     let effect = JournalApplyEffect::CreatedEntity {
-        operation_id: PushOperationId("create-gmail-send".to_string()),
+        operation_id: PushOperationId("create-gmail-outbox".to_string()),
         operation_index: 0,
         parent_id: sent_folder_id.clone(),
         entity_id: created_remote_id.clone(),
@@ -2108,7 +2108,7 @@ fn daemon_push_resumes_applied_gmail_send_reconciliation_without_reapplying() {
 fn daemon_push_blocks_ambiguous_gmail_send_journal_without_reapplying() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
-    let source_path = Path::new("send/reply.md");
+    let source_path = Path::new("outbox/reply.md");
     let cache_path =
         virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
     fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
@@ -2118,7 +2118,7 @@ fn daemon_push_blocks_ambiguous_gmail_send_journal_without_reapplying() {
     )
     .expect("cache file");
 
-    let send_folder_id = RemoteId::new("gmail-folder:send");
+    let outbox_folder_id = RemoteId::new("gmail-folder:outbox");
     let sent_folder_id = RemoteId::new("gmail-folder:sent");
     let mut store = InMemoryStateStore::new();
     store
@@ -2130,12 +2130,12 @@ fn daemon_push_blocks_ambiguous_gmail_send_journal_without_reapplying() {
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
-            send_folder_id.clone(),
+            outbox_folder_id.clone(),
             EntityKind::Directory,
-            "send",
-            "send",
+            "outbox",
+            "outbox",
         ))
-        .expect("save send folder");
+        .expect("save outbox folder");
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
@@ -2148,11 +2148,11 @@ fn daemon_push_blocks_ambiguous_gmail_send_journal_without_reapplying() {
     store
         .save_virtual_mutation(virtual_mutation(
             &fixture.mount_id,
-            "local:gmail-send",
+            "local:gmail-outbox",
             VirtualMutationKind::Create,
             None,
-            Some(send_folder_id.clone()),
-            "send/reply.md",
+            Some(outbox_folder_id.clone()),
+            "outbox/reply.md",
             Some(cache_path),
         ))
         .expect("save mutation");
@@ -2167,9 +2167,9 @@ fn daemon_push_blocks_ambiguous_gmail_send_journal_without_reapplying() {
         PropertyValue::List(vec!["user@example.com".to_string()]),
     );
     let plan = PushPlan::new(
-        vec![send_folder_id],
+        vec![outbox_folder_id],
         vec![PushOperation::CreateEntity {
-            parent_id: RemoteId::new("gmail-folder:send"),
+            parent_id: RemoteId::new("gmail-folder:outbox"),
             parent_kind: Some(EntityKind::Directory),
             parent_workspace: false,
             title: "Reply".to_string(),
@@ -2178,7 +2178,7 @@ fn daemon_push_blocks_ambiguous_gmail_send_journal_without_reapplying() {
             source_path: source_path.to_path_buf(),
         }],
     );
-    let push_id = PushId("push-ambiguous-gmail-send".to_string());
+    let push_id = PushId("push-ambiguous-gmail-outbox".to_string());
     store
         .append_journal(JournalEntry::new(
             push_id.clone(),
@@ -2215,7 +2215,7 @@ fn daemon_push_blocks_ambiguous_gmail_send_journal_without_reapplying() {
 fn daemon_push_blocks_failed_gmail_send_recovery_lookup_without_reapplying() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
-    let source_path = Path::new("send/reply.md");
+    let source_path = Path::new("outbox/reply.md");
     let cache_path =
         virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
     fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
@@ -2225,7 +2225,7 @@ fn daemon_push_blocks_failed_gmail_send_recovery_lookup_without_reapplying() {
     )
     .expect("cache file");
 
-    let send_folder_id = RemoteId::new("gmail-folder:send");
+    let outbox_folder_id = RemoteId::new("gmail-folder:outbox");
     let sent_folder_id = RemoteId::new("gmail-folder:sent");
     let mut store = InMemoryStateStore::new();
     store
@@ -2237,12 +2237,12 @@ fn daemon_push_blocks_failed_gmail_send_recovery_lookup_without_reapplying() {
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
-            send_folder_id.clone(),
+            outbox_folder_id.clone(),
             EntityKind::Directory,
-            "send",
-            "send",
+            "outbox",
+            "outbox",
         ))
-        .expect("save send folder");
+        .expect("save outbox folder");
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
@@ -2255,11 +2255,11 @@ fn daemon_push_blocks_failed_gmail_send_recovery_lookup_without_reapplying() {
     store
         .save_virtual_mutation(virtual_mutation(
             &fixture.mount_id,
-            "local:gmail-send",
+            "local:gmail-outbox",
             VirtualMutationKind::Create,
             None,
-            Some(send_folder_id.clone()),
-            "send/reply.md",
+            Some(outbox_folder_id.clone()),
+            "outbox/reply.md",
             Some(cache_path),
         ))
         .expect("save mutation");
@@ -2274,9 +2274,9 @@ fn daemon_push_blocks_failed_gmail_send_recovery_lookup_without_reapplying() {
         PropertyValue::List(vec!["user@example.com".to_string()]),
     );
     let plan = PushPlan::new(
-        vec![send_folder_id],
+        vec![outbox_folder_id],
         vec![PushOperation::CreateEntity {
-            parent_id: RemoteId::new("gmail-folder:send"),
+            parent_id: RemoteId::new("gmail-folder:outbox"),
             parent_kind: Some(EntityKind::Directory),
             parent_workspace: false,
             title: "Reply".to_string(),
@@ -2285,7 +2285,7 @@ fn daemon_push_blocks_failed_gmail_send_recovery_lookup_without_reapplying() {
             source_path: source_path.to_path_buf(),
         }],
     );
-    let push_id = PushId("push-failed-gmail-send-lookup".to_string());
+    let push_id = PushId("push-failed-gmail-outbox-lookup".to_string());
     store
         .append_journal(JournalEntry::new(
             push_id.clone(),
@@ -2324,7 +2324,7 @@ fn daemon_push_blocks_failed_gmail_send_recovery_lookup_without_reapplying() {
 fn daemon_push_blocks_failed_gmail_message_send_without_reapplying() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
-    let source_path = Path::new("send/reply.md");
+    let source_path = Path::new("outbox/reply.md");
     let cache_path =
         virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
     fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
@@ -2334,7 +2334,7 @@ fn daemon_push_blocks_failed_gmail_message_send_without_reapplying() {
     )
     .expect("cache file");
 
-    let send_folder_id = RemoteId::new("gmail-folder:send");
+    let outbox_folder_id = RemoteId::new("gmail-folder:outbox");
     let sent_folder_id = RemoteId::new("gmail-folder:sent");
     let mut store = InMemoryStateStore::new();
     store
@@ -2346,12 +2346,12 @@ fn daemon_push_blocks_failed_gmail_message_send_without_reapplying() {
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
-            send_folder_id.clone(),
+            outbox_folder_id.clone(),
             EntityKind::Directory,
-            "send",
-            "send",
+            "outbox",
+            "outbox",
         ))
-        .expect("save send folder");
+        .expect("save outbox folder");
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
@@ -2364,11 +2364,11 @@ fn daemon_push_blocks_failed_gmail_message_send_without_reapplying() {
     store
         .save_virtual_mutation(virtual_mutation(
             &fixture.mount_id,
-            "local:gmail-send",
+            "local:gmail-outbox",
             VirtualMutationKind::Create,
             None,
-            Some(send_folder_id.clone()),
-            "send/reply.md",
+            Some(outbox_folder_id.clone()),
+            "outbox/reply.md",
             Some(cache_path),
         ))
         .expect("save mutation");
@@ -2383,9 +2383,9 @@ fn daemon_push_blocks_failed_gmail_message_send_without_reapplying() {
         PropertyValue::List(vec!["user@example.com".to_string()]),
     );
     let plan = PushPlan::new(
-        vec![send_folder_id],
+        vec![outbox_folder_id],
         vec![PushOperation::CreateEntity {
-            parent_id: RemoteId::new("gmail-folder:send"),
+            parent_id: RemoteId::new("gmail-folder:outbox"),
             parent_kind: Some(EntityKind::Directory),
             parent_workspace: false,
             title: "Reply".to_string(),
@@ -2430,7 +2430,7 @@ fn daemon_push_blocks_failed_gmail_message_send_without_reapplying() {
 fn daemon_push_reconciles_repeated_gmail_send_filename_to_unique_sent_paths() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
-    let source_path = Path::new("send/reply.md");
+    let source_path = Path::new("outbox/reply.md");
     let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
     let cache_path =
         virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
@@ -2441,7 +2441,7 @@ fn daemon_push_reconciles_repeated_gmail_send_filename_to_unique_sent_paths() {
     )
     .expect("cache file");
 
-    let send_folder_id = RemoteId::new("gmail-folder:send");
+    let outbox_folder_id = RemoteId::new("gmail-folder:outbox");
     let sent_folder_id = RemoteId::new("gmail-folder:sent");
     let first_remote_id = RemoteId::new("gmail-message:sent-1");
     let second_remote_id = RemoteId::new("gmail-message:sent-2");
@@ -2455,12 +2455,12 @@ fn daemon_push_reconciles_repeated_gmail_send_filename_to_unique_sent_paths() {
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
-            send_folder_id.clone(),
+            outbox_folder_id.clone(),
             EntityKind::Directory,
-            "send",
-            "send",
+            "outbox",
+            "outbox",
         ))
-        .expect("save send folder");
+        .expect("save outbox folder");
     store
         .save_entity(EntityRecord::new(
             fixture.mount_id.clone(),
@@ -2473,11 +2473,11 @@ fn daemon_push_reconciles_repeated_gmail_send_filename_to_unique_sent_paths() {
     store
         .save_virtual_mutation(virtual_mutation(
             &fixture.mount_id,
-            "local:gmail-send-1",
+            "local:gmail-outbox-1",
             VirtualMutationKind::Create,
             None,
-            Some(send_folder_id.clone()),
-            "send/reply.md",
+            Some(outbox_folder_id.clone()),
+            "outbox/reply.md",
             Some(cache_path.clone()),
         ))
         .expect("save first mutation");
@@ -2492,7 +2492,7 @@ fn daemon_push_reconciles_repeated_gmail_send_filename_to_unique_sent_paths() {
             ),
         )
         .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
-            operation_id: PushOperationId("create-gmail-send-1".to_string()),
+            operation_id: PushOperationId("create-gmail-outbox-1".to_string()),
             operation_index: 0,
             parent_id: sent_folder_id.clone(),
             entity_id: first_remote_id.clone(),
@@ -2528,11 +2528,11 @@ fn daemon_push_reconciles_repeated_gmail_send_filename_to_unique_sent_paths() {
     store
         .save_virtual_mutation(virtual_mutation(
             &fixture.mount_id,
-            "local:gmail-send-2",
+            "local:gmail-outbox-2",
             VirtualMutationKind::Create,
             None,
-            Some(send_folder_id),
-            "send/reply.md",
+            Some(outbox_folder_id),
+            "outbox/reply.md",
             Some(cache_path),
         ))
         .expect("save second mutation");
@@ -2547,7 +2547,7 @@ fn daemon_push_reconciles_repeated_gmail_send_filename_to_unique_sent_paths() {
             ),
         )
         .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
-            operation_id: PushOperationId("create-gmail-send-2".to_string()),
+            operation_id: PushOperationId("create-gmail-outbox-2".to_string()),
             operation_index: 0,
             parent_id: sent_folder_id,
             entity_id: second_remote_id.clone(),

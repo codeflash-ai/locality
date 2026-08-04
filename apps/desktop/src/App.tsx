@@ -735,7 +735,7 @@ function suggestedAgentPrompt(mountPath: string, connector: OnboardingConnectorI
     case "google-calendar":
       return `Use Locality to inspect my Google Calendar source. Open the files under ${mountPath}, review calendar events with normal file tools, and prepare new event drafts for Locality review before creating them.`;
     case "gmail":
-      return `Use Locality to inspect my Gmail source. Open the files under ${mountPath}, search mail with normal file tools, use draft/ for unsent Gmail drafts, and use send/ only when I explicitly ask you to send mail. Leave outbound changes for Locality review.`;
+      return `Use Locality to inspect my Gmail source. Open the files under ${mountPath}, search mail with normal file tools, use draft/ for unsent Gmail drafts, and use outbox/ only when I explicitly ask you to send mail. Leave outbound changes for Locality review.`;
     case "linear":
       return `Use Locality to edit my Linear issues. Open the files under ${mountPath}, update issue Markdown and editable frontmatter, and leave changes pending for Locality review before pushing.`;
     case "notion":
@@ -3980,7 +3980,7 @@ function AddSourceDialog({
     {
       id: "gmail",
       name: "Gmail",
-      description: "Inbox and sent as readable files, draft/ for Gmail drafts, send/ for reviewed direct sends.",
+      description: "Inbox and sent as readable files, draft/ for Gmail drafts, outbox/ for reviewed direct sends.",
       status: sourceConnectorStatus(snapshot, "gmail"),
       keywords: ["gmail", "mail", "email", "inbox", "drafts"],
       mounted: sourceMounted(snapshot, "gmail"),
@@ -7841,7 +7841,7 @@ const onboardingConnectorCards: OnboardingConnectorCard[] = [
   {
     connector: "gmail",
     title: "Gmail",
-    description: "Inbox and sent mail as local files, draft/ for Gmail drafts, send/ for reviewed sends.",
+    description: "Inbox and sent mail as local files, draft/ for Gmail drafts, outbox/ for reviewed sends.",
   },
   {
     connector: "granola",
