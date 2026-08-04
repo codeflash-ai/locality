@@ -475,12 +475,7 @@ where
     let Some(plan) = prepared.pipeline.plan.as_ref() else {
         return Ok(None);
     };
-    if plan.operations.is_empty()
-        || !plan
-            .operations
-            .iter()
-            .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
-    {
+    if !gmail_send_replay_plan_can_be_ambiguous(plan) {
         return Ok(None);
     }
 
@@ -517,9 +512,7 @@ where
 {
     let mut latest = None;
     for journal in store.list_journal().map_err(LocalityError::from)? {
-        if journal.mount_id != *mount_id
-            || !journal_created_entity_source_paths_match(&journal.plan, plan)
-        {
+        if journal.mount_id != *mount_id || !ambiguous_gmail_send_plans_match(&journal.plan, plan) {
             continue;
         }
         if latest
@@ -545,6 +538,50 @@ fn ambiguous_gmail_send_status(status: &JournalStatus) -> bool {
         }
         _ => false,
     }
+}
+
+fn gmail_send_replay_plan_can_be_ambiguous(plan: &PushPlan) -> bool {
+    !plan.operations.is_empty()
+        && (plan
+            .operations
+            .iter()
+            .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+            || !gmail_draft_send_moves(plan).is_empty())
+}
+
+fn ambiguous_gmail_send_plans_match(left: &PushPlan, right: &PushPlan) -> bool {
+    let right_create_sources = plan_create_entity_sources(right);
+    if !right_create_sources.is_empty() && journal_created_entity_source_paths_match(left, right) {
+        return true;
+    }
+
+    let mut left_moves = gmail_draft_send_moves(left);
+    let mut right_moves = gmail_draft_send_moves(right);
+    if right_moves.is_empty() {
+        return false;
+    }
+    left_moves.sort();
+    right_moves.sort();
+    left_moves == right_moves
+}
+
+fn gmail_draft_send_moves(plan: &PushPlan) -> Vec<(&RemoteId, &RemoteId, &PathBuf)> {
+    plan.operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PushOperation::MoveEntity {
+                entity_id,
+                new_parent_id,
+                projected_path,
+                ..
+            } if entity_id.0.starts_with("gmail-draft:")
+                && new_parent_id.0 == "gmail-folder:outbox" =>
+            {
+                Some((entity_id, new_parent_id, projected_path))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn resume_failed_applied_reconciliation<S, Source>(

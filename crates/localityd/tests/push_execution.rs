@@ -2212,6 +2212,150 @@ fn daemon_push_blocks_ambiguous_gmail_send_journal_without_reapplying() {
 }
 
 #[test]
+fn daemon_push_blocks_ambiguous_gmail_draft_move_send_journal_without_reapplying() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("outbox/Send Now.md");
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache_path,
+        "---\nloc:\n  id: gmail-draft:draft-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Send Now\nsubject: Send now subject\nto: [\"ann@example.com\"]\n---\nEdited body before sending.\n",
+    )
+    .expect("cache file");
+
+    let draft_folder_id = RemoteId::new("gmail-folder:draft");
+    let outbox_folder_id = RemoteId::new("gmail-folder:outbox");
+    let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "gmail", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            outbox_folder_id.clone(),
+            EntityKind::Directory,
+            "outbox",
+            "outbox",
+        ))
+        .expect("save outbox folder");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                draft_remote_id.clone(),
+                EntityKind::Page,
+                "Original",
+                source_path,
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save moved draft");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                draft_remote_id.clone(),
+                "Original body.\n",
+                1,
+                [RemoteId::new("body-1")],
+            )
+            .expect("shadow")
+            .with_frontmatter("loc:\n  id: gmail-draft:draft-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Original\nsubject: Original subject\nto: [\"ann@example.com\"]\n"),
+        )
+        .expect("save shadow");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:draft-1-to-outbox".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(draft_remote_id.clone()),
+            parent_remote_id: Some(outbox_folder_id.clone()),
+            original_path: Some(PathBuf::from("draft/Original.md")),
+            projected_path: source_path.to_path_buf(),
+            title: "Send Now".to_string(),
+            content_path: Some(cache_path),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save move mutation");
+    fs::create_dir_all(fixture.root.join("outbox")).expect("visible outbox folder");
+
+    let plan = PushPlan::new(
+        vec![draft_remote_id.clone()],
+        vec![
+            PushOperation::MoveEntity {
+                entity_id: draft_remote_id.clone(),
+                new_parent_id: outbox_folder_id,
+                new_parent_kind: EntityKind::Directory,
+                new_title: "Send Now".to_string(),
+                projected_path: source_path.to_path_buf(),
+            },
+            PushOperation::UpdateProperties {
+                entity_id: draft_remote_id.clone(),
+                properties: BTreeMap::from([(
+                    "subject".to_string(),
+                    PropertyValue::String("Send now subject".to_string()),
+                )]),
+            },
+            PushOperation::UpdateEntityBody {
+                entity_id: draft_remote_id,
+                body: "Edited body before sending.\n".to_string(),
+            },
+        ],
+    );
+    let push_id = PushId("push-ambiguous-gmail-draft-send".to_string());
+    store
+        .append_journal(JournalEntry::new(
+            push_id.clone(),
+            fixture.mount_id.clone(),
+            plan.affected_entities.clone(),
+            plan,
+            JournalStatus::Applying,
+        ))
+        .expect("append applying journal");
+    let source = FakePushSource::default();
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("retry ambiguous gmail draft send");
+
+    assert_eq!(report.action, PushJobAction::Failed);
+    assert_eq!(
+        source.applied_count(),
+        0,
+        "retry must not resend Gmail draft"
+    );
+    assert_eq!(report.push_id.as_ref(), Some(&push_id));
+    assert_eq!(report.journal_status, Some(JournalStatus::Applying));
+    let error = report.error.expect("guardrail error");
+    assert_eq!(error.code, "guardrail");
+    assert!(error.message.contains("ambiguous result"));
+}
+
+#[test]
 fn daemon_push_blocks_failed_gmail_send_recovery_lookup_without_reapplying() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
