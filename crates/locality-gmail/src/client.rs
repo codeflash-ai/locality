@@ -10,8 +10,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::dto::{
-    GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
-    GmailMessagePartBody, GmailMessageSendRequest, GmailThread, GmailThreadList,
+    GmailDraft, GmailDraftCreateRequest, GmailDraftList, GmailDraftSendRequest,
+    GmailDraftUpdateRequest, GmailMessage, GmailMessageList, GmailMessagePartBody,
+    GmailMessageSendRequest, GmailThread, GmailThreadList,
 };
 
 pub const DEFAULT_GMAIL_API_BASE_URL: &str = "https://gmail.googleapis.com/gmail/v1";
@@ -43,7 +44,19 @@ pub trait GmailApi: std::fmt::Debug + Send + Sync {
         message_id: &str,
         attachment_id: &str,
     ) -> LocalityResult<GmailMessagePartBody>;
+    fn list_drafts(
+        &self,
+        max_results: u32,
+        page_token: Option<&str>,
+        query: Option<&str>,
+    ) -> LocalityResult<GmailDraftList>;
+    fn get_draft_full(&self, draft_id: &str) -> LocalityResult<GmailDraft>;
     fn create_draft(&self, request: GmailDraftCreateRequest) -> LocalityResult<GmailDraft>;
+    fn update_draft(
+        &self,
+        draft_id: &str,
+        request: GmailDraftUpdateRequest,
+    ) -> LocalityResult<GmailDraft>;
     fn send_message(&self, request: GmailMessageSendRequest) -> LocalityResult<GmailMessage>;
     fn send_draft(&self, request: GmailDraftSendRequest) -> LocalityResult<GmailMessage>;
 }
@@ -105,6 +118,21 @@ impl HttpGmailApiClient {
         decode_response(
             self.client
                 .post(format!("{}{}", self.base_url, path))
+                .bearer_auth(&self.access_token)
+                .json(body)
+                .send(),
+            context,
+        )
+    }
+
+    fn put_json_with_context<T, B>(&self, path: &str, body: &B, context: &str) -> LocalityResult<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        decode_response(
+            self.client
+                .put(format!("{}{}", self.base_url, path))
                 .bearer_auth(&self.access_token)
                 .json(body)
                 .send(),
@@ -199,8 +227,45 @@ impl GmailApi for HttpGmailApiClient {
         )
     }
 
+    fn list_drafts(
+        &self,
+        max_results: u32,
+        page_token: Option<&str>,
+        search_query: Option<&str>,
+    ) -> LocalityResult<GmailDraftList> {
+        let mut params = vec![("maxResults".to_string(), max_results.to_string())];
+        if let Some(page_token) = page_token {
+            params.push(("pageToken".to_string(), page_token.to_string()));
+        }
+        if let Some(search_query) = search_query {
+            params.push(("q".to_string(), search_query.to_string()));
+        }
+        self.get_json("/users/me/drafts", params)
+    }
+
+    fn get_draft_full(&self, draft_id: &str) -> LocalityResult<GmailDraft> {
+        let draft_id = percent_encode_path_segment(draft_id);
+        self.get_json(
+            &format!("/users/me/drafts/{draft_id}"),
+            vec![("format".to_string(), "full".to_string())],
+        )
+    }
+
     fn create_draft(&self, request: GmailDraftCreateRequest) -> LocalityResult<GmailDraft> {
         self.post_json_with_context("/users/me/drafts", &request, "gmail draft create")
+    }
+
+    fn update_draft(
+        &self,
+        draft_id: &str,
+        request: GmailDraftUpdateRequest,
+    ) -> LocalityResult<GmailDraft> {
+        let draft_id = percent_encode_path_segment(draft_id);
+        self.put_json_with_context(
+            &format!("/users/me/drafts/{draft_id}"),
+            &request,
+            "gmail draft update",
+        )
     }
 
     fn send_message(&self, request: GmailMessageSendRequest) -> LocalityResult<GmailMessage> {
@@ -273,7 +338,7 @@ mod tests {
 
     use locality_core::LocalityError;
 
-    use crate::dto::GmailMessageSendRequest;
+    use crate::dto::{GmailDraftUpdateRequest, GmailMessageSendRequest, GmailRawMessage};
 
     use super::{GmailApi, HttpGmailApiClient};
 
@@ -400,6 +465,46 @@ mod tests {
     }
 
     #[test]
+    fn list_drafts_calls_gmail_drafts_endpoint_with_max_results() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            r#"{"drafts":[{"id":"draft-1","message":{"id":"msg-1","threadId":"thread-1"}}],"resultSizeEstimate":1}"#,
+        );
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+
+        let drafts = client
+            .list_drafts(100, None, None)
+            .expect("draft list response");
+
+        assert_eq!(drafts.drafts[0].id, "draft-1");
+        let request = request_rx.recv().expect("request line");
+        server.join().expect("server exits");
+        let target = request.split_whitespace().nth(1).expect("request target");
+        assert_eq!(target, "/users/me/drafts?maxResults=100");
+    }
+
+    #[test]
+    fn get_draft_full_calls_gmail_draft_endpoint_with_full_format() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            r#"{"id":"draft/1 space","message":{"id":"msg-1","threadId":"thread-1"}}"#,
+        );
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+
+        let draft = client
+            .get_draft_full("draft/1 space")
+            .expect("draft response");
+
+        assert_eq!(draft.id, "draft/1 space");
+        let request = request_rx.recv().expect("request line");
+        server.join().expect("server exits");
+        let target = request.split_whitespace().nth(1).expect("request target");
+        assert_eq!(target, "/users/me/drafts/draft%2F1%20space?format=full");
+        assert!(!target.contains("draft/1"), "{target}");
+        assert!(!target.contains(' '), "{target}");
+    }
+
+    #[test]
     fn http_errors_map_google_status_semantics() {
         assert!(matches!(
             request_error_for_status("HTTP/1.1 404 Not Found", "missing"),
@@ -496,6 +601,43 @@ mod tests {
         );
         assert!(
             request.ends_with(r#"{"raw":"raw-message-body"}"#),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn update_draft_puts_raw_body_to_gmail_draft_endpoint() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            r#"{"id":"draft/1","message":{"id":"updated-msg-1","threadId":"thread-1"}}"#,
+        );
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+
+        let updated = client
+            .update_draft(
+                "draft/1",
+                GmailDraftUpdateRequest {
+                    message: GmailRawMessage {
+                        raw: "updated-raw".to_string(),
+                    },
+                },
+            )
+            .expect("draft update response");
+
+        assert_eq!(updated.message.id, "updated-msg-1");
+        let request = request_rx.recv().expect("request");
+        server.join().expect("server exits");
+        assert!(
+            request.starts_with("PUT /users/me/drafts/draft%2F1 HTTP/1.1"),
+            "{request}"
+        );
+        let request_lowercase = request.to_ascii_lowercase();
+        assert!(
+            request_lowercase.contains("authorization: bearer access-token"),
+            "{request}"
+        );
+        assert!(
+            request.ends_with(r#"{"message":{"raw":"updated-raw"}}"#),
             "{request}"
         );
     }

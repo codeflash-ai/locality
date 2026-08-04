@@ -1287,9 +1287,9 @@ mod tests {
     use super::{GmailConfig, GmailConnector};
     use crate::client::GmailApi;
     use crate::dto::{
-        GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
-        GmailMessagePartBody, GmailMessageRef, GmailMessageSendRequest, GmailThread,
-        GmailThreadList,
+        GmailDraft, GmailDraftCreateRequest, GmailDraftList, GmailDraftSendRequest,
+        GmailDraftUpdateRequest, GmailMessage, GmailMessageList, GmailMessagePartBody,
+        GmailMessageRef, GmailMessageSendRequest, GmailThread, GmailThreadList,
     };
     use crate::settings::GmailMountSettings;
 
@@ -2697,6 +2697,22 @@ mod tests {
             Ok(GmailMessagePartBody::default())
         }
 
+        fn list_drafts(
+            &self,
+            _max_results: u32,
+            _page_token: Option<&str>,
+            _query: Option<&str>,
+        ) -> locality_core::LocalityResult<GmailDraftList> {
+            Ok(GmailDraftList::default())
+        }
+
+        fn get_draft_full(&self, draft_id: &str) -> locality_core::LocalityResult<GmailDraft> {
+            Ok(GmailDraft {
+                id: draft_id.to_string(),
+                message: message_fixture("draft-msg-1"),
+            })
+        }
+
         fn create_draft(
             &self,
             request: GmailDraftCreateRequest,
@@ -2708,6 +2724,14 @@ mod tests {
                 id: "draft-1".to_string(),
                 message: message_fixture("draft-message-1"),
             })
+        }
+
+        fn update_draft(
+            &self,
+            _draft_id: &str,
+            _request: GmailDraftUpdateRequest,
+        ) -> locality_core::LocalityResult<GmailDraft> {
+            panic!("not used")
         }
 
         fn send_message(

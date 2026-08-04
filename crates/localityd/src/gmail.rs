@@ -570,8 +570,9 @@ mod tests {
     use locality_gmail::attachments::attachment_local_path;
     use locality_gmail::client::GmailApi;
     use locality_gmail::dto::{
-        GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
-        GmailMessagePartBody, GmailMessageSendRequest, GmailThread, GmailThreadList,
+        GmailDraft, GmailDraftCreateRequest, GmailDraftList, GmailDraftSendRequest,
+        GmailDraftUpdateRequest, GmailMessage, GmailMessageList, GmailMessagePartBody,
+        GmailMessageSendRequest, GmailThread, GmailThreadList,
     };
 
     use super::*;
@@ -793,7 +794,31 @@ mod tests {
             })
         }
 
+        fn list_drafts(
+            &self,
+            _max_results: u32,
+            _page_token: Option<&str>,
+            _query: Option<&str>,
+        ) -> LocalityResult<GmailDraftList> {
+            Ok(GmailDraftList::default())
+        }
+
+        fn get_draft_full(&self, draft_id: &str) -> LocalityResult<GmailDraft> {
+            Ok(GmailDraft {
+                id: draft_id.to_string(),
+                message: message_fixture("draft-msg-1"),
+            })
+        }
+
         fn create_draft(&self, _request: GmailDraftCreateRequest) -> LocalityResult<GmailDraft> {
+            panic!("not used")
+        }
+
+        fn update_draft(
+            &self,
+            _draft_id: &str,
+            _request: GmailDraftUpdateRequest,
+        ) -> LocalityResult<GmailDraft> {
             panic!("not used")
         }
 
