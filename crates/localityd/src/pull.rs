@@ -890,11 +890,7 @@ where
                 remote_edited_at: record.remote_edited_at.clone(),
                 ..entry
             };
-            if plain_files_directory_pull {
-                save_entity_after_gmail_draft_repair(store, mount, &projected_entry, record)?;
-            } else {
-                store.save_entity(record).map_err(PullError::Store)?;
-            }
+            save_entity_after_gmail_draft_repair(store, mount, &projected_entry, record)?;
             if plain_files_directory_pull {
                 rename_projection_if_needed(mount, existing.as_ref(), &projected_entry)?;
             }
@@ -3645,6 +3641,77 @@ mod tests {
     }
 
     #[test]
+    fn pull_gmail_draft_virtual_directory_repairs_legacy_message_id_entity_collision() {
+        let fixture = PullFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(fixture.mount_id.clone(), "gmail", fixture.root.clone())
+            .projection(ProjectionMode::LinuxFuse);
+        store.save_mount(mount.clone()).expect("save mount");
+        let draft_folder_id = RemoteId::new("gmail-folder:draft");
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                draft_folder_id.clone(),
+                EntityKind::Directory,
+                "draft",
+                "draft",
+            ))
+            .expect("save draft folder");
+        let draft_path = "draft/1720900000000-hello-draft-msg-1.md";
+        let legacy_message_id = RemoteId::new("draft-msg-1");
+        let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    fixture.mount_id.clone(),
+                    legacy_message_id.clone(),
+                    EntityKind::Page,
+                    "Hello",
+                    draft_path,
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save legacy draft");
+        let source = FakePullSource::new(Vec::new(), Vec::new()).with_incremental_children(
+            &draft_folder_id,
+            vec![tree_entry(
+                &fixture.mount_id,
+                &draft_remote_id,
+                "Hello",
+                draft_path,
+                HydrationState::Stub,
+            )],
+        );
+
+        let report = super::pull_virtual_directory_path(
+            &mut store,
+            &source,
+            &mount,
+            Path::new("draft"),
+            fixture.root.join("draft"),
+            None,
+        )
+        .expect("pull virtual draft directory")
+        .expect("draft directory report");
+
+        assert_eq!(report.enumerated, 1);
+        assert!(
+            store
+                .get_entity(&fixture.mount_id, &legacy_message_id)
+                .expect("legacy lookup")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_entity(&fixture.mount_id, &draft_remote_id)
+                .expect("draft lookup")
+                .expect("draft entity")
+                .path,
+            PathBuf::from(draft_path)
+        );
+    }
+
+    #[test]
     fn pull_plain_directory_moves_existing_projected_child_path() {
         let fixture = PullFixture::new();
         let mut store = InMemoryStateStore::new();
@@ -3886,6 +3953,7 @@ mod tests {
     struct FakePullSource {
         entries: Vec<locality_core::model::TreeEntry>,
         children: BTreeMap<RemoteId, Vec<locality_core::model::TreeEntry>>,
+        incremental_children: BTreeSet<RemoteId>,
         rendered: BTreeMap<RemoteId, HydratedEntity>,
         schemas: BTreeMap<RemoteId, String>,
         fetch_count: Arc<AtomicU64>,
@@ -3899,6 +3967,7 @@ mod tests {
             Self {
                 entries,
                 children: BTreeMap::new(),
+                incremental_children: BTreeSet::new(),
                 rendered: rendered
                     .into_iter()
                     .map(|entity| (entity.shadow.entity_id.clone(), entity))
@@ -3924,6 +3993,16 @@ mod tests {
             entries: Vec<locality_core::model::TreeEntry>,
         ) -> Self {
             self.children.insert(parent_id.clone(), entries);
+            self
+        }
+
+        fn with_incremental_children(
+            mut self,
+            parent_id: &RemoteId,
+            entries: Vec<locality_core::model::TreeEntry>,
+        ) -> Self {
+            self.children.insert(parent_id.clone(), entries);
+            self.incremental_children.insert(parent_id.clone());
             self
         }
     }
@@ -3962,9 +4041,12 @@ mod tests {
                 | ChildContainer::PageChildren(remote_id) => remote_id,
                 ChildContainer::Root => RemoteId::new("root"),
             };
-            Ok(ListChildrenResult::complete(
-                self.children.get(&key).cloned().unwrap_or_default(),
-            ))
+            let entries = self.children.get(&key).cloned().unwrap_or_default();
+            if self.incremental_children.contains(&key) {
+                Ok(ListChildrenResult::incremental(entries))
+            } else {
+                Ok(ListChildrenResult::complete(entries))
+            }
         }
 
         fn fetch(&self, _request: FetchRequest) -> LocalityResult<NativeEntity> {
