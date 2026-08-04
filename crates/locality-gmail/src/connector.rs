@@ -827,11 +827,12 @@ fn apply_draft_mutation(
         draft.subject = subject;
     } else if let Some(title) = non_empty_string_property(&mutation.properties, "title") {
         draft.subject = title;
-    } else if let Some(title) = mutation
-        .title
-        .as_ref()
-        .filter(|title| !title.trim().is_empty())
-    {
+    } else if let Some(title) = mutation.title.as_ref().filter(|title| {
+        !title.trim().is_empty()
+            && (draft.subject.trim().is_empty()
+                || mutation.properties.contains_key("subject")
+                || mutation.properties.contains_key("title"))
+    }) {
         draft.subject = title.clone();
     } else if let Some(title) = baseline_title.filter(|title| !title.trim().is_empty()) {
         draft.subject = title.to_string();
@@ -3396,9 +3397,57 @@ mod tests {
         );
         let mime = decode_raw_mime(&calls.updated_drafts[0].1);
         assert!(mime.contains("To: ann@example.com\r\n"));
-        assert!(mime.contains("Subject: Move title subject\r\n"));
+        assert!(mime.contains("Subject: Hello\r\n"));
+        assert!(!mime.contains("Subject: Move title subject\r\n"));
         assert!(!mime.contains("Message-ID: <"));
         assert!(mime.contains("\r\n\r\nReady to send\r\n"));
+    }
+
+    #[test]
+    fn apply_sends_remote_gmail_draft_preserves_current_subject_on_move_only_send() {
+        let api = Arc::new(FakeGmailApi::default());
+        let mut message = message_fixture("draft-original-msg");
+        for header in &mut message.payload.as_mut().expect("payload").headers {
+            if header.name.eq_ignore_ascii_case("subject") {
+                header.value = "Updated draft subject".to_string();
+            }
+        }
+        api.calls.lock().expect("calls").draft_full.insert(
+            "draft-123".to_string(),
+            GmailDraft {
+                id: "draft-123".to_string(),
+                message,
+            },
+        );
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let draft_remote_id = RemoteId::new("gmail-draft:draft-123");
+        let plan = PushPlan::new(
+            vec![draft_remote_id.clone()],
+            vec![PushOperation::MoveEntity {
+                entity_id: draft_remote_id,
+                new_parent_id: RemoteId::new("gmail-folder:outbox"),
+                new_parent_kind: EntityKind::Directory,
+                new_title: "Original projected title".to_string(),
+                projected_path: "outbox/original-projected-title.md".into(),
+            }],
+        );
+
+        connector
+            .apply(locality_connector::ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("gmail-main"),
+                plan: &plan,
+                operation_ids: &[PushOperationId("op-move".to_string())],
+                remote_preconditions: &[] as &[RemotePrecondition],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let calls = api.calls.lock().expect("calls");
+        let mime = decode_raw_mime(&calls.updated_drafts[0].1);
+        assert!(mime.contains("Subject: Updated draft subject\r\n"));
+        assert!(!mime.contains("Subject: Original projected title\r\n"));
+        assert_eq!(calls.sent_drafts, vec!["draft-123"]);
     }
 
     #[test]

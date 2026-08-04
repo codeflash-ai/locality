@@ -423,6 +423,24 @@ path.write_text("\n".join(frontmatter + ["---", updated_body, ""]), encoding="ut
 PY
 }
 
+classify_created_gmail_remote_id() {
+  local created_remote_id="$1"
+
+  draft_id=""
+  raw_message_id=""
+  if [[ -z "$created_remote_id" ]]; then
+    return 1
+  fi
+  if [[ "$created_remote_id" == gmail-draft:* ]]; then
+    draft_id="${created_remote_id#gmail-draft:}"
+  elif [[ "$created_remote_id" == gmail-message:* ]]; then
+    raw_message_id="${created_remote_id#gmail-message:}"
+  else
+    raw_message_id="$created_remote_id"
+  fi
+  [[ -n "$draft_id" || -n "$raw_message_id" ]]
+}
+
 gmail_access_token() {
   local mode="${1:-required}"
   local access_token
@@ -767,6 +785,27 @@ JSON
   if ! gmail_message_subject_body_matches "$message_json" "$selftest_subject" "$selftest_marker" message; then
     live_fail "Gmail helper self-test rejected a matching message subject/body marker"
   fi
+
+  draft_id=""
+  raw_message_id=""
+  classify_created_gmail_remote_id "gmail-draft:draft-1"
+  if [[ "$draft_id" != "draft-1" || -n "$raw_message_id" ]]; then
+    live_fail "Gmail helper self-test did not accept a stable Gmail draft remote id"
+  fi
+
+  draft_id=""
+  raw_message_id=""
+  classify_created_gmail_remote_id "gmail-message:msg-1"
+  if [[ "$raw_message_id" != "msg-1" || -n "$draft_id" ]]; then
+    live_fail "Gmail helper self-test did not preserve a prefixed Gmail message id"
+  fi
+
+  draft_id=""
+  raw_message_id=""
+  classify_created_gmail_remote_id "msg-2"
+  if [[ "$raw_message_id" != "msg-2" || -n "$draft_id" ]]; then
+    live_fail "Gmail helper self-test did not preserve a legacy raw Gmail message id"
+  fi
 }
 
 if [[ "${LOCALITY_LIVE_GMAIL_SELFTEST:-}" == "1" ]]; then
@@ -865,18 +904,7 @@ LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$draft_path" \
   >"$push_report" 2>>"$command_log"
 assert_json_ok "$push_report" "Gmail push report"
 message_id="$(json_field "$push_report" "changed_remote_ids.0" 2>/dev/null || true)"
-if [[ -z "$message_id" ]]; then
-  live_fail "Gmail push report did not include changed_remote_ids.0"
-fi
-if [[ "$message_id" == gmail-draft:* ]]; then
-  draft_id="${message_id#gmail-draft:}"
-  raw_message_id=""
-elif [[ "$message_id" == gmail-message:* ]]; then
-  raw_message_id="${message_id#gmail-message:}"
-else
-  raw_message_id="$message_id"
-fi
-if [[ -z "$raw_message_id" ]]; then
+if ! classify_created_gmail_remote_id "$message_id"; then
   live_fail "Gmail push report produced an empty message id"
 fi
 
@@ -948,18 +976,8 @@ if [[ "${LOCALITY_LIVE_GMAIL_SEND:-0}" == "1" ]]; then
     >"$remote_draft_push_report" 2>>"$command_log"
   assert_json_ok "$remote_draft_push_report" "Gmail remote draft create push report"
   remote_created_id="$(json_field "$remote_draft_push_report" "changed_remote_ids.0" 2>/dev/null || true)"
-  if [[ -z "$remote_created_id" ]]; then
-    live_fail "Gmail remote draft create push report did not include changed_remote_ids.0"
-  fi
-  if [[ "$remote_created_id" == gmail-draft:* ]]; then
-    draft_id="${remote_created_id#gmail-draft:}"
-    raw_message_id=""
-  elif [[ "$remote_created_id" == gmail-message:* ]]; then
-    raw_message_id="${remote_created_id#gmail-message:}"
-    draft_id=""
-  else
-    raw_message_id="$remote_created_id"
-    draft_id=""
+  if ! classify_created_gmail_remote_id "$remote_created_id"; then
+    live_fail "Gmail remote draft create push report produced an empty message id"
   fi
 
   step="pulling Gmail workspace after remote draft create"
@@ -1020,7 +1038,8 @@ if [[ "${LOCALITY_LIVE_GMAIL_SEND:-0}" == "1" ]]; then
   remote_sent_message_id="$verified_remote_sent_id"
 
   step="trashing sent Gmail remote draft scratch message"
-  trash_gmail_message "$remote_sent_message_id" required
+  trash_gmail_message "$remote_sent_message_id" best_effort >/dev/null 2>&1 || \
+    echo "warning: Gmail OAuth scope did not allow trashing sent scratch message" >&2
   remote_sent_message_id=""
 
   echo "live Gmail API, CLI, daemon, and Linux FUSE draft, direct-send, and remote draft edit/send checks passed"
