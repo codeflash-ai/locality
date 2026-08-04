@@ -792,7 +792,7 @@ Gmail facts:\n\
 - To inspect inbound attachments, first hydrate the message or thread Markdown by opening it or running `loc pull <message-or-thread-path>`.\n\
 - Hydrated messages list attachments in YAML frontmatter under `gmail.attachments`; read `filename`, `mime_type`, `size`, `attachment_id`, and `path` from that list.\n\
 - Open the attachment file at the listed `path`, relative to the mount root. Gmail attachment caches normally live under `.loc/gmail/attachments/...`; use the frontmatter path exactly.\n\
-- Gmail draft/outbox creation does not support outbound attachments yet. Do not add `attachment` or `attachments` frontmatter to draft or outbox files.\n",
+- Gmail draft creation does not support outbound attachments yet. Outbox direct-send creation does not support outbound attachments yet either. Do not add `attachment` or `attachments` frontmatter to draft or outbox files.\n",
         generic_mount_guidance("Gmail")
     )
 }
