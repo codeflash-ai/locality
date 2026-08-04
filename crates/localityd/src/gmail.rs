@@ -349,6 +349,9 @@ pub(crate) fn validate_gmail_changed_frontmatter(
             ),
         ));
     }
+    if is_direct_outbound_child(context.relative_path) {
+        validate_gmail_outbound_frontmatter(&mut report, context);
+    }
     Ok(report)
 }
 
@@ -367,6 +370,17 @@ pub(crate) fn validate_gmail_create_frontmatter(
         ));
     }
 
+    if is_direct_outbound_child(context.relative_path) {
+        validate_gmail_outbound_frontmatter(&mut report, context);
+    }
+
+    Ok(report)
+}
+
+fn validate_gmail_outbound_frontmatter(
+    report: &mut ValidationReport,
+    context: SourceValidationContext<'_>,
+) {
     let has_subject = frontmatter_string(&context.parsed.frontmatter.properties, "subject")
         .as_deref()
         .is_some_and(|subject| !subject.trim().is_empty())
@@ -405,8 +419,6 @@ pub(crate) fn validate_gmail_create_frontmatter(
             Some("remove attachment frontmatter".to_string()),
         ));
     }
-
-    Ok(report)
 }
 
 fn gmail_draft_frontmatter_has_attachments(

@@ -360,8 +360,12 @@ pub fn source_move_decision_for_parent_path(
         return decision;
     }
     if mount.connector == "gmail" {
-        return SourceWriteDecision::ReadOnly {
-            reason: "Gmail moves are not supported; create a new file directly under draft/ or outbox/",
+        return if parent_path.components().count() == 1 && parent_path == Path::new("outbox") {
+            SourceWriteDecision::Writable
+        } else {
+            SourceWriteDecision::ReadOnly {
+                reason: "Gmail only supports moving an existing draft directly into outbox/ to send it",
+            }
         };
     }
     if mount.connector == LINEAR_CONNECTOR_ID {
@@ -494,8 +498,8 @@ fn gmail_source_descriptor() -> SourceDescriptor {
         create_entity_parent_kinds: vec![EntityKind::Directory],
         move_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: None,
-        body_diff_mode: BodyDiffMode::Block,
-        virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
+        body_diff_mode: BodyDiffMode::WholeEntity,
+        virtual_rename_policy: VirtualRenamePolicy::PreserveCanonical,
         max_background_discovery_workers: 4,
     }
 }

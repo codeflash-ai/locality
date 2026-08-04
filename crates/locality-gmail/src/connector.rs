@@ -113,7 +113,7 @@ impl Connector for GmailConnector {
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             supports_block_updates: false,
-            supports_entity_body_updates: false,
+            supports_entity_body_updates: true,
             supports_databases: false,
             supports_oauth: true,
             supports_remote_observation: true,
@@ -125,7 +125,14 @@ impl Connector for GmailConnector {
     }
 
     fn supported_push_operations(&self) -> BTreeSet<PushOperationKind> {
-        [PushOperationKind::CreateEntity].into_iter().collect()
+        [
+            PushOperationKind::CreateEntity,
+            PushOperationKind::UpdateProperties,
+            PushOperationKind::UpdateEntityBody,
+            PushOperationKind::MoveEntity,
+        ]
+        .into_iter()
+        .collect()
     }
 
     fn enumerate(&self, request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>> {
