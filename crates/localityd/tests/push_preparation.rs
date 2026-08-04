@@ -1355,6 +1355,72 @@ fn prepare_stale_pending_move_rechecks_source_and_mount_write_policy() {
             .any(|issue| issue.code == "source_path_read_only")
     );
 
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.virtual_store("gmail");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("gmail-folder:outbox"),
+            EntityKind::Directory,
+            "outbox",
+            "outbox",
+        ))
+        .expect("save outbox folder");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("draft-1"),
+                EntityKind::Page,
+                "Draft subject",
+                "outbox/ENG-1.md",
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save moved outbound draft");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("draft-1"),
+                "Draft body",
+                8,
+                [RemoteId::new("body-1")],
+            )
+            .expect("shadow"),
+        )
+        .expect("save outbound shadow");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:draft-1-to-send".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(RemoteId::new("draft-1")),
+            parent_remote_id: Some(RemoteId::new("gmail-folder:outbox")),
+            original_path: Some(PathBuf::from("draft/ENG-1.md")),
+            projected_path: PathBuf::from("outbox/ENG-1.md"),
+            title: "Draft subject".to_string(),
+            content_path: None,
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save stale outbound move");
+    fs::create_dir_all(fixture.root.join("outbox")).expect("visible outbox folder");
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("outbox")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare stale Gmail outbound move");
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert!(prepared.pipeline.validation.issues.iter().any(|issue| {
+        issue.code == "source_move_parent_read_only"
+            && issue.message
+                == "Gmail moves are not supported; create a new file directly under draft/ or outbox/"
+    }));
+
     let (fixture, mut store) = linear_move_store(None, true);
     store
         .save_mount(
@@ -2014,6 +2080,71 @@ fn prepare_gmail_draft_create_keeps_subject_and_recipients_as_properties() {
             assert_eq!(title, "Reply");
             assert_eq!(body, "Body\n");
             assert_eq!(source_path, &PathBuf::from("draft/reply.md"));
+            assert_eq!(
+                properties.get("subject"),
+                Some(&PropertyValue::String("Reply subject".to_string()))
+            );
+            assert_eq!(
+                properties.get("to"),
+                Some(&PropertyValue::List(vec!["ann@example.com".to_string()]))
+            );
+            assert_eq!(
+                properties.get("cc"),
+                Some(&PropertyValue::List(vec!["copy@example.com".to_string()]))
+            );
+            assert_eq!(properties.get("bcc"), Some(&PropertyValue::List(vec![])));
+        }
+        operation => panic!("unexpected operation: {operation:?}"),
+    }
+}
+
+#[test]
+fn prepare_gmail_send_create_keeps_subject_and_recipients_as_properties() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("gmail");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("gmail-folder:outbox"),
+                EntityKind::Directory,
+                "outbox",
+                "outbox",
+            )
+            .with_hydration(HydrationState::Stub)
+            .with_remote_edited_at("folder:outbox"),
+        )
+        .expect("save outbox folder");
+    let send_path = fixture.write_raw(
+        "outbox/reply.md",
+        "---\nloc:\n  type: page\n  connector: gmail\ntitle: Reply\nsubject: Reply subject\nto: [\"ann@example.com\"]\ncc: [\"copy@example.com\"]\nbcc: []\n---\nBody\n",
+    );
+
+    let prepared = prepare_push(
+        &store,
+        &job(send_path),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::ConfirmPlan);
+    let plan = prepared.pipeline.plan.expect("plan");
+    match &plan.operations[0] {
+        PushOperation::CreateEntity {
+            parent_id,
+            parent_kind,
+            title,
+            properties,
+            body,
+            source_path,
+            ..
+        } => {
+            assert_eq!(parent_id, &RemoteId::new("gmail-folder:outbox"));
+            assert_eq!(parent_kind, &Some(EntityKind::Directory));
+            assert_eq!(title, "Reply");
+            assert_eq!(body, "Body\n");
+            assert_eq!(source_path, &PathBuf::from("outbox/reply.md"));
             assert_eq!(
                 properties.get("subject"),
                 Some(&PropertyValue::String("Reply subject".to_string()))

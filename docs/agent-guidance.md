@@ -38,7 +38,9 @@ The skill tells agents:
 - Agents should use `loc status <path>`, `loc inspect <path>`, and `loc diff <path>` to inspect local state, remote comparison, and planned operations.
 - Agents should use `loc mv <source> <dest>` for intentional page/file moves or renames in mounted Locality content, then inspect with `loc status <path>` or `loc diff <path>`.
 - For Notion, agents should read the mount-local `AGENTS.md` for the concrete page and row creation contract. Prefer `loc create page --title "New Page" --parent <parent-directory>` for new pages, and add `--private` when the remote page should be created in Notion's Private section; manually, pages are directories, a new child page is created by writing `parent-page/new-page/page.md`, new page frontmatter needs `title: "..."`, and generated `loc:` identity frontmatter is omitted until Locality adds it after push.
-- For Calendar and Gmail, outbound operations use draft folders; for Linear, supported edits include issue body/frontmatter changes and status moves; Slack and Granola are read-only.
+- For Calendar, outbound operations use draft folders for new events.
+- For Gmail, outbound operations distinguish `draft/` for unsent drafts from `outbox/` for direct sends. Use `outbox/` only when the user explicitly asks to send now; otherwise use `draft/`.
+- For Linear, supported edits include issue body/frontmatter changes and status moves; Slack and Granola are read-only.
 - If desktop Live Mode is on, agents should expect safe local edits and clean remote changes to sync in the background. They can inspect state with `loc live-mode status <file>`, but should not run routine `loc pull` or `loc push` after every edit.
 - If the user asks the agent to sync, send, publish, update the source, or apply the edit remotely, the agent should not stop after local edits. The safe sequence is `loc diff <path>`, then `loc push <path> -y` for safe plans.
 - Agents should also push when Live Mode pauses for review and the user approves the scoped plan.

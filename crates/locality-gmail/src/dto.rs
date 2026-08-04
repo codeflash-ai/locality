@@ -90,6 +90,11 @@ pub struct GmailDraftCreateRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GmailMessageSendRequest {
+    pub raw: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GmailDraftSendRequest {
     pub id: String,
 }

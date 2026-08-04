@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 
 use crate::dto::{
     GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
-    GmailMessagePartBody, GmailThread, GmailThreadList,
+    GmailMessagePartBody, GmailMessageSendRequest, GmailThread, GmailThreadList,
 };
 
 pub const DEFAULT_GMAIL_API_BASE_URL: &str = "https://gmail.googleapis.com/gmail/v1";
@@ -44,6 +44,7 @@ pub trait GmailApi: std::fmt::Debug + Send + Sync {
         attachment_id: &str,
     ) -> LocalityResult<GmailMessagePartBody>;
     fn create_draft(&self, request: GmailDraftCreateRequest) -> LocalityResult<GmailDraft>;
+    fn send_message(&self, request: GmailMessageSendRequest) -> LocalityResult<GmailMessage>;
     fn send_draft(&self, request: GmailDraftSendRequest) -> LocalityResult<GmailMessage>;
 }
 
@@ -202,6 +203,10 @@ impl GmailApi for HttpGmailApiClient {
         self.post_json_with_context("/users/me/drafts", &request, "gmail draft create")
     }
 
+    fn send_message(&self, request: GmailMessageSendRequest) -> LocalityResult<GmailMessage> {
+        self.post_json_with_context("/users/me/messages/send", &request, "gmail message send")
+    }
+
     fn send_draft(&self, request: GmailDraftSendRequest) -> LocalityResult<GmailMessage> {
         self.post_json_with_context("/users/me/drafts/send", &request, "gmail draft send")
     }
@@ -267,6 +272,8 @@ mod tests {
     use std::thread;
 
     use locality_core::LocalityError;
+
+    use crate::dto::GmailMessageSendRequest;
 
     use super::{GmailApi, HttpGmailApiClient};
 
@@ -461,6 +468,38 @@ mod tests {
         assert!(!target.contains("?x"), "{target}");
     }
 
+    #[test]
+    fn send_message_posts_raw_body_to_gmail_send_endpoint() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            r#"{"id":"sent-msg-1","threadId":"thread-1","labelIds":["SENT"]}"#,
+        );
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+
+        let sent = client
+            .send_message(GmailMessageSendRequest {
+                raw: "raw-message-body".to_string(),
+            })
+            .expect("send response");
+
+        assert_eq!(sent.id, "sent-msg-1");
+        let request = request_rx.recv().expect("request");
+        server.join().expect("server exits");
+        assert!(
+            request.starts_with("POST /users/me/messages/send HTTP/1.1"),
+            "{request}"
+        );
+        let request_lowercase = request.to_ascii_lowercase();
+        assert!(
+            request_lowercase.contains("authorization: bearer access-token"),
+            "{request}"
+        );
+        assert!(
+            request.ends_with(r#"{"raw":"raw-message-body"}"#),
+            "{request}"
+        );
+    }
+
     fn request_error_for_status(status_line: &'static str, body: &'static str) -> LocalityError {
         let (base_url, request_rx, server) = spawn_response_server(status_line, body);
         let client = HttpGmailApiClient::with_base_url("access-token", base_url);
@@ -482,8 +521,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept request");
             let request = read_http_request(&mut stream);
-            let request_line = request.lines().next().unwrap_or_default().to_string();
-            request_tx.send(request_line).expect("send request line");
+            request_tx.send(request).expect("send request");
             let response = format!(
                 "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -507,6 +545,28 @@ mod tests {
             if request.windows(4).any(|window| window == b"\r\n\r\n") {
                 break;
             }
+        }
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .unwrap_or(request.len());
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let bytes_read = stream.read(&mut buffer).expect("read request body");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..bytes_read]);
         }
         String::from_utf8(request).expect("utf8 request")
     }

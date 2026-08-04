@@ -322,11 +322,11 @@ pub fn source_create_decision_for_parent_path(
         return decision;
     }
     if mount.connector == "gmail" {
-        return if parent_path == Path::new("draft") {
+        return if matches!(parent_path.to_str(), Some("draft" | "outbox")) {
             SourceWriteDecision::Writable
         } else {
             SourceWriteDecision::ReadOnly {
-                reason: "Gmail creates are only supported directly inside draft/",
+                reason: "Gmail creates are only supported directly inside draft/ or outbox/",
             }
         };
     }
@@ -360,12 +360,8 @@ pub fn source_move_decision_for_parent_path(
         return decision;
     }
     if mount.connector == "gmail" {
-        return if parent_path == Path::new("draft") {
-            SourceWriteDecision::Writable
-        } else {
-            SourceWriteDecision::ReadOnly {
-                reason: "Gmail moves are only supported directly inside draft/",
-            }
+        return SourceWriteDecision::ReadOnly {
+            reason: "Gmail moves are not supported; create a new file directly under draft/ or outbox/",
         };
     }
     if mount.connector == LINEAR_CONNECTOR_ID {
@@ -639,19 +635,25 @@ fn linear_source_descriptor() -> SourceDescriptor {
 }
 
 fn gmail_write_decision_for_path(relative_path: &Path) -> SourceWriteDecision {
-    match relative_path
-        .components()
-        .next()
-        .and_then(|component| match component {
-            std::path::Component::Normal(value) => value.to_str(),
-            _ => None,
-        }) {
-        Some("draft") => SourceWriteDecision::Writable,
+    let mut components = relative_path.components();
+    match components.next().and_then(|component| match component {
+        std::path::Component::Normal(value) => value.to_str(),
+        _ => None,
+    }) {
+        Some("draft" | "outbox") => match components.next() {
+            None => SourceWriteDecision::Writable,
+            Some(std::path::Component::Normal(_)) if components.next().is_none() => {
+                SourceWriteDecision::Writable
+            }
+            _ => SourceWriteDecision::ReadOnly {
+                reason: "Gmail writes are only supported directly under draft/ or outbox/",
+            },
+        },
         Some("inbox") | Some("sent") => SourceWriteDecision::ReadOnly {
             reason: "Gmail inbox and sent items are read-only",
         },
         _ => SourceWriteDecision::ReadOnly {
-            reason: "Gmail writes are only supported under draft/",
+            reason: "Gmail writes are only supported directly under draft/ or outbox/",
         },
     }
 }
@@ -781,13 +783,16 @@ fn gmail_mount_guidance() -> String {
     format!(
         "{}\n\
 Gmail facts:\n\
-- This mount projects Gmail inbox/, sent/, and draft/ folders.\n\
-- inbox/ and sent/ are read-only. Create a Markdown file directly under draft/ to create an unsent Gmail draft.\n\
-- Draft creates require `to` frontmatter and either `subject` or `title` frontmatter.\n\
+- This mount projects Gmail inbox/, sent/, draft/, and outbox/ folders.\n\
+- inbox/ and sent/ are read-only mailbox history.\n\
+- Create a Markdown file directly under draft/ to create an unsent Gmail draft.\n\
+- Create a Markdown file directly under outbox/ to send immediately after explicit review and push.\n\
+- Both outbound folders require `to` frontmatter and either `subject` or `title` frontmatter.\n\
+- Use outbox/ only when the user explicitly asks to send mail now; otherwise use draft/ for review in Gmail.\n\
 - To inspect inbound attachments, first hydrate the message or thread Markdown by opening it or running `loc pull <message-or-thread-path>`.\n\
 - Hydrated messages list attachments in YAML frontmatter under `gmail.attachments`; read `filename`, `mime_type`, `size`, `attachment_id`, and `path` from that list.\n\
 - Open the attachment file at the listed `path`, relative to the mount root. Gmail attachment caches normally live under `.loc/gmail/attachments/...`; use the frontmatter path exactly.\n\
-- Gmail draft creation does not support outbound attachments yet. Do not add `attachment` or `attachments` frontmatter to draft files.\n",
+- Gmail draft creation does not support outbound attachments yet. Outbox direct-send creation does not support outbound attachments yet either. Do not add `attachment` or `attachments` frontmatter to draft or outbox files.\n",
         generic_mount_guidance("Gmail")
     )
 }

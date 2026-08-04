@@ -336,14 +336,16 @@ from the legacy app-group content tree into the current content root before
 reading or writing the new root; existing current-root files are never
 overwritten.
 
-Before a virtual Gmail draft is sent, its temporary File Provider identifier is
-stored in the durable push journal. After the send and read-back reconcile, the
-daemon removes that exact user-visible File Provider item on a background thread
-and then signals the source `draft/` and destination `sent/` enumerators. The
-extension accepts deletion of a temporary `local:` item that reconciliation has
-already removed from daemon state, while remote and unconfirmed deletes remain
-blocked. Versioned sync anchors expire older anchor formats without trying to
-infer locally-created deletions from an incomplete directory snapshot.
+Before a virtual Gmail direct-send item is pushed, its source file lives under
+`outbox/` and its temporary File Provider identifier is stored in the durable push
+journal. After the send and read-back reconcile, the daemon removes that exact
+user-visible `outbox/` File Provider item on a background thread and then signals
+the source `outbox/` and destination `sent/` enumerators. The extension accepts
+deletion of a temporary `local:` item that reconciliation has already removed
+from daemon state, while remote and unconfirmed deletes remain blocked. Unsent
+Gmail draft pushes remain under the `draft/` path and reconcile as Gmail drafts,
+not direct sends. Versioned sync anchors expire older anchor formats without
+trying to infer locally-created deletions from an incomplete directory snapshot.
 
 Scheduled reconciliation skips writing placeholder Markdown files for virtual
 filesystem projection modes such as `macos_file_provider` and `linux_fuse`; it

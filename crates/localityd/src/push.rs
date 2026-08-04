@@ -75,7 +75,8 @@ use crate::remote_truth::DirectSourceReplica;
 use crate::shadow_match::shadows_match;
 use crate::source::{
     LocalSourceValidator, SourcePushValidator, SourceValidationContext,
-    source_create_decision_for_parent_path, source_descriptor, source_write_decision_for_path,
+    source_create_decision_for_parent_path, source_descriptor,
+    source_move_decision_for_parent_path, source_write_decision_for_path,
 };
 use crate::virtual_fs::{
     repair_legacy_macos_content_root, virtual_fs_content_path, virtual_fs_content_root,
@@ -537,7 +538,11 @@ where
 fn ambiguous_gmail_send_status(status: &JournalStatus) -> bool {
     match status {
         JournalStatus::Applying => true,
-        JournalStatus::Failed(message) => message.contains("gmail draft send"),
+        JournalStatus::Failed(message) => {
+            message.contains("gmail send")
+                || message.contains("gmail draft send")
+                || message.contains("gmail message send")
+        }
         _ => false,
     }
 }
@@ -937,7 +942,7 @@ fn draft_create_auto_save_block_reason(prepared: &PreparedPush) -> Option<String
         return None;
     }
     match prepared.mount.connector.as_str() {
-        "gmail" => Some("Gmail draft creation requires review".to_string()),
+        "gmail" => Some("Gmail outbound email creates require review".to_string()),
         "google-calendar" => Some("Google Calendar event creates require review".to_string()),
         _ => None,
     }
@@ -3044,8 +3049,9 @@ where
                     &mount,
                     mutation.original_path.as_deref().unwrap_or(&entity.path),
                 );
-                append_source_write_validation(&mut validation, &mount, &mutation.projected_path);
                 let parent = move_parent_entity_for_mutation(store, &mount, mutation)?;
+                append_source_write_validation(&mut validation, &mount, &mutation.projected_path);
+                append_source_move_parent_validation(&mut validation, &mount, &parent.path);
                 let mut new_title = mutation.title.clone();
                 let mut remaining_operations = Vec::new();
                 if let Some(contents) = pending_move_contents(&mount, mutation, state_root)? {
@@ -3214,6 +3220,24 @@ fn append_source_create_validation(
             None,
             reason,
             Some("remove the stale pending create or choose a writable parent".to_string()),
+        ));
+    }
+}
+
+fn append_source_move_parent_validation(
+    validation: &mut ValidationReport,
+    mount: &MountConfig,
+    parent: &Path,
+) {
+    if let crate::source::SourceWriteDecision::ReadOnly { reason } =
+        source_move_decision_for_parent_path(mount, parent)
+    {
+        validation.push(ValidationIssue::new(
+            "source_move_parent_read_only",
+            parent,
+            None,
+            reason,
+            Some("remove the stale pending move or choose a supported destination".to_string()),
         ));
     }
 }
