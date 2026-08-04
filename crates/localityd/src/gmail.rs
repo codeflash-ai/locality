@@ -7,6 +7,7 @@ use locality_core::diff::property_value_from_frontmatter;
 use locality_core::hydration::HydrationRequest;
 use locality_core::model::{EntityKind, HydrationState, RemoteId, TreeEntry};
 use locality_core::planner::PropertyValue;
+use locality_core::shadow::ShadowDocument;
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
 use locality_gmail::attachments::{GmailAttachmentSpec, decode_attachment_body};
@@ -21,7 +22,9 @@ use locality_gmail::{
 };
 use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
-    CredentialStore, EntityRecord, EntityRepository, MountConfig, StoreResult,
+    CredentialStore, EntityRecord, EntityRepository, FreshnessStateRepository,
+    HydrationJobRepository, MountConfig, RemoteObservationRepository, ShadowRepository,
+    StoreResult,
 };
 
 use crate::hydration::{HydratedAsset, HydratedEntity, HydrationSource};
@@ -30,6 +33,12 @@ use crate::source::{SourceAdapter, SourcePushValidator, SourceValidationContext}
 
 const GMAIL_CONNECT_COMMAND: &str = "loc connect gmail";
 const GMAIL_DRAFT_REMOTE_PREFIX: &str = "gmail-draft:";
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GmailDraftIdentityRepair {
+    pub retired_legacy: Option<EntityRecord>,
+    pub retired_shadow: Option<ShadowDocument>,
+}
 
 pub fn resolve_gmail_connector_for_mount<S>(
     store: &S,
@@ -78,24 +87,48 @@ pub(crate) fn repair_legacy_gmail_draft_message_id_collision<S>(
     store: &mut S,
     mount: &MountConfig,
     record: &EntityRecord,
-) -> StoreResult<()>
+    replacement_frontmatter: Option<&str>,
+) -> StoreResult<GmailDraftIdentityRepair>
 where
-    S: EntityRepository + ?Sized,
+    S: EntityRepository
+        + ShadowRepository
+        + HydrationJobRepository
+        + FreshnessStateRepository
+        + RemoteObservationRepository
+        + ?Sized,
 {
     if !is_gmail_draft_identity_repair_candidate(mount, record) {
-        return Ok(());
+        return Ok(GmailDraftIdentityRepair::default());
     }
 
     let Some(occupant) = store.find_entity_by_path(&mount.mount_id, &record.path)? else {
-        return Ok(());
+        return Ok(GmailDraftIdentityRepair::default());
     };
     if occupant.remote_id == record.remote_id {
-        return Ok(());
+        return Ok(GmailDraftIdentityRepair::default());
     }
     if is_clean_legacy_gmail_draft_message_id(&occupant) {
+        let retired_shadow = store
+            .get_shadow_record(&mount.mount_id, &occupant.remote_id)?
+            .map(|record| record.into_document());
+        if let Some(mut migrated_shadow) = retired_shadow.clone() {
+            migrated_shadow.entity_id = record.remote_id.clone();
+            if let Some(frontmatter) = replacement_frontmatter {
+                migrated_shadow.frontmatter = frontmatter.to_string();
+            }
+            store.save_shadow(&mount.mount_id, migrated_shadow)?;
+        }
+        store.delete_hydration_job(&mount.mount_id, &occupant.remote_id)?;
+        store.delete_freshness_state(&mount.mount_id, &occupant.remote_id)?;
+        store.delete_remote_observation(&mount.mount_id, &occupant.remote_id)?;
+        store.delete_shadow(&mount.mount_id, &occupant.remote_id)?;
         store.delete_entity(&mount.mount_id, &occupant.remote_id)?;
+        return Ok(GmailDraftIdentityRepair {
+            retired_legacy: Some(occupant),
+            retired_shadow,
+        });
     }
-    Ok(())
+    Ok(GmailDraftIdentityRepair::default())
 }
 
 fn is_gmail_draft_identity_repair_candidate(mount: &MountConfig, record: &EntityRecord) -> bool {

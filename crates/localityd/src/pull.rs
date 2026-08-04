@@ -75,6 +75,7 @@ where
     S: MountRepository
         + EntityRepository
         + ShadowRepository
+        + locality_store::HydrationJobRepository
         + locality_store::VirtualMutationRepository
         + locality_store::FreshnessStateRepository
         + locality_store::RemoteObservationRepository,
@@ -93,6 +94,7 @@ where
     S: MountRepository
         + EntityRepository
         + ShadowRepository
+        + locality_store::HydrationJobRepository
         + locality_store::VirtualMutationRepository
         + locality_store::FreshnessStateRepository
         + locality_store::RemoteObservationRepository,
@@ -333,7 +335,7 @@ where
             .get_entity(&entry.mount_id, &entry.remote_id)
             .map_err(PullError::Store)?;
         let record = virtual_child_entity_record(entry, existing.as_ref());
-        save_entity_after_gmail_draft_repair(store, mount, record)?;
+        store.save_entity(record).map_err(PullError::Store)?;
     }
 
     Ok(PullReport {
@@ -428,6 +430,7 @@ fn pull_mount_root<S, Source>(
 where
     S: EntityRepository
         + ShadowRepository
+        + locality_store::HydrationJobRepository
         + locality_store::FreshnessStateRepository
         + locality_store::RemoteObservationRepository,
     Source: SourceAdapter,
@@ -456,7 +459,7 @@ where
             path: record.path.clone(),
             ..entry.clone()
         };
-        save_entity_after_gmail_draft_repair(store, mount, record)?;
+        save_entity_after_gmail_draft_repair(store, mount, &projected_entry, record)?;
         rename_projection_if_needed(mount, existing.as_ref(), &projected_entry)?;
         if write_stub_if_needed(source, mount, &projected_entry, state_root)? {
             stubbed += 1;
@@ -528,6 +531,7 @@ fn repair_missing_media_for_hydrated_entries<S, Source>(
 where
     S: EntityRepository
         + ShadowRepository
+        + locality_store::HydrationJobRepository
         + locality_store::FreshnessStateRepository
         + locality_store::RemoteObservationRepository,
     Source: SourceAdapter,
@@ -697,6 +701,7 @@ fn pull_page_directory_path<S, Source>(
 where
     S: EntityRepository
         + ShadowRepository
+        + locality_store::HydrationJobRepository
         + locality_store::FreshnessStateRepository
         + locality_store::RemoteObservationRepository,
     Source: SourceAdapter,
@@ -757,7 +762,7 @@ where
             .get_entity(&entry.mount_id, &entry.remote_id)
             .map_err(PullError::Store)?;
         let record = virtual_child_entity_record(entry, existing.as_ref());
-        save_entity_after_gmail_draft_repair(store, mount, record)?;
+        store.save_entity(record).map_err(PullError::Store)?;
         if is_page {
             child_page_ids.push(child_id);
         }
@@ -803,6 +808,7 @@ fn pull_virtual_directory_path<S, Source>(
 where
     S: EntityRepository
         + ShadowRepository
+        + locality_store::HydrationJobRepository
         + locality_store::FreshnessStateRepository
         + locality_store::RemoteObservationRepository,
     Source: SourceAdapter,
@@ -884,7 +890,11 @@ where
                 remote_edited_at: record.remote_edited_at.clone(),
                 ..entry
             };
-            save_entity_after_gmail_draft_repair(store, mount, record)?;
+            if plain_files_directory_pull {
+                save_entity_after_gmail_draft_repair(store, mount, &projected_entry, record)?;
+            } else {
+                store.save_entity(record).map_err(PullError::Store)?;
+            }
             if plain_files_directory_pull {
                 rename_projection_if_needed(mount, existing.as_ref(), &projected_entry)?;
             }
@@ -1068,7 +1078,11 @@ fn collect_connector_directory_descendants<S, Source>(
     visited: &mut BTreeSet<RemoteId>,
 ) -> Result<ConnectorDirectoryTraversalReport, PullError>
 where
-    S: EntityRepository + ShadowRepository,
+    S: EntityRepository
+        + ShadowRepository
+        + locality_store::HydrationJobRepository
+        + locality_store::FreshnessStateRepository
+        + locality_store::RemoteObservationRepository,
     Source: SourceAdapter,
 {
     let mut report = ConnectorDirectoryTraversalReport::default();
@@ -1136,7 +1150,7 @@ where
                 remote_edited_at: record.remote_edited_at.clone(),
                 ..entry
             };
-            save_entity_after_gmail_draft_repair(store, mount, record)?;
+            save_entity_after_gmail_draft_repair(store, mount, &projected_entry, record)?;
             rename_projection_if_needed(mount, existing.as_ref(), &projected_entry)?;
             if write_stub_if_needed(source, mount, &projected_entry, state_root)? {
                 report.stubbed += 1;
@@ -1254,7 +1268,7 @@ where
                 .get_entity(&entry.mount_id, &entry.remote_id)
                 .map_err(PullError::Store)?;
             let record = virtual_child_entity_record(entry, existing.as_ref());
-            save_entity_after_gmail_draft_repair(store, mount, record)?;
+            store.save_entity(record).map_err(PullError::Store)?;
             if is_page {
                 child_page_ids.push(child_id);
             }
@@ -1298,14 +1312,90 @@ fn virtual_child_entity_record(entry: TreeEntry, existing: Option<&EntityRecord>
 fn save_entity_after_gmail_draft_repair<S>(
     store: &mut S,
     mount: &MountConfig,
+    entry: &TreeEntry,
     record: EntityRecord,
 ) -> Result<(), PullError>
 where
-    S: EntityRepository,
+    S: EntityRepository
+        + ShadowRepository
+        + locality_store::HydrationJobRepository
+        + locality_store::FreshnessStateRepository
+        + locality_store::RemoteObservationRepository,
 {
-    crate::gmail::repair_legacy_gmail_draft_message_id_collision(store, mount, &record)
-        .map_err(PullError::Store)?;
-    store.save_entity(record).map_err(PullError::Store)
+    let replacement_frontmatter = gmail_draft_replacement_frontmatter(entry);
+    let repair = crate::gmail::repair_legacy_gmail_draft_message_id_collision(
+        store,
+        mount,
+        &record,
+        Some(&replacement_frontmatter),
+    )
+    .map_err(PullError::Store)?;
+    store.save_entity(record).map_err(PullError::Store)?;
+    repair_gmail_draft_projection_after_identity_repair(
+        mount,
+        entry,
+        &replacement_frontmatter,
+        &repair,
+    )
+}
+
+fn gmail_draft_replacement_frontmatter(entry: &TreeEntry) -> String {
+    entry
+        .stub_frontmatter
+        .clone()
+        .unwrap_or_else(|| stub_frontmatter(entry))
+}
+
+fn repair_gmail_draft_projection_after_identity_repair(
+    mount: &MountConfig,
+    entry: &TreeEntry,
+    replacement_frontmatter: &str,
+    repair: &crate::gmail::GmailDraftIdentityRepair,
+) -> Result<(), PullError> {
+    if mount.projection.uses_virtual_filesystem() || repair.retired_legacy.is_none() {
+        return Ok(());
+    }
+    if entry.kind != EntityKind::Page {
+        return Ok(());
+    }
+
+    let path = mount.root.join(&entry.path);
+    if !path.exists() {
+        return Ok(());
+    }
+    let contents = std::fs::read_to_string(&path).map_err(|error| PullError::ReadFile {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+    let parsed = match parse_canonical_markdown(&contents) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(()),
+    };
+    if parsed.document.is_stub()
+        && parsed.remote_id()
+            == repair
+                .retired_legacy
+                .as_ref()
+                .map(|legacy| &legacy.remote_id)
+    {
+        write_atomic(&path, stub_markdown(entry)?)?;
+        return Ok(());
+    }
+
+    let Some(retired_shadow) = repair.retired_shadow.as_ref() else {
+        return Ok(());
+    };
+    if !parsed_matches_shadow(&parsed, retired_shadow) {
+        return Ok(());
+    }
+
+    write_atomic(
+        &path,
+        render_canonical_markdown(&CanonicalDocument::new(
+            replacement_frontmatter.to_string(),
+            parsed.document.body,
+        )),
+    )
 }
 
 #[derive(Debug)]
@@ -2707,15 +2797,17 @@ mod tests {
         ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
     };
     use locality_core::LocalityResult;
-    use locality_core::canonical::render_canonical_markdown;
-    use locality_core::freshness::RemoteObservation;
+    use locality_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
+    use locality_core::freshness::{FreshnessTier, RemoteObservation};
     use locality_core::hydration::{HydrationReason, HydrationRequest};
     use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
     use locality_core::planner::PushOperationKind;
     use locality_core::shadow::{ShadowDocument, segment_markdown_body};
     use locality_store::{
-        EntityRecord, EntityRepository, InMemoryStateStore, MountRepository, ProjectionMode,
-        ShadowRepository, StoreError,
+        EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
+        HydrationJobRecord, HydrationJobRepository, InMemoryStateStore, MountRepository,
+        ProjectionMode, RemoteObservationRecord, RemoteObservationRepository, ShadowRepository,
+        SqliteStateStore, StoreError,
     };
 
     use super::{PullError, can_replace_file, write_atomic};
@@ -3306,6 +3398,253 @@ mod tests {
     }
 
     #[test]
+    fn pull_gmail_draft_repairs_projection_and_sqlite_side_state() {
+        let fixture = PullFixture::new();
+        let state_root = fixture.root.join(".loc-state");
+        let mut store = SqliteStateStore::open(state_root.clone()).expect("open sqlite store");
+        let mount_id = MountId::new("gmail-main");
+        let mount = MountConfig::new(mount_id.clone(), "gmail", fixture.root.clone());
+        store.save_mount(mount.clone()).expect("save mount");
+        let draft_path = "draft/1720900000000-hello-draft-msg-1.md";
+        let legacy_message_id = RemoteId::new("draft-msg-1");
+        let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+        let old_frontmatter = gmail_draft_frontmatter(&legacy_message_id);
+        let new_frontmatter = gmail_draft_frontmatter(&draft_remote_id);
+        let body = "Draft body stays editable.\n";
+        let old_document = CanonicalDocument::new(old_frontmatter.clone(), body.to_string());
+        write_atomic(
+            &fixture.root.join(draft_path),
+            render_canonical_markdown(&old_document),
+        )
+        .expect("write legacy projection");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    legacy_message_id.clone(),
+                    EntityKind::Page,
+                    "Hello",
+                    draft_path,
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save legacy draft");
+        store
+            .save_shadow(
+                &mount_id,
+                shadow_document(&legacy_message_id, &old_frontmatter, body),
+            )
+            .expect("save legacy shadow");
+        store
+            .upsert_hydration_job(HydrationJobRecord::from(HydrationRequest::new(
+                mount_id.clone(),
+                legacy_message_id.clone(),
+                fixture.root.join(draft_path),
+                HydrationState::Hydrated,
+                HydrationReason::ExplicitPull,
+            )))
+            .expect("save legacy hydration job");
+        store
+            .save_freshness_state(FreshnessStateRecord::new(
+                mount_id.clone(),
+                legacy_message_id.clone(),
+                FreshnessTier::Warm,
+            ))
+            .expect("save legacy freshness");
+        store
+            .save_remote_observation(RemoteObservationRecord::new(
+                mount_id.clone(),
+                legacy_message_id.clone(),
+                EntityKind::Page,
+                "Hello",
+                draft_path,
+                "observed-old",
+            ))
+            .expect("save legacy observation");
+        let mut entry = tree_entry(
+            &mount_id,
+            &draft_remote_id,
+            "Hello",
+            draft_path,
+            HydrationState::Stub,
+        );
+        entry.stub_frontmatter = Some(new_frontmatter.clone());
+        let source = FakePullSource::new(vec![entry], Vec::new());
+
+        let report =
+            super::pull_mount_root(&mut store, &source, &mount, fixture.root.clone(), None)
+                .expect("pull root");
+
+        assert_eq!(report.enumerated, 1);
+        assert!(
+            store
+                .get_entity(&mount_id, &legacy_message_id)
+                .expect("legacy lookup")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_entity(&mount_id, &draft_remote_id)
+                .expect("draft lookup")
+                .expect("draft entity")
+                .path,
+            PathBuf::from(draft_path)
+        );
+        let rewritten = std::fs::read_to_string(fixture.root.join(draft_path))
+            .expect("read rewritten projection");
+        let parsed = parse_canonical_markdown(&rewritten).expect("parse rewritten projection");
+        assert_eq!(parsed.remote_id(), Some(&draft_remote_id));
+        assert_eq!(parsed.document.frontmatter, new_frontmatter);
+        assert_eq!(parsed.document.body, body);
+        assert!(
+            store
+                .get_shadow_record(&mount_id, &legacy_message_id)
+                .expect("legacy shadow lookup")
+                .is_none()
+        );
+        let migrated_shadow = store
+            .load_shadow(&mount_id, &draft_remote_id)
+            .expect("load migrated shadow");
+        assert_eq!(migrated_shadow.entity_id, draft_remote_id);
+        assert_eq!(migrated_shadow.frontmatter, new_frontmatter);
+        assert_eq!(migrated_shadow.rendered_body, body);
+        assert!(
+            !store
+                .list_hydration_jobs()
+                .expect("list hydration jobs")
+                .iter()
+                .any(|job| job.remote_id == legacy_message_id)
+        );
+        assert!(
+            store
+                .get_freshness_state(&mount_id, &legacy_message_id)
+                .expect("legacy freshness lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_remote_observation(&mount_id, &legacy_message_id)
+                .expect("legacy observation lookup")
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn pull_gmail_draft_repairs_legacy_stub_projection_identity() {
+        let fixture = PullFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(fixture.mount_id.clone(), "gmail", fixture.root.clone());
+        store.save_mount(mount.clone()).expect("save mount");
+        let draft_path = "draft/1720900000000-hello-draft-msg-1.md";
+        let legacy_message_id = RemoteId::new("draft-msg-1");
+        let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    fixture.mount_id.clone(),
+                    legacy_message_id.clone(),
+                    EntityKind::Page,
+                    "Hello",
+                    draft_path,
+                )
+                .with_hydration(HydrationState::Stub),
+            )
+            .expect("save legacy draft");
+        let mut legacy_entry = tree_entry(
+            &fixture.mount_id,
+            &legacy_message_id,
+            "Hello",
+            draft_path,
+            HydrationState::Stub,
+        );
+        legacy_entry.stub_frontmatter = Some(gmail_draft_frontmatter(&legacy_message_id));
+        write_atomic(
+            &fixture.root.join(draft_path),
+            super::stub_markdown(&legacy_entry).expect("legacy stub markdown"),
+        )
+        .expect("write legacy stub");
+        let mut draft_entry = tree_entry(
+            &fixture.mount_id,
+            &draft_remote_id,
+            "Hello",
+            draft_path,
+            HydrationState::Stub,
+        );
+        draft_entry.stub_frontmatter = Some(gmail_draft_frontmatter(&draft_remote_id));
+        let source = FakePullSource::new(vec![draft_entry], Vec::new());
+
+        super::pull_mount_root(&mut store, &source, &mount, fixture.root.clone(), None)
+            .expect("pull root");
+
+        let rewritten =
+            std::fs::read_to_string(fixture.root.join(draft_path)).expect("read rewritten stub");
+        let parsed = parse_canonical_markdown(&rewritten).expect("parse rewritten stub");
+        assert_eq!(parsed.remote_id(), Some(&draft_remote_id));
+        assert!(parsed.document.is_stub());
+    }
+
+    #[test]
+    fn pull_gmail_draft_does_not_rewrite_locally_edited_stub_projection() {
+        let fixture = PullFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(fixture.mount_id.clone(), "gmail", fixture.root.clone());
+        store.save_mount(mount.clone()).expect("save mount");
+        let draft_path = "draft/1720900000000-hello-draft-msg-1.md";
+        let legacy_message_id = RemoteId::new("draft-msg-1");
+        let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    fixture.mount_id.clone(),
+                    legacy_message_id.clone(),
+                    EntityKind::Page,
+                    "Hello",
+                    draft_path,
+                )
+                .with_hydration(HydrationState::Stub),
+            )
+            .expect("save legacy draft");
+        let locally_edited_stub = render_canonical_markdown(&CanonicalDocument::new(
+            gmail_draft_frontmatter(&legacy_message_id),
+            format!(
+                "{}\n\nLocal note that should not be overwritten.\n",
+                CanonicalDocument::STUB_MARKER
+            ),
+        ));
+        write_atomic(&fixture.root.join(draft_path), locally_edited_stub.clone())
+            .expect("write locally edited stub");
+        let mut draft_entry = tree_entry(
+            &fixture.mount_id,
+            &draft_remote_id,
+            "Hello",
+            draft_path,
+            HydrationState::Stub,
+        );
+        draft_entry.stub_frontmatter = Some(gmail_draft_frontmatter(&draft_remote_id));
+        let source = FakePullSource::new(vec![draft_entry], Vec::new());
+
+        super::pull_mount_root(&mut store, &source, &mount, fixture.root.clone(), None)
+            .expect("pull root");
+
+        let after =
+            std::fs::read_to_string(fixture.root.join(draft_path)).expect("read projection");
+        assert_eq!(after, locally_edited_stub);
+        assert!(
+            store
+                .get_entity(&fixture.mount_id, &legacy_message_id)
+                .expect("legacy lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_entity(&fixture.mount_id, &draft_remote_id)
+                .expect("draft lookup")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn pull_plain_directory_moves_existing_projected_child_path() {
         let fixture = PullFixture::new();
         let mut store = InMemoryStateStore::new();
@@ -3733,6 +4072,24 @@ mod tests {
             remote_edited_at: Some("2026-06-11T00:00:00.000Z".to_string()),
             assets,
         }
+    }
+
+    fn gmail_draft_frontmatter(remote_id: &RemoteId) -> String {
+        format!(
+            "loc:\n  id: \"{}\"\n  type: page\n  connector: gmail\n  synced_at: \"2026-06-11T00:00:00.000Z\"\n  remote_edited_at: \"2026-06-11T00:00:00.000Z\"\ntitle: Hello\nsubject: Hello\nto: [\"ann@example.com\"]\ngmail:\n  mailbox: draft\n  message_count: 1\n",
+            remote_id.0
+        )
+    }
+
+    fn shadow_document(remote_id: &RemoteId, frontmatter: &str, body: &str) -> ShadowDocument {
+        ShadowDocument::from_synced_body(
+            remote_id.clone(),
+            body.to_string(),
+            frontmatter.lines().count() + 3,
+            [RemoteId::new("body-1")],
+        )
+        .expect("shadow")
+        .with_frontmatter(frontmatter.to_string())
     }
 
     impl Drop for PullFixture {

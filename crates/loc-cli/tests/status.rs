@@ -1545,6 +1545,10 @@ impl ShadowRepository for BulkOnlyStatusStore {
     ) -> StoreResult<Option<ShadowSnapshotRecord>> {
         self.inner.get_shadow_record(mount_id, entity_id)
     }
+
+    fn delete_shadow(&mut self, mount_id: &MountId, entity_id: &RemoteId) -> StoreResult<()> {
+        self.inner.delete_shadow(mount_id, entity_id)
+    }
 }
 
 impl JournalRepository for BulkOnlyStatusStore {

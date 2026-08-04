@@ -131,7 +131,11 @@ pub fn reconcile_scheduled_pull<S, H, Source, Strategy>(
     policy: &HydrationPolicy,
 ) -> LocalityResult<ScheduledPullReport>
 where
-    S: EntityRepository + RemoteObservationRepository + FreshnessStateRepository,
+    S: EntityRepository
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + locality_store::HydrationJobRepository
+        + locality_store::ShadowRepository,
     H: HydrationEngine,
     Source: ScheduledPullSource + ?Sized,
     Strategy: FetchScheduleStrategy + ?Sized,
@@ -153,7 +157,11 @@ pub fn reconcile_scheduled_pull_with_state_root<S, H, Source, Strategy>(
     state_root: Option<&Path>,
 ) -> LocalityResult<ScheduledPullReport>
 where
-    S: EntityRepository + RemoteObservationRepository + FreshnessStateRepository,
+    S: EntityRepository
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + locality_store::HydrationJobRepository
+        + locality_store::ShadowRepository,
     H: HydrationEngine,
     Source: ScheduledPullSource + ?Sized,
     Strategy: FetchScheduleStrategy + ?Sized,
@@ -205,7 +213,7 @@ where
                 path: record.path.clone(),
                 ..entry.clone()
             };
-            save_entity_after_gmail_draft_repair(store, mount, record)?;
+            save_entity_after_gmail_draft_repair(store, mount, &projected_entry, record)?;
             rename_projection_if_needed(mount, existing.as_ref(), &projected_entry)?;
 
             match refresh_projection(source, mount, &projected_entry, state_root)? {
@@ -328,12 +336,26 @@ fn merged_entity_record(
 fn save_entity_after_gmail_draft_repair<S>(
     store: &mut S,
     mount: &MountConfig,
+    entry: &TreeEntry,
     record: EntityRecord,
 ) -> LocalityResult<()>
 where
-    S: EntityRepository,
+    S: EntityRepository
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + locality_store::HydrationJobRepository
+        + locality_store::ShadowRepository,
 {
-    crate::gmail::repair_legacy_gmail_draft_message_id_collision(store, mount, &record)?;
+    let replacement_frontmatter = entry
+        .stub_frontmatter
+        .clone()
+        .unwrap_or_else(|| stub_frontmatter(entry));
+    crate::gmail::repair_legacy_gmail_draft_message_id_collision(
+        store,
+        mount,
+        &record,
+        Some(&replacement_frontmatter),
+    )?;
     store.save_entity(record)?;
     Ok(())
 }

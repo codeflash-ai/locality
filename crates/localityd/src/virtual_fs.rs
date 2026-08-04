@@ -19,8 +19,9 @@ use locality_core::path_projection::{
 };
 use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
-    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository, MountConfig,
-    MountRepository, ProjectionMode, ShadowRepository, StoreError, VirtualMoveRepository,
+    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
+    HydrationJobRepository, MountConfig, MountRepository, ProjectionMode,
+    RemoteObservationRepository, ShadowRepository, StoreError, VirtualMoveRepository,
     VirtualMoveTransition, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
@@ -499,7 +500,12 @@ pub fn refresh_virtual_fs_children<S, C>(
     container_identifier: &str,
 ) -> LocalityResult<VirtualFsRefreshChildrenReport>
 where
-    S: MountRepository + EntityRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + HydrationJobRepository
+        + FreshnessStateRepository
+        + RemoteObservationRepository,
     C: Connector + ?Sized,
 {
     let mount = require_virtual_mount(store, mount_id)?;
@@ -534,15 +540,47 @@ where
         let existing = store
             .get_entity(&entry.mount_id, &entry.remote_id)
             .map_err(LocalityError::from)?;
-        let record = refreshed_entity_record(entry, existing.as_ref());
+        let record = refreshed_entity_record(entry.clone(), existing.as_ref());
         if existing.as_ref() != Some(&record) {
             changed = true;
         }
+        let replacement_frontmatter = entry
+            .stub_frontmatter
+            .clone()
+            .unwrap_or_else(|| virtual_fs_stub_frontmatter(&entry));
+        crate::gmail::repair_legacy_gmail_draft_message_id_collision(
+            store,
+            &mount,
+            &record,
+            Some(&replacement_frontmatter),
+        )
+        .map_err(LocalityError::from)?;
         store.save_entity(record).map_err(LocalityError::from)?;
         saved += 1;
     }
 
     Ok(VirtualFsRefreshChildrenReport { saved, changed })
+}
+
+fn virtual_fs_stub_frontmatter(entry: &locality_core::model::TreeEntry) -> String {
+    format!(
+        "loc:\n  id: {}\n  type: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\n",
+        entry.remote_id.0,
+        virtual_fs_entity_type_name(&entry.kind),
+        yaml_string(entry.remote_edited_at.as_deref().unwrap_or("unknown")),
+        yaml_string(entry.remote_edited_at.as_deref().unwrap_or("unknown")),
+        yaml_string(&entry.title)
+    )
+}
+
+fn virtual_fs_entity_type_name(kind: &EntityKind) -> &'static str {
+    match kind {
+        EntityKind::Page => "page",
+        EntityKind::Database => "database",
+        EntityKind::Directory => "directory",
+        EntityKind::Asset => "asset",
+        EntityKind::Unknown(_) => "unknown",
+    }
 }
 
 pub(crate) fn prune_stale_virtual_children<S>(
@@ -600,7 +638,12 @@ pub fn refresh_virtual_fs_children_with_content_root<S, C>(
     container_identifier: &str,
 ) -> LocalityResult<VirtualFsRefreshChildrenReport>
 where
-    S: MountRepository + EntityRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + HydrationJobRepository
+        + FreshnessStateRepository
+        + RemoteObservationRepository,
     C: Connector + HydrationSource + ?Sized,
 {
     let _ = require_virtual_mount(store, mount_id)?;
@@ -6153,6 +6196,74 @@ mod tests {
 
         assert_eq!(report.item.path, "draft/reply.md");
         assert_eq!(report.item.entity_kind, Some(EntityKind::Page));
+    }
+
+    #[test]
+    fn refresh_children_repairs_legacy_gmail_draft_message_id_collision() {
+        let mount_id = MountId::new("gmail-main");
+        let mut store = InMemoryStateStore::new();
+        let mount = virtual_mount_with_connector(&mount_id, "gmail");
+        store.save_mount(mount).expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("gmail-folder:draft"),
+                EntityKind::Directory,
+                "draft",
+                "draft",
+            ))
+            .expect("save draft folder");
+        let draft_path = "draft/1720900000000-hello-draft-msg-1.md";
+        let legacy_message_id = RemoteId::new("draft-msg-1");
+        let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    legacy_message_id.clone(),
+                    EntityKind::Page,
+                    "Hello",
+                    draft_path,
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save legacy draft");
+        let connector = StaticChildrenConnector {
+            entries: vec![TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: draft_remote_id.clone(),
+                kind: EntityKind::Page,
+                title: "Hello".to_string(),
+                path: draft_path.into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: None,
+                stub_frontmatter: None,
+            }],
+            expected_parent_path: PathBuf::from("draft"),
+            database_schema: None,
+            complete: false,
+        };
+
+        let report =
+            refresh_virtual_fs_children(&mut store, &connector, &mount_id, "gmail-folder:draft")
+                .expect("refresh draft children");
+
+        assert_eq!(report.saved, 1);
+        assert!(
+            store
+                .get_entity(&mount_id, &legacy_message_id)
+                .expect("legacy lookup")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_entity(&mount_id, &draft_remote_id)
+                .expect("draft lookup")
+                .expect("draft entity")
+                .path,
+            PathBuf::from(draft_path)
+        );
     }
 
     #[test]

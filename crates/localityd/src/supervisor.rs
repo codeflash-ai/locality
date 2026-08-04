@@ -9,8 +9,8 @@ use locality_core::journal::JournalStore;
 use locality_core::model::{EntityKind, HydrationState};
 use locality_store::{
     AutoSaveRepository, EntityRecord, EntityRepository, FreshnessStateRepository,
-    JournalRepository, MountConfig, MountRepository, ProjectionMode, RemoteObservationRepository,
-    ShadowRepository, VirtualMutationRepository,
+    HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
+    RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
 };
 
 use crate::execution::{
@@ -252,6 +252,7 @@ where
         + EntityRepository
         + RemoteObservationRepository
         + FreshnessStateRepository
+        + HydrationJobRepository
         + ShadowRepository
         + JournalRepository
         + JournalStore
