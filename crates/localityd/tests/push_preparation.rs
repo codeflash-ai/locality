@@ -1370,7 +1370,7 @@ fn prepare_stale_pending_move_rechecks_source_and_mount_write_policy() {
         .save_entity(
             EntityRecord::new(
                 fixture.mount_id.clone(),
-                RemoteId::new("draft-1"),
+                RemoteId::new("gmail-draft:draft-1"),
                 EntityKind::Page,
                 "Draft subject",
                 "outbox/ENG-1.md",
@@ -1382,7 +1382,7 @@ fn prepare_stale_pending_move_rechecks_source_and_mount_write_policy() {
         .save_shadow(
             &fixture.mount_id,
             ShadowDocument::from_synced_body(
-                RemoteId::new("draft-1"),
+                RemoteId::new("gmail-draft:draft-1"),
                 "Draft body",
                 8,
                 [RemoteId::new("body-1")],
@@ -1395,7 +1395,7 @@ fn prepare_stale_pending_move_rechecks_source_and_mount_write_policy() {
             mount_id: fixture.mount_id.clone(),
             local_id: "move:draft-1-to-send".to_string(),
             mutation_kind: VirtualMutationKind::Move,
-            target_remote_id: Some(RemoteId::new("draft-1")),
+            target_remote_id: Some(RemoteId::new("gmail-draft:draft-1")),
             parent_remote_id: Some(RemoteId::new("gmail-folder:outbox")),
             original_path: Some(PathBuf::from("draft/ENG-1.md")),
             projected_path: PathBuf::from("outbox/ENG-1.md"),
@@ -1413,13 +1413,17 @@ fn prepare_stale_pending_move_rechecks_source_and_mount_write_policy() {
         &LocalSourceValidator,
     )
     .expect("prepare stale Gmail outbound move");
-    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
-    assert!(prepared.pipeline.plan.is_none());
-    assert!(prepared.pipeline.validation.issues.iter().any(|issue| {
-        issue.code == "source_move_parent_read_only"
-            && issue.message
-                == "Gmail moves are not supported; create a new file directly under draft/ or outbox/"
-    }));
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::ConfirmPlan);
+    assert_eq!(
+        prepared.pipeline.plan.expect("plan").operations,
+        vec![PushOperation::MoveEntity {
+            entity_id: RemoteId::new("gmail-draft:draft-1"),
+            new_parent_id: RemoteId::new("gmail-folder:outbox"),
+            new_parent_kind: EntityKind::Directory,
+            new_title: "Draft subject".to_string(),
+            projected_path: PathBuf::from("outbox/ENG-1.md"),
+        }]
+    );
 
     let (fixture, mut store) = linear_move_store(None, true);
     store

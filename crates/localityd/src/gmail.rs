@@ -349,7 +349,15 @@ pub(crate) fn validate_gmail_changed_frontmatter(
             ),
         ));
     }
-    if is_direct_outbound_child(context.relative_path) {
+    if is_nested_outbound_child(context.relative_path) {
+        report.push(ValidationIssue::new(
+            "gmail_outbound_nested_unsupported",
+            context.relative_path,
+            Some(1),
+            "Gmail writes are only supported directly under draft/ or outbox/",
+            Some("move the Gmail Markdown file directly under draft/ or outbox/".to_string()),
+        ));
+    } else if is_direct_outbound_child(context.relative_path) {
         validate_gmail_outbound_frontmatter(&mut report, context);
     }
     Ok(report)
@@ -480,6 +488,15 @@ fn is_direct_outbound_child(path: &Path) -> bool {
         Some(Component::Normal(component)) if component == "draft" || component == "outbox"
     ) && matches!(components.next(), Some(Component::Normal(_)))
         && components.next().is_none()
+}
+
+fn is_nested_outbound_child(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(
+        components.next(),
+        Some(Component::Normal(component)) if component == "draft" || component == "outbox"
+    ) && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_some()
 }
 
 impl HydrationSource for GmailConnector {

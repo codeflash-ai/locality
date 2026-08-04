@@ -2169,6 +2169,18 @@ fn local_gmail_validator_allows_valid_changed_draft() {
 }
 
 #[test]
+fn local_gmail_validator_rejects_changed_nested_draft_and_outbox() {
+    for path in ["draft/nested/foo.md", "outbox/nested/foo.md"] {
+        let issues = validate_gmail_changed(
+            path,
+            "---\nto: [\"user@example.com\"]\nsubject: Hello\n---\nBody\n",
+        );
+
+        assert_eq!(issues, vec!["gmail_outbound_nested_unsupported"], "{path}");
+    }
+}
+
+#[test]
 fn local_gmail_validator_rejects_changed_draft_without_to() {
     let issues = validate_gmail_changed("draft/foo.md", "---\nsubject: Hello\n---\nBody\n");
 
@@ -2232,6 +2244,54 @@ fn local_gmail_validator_allows_valid_changed_outbox() {
     );
 
     assert!(issues.is_empty());
+}
+
+#[test]
+fn local_gmail_validator_rejects_changed_outbox_without_to() {
+    let issues = validate_gmail_changed("outbox/foo.md", "---\nsubject: Hello\n---\nBody\n");
+
+    assert_eq!(issues, vec!["gmail_draft_missing_to"]);
+}
+
+#[test]
+fn local_gmail_validator_rejects_changed_outbox_without_subject() {
+    let issues = validate_gmail_changed(
+        "outbox/foo.md",
+        "---\nto: [\"user@example.com\"]\nsubject: \"\"\n---\nBody\n",
+    );
+
+    assert_eq!(issues, vec!["gmail_draft_missing_subject"]);
+
+    let issues = validate_gmail_changed(
+        "outbox/foo.md",
+        "---\ntitle: Fallback title\nto: [\"user@example.com\"]\nsubject: \"\"\n---\nBody\n",
+    );
+
+    assert!(issues.is_empty());
+}
+
+#[test]
+fn local_gmail_validator_rejects_changed_outbox_with_attachments() {
+    for (field, markdown) in [
+        (
+            "attachments",
+            "---\nto: [\"user@example.com\"]\nsubject: Hello\nattachments: [\"invoice.pdf\"]\n---\nBody\n",
+        ),
+        (
+            "gmail.attachments",
+            "---\nto: [\"user@example.com\"]\nsubject: Hello\ngmail:\n  attachments:\n    - filename: invoice.pdf\n---\nBody\n",
+        ),
+    ] {
+        let issues = validate_gmail_changed_issues("outbox/foo.md", markdown);
+
+        assert_eq!(issues.len(), 1, "{field}");
+        assert_eq!(issues[0].code, "gmail_attachments_unsupported", "{field}");
+        assert_eq!(
+            issues[0].suggested_fix.as_deref(),
+            Some("remove attachment frontmatter"),
+            "{field}"
+        );
+    }
 }
 
 #[test]
