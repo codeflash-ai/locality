@@ -29,10 +29,10 @@ use crate::dto::{
 use crate::oauth::GMAIL_CONNECTOR_ID;
 use crate::render::{
     GmailDraftDocument, GmailNativeBundle, GmailThreadMessageNativeBundle, GmailThreadNativeBundle,
-    build_draft_mime_with_message_id, message_frontmatter, parse_thread_message_remote_id,
-    parse_thread_remote_id, raw_message_base64url, remote_version, render_gmail_message,
-    render_gmail_thread, render_gmail_thread_message, thread_message_remote_id, thread_remote_id,
-    thread_remote_version,
+    build_draft_mime_with_message_id, message_frontmatter, message_frontmatter_with_entity_id,
+    parse_thread_message_remote_id, parse_thread_remote_id, raw_message_base64url, remote_version,
+    render_gmail_message, render_gmail_thread, render_gmail_thread_message,
+    thread_message_remote_id, thread_remote_id, thread_remote_version,
 };
 use crate::settings::{GmailMountSettings, GmailProjectionView};
 
@@ -41,6 +41,15 @@ const INBOX_FOLDER_ID: &str = "gmail-folder:inbox";
 const SENT_FOLDER_ID: &str = "gmail-folder:sent";
 const DRAFT_FOLDER_ID: &str = "gmail-folder:draft";
 const OUTBOX_FOLDER_ID: &str = "gmail-folder:outbox";
+const DRAFT_REMOTE_PREFIX: &str = "gmail-draft:";
+
+fn draft_remote_id(draft_id: &str) -> RemoteId {
+    RemoteId::new(format!("{DRAFT_REMOTE_PREFIX}{draft_id}"))
+}
+
+fn parse_draft_remote_id(remote_id: &RemoteId) -> Option<&str> {
+    remote_id.as_str().strip_prefix(DRAFT_REMOTE_PREFIX)
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct GmailConfig {
@@ -146,12 +155,10 @@ impl Connector for GmailConnector {
                 "sent",
                 Path::new("sent"),
             )?);
-            entries.extend(list_label_entries(
+            entries.extend(list_draft_entries(
                 self.api.as_ref(),
                 &self.config.settings,
                 &request.mount_id,
-                "DRAFT",
-                "draft",
                 Path::new("draft"),
             )?);
             return Ok(entries);
@@ -174,12 +181,10 @@ impl Connector for GmailConnector {
             "sent",
             Path::new("sent"),
         )?);
-        entries.extend(list_label_entries(
+        entries.extend(list_draft_entries(
             self.api.as_ref(),
             &self.config.settings,
             &request.mount_id,
-            "DRAFT",
-            "draft",
             Path::new("draft"),
         )?);
         Ok(entries)
@@ -237,12 +242,10 @@ impl Connector for GmailConnector {
             ChildContainer::DirectoryChildren(remote_id)
                 if remote_id.as_str() == DRAFT_FOLDER_ID =>
             {
-                list_label_entries(
+                list_draft_entries(
                     self.api.as_ref(),
                     &self.config.settings,
                     &request.mount_id,
-                    "DRAFT",
-                    "draft",
                     &request.parent_path,
                 )?
             }
@@ -350,6 +353,26 @@ impl Connector for GmailConnector {
             .with_raw_metadata_json(gmail_thread_metadata_json(&thread, &mailbox)));
         }
 
+        if let Some(draft_id) = parse_draft_remote_id(&request.remote_id) {
+            let draft = self.api.get_draft_full(draft_id)?;
+            let entry = draft_entry(
+                &request.mount_id,
+                Path::new("draft"),
+                draft.id.clone(),
+                draft.message.clone(),
+            )?;
+            return Ok(RemoteObservation::new(
+                request.mount_id,
+                draft_remote_id(&draft.id),
+                EntityKind::Page,
+                entry.title,
+                entry.path,
+            )
+            .with_parent(RemoteId::new(DRAFT_FOLDER_ID))
+            .with_remote_version(RemoteVersion::new(remote_version(&draft.message)))
+            .with_raw_metadata_json(gmail_message_metadata_json(&draft.message, "draft", None)));
+        }
+
         let message = self.api.get_message_metadata(request.remote_id.as_str())?;
         let mailbox = mailbox_from_labels(&message.label_ids);
         let parent_id = mailbox_folder_id(mailbox);
@@ -408,9 +431,28 @@ impl Connector for GmailConnector {
             });
         }
 
+        if let Some(draft_id) = parse_draft_remote_id(&request.remote_id) {
+            let draft = self.api.get_draft_full(draft_id)?;
+            let remote_id = draft_remote_id(&draft.id);
+            let bundle = GmailNativeBundle {
+                mailbox: "draft".to_string(),
+                draft_id: Some(draft.id),
+                message: draft.message,
+            };
+            let raw = serde_json::to_vec(&bundle).map_err(|error| {
+                LocalityError::Io(format!("gmail draft native encode failed: {error}"))
+            })?;
+            return Ok(NativeEntity {
+                remote_id,
+                kind: "gmail_message".to_string(),
+                raw,
+            });
+        }
+
         let message = self.api.get_message_full(request.remote_id.as_str())?;
         let bundle = GmailNativeBundle {
             mailbox: mailbox_from_labels(&message.label_ids).to_string(),
+            draft_id: None,
             message,
         };
         let raw = serde_json::to_vec(&bundle)
@@ -789,6 +831,28 @@ fn list_label_entries(
         .collect()
 }
 
+fn list_draft_entries(
+    api: &dyn GmailApi,
+    settings: &GmailMountSettings,
+    mount_id: &MountId,
+    parent_path: &Path,
+) -> LocalityResult<Vec<TreeEntry>> {
+    let mut entries = Vec::new();
+    let mut page_token: Option<String> = None;
+    let query = gmail_recent_query(settings);
+    loop {
+        let list = api.list_drafts(GMAIL_PAGE_SIZE, page_token.as_deref(), query.as_deref())?;
+        for draft in list.drafts {
+            entries.push(draft_entry(mount_id, parent_path, draft.id, draft.message)?);
+        }
+        match list.next_page_token {
+            Some(next) => page_token = Some(next),
+            None => break,
+        }
+    }
+    Ok(entries)
+}
+
 fn list_thread_entries(
     api: &dyn GmailApi,
     settings: &GmailMountSettings,
@@ -848,6 +912,14 @@ fn list_message_refs(
     Ok(messages)
 }
 
+fn gmail_recent_query(settings: &GmailMountSettings) -> Option<String> {
+    settings
+        .gmail
+        .date_window
+        .as_ref()
+        .map(|window| window.query())
+}
+
 fn list_thread_refs(
     api: &dyn GmailApi,
     settings: &GmailMountSettings,
@@ -899,6 +971,7 @@ fn message_entry(
     let path = parent_path.join(message_filename(&message, &title));
     let bundle = GmailNativeBundle {
         mailbox: mailbox.to_string(),
+        draft_id: None,
         message: message.clone(),
     };
     TreeEntry {
@@ -912,6 +985,34 @@ fn message_entry(
         remote_edited_at: Some(version),
         stub_frontmatter: Some(message_frontmatter(&bundle)),
     }
+}
+
+fn draft_entry(
+    mount_id: &MountId,
+    parent_path: &Path,
+    draft_id: String,
+    message: GmailMessage,
+) -> LocalityResult<TreeEntry> {
+    let version = remote_version(&message);
+    let path = parent_path.join(message_filename(&message, "draft"));
+    let remote_id = draft_remote_id(&draft_id);
+    let bundle = GmailNativeBundle {
+        mailbox: "draft".to_string(),
+        draft_id: Some(draft_id),
+        message,
+    };
+    let stub_frontmatter = Some(message_frontmatter_with_entity_id(&bundle, &remote_id));
+    Ok(TreeEntry {
+        mount_id: mount_id.clone(),
+        remote_id,
+        kind: EntityKind::Page,
+        title: "draft".to_string(),
+        path,
+        hydration: HydrationState::Stub,
+        content_hash: None,
+        remote_edited_at: Some(version),
+        stub_frontmatter,
+    })
 }
 
 fn thread_message_entry(
@@ -1287,7 +1388,7 @@ mod tests {
     use super::{GmailConfig, GmailConnector};
     use crate::client::GmailApi;
     use crate::dto::{
-        GmailDraft, GmailDraftCreateRequest, GmailDraftList, GmailDraftSendRequest,
+        GmailDraft, GmailDraftCreateRequest, GmailDraftList, GmailDraftRef, GmailDraftSendRequest,
         GmailDraftUpdateRequest, GmailMessage, GmailMessageList, GmailMessagePartBody,
         GmailMessageRef, GmailMessageSendRequest, GmailThread, GmailThreadList,
     };
@@ -1328,6 +1429,9 @@ mod tests {
         assert!(entries.iter().any(|entry| entry.path.starts_with("inbox/")));
         assert!(entries.iter().any(|entry| entry.path.starts_with("sent/")));
         assert!(entries.iter().any(|entry| entry.path.starts_with("draft/")));
+        assert!(entries.iter().any(|entry| entry.remote_id
+            == RemoteId::new("gmail-draft:draft-1")
+            && entry.path.starts_with("draft/")));
         assert!(
             !entries
                 .iter()
@@ -1335,7 +1439,8 @@ mod tests {
                     && entry.path.starts_with("outbox"))
         );
         let calls = api.calls.lock().expect("calls");
-        assert_eq!(calls.list_max_results, vec![100, 100, 100]);
+        assert_eq!(calls.list_max_results, vec![100, 100]);
+        assert_eq!(calls.draft_list_max_results, vec![100]);
     }
 
     #[test]
@@ -1398,13 +1503,17 @@ mod tests {
                 "after:2026/07/01 before:2026/07/15".to_string(),
                 "after:2026/07/01 before:2026/07/15".to_string(),
                 "after:2026/07/01 before:2026/07/15".to_string(),
-                "after:2026/07/01 before:2026/07/15".to_string(),
             ]
         );
         assert_eq!(
-            calls.list_page_tokens,
-            vec![None, Some("next-inbox".to_string()), None, None]
+            calls.draft_list_queries,
+            vec!["after:2026/07/01 before:2026/07/15".to_string()]
         );
+        assert_eq!(
+            calls.list_page_tokens,
+            vec![None, Some("next-inbox".to_string()), None]
+        );
+        assert_eq!(calls.draft_list_page_tokens, vec![None]);
     }
 
     #[test]
@@ -1420,9 +1529,12 @@ mod tests {
             .expect("enumerate");
 
         let calls = api.calls.lock().expect("calls");
-        assert_eq!(calls.list_max_results, vec![100, 100, 100]);
-        assert_eq!(calls.list_page_tokens, vec![None, None, None]);
+        assert_eq!(calls.list_max_results, vec![100, 100]);
+        assert_eq!(calls.draft_list_max_results, vec![100]);
+        assert_eq!(calls.list_page_tokens, vec![None, None]);
+        assert_eq!(calls.draft_list_page_tokens, vec![None]);
         assert!(calls.list_queries.is_empty());
+        assert!(calls.draft_list_queries.is_empty());
     }
 
     #[test]
@@ -1502,12 +1614,18 @@ mod tests {
                 .iter()
                 .any(|entry| entry.remote_id == RemoteId::new("gmail-thread:sent:thread-sent-1"))
         );
+        assert!(entries.iter().any(|entry| entry.remote_id
+            == RemoteId::new("gmail-draft:draft-1")
+            && entry.path.starts_with("draft/")));
+        let calls = api.calls.lock().expect("calls");
+        assert!(!calls.message_list_labels.contains(&"DRAFT".to_string()));
+        assert_eq!(calls.draft_list_max_results, vec![100]);
     }
 
     #[test]
     fn list_children_for_draft_folder_returns_remote_drafts() {
         let api = Arc::new(FakeGmailApi::default());
-        let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
 
         let result = connector
             .list_children(ListChildrenRequest {
@@ -1518,7 +1636,14 @@ mod tests {
             .expect("list draft");
 
         assert_eq!(result.entries.len(), 1);
+        assert_eq!(
+            result.entries[0].remote_id,
+            RemoteId::new("gmail-draft:draft-1")
+        );
         assert!(result.entries[0].path.starts_with("draft/"));
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.draft_list_max_results, vec![100]);
+        assert!(!calls.message_list_labels.contains(&"DRAFT".to_string()));
     }
 
     #[test]
@@ -1657,6 +1782,50 @@ mod tests {
     }
 
     #[test]
+    fn fetch_remote_draft_uses_draft_resource_and_renders_draft_id() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let remote_id = RemoteId::new("gmail-draft:draft-1");
+
+        let native = connector
+            .fetch(FetchRequest {
+                remote_id: remote_id.clone(),
+            })
+            .expect("fetch draft");
+
+        assert_eq!(native.remote_id, remote_id);
+        assert_eq!(native.kind, "gmail_message");
+        let rendered = connector.render(&native).expect("render draft");
+        assert!(rendered.frontmatter.contains("id: \"gmail-draft:draft-1\""));
+        assert!(rendered.frontmatter.contains("mailbox: \"draft\""));
+        assert!(rendered.frontmatter.contains("draft_id: \"draft-1\""));
+        assert!(rendered.frontmatter.contains("message_id: \"draft-msg-1\""));
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.draft_full_ids, vec!["draft-1".to_string()]);
+        assert!(calls.message_full_ids.is_empty());
+    }
+
+    #[test]
+    fn fetch_legacy_draft_message_remote_id_still_works() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+
+        let native = connector
+            .fetch(FetchRequest {
+                remote_id: RemoteId::new("draft-msg-1"),
+            })
+            .expect("fetch legacy draft message");
+
+        let rendered = connector.render(&native).expect("render legacy draft");
+        assert!(rendered.frontmatter.contains("id: \"draft-msg-1\""));
+        assert!(rendered.frontmatter.contains("mailbox: \"draft\""));
+        assert!(!rendered.frontmatter.contains("draft_id:"));
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.message_full_ids, vec!["draft-msg-1".to_string()]);
+        assert!(calls.draft_full_ids.is_empty());
+    }
+
+    #[test]
     fn observe_thread_remote_id_returns_thread_page_metadata() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
@@ -1695,6 +1864,33 @@ mod tests {
             .expect("metadata_text");
         assert!(search_terms.contains(&serde_json::json!("Ann <ann@example.com>")));
         assert!(search_terms.contains(&serde_json::json!("Hello")));
+    }
+
+    #[test]
+    fn observe_remote_draft_uses_draft_resource() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let remote_id = RemoteId::new("gmail-draft:draft-1");
+
+        let observation = connector
+            .observe(ObserveRequest {
+                mount_id: MountId::new("gmail-main"),
+                remote_id: remote_id.clone(),
+            })
+            .expect("observe draft");
+
+        assert_eq!(observation.remote_id, remote_id);
+        assert_eq!(
+            observation.parent_remote_id,
+            Some(RemoteId::new("gmail-folder:draft"))
+        );
+        assert_eq!(
+            observation.projected_path,
+            std::path::PathBuf::from("draft/1720900000000-draft-draft-msg-1.md")
+        );
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.draft_full_ids, vec!["draft-1".to_string()]);
+        assert!(calls.message_metadata_ids.is_empty());
     }
 
     #[test]
@@ -2505,6 +2701,7 @@ mod tests {
 
     #[derive(Default, Debug)]
     struct FakeCalls {
+        message_list_labels: Vec<String>,
         list_max_results: Vec<u32>,
         list_queries: Vec<String>,
         paged_message_ids: std::collections::BTreeMap<(String, Option<String>), GmailMessageList>,
@@ -2512,6 +2709,9 @@ mod tests {
         paged_thread_ids: std::collections::BTreeMap<(String, Option<String>), GmailThreadList>,
         thread_metadata: std::collections::BTreeMap<String, GmailThread>,
         list_page_tokens: Vec<Option<String>>,
+        draft_list_max_results: Vec<u32>,
+        draft_list_page_tokens: Vec<Option<String>>,
+        draft_list_queries: Vec<String>,
         panic_after_list_calls: Option<usize>,
         sent_search_results: std::collections::BTreeMap<String, String>,
         sent_search_results_after_send: std::collections::BTreeMap<String, String>,
@@ -2519,6 +2719,9 @@ mod tests {
         send_message_error: Option<LocalityError>,
         sent_search_error_after_send: Option<LocalityError>,
         message_labels: std::collections::BTreeMap<String, Vec<String>>,
+        message_metadata_ids: Vec<String>,
+        message_full_ids: Vec<String>,
+        draft_full_ids: Vec<String>,
         created_drafts: usize,
         created_draft_raw: Vec<String>,
         sent_drafts: Vec<String>,
@@ -2535,6 +2738,7 @@ mod tests {
             query: Option<&str>,
         ) -> locality_core::LocalityResult<GmailMessageList> {
             let mut calls = self.calls.lock().expect("calls");
+            calls.message_list_labels.push(label_id.to_string());
             calls.list_max_results.push(max_results);
             calls.list_page_tokens.push(_page_token.map(str::to_string));
             if let Some(limit) = calls.panic_after_list_calls {
@@ -2651,13 +2855,9 @@ mod tests {
             &self,
             message_id: &str,
         ) -> locality_core::LocalityResult<GmailMessage> {
-            let labels = self
-                .calls
-                .lock()
-                .expect("calls")
-                .message_labels
-                .get(message_id)
-                .cloned();
+            let mut calls = self.calls.lock().expect("calls");
+            calls.message_metadata_ids.push(message_id.to_string());
+            let labels = calls.message_labels.get(message_id).cloned();
             Ok(message_fixture_with_labels(message_id, labels))
         }
 
@@ -2665,6 +2865,11 @@ mod tests {
             &self,
             message_id: &str,
         ) -> locality_core::LocalityResult<GmailMessage> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .message_full_ids
+                .push(message_id.to_string());
             Ok(message_fixture(message_id))
         }
 
@@ -2699,14 +2904,34 @@ mod tests {
 
         fn list_drafts(
             &self,
-            _max_results: u32,
-            _page_token: Option<&str>,
-            _query: Option<&str>,
+            max_results: u32,
+            page_token: Option<&str>,
+            query: Option<&str>,
         ) -> locality_core::LocalityResult<GmailDraftList> {
-            Ok(GmailDraftList::default())
+            let mut calls = self.calls.lock().expect("calls");
+            calls.draft_list_max_results.push(max_results);
+            calls
+                .draft_list_page_tokens
+                .push(page_token.map(str::to_string));
+            if let Some(query) = query {
+                calls.draft_list_queries.push(query.to_string());
+            }
+            Ok(GmailDraftList {
+                drafts: vec![GmailDraftRef {
+                    id: "draft-1".to_string(),
+                    message: message_fixture("draft-msg-1"),
+                }],
+                next_page_token: None,
+                result_size_estimate: Some(1),
+            })
         }
 
         fn get_draft_full(&self, draft_id: &str) -> locality_core::LocalityResult<GmailDraft> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .draft_full_ids
+                .push(draft_id.to_string());
             Ok(GmailDraft {
                 id: draft_id.to_string(),
                 message: message_fixture("draft-msg-1"),
