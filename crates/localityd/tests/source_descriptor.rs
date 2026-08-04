@@ -126,14 +126,16 @@ fn gmail_descriptor_comes_from_registry() {
 Gmail facts:
 - This mount projects Gmail inbox/, sent/, draft/, and outbox/ folders.
 - inbox/ and sent/ are read-only mailbox history.
+- draft/ contains remote Gmail drafts and local draft creates. Edit a remote draft there and push to update the Gmail draft.
 - Create a Markdown file directly under draft/ to create an unsent Gmail draft.
-- Create a Markdown file directly under outbox/ to send immediately after explicit review and push.
+- outbox/ is local-only send staging. Create a Markdown file directly under outbox/ to send immediately after explicit review and push.
+- Move an existing remote draft from draft/ to outbox/ and push to send the updated draft.
 - Both outbound folders require `to` frontmatter and either `subject` or `title` frontmatter.
-- Use outbox/ only when the user explicitly asks to send mail now; otherwise use draft/ for review in Gmail.
+- Use outbox/ only when the user explicitly asks to send mail now; otherwise leave messages in draft/ for drafting and revision.
 - To inspect inbound attachments, first hydrate the message or thread Markdown by opening it or running `loc pull <message-or-thread-path>`.
 - Hydrated messages list attachments in YAML frontmatter under `gmail.attachments`; read `filename`, `mime_type`, `size`, `attachment_id`, and `path` from that list.
 - Open the attachment file at the listed `path`, relative to the mount root. Gmail attachment caches normally live under `.loc/gmail/attachments/...`; use the frontmatter path exactly.
-- Gmail draft creation does not support outbound attachments yet. Outbox direct-send creation does not support outbound attachments yet either. Do not add `attachment` or `attachments` frontmatter to draft or outbox files.
+- Gmail outbound attachments are not supported yet. Do not add `attachment` or `attachments` frontmatter to draft or outbox files.
 ";
     assert!(
         descriptor

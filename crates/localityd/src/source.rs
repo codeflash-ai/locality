@@ -789,14 +789,16 @@ fn gmail_mount_guidance() -> String {
 Gmail facts:\n\
 - This mount projects Gmail inbox/, sent/, draft/, and outbox/ folders.\n\
 - inbox/ and sent/ are read-only mailbox history.\n\
+- draft/ contains remote Gmail drafts and local draft creates. Edit a remote draft there and push to update the Gmail draft.\n\
 - Create a Markdown file directly under draft/ to create an unsent Gmail draft.\n\
-- Create a Markdown file directly under outbox/ to send immediately after explicit review and push.\n\
+- outbox/ is local-only send staging. Create a Markdown file directly under outbox/ to send immediately after explicit review and push.\n\
+- Move an existing remote draft from draft/ to outbox/ and push to send the updated draft.\n\
 - Both outbound folders require `to` frontmatter and either `subject` or `title` frontmatter.\n\
-- Use outbox/ only when the user explicitly asks to send mail now; otherwise use draft/ for review in Gmail.\n\
+- Use outbox/ only when the user explicitly asks to send mail now; otherwise leave messages in draft/ for drafting and revision.\n\
 - To inspect inbound attachments, first hydrate the message or thread Markdown by opening it or running `loc pull <message-or-thread-path>`.\n\
 - Hydrated messages list attachments in YAML frontmatter under `gmail.attachments`; read `filename`, `mime_type`, `size`, `attachment_id`, and `path` from that list.\n\
 - Open the attachment file at the listed `path`, relative to the mount root. Gmail attachment caches normally live under `.loc/gmail/attachments/...`; use the frontmatter path exactly.\n\
-- Gmail draft creation does not support outbound attachments yet. Outbox direct-send creation does not support outbound attachments yet either. Do not add `attachment` or `attachments` frontmatter to draft or outbox files.\n",
+- Gmail outbound attachments are not supported yet. Do not add `attachment` or `attachments` frontmatter to draft or outbox files.\n",
         generic_mount_guidance("Gmail")
     )
 }

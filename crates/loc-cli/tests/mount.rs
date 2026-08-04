@@ -121,7 +121,7 @@ fn mount_writes_gmail_attachment_guidance() {
     assert!(agents.contains("`filename`, `mime_type`, `size`, `attachment_id`, and `path`"));
     assert!(agents.contains(".loc/gmail/attachments/..."));
     assert!(agents.contains("use the frontmatter path exactly"));
-    assert!(agents.contains("Gmail draft creation does not support outbound attachments yet"));
+    assert!(agents.contains("Gmail outbound attachments are not supported yet"));
 }
 
 #[test]
