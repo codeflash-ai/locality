@@ -783,7 +783,11 @@ fn gmail_mount_guidance() -> String {
 Gmail facts:\n\
 - This mount projects Gmail inbox/, sent/, and draft/ folders.\n\
 - inbox/ and sent/ are read-only. Create a Markdown file directly under draft/ to create an unsent Gmail draft.\n\
-- Draft creates require `to` frontmatter and either `subject` or `title` frontmatter.\n",
+- Draft creates require `to` frontmatter and either `subject` or `title` frontmatter.\n\
+- To inspect inbound attachments, first hydrate the message or thread Markdown by opening it or running `loc pull <message-or-thread-path>`.\n\
+- Hydrated messages list attachments in YAML frontmatter under `gmail.attachments`; read `filename`, `mime_type`, `size`, `attachment_id`, and `path` from that list.\n\
+- Open the attachment file at the listed `path`, relative to the mount root. Gmail attachment caches normally live under `.loc/gmail/attachments/...`; use the frontmatter path exactly.\n\
+- Gmail draft creation does not support outbound attachments yet. Do not add `attachment` or `attachments` frontmatter to draft files.\n",
         generic_mount_guidance("Gmail")
     )
 }

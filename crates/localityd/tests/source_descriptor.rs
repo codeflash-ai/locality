@@ -121,7 +121,23 @@ fn gmail_descriptor_comes_from_registry() {
     assert_eq!(descriptor.connect_command(), Some("loc connect gmail"));
     assert_eq!(descriptor.auth_env_var(), None);
     assert!(descriptor.supports_oauth());
-    assert!(descriptor.mount_guidance().contains("Gmail facts"));
+    let expected_gmail_guidance = "\
+Gmail facts:
+- This mount projects Gmail inbox/, sent/, and draft/ folders.
+- inbox/ and sent/ are read-only. Create a Markdown file directly under draft/ to create an unsent Gmail draft.
+- Draft creates require `to` frontmatter and either `subject` or `title` frontmatter.
+- To inspect inbound attachments, first hydrate the message or thread Markdown by opening it or running `loc pull <message-or-thread-path>`.
+- Hydrated messages list attachments in YAML frontmatter under `gmail.attachments`; read `filename`, `mime_type`, `size`, `attachment_id`, and `path` from that list.
+- Open the attachment file at the listed `path`, relative to the mount root. Gmail attachment caches normally live under `.loc/gmail/attachments/...`; use the frontmatter path exactly.
+- Gmail draft creation does not support outbound attachments yet. Do not add `attachment` or `attachments` frontmatter to draft files.
+";
+    assert!(
+        descriptor
+            .mount_guidance()
+            .contains(expected_gmail_guidance),
+        "Gmail guidance missing attachment workflow:\n{}",
+        descriptor.mount_guidance()
+    );
     assert_eq!(
         descriptor.create_entity_parent_kinds(),
         &[EntityKind::Directory]
