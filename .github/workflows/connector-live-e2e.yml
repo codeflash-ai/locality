@@ -266,6 +266,7 @@ jobs:
           LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON }}
           LOCALITY_GMAIL_LIVE_TO_EMAIL: ${{ secrets.LOCALITY_GMAIL_LIVE_TO_EMAIL }}
           LOCALITY_LIVE_GMAIL_VFS: "1"
+          LOCALITY_LIVE_GMAIL_SEND: "1"
           LOCALITY_LIVE_FORCE_OAUTH_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
           LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && format('{0}/locality-gmail-live-credential.json', runner.temp) || '' }}
         run: tests/live_gmail_vfs_roundtrip.sh
