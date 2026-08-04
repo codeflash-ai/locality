@@ -432,13 +432,35 @@ fn validate_gmail_outbound_frontmatter(
 fn gmail_draft_frontmatter_has_attachments(
     properties: &locality_core::canonical::FrontmatterProperties,
 ) -> bool {
-    properties.contains_key("attachment")
-        || properties.contains_key("attachments")
+    properties
+        .get("attachment")
+        .map(property_value_from_frontmatter)
+        .as_ref()
+        .is_some_and(|value| property_value_has_attachment_metadata(Some(value)))
+        || properties
+            .get("attachments")
+            .map(property_value_from_frontmatter)
+            .as_ref()
+            .is_some_and(|value| property_value_has_attachment_metadata(Some(value)))
         || matches!(
             properties.get("gmail").map(property_value_from_frontmatter),
             Some(PropertyValue::Object(gmail))
-                if gmail.contains_key("attachment") || gmail.contains_key("attachments")
+                if property_value_has_attachment_metadata(gmail.get("attachment"))
+                    || property_value_has_attachment_metadata(gmail.get("attachments"))
         )
+}
+
+fn property_value_has_attachment_metadata(value: Option<&PropertyValue>) -> bool {
+    match value {
+        None | Some(PropertyValue::Null) => false,
+        Some(PropertyValue::String(value)) => !value.trim().is_empty(),
+        Some(PropertyValue::List(values)) => values.iter().any(|value| !value.trim().is_empty()),
+        Some(PropertyValue::Array(values)) => values
+            .iter()
+            .any(|value| property_value_has_attachment_metadata(Some(value))),
+        Some(PropertyValue::Object(values)) => !values.is_empty(),
+        Some(PropertyValue::Bool(_) | PropertyValue::Number(_)) => true,
+    }
 }
 
 fn frontmatter_string_list(

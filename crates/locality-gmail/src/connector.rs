@@ -1535,12 +1535,27 @@ fn parse_gmail_draft_document(document: &CanonicalDocument) -> LocalityResult<Gm
 }
 
 fn raw_draft_frontmatter_has_attachments(frontmatter: &RawDraftFrontmatter) -> bool {
-    frontmatter.attachment.is_some()
-        || frontmatter.attachments.is_some()
-        || frontmatter
-            .gmail
-            .as_ref()
-            .is_some_and(|gmail| gmail.attachment.is_some() || gmail.attachments.is_some())
+    raw_attachment_value_has_metadata(frontmatter.attachment.as_ref())
+        || raw_attachment_value_has_metadata(frontmatter.attachments.as_ref())
+        || frontmatter.gmail.as_ref().is_some_and(|gmail| {
+            raw_attachment_value_has_metadata(gmail.attachment.as_ref())
+                || raw_attachment_value_has_metadata(gmail.attachments.as_ref())
+        })
+}
+
+fn raw_attachment_value_has_metadata(value: Option<&yaml_serde::Value>) -> bool {
+    match value {
+        None | Some(yaml_serde::Value::Null) => false,
+        Some(yaml_serde::Value::String(value)) => !value.trim().is_empty(),
+        Some(yaml_serde::Value::Sequence(values)) => values
+            .iter()
+            .any(|value| raw_attachment_value_has_metadata(Some(value))),
+        Some(yaml_serde::Value::Mapping(values)) => !values.is_empty(),
+        Some(yaml_serde::Value::Tagged(tagged)) => {
+            raw_attachment_value_has_metadata(Some(&tagged.value))
+        }
+        Some(yaml_serde::Value::Bool(_) | yaml_serde::Value::Number(_)) => true,
+    }
 }
 
 fn raw_recipients(value: RawRecipients) -> Vec<String> {
@@ -1570,13 +1585,27 @@ fn draft_from_push_create(
 }
 
 fn draft_properties_have_attachments(properties: &BTreeMap<String, PropertyValue>) -> bool {
-    properties.contains_key("attachments")
-        || properties.contains_key("attachment")
+    property_value_has_attachment_metadata(properties.get("attachments"))
+        || property_value_has_attachment_metadata(properties.get("attachment"))
         || matches!(
             properties.get("gmail"),
             Some(PropertyValue::Object(gmail))
-                if gmail.contains_key("attachments") || gmail.contains_key("attachment")
+                if property_value_has_attachment_metadata(gmail.get("attachments"))
+                    || property_value_has_attachment_metadata(gmail.get("attachment"))
         )
+}
+
+fn property_value_has_attachment_metadata(value: Option<&PropertyValue>) -> bool {
+    match value {
+        None | Some(PropertyValue::Null) => false,
+        Some(PropertyValue::String(value)) => !value.trim().is_empty(),
+        Some(PropertyValue::List(values)) => values.iter().any(|value| !value.trim().is_empty()),
+        Some(PropertyValue::Array(values)) => values
+            .iter()
+            .any(|value| property_value_has_attachment_metadata(Some(value))),
+        Some(PropertyValue::Object(values)) => !values.is_empty(),
+        Some(PropertyValue::Bool(_) | PropertyValue::Number(_)) => true,
+    }
 }
 
 fn recipients_property(properties: &BTreeMap<String, PropertyValue>, key: &str) -> Vec<String> {
@@ -3476,6 +3505,55 @@ mod tests {
     }
 
     #[test]
+    fn apply_allows_empty_draft_attachment_metadata() {
+        let api = Arc::new(FakeGmailApi::default());
+        api.calls.lock().expect("calls").draft_full.insert(
+            "draft-123".to_string(),
+            GmailDraft {
+                id: "draft-123".to_string(),
+                message: message_fixture("draft-original-msg"),
+            },
+        );
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("gmail-draft:draft-123")],
+            vec![PushOperation::UpdateProperties {
+                entity_id: RemoteId::new("gmail-draft:draft-123"),
+                properties: std::collections::BTreeMap::from([
+                    (
+                        "attachment".to_string(),
+                        PropertyValue::String(String::new()),
+                    ),
+                    ("attachments".to_string(), PropertyValue::List(Vec::new())),
+                    (
+                        "gmail".to_string(),
+                        PropertyValue::Object(std::collections::BTreeMap::from([(
+                            "attachments".to_string(),
+                            PropertyValue::Array(Vec::new()),
+                        )])),
+                    ),
+                ]),
+            }],
+        );
+
+        connector
+            .apply(locality_connector::ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("gmail-main"),
+                plan: &plan,
+                operation_ids: &[PushOperationId("op-properties".to_string())],
+                remote_preconditions: &[] as &[RemotePrecondition],
+                local_root: None,
+            })
+            .expect("empty attachment metadata should be ignored");
+
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.draft_full_ids, vec!["draft-123"]);
+        assert_eq!(calls.updated_drafts.len(), 1);
+        assert!(calls.sent_drafts.is_empty());
+    }
+
+    #[test]
     fn apply_rejects_draft_update_when_remote_draft_has_attachments() {
         let api = Arc::new(FakeGmailApi::default());
         api.calls.lock().expect("calls").draft_full.insert(
@@ -3525,6 +3603,19 @@ mod tests {
             .expect_err("nested gmail attachments should be unsupported");
 
         assert!(matches!(error, LocalityError::Unsupported(_)));
+    }
+
+    #[test]
+    fn parse_draft_allows_empty_attachment_metadata() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
+
+        connector
+            .parse(&CanonicalDocument::new(
+                "to: [\"ann@example.com\"]\nsubject: Hello\nattachment: \"\"\nattachments: []\ngmail:\n  attachments: []\n",
+                "Body",
+            ))
+            .expect("empty attachment metadata should be ignored");
     }
 
     #[test]

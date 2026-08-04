@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, NativeEntity,
@@ -21,6 +23,13 @@ use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, Pu
 use locality_core::push::PushExecutionAction;
 use locality_core::shadow::ShadowDocument;
 use locality_core::{LocalityError, LocalityResult};
+use locality_gmail::client::GmailApi;
+use locality_gmail::dto::{
+    GmailDraft, GmailDraftCreateRequest, GmailDraftList, GmailDraftSendRequest,
+    GmailDraftUpdateRequest, GmailHeader, GmailMessage, GmailMessageList, GmailMessagePart,
+    GmailMessagePartBody, GmailMessageSendRequest, GmailThread, GmailThreadList,
+};
+use locality_gmail::{GmailConfig, GmailConnector};
 use locality_linear::{
     LinearApi, LinearConfig, LinearConnector, LinearIssue, LinearIssuePage, LinearIssuePriority,
     LinearIssueState, LinearIssueUpdateInput, LinearLabel, LinearProject, LinearTeam, LinearUser,
@@ -35,7 +44,7 @@ use locality_notion::{NotionConfig, NotionConnector};
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, EntityRecord,
     EntityRepository, InMemoryStateStore, JournalRepository, MountConfig, MountRepository,
-    ProjectionMode, ShadowRepository, VirtualMutationKind, VirtualMutationRecord,
+    ProjectionMode, ShadowRepository, SqliteStateStore, VirtualMutationKind, VirtualMutationRecord,
     VirtualMutationRepository,
 };
 use localityd::execution::{DaemonExecutor, PushJob};
@@ -1238,6 +1247,668 @@ fn daemon_push_reconciles_gmail_send_create_to_sent_folder() {
             .find_virtual_mutation_by_path(&fixture.mount_id, source_path)
             .expect("find mutation")
             .is_none()
+    );
+}
+
+#[test]
+fn daemon_push_reconciles_gmail_draft_update() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("draft/Remote Draft.md");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+    let api = Arc::new(RecordingGmailApi::new());
+    let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+    let mut store = gmail_draft_store(&fixture, &connector, &draft_remote_id, source_path);
+    let rendered = store
+        .load_shadow(&fixture.mount_id, &draft_remote_id)
+        .expect("load draft shadow");
+    let edited_frontmatter = rendered
+        .frontmatter
+        .replace("title: \"Remote Draft\"", "title: \"Updated Draft\"")
+        .replace("to: [\"ann@example.com\"]", "to: [\"bob@example.com\"]")
+        .replace("subject: \"Remote Draft\"", "subject: \"Updated Draft\"");
+    let edited = render_canonical_markdown(&CanonicalDocument::new(
+        edited_frontmatter,
+        "Updated body.\n".to_string(),
+    ));
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(&cache_path, &edited).expect("edit draft");
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: true,
+            confirm_dangerous: true,
+        },
+        &connector,
+        Some(&state_root),
+    )
+    .expect("push draft update");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    let calls = api.calls();
+    assert_eq!(calls.updated_drafts.len(), 1);
+    assert_eq!(calls.updated_drafts[0].0, "draft-1");
+    assert!(decode_raw_mime(&calls.updated_drafts[0].1).contains("Updated body."));
+    assert!(calls.sent_drafts.is_empty());
+    let entity = store
+        .get_entity(&fixture.mount_id, &draft_remote_id)
+        .expect("get draft")
+        .expect("draft entity");
+    assert_eq!(entity.remote_id, draft_remote_id);
+    assert_eq!(entity.path, PathBuf::from("draft/Remote Draft.md"));
+    assert!(content_root.join(source_path).exists());
+    let shadow = store
+        .load_shadow(&fixture.mount_id, &draft_remote_id)
+        .expect("load reconciled shadow");
+    let projected = fs::read_to_string(content_root.join(source_path)).expect("projected draft");
+    assert_eq!(
+        render_canonical_markdown(&CanonicalDocument::new(
+            shadow.frontmatter.clone(),
+            shadow.rendered_body.clone(),
+        )),
+        projected
+    );
+    assert!(projected.contains("subject: \"Updated Draft\""));
+    assert!(projected.contains("to: [\"bob@example.com\"]"));
+    assert!(projected.contains("Updated body."));
+}
+
+#[test]
+fn daemon_push_reconciles_gmail_draft_move_to_outbox_send() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let original_path = Path::new("draft/Remote Draft.md");
+    let source_path = Path::new("outbox/Send Remote Draft.md");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+    let sent_remote_id = RemoteId::new("gmail-message:sent-1");
+    let api = Arc::new(RecordingGmailApi::new());
+    let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+    let mut store = gmail_draft_store(&fixture, &connector, &draft_remote_id, original_path);
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                draft_remote_id.clone(),
+                EntityKind::Page,
+                "Send Remote Draft",
+                source_path,
+            )
+            .with_hydration(HydrationState::Dirty)
+            .with_remote_edited_at("gmail:draft-message-1:1720900000000:DRAFT"),
+        )
+        .expect("save moved draft entity");
+    let rendered = store
+        .load_shadow(&fixture.mount_id, &draft_remote_id)
+        .expect("load draft shadow");
+    let edited_frontmatter = rendered
+        .frontmatter
+        .replace("title: \"Remote Draft\"", "title: \"Send Remote Draft\"")
+        .replace("to: [\"ann@example.com\"]", "to: [\"bob@example.com\"]")
+        .replace(
+            "subject: \"Remote Draft\"",
+            "subject: \"Send Remote Draft\"",
+        );
+    let edited = render_canonical_markdown(&CanonicalDocument::new(
+        edited_frontmatter,
+        "Edited body before sending.\n".to_string(),
+    ));
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(&cache_path, &edited).expect("edit moved draft");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:draft-1-to-outbox".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(draft_remote_id.clone()),
+            parent_remote_id: Some(RemoteId::new("gmail-folder:outbox")),
+            original_path: Some(original_path.to_path_buf()),
+            projected_path: source_path.to_path_buf(),
+            title: "Send Remote Draft".to_string(),
+            content_path: Some(cache_path),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save move mutation");
+    fs::create_dir_all(fixture.root.join("outbox")).expect("visible outbox folder");
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: true,
+            confirm_dangerous: true,
+        },
+        &connector,
+        Some(&state_root),
+    )
+    .expect("push draft send");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    let calls = api.calls();
+    assert_eq!(calls.updated_drafts.len(), 1);
+    assert_eq!(calls.updated_drafts[0].0, "draft-1");
+    assert_eq!(calls.sent_drafts, vec!["draft-1"]);
+    assert!(
+        calls
+            .call_log
+            .iter()
+            .position(|call| call == "update_draft:draft-1")
+            < calls
+                .call_log
+                .iter()
+                .position(|call| call == "send_draft:draft-1")
+    );
+    let sent = store
+        .get_entity(&fixture.mount_id, &sent_remote_id)
+        .expect("get sent message")
+        .expect("sent message entity");
+    assert_eq!(sent.remote_id, sent_remote_id);
+    assert!(sent.path.starts_with("sent"));
+    assert!(content_root.join(&sent.path).exists());
+    assert!(!content_root.join(original_path).exists());
+    assert!(!content_root.join(source_path).exists());
+    assert!(
+        store
+            .get_entity(&fixture.mount_id, &draft_remote_id)
+            .expect("get archived draft")
+            .is_none()
+    );
+    assert!(
+        store
+            .find_virtual_mutation_by_path(&fixture.mount_id, source_path)
+            .expect("find move mutation")
+            .is_none()
+    );
+}
+
+#[test]
+fn daemon_push_resumes_gmail_draft_send_reconciliation_without_reapplying() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let original_path = Path::new("draft/Remote Draft.md");
+    let source_path = Path::new("outbox/Send Remote Draft.md");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+    let sent_remote_id = RemoteId::new("gmail-message:sent-1");
+    let api = Arc::new(RecordingGmailApi::new().with_sent_fetch_failures(&sent_remote_id, 1));
+    let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+    let mut store = gmail_draft_store(&fixture, &connector, &draft_remote_id, original_path);
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                draft_remote_id.clone(),
+                EntityKind::Page,
+                "Send Remote Draft",
+                source_path,
+            )
+            .with_hydration(HydrationState::Dirty)
+            .with_remote_edited_at("gmail:draft-message-1:1720900000000:DRAFT"),
+        )
+        .expect("save moved draft entity");
+    let rendered = store
+        .load_shadow(&fixture.mount_id, &draft_remote_id)
+        .expect("load draft shadow");
+    let edited_frontmatter = rendered
+        .frontmatter
+        .replace("title: \"Remote Draft\"", "title: \"Send Remote Draft\"")
+        .replace("to: [\"ann@example.com\"]", "to: [\"bob@example.com\"]")
+        .replace(
+            "subject: \"Remote Draft\"",
+            "subject: \"Send Remote Draft\"",
+        );
+    let edited = render_canonical_markdown(&CanonicalDocument::new(
+        edited_frontmatter.clone(),
+        "Edited body before sending.\n".to_string(),
+    ));
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(&cache_path, &edited).expect("edit moved draft");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:draft-1-to-outbox".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(draft_remote_id.clone()),
+            parent_remote_id: Some(RemoteId::new("gmail-folder:outbox")),
+            original_path: Some(original_path.to_path_buf()),
+            projected_path: source_path.to_path_buf(),
+            title: "Send Remote Draft".to_string(),
+            content_path: Some(cache_path.clone()),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save move mutation");
+    fs::create_dir_all(fixture.root.join("outbox")).expect("visible outbox folder");
+    let job = || PushJob {
+        target_path: fixture.root.join(source_path),
+        assume_yes: true,
+        confirm_dangerous: true,
+    };
+
+    let first =
+        execute_push_job_with_content_root(&mut store, job(), &connector, Some(&state_root))
+            .expect("first draft send push");
+
+    assert_eq!(first.action, PushJobAction::Failed);
+    let first_push_id = first.push_id.expect("first push id");
+    let calls = api.calls();
+    assert_eq!(calls.updated_drafts.len(), 1);
+    assert_eq!(calls.sent_drafts, vec!["draft-1"]);
+    let stale_edit = render_canonical_markdown(&CanonicalDocument::new(
+        edited_frontmatter,
+        "Changed after send readback failed.\n".to_string(),
+    ));
+    fs::write(&cache_path, &stale_edit).expect("write stale local edit");
+
+    let second =
+        execute_push_job_with_content_root(&mut store, job(), &connector, Some(&state_root))
+            .expect("resume draft send push");
+
+    assert_eq!(second.action, PushJobAction::Reconciled);
+    assert_eq!(second.push_id.as_ref(), Some(&first_push_id));
+    let calls = api.calls();
+    assert_eq!(
+        calls.updated_drafts.len(),
+        1,
+        "retry must not update the sent draft again"
+    );
+    assert_eq!(
+        calls.sent_drafts,
+        vec!["draft-1"],
+        "retry must not resend Gmail draft"
+    );
+    let sent = store
+        .get_entity(&fixture.mount_id, &sent_remote_id)
+        .expect("get sent message")
+        .expect("sent message entity");
+    assert!(sent.path.starts_with("sent"));
+    assert!(content_root.join(&sent.path).exists());
+    assert!(
+        store
+            .get_entity(&fixture.mount_id, &draft_remote_id)
+            .expect("get archived draft")
+            .is_none()
+    );
+    assert_eq!(
+        fs::read_to_string(content_root.join(source_path)).expect("preserved stale edit"),
+        stale_edit
+    );
+    let mutation = store
+        .find_virtual_mutation_by_path(&fixture.mount_id, source_path)
+        .expect("find preserved mutation")
+        .expect("preserved mutation");
+    assert_eq!(mutation.mutation_kind, VirtualMutationKind::Create);
+    assert_eq!(mutation.target_remote_id, None);
+    assert_eq!(
+        mutation.parent_remote_id,
+        Some(RemoteId::new("gmail-folder:outbox"))
+    );
+}
+
+#[test]
+fn daemon_push_resumes_gmail_draft_send_after_outbox_rename_without_reapplying() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let original_path = Path::new("draft/Remote Draft.md");
+    let source_path = Path::new("outbox/Send Remote Draft.md");
+    let renamed_path = Path::new("outbox/Renamed Remote Draft.md");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+    let sent_remote_id = RemoteId::new("gmail-message:sent-1");
+    let api = Arc::new(RecordingGmailApi::new().with_sent_fetch_failures(&sent_remote_id, 1));
+    let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+    let mut store = gmail_draft_store(&fixture, &connector, &draft_remote_id, original_path);
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                draft_remote_id.clone(),
+                EntityKind::Page,
+                "Send Remote Draft",
+                source_path,
+            )
+            .with_hydration(HydrationState::Dirty)
+            .with_remote_edited_at("gmail:draft-message-1:1720900000000:DRAFT"),
+        )
+        .expect("save moved draft entity");
+    let rendered = store
+        .load_shadow(&fixture.mount_id, &draft_remote_id)
+        .expect("load draft shadow");
+    let edited_frontmatter = rendered
+        .frontmatter
+        .replace("title: \"Remote Draft\"", "title: \"Send Remote Draft\"")
+        .replace("to: [\"ann@example.com\"]", "to: [\"bob@example.com\"]")
+        .replace(
+            "subject: \"Remote Draft\"",
+            "subject: \"Send Remote Draft\"",
+        );
+    let edited = render_canonical_markdown(&CanonicalDocument::new(
+        edited_frontmatter,
+        "Edited body before sending.\n".to_string(),
+    ));
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(&cache_path, &edited).expect("edit moved draft");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:draft-1-to-outbox".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(draft_remote_id.clone()),
+            parent_remote_id: Some(RemoteId::new("gmail-folder:outbox")),
+            original_path: Some(original_path.to_path_buf()),
+            projected_path: source_path.to_path_buf(),
+            title: "Send Remote Draft".to_string(),
+            content_path: Some(cache_path.clone()),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save move mutation");
+    fs::create_dir_all(fixture.root.join("outbox")).expect("visible outbox folder");
+
+    let first = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: true,
+            confirm_dangerous: true,
+        },
+        &connector,
+        Some(&state_root),
+    )
+    .expect("first draft send push");
+
+    assert_eq!(first.action, PushJobAction::Failed);
+    let first_push_id = first.push_id.expect("first push id");
+    let calls = api.calls();
+    assert_eq!(calls.updated_drafts.len(), 1);
+    assert_eq!(calls.sent_drafts, vec!["draft-1"]);
+
+    let renamed_cache_path = virtual_fs_content_path(&state_root, &fixture.mount_id, renamed_path)
+        .expect("renamed cache path");
+    fs::create_dir_all(renamed_cache_path.parent().expect("renamed parent"))
+        .expect("renamed cache parent");
+    let renamed_edit = render_canonical_markdown(&CanonicalDocument::new(
+        "loc:\n  id: gmail-draft:draft-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: \"Renamed Remote Draft\"\nsubject: \"Renamed Remote Draft\"\nto: [\"bob@example.com\"]\n".to_string(),
+        "Changed after send readback failed.\n".to_string(),
+    ));
+    fs::remove_file(&cache_path).expect("remove old cache path");
+    fs::write(&renamed_cache_path, &renamed_edit).expect("write renamed stale edit");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:draft-1-to-outbox".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(draft_remote_id.clone()),
+            parent_remote_id: Some(RemoteId::new("gmail-folder:outbox")),
+            original_path: Some(original_path.to_path_buf()),
+            projected_path: renamed_path.to_path_buf(),
+            title: "Renamed Remote Draft".to_string(),
+            content_path: Some(renamed_cache_path.clone()),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:01:00Z".to_string(),
+        })
+        .expect("save renamed move mutation");
+
+    let second = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(renamed_path),
+            assume_yes: true,
+            confirm_dangerous: true,
+        },
+        &connector,
+        Some(&state_root),
+    )
+    .expect("resume renamed draft send push");
+
+    assert_eq!(second.action, PushJobAction::Reconciled);
+    assert_eq!(second.push_id.as_ref(), Some(&first_push_id));
+    let calls = api.calls();
+    assert_eq!(
+        calls.updated_drafts.len(),
+        1,
+        "retry must not update the sent draft again"
+    );
+    assert_eq!(
+        calls.sent_drafts,
+        vec!["draft-1"],
+        "retry must not resend Gmail draft"
+    );
+    let sent = store
+        .get_entity(&fixture.mount_id, &sent_remote_id)
+        .expect("get sent message")
+        .expect("sent message entity");
+    assert!(sent.path.starts_with("sent"));
+    assert!(content_root.join(&sent.path).exists());
+    assert_eq!(
+        fs::read_to_string(content_root.join(renamed_path)).expect("preserved renamed edit"),
+        renamed_edit
+    );
+    let mutation = store
+        .find_virtual_mutation_by_path(&fixture.mount_id, renamed_path)
+        .expect("find preserved renamed mutation")
+        .expect("preserved renamed mutation");
+    assert_eq!(mutation.mutation_kind, VirtualMutationKind::Create);
+    assert_eq!(mutation.target_remote_id, None);
+    assert_eq!(mutation.content_path, Some(renamed_cache_path));
+}
+
+#[test]
+fn daemon_push_converts_preserved_gmail_outbox_edit_with_sqlite_store() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let original_path = Path::new("draft/Remote Draft.md");
+    let source_path = Path::new("outbox/Send Remote Draft.md");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+    let sent_remote_id = RemoteId::new("gmail-message:sent-1");
+    let api = Arc::new(RecordingGmailApi::new().with_sent_fetch_failures(&sent_remote_id, 1));
+    let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open sqlite store");
+    seed_gmail_draft_store(
+        &mut store,
+        &fixture,
+        &connector,
+        &draft_remote_id,
+        original_path,
+    );
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                draft_remote_id.clone(),
+                EntityKind::Page,
+                "Send Remote Draft",
+                source_path,
+            )
+            .with_hydration(HydrationState::Dirty)
+            .with_remote_edited_at("gmail:draft-message-1:1720900000000:DRAFT"),
+        )
+        .expect("save moved draft entity");
+    let rendered = store
+        .load_shadow(&fixture.mount_id, &draft_remote_id)
+        .expect("load draft shadow");
+    let edited_frontmatter = rendered
+        .frontmatter
+        .replace("title: \"Remote Draft\"", "title: \"Send Remote Draft\"")
+        .replace("to: [\"ann@example.com\"]", "to: [\"bob@example.com\"]")
+        .replace(
+            "subject: \"Remote Draft\"",
+            "subject: \"Send Remote Draft\"",
+        );
+    let edited = render_canonical_markdown(&CanonicalDocument::new(
+        edited_frontmatter.clone(),
+        "Edited body before sending.\n".to_string(),
+    ));
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(&cache_path, &edited).expect("edit moved draft");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:draft-1-to-outbox".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(draft_remote_id.clone()),
+            parent_remote_id: Some(RemoteId::new("gmail-folder:outbox")),
+            original_path: Some(original_path.to_path_buf()),
+            projected_path: source_path.to_path_buf(),
+            title: "Send Remote Draft".to_string(),
+            content_path: Some(cache_path.clone()),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save move mutation");
+    fs::create_dir_all(fixture.root.join("outbox")).expect("visible outbox folder");
+    let job = || PushJob {
+        target_path: fixture.root.join(source_path),
+        assume_yes: true,
+        confirm_dangerous: true,
+    };
+
+    let first =
+        execute_push_job_with_content_root(&mut store, job(), &connector, Some(&state_root))
+            .expect("first draft send push");
+
+    assert_eq!(first.action, PushJobAction::Failed);
+    let stale_edit = render_canonical_markdown(&CanonicalDocument::new(
+        edited_frontmatter,
+        "Changed after send readback failed.\n".to_string(),
+    ));
+    fs::write(&cache_path, &stale_edit).expect("write stale local edit");
+
+    let second =
+        execute_push_job_with_content_root(&mut store, job(), &connector, Some(&state_root))
+            .expect("resume draft send push");
+
+    assert_eq!(second.action, PushJobAction::Reconciled);
+    let calls = api.calls();
+    assert_eq!(
+        calls.updated_drafts.len(),
+        1,
+        "retry must not update the sent draft again"
+    );
+    assert_eq!(
+        calls.sent_drafts,
+        vec!["draft-1"],
+        "retry must not resend Gmail draft"
+    );
+    assert_eq!(
+        fs::read_to_string(content_root.join(source_path)).expect("preserved stale edit"),
+        stale_edit
+    );
+    let mutation = store
+        .find_virtual_mutation_by_path(&fixture.mount_id, source_path)
+        .expect("find preserved mutation")
+        .expect("preserved mutation");
+    assert_eq!(mutation.mutation_kind, VirtualMutationKind::Create);
+    assert_eq!(mutation.target_remote_id, None);
+    assert_eq!(mutation.content_path, Some(cache_path));
+}
+
+#[test]
+fn daemon_push_resumes_applying_gmail_draft_send_with_complete_effects() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let original_path = Path::new("draft/Remote Draft.md");
+    let source_path = Path::new("outbox/Send Remote Draft.md");
+    let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+    let sent_remote_id = RemoteId::new("gmail-message:sent-1");
+    let api = Arc::new(RecordingGmailApi::new().with_sent_fetch_failures(&sent_remote_id, 1));
+    let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+    let mut store = gmail_draft_store(&fixture, &connector, &draft_remote_id, original_path);
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                draft_remote_id.clone(),
+                EntityKind::Page,
+                "Send Remote Draft",
+                source_path,
+            )
+            .with_hydration(HydrationState::Dirty)
+            .with_remote_edited_at("gmail:draft-message-1:1720900000000:DRAFT"),
+        )
+        .expect("save moved draft entity");
+    let rendered = store
+        .load_shadow(&fixture.mount_id, &draft_remote_id)
+        .expect("load draft shadow");
+    let edited_frontmatter = rendered
+        .frontmatter
+        .replace("title: \"Remote Draft\"", "title: \"Send Remote Draft\"")
+        .replace("to: [\"ann@example.com\"]", "to: [\"bob@example.com\"]")
+        .replace(
+            "subject: \"Remote Draft\"",
+            "subject: \"Send Remote Draft\"",
+        );
+    let edited = render_canonical_markdown(&CanonicalDocument::new(
+        edited_frontmatter,
+        "Edited body before sending.\n".to_string(),
+    ));
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(&cache_path, &edited).expect("edit moved draft");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:draft-1-to-outbox".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(draft_remote_id.clone()),
+            parent_remote_id: Some(RemoteId::new("gmail-folder:outbox")),
+            original_path: Some(original_path.to_path_buf()),
+            projected_path: source_path.to_path_buf(),
+            title: "Send Remote Draft".to_string(),
+            content_path: Some(cache_path),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save move mutation");
+    fs::create_dir_all(fixture.root.join("outbox")).expect("visible outbox folder");
+    let job = || PushJob {
+        target_path: fixture.root.join(source_path),
+        assume_yes: true,
+        confirm_dangerous: true,
+    };
+
+    let first =
+        execute_push_job_with_content_root(&mut store, job(), &connector, Some(&state_root))
+            .expect("first draft send push");
+
+    assert_eq!(first.action, PushJobAction::Failed);
+    let first_push_id = first.push_id.expect("first push id");
+    store
+        .update_journal_status(&first_push_id, JournalStatus::Applying)
+        .expect("force applying status");
+
+    let second =
+        execute_push_job_with_content_root(&mut store, job(), &connector, Some(&state_root))
+            .expect("resume applying draft send push");
+
+    assert_eq!(second.action, PushJobAction::Reconciled);
+    assert_eq!(second.push_id.as_ref(), Some(&first_push_id));
+    let calls = api.calls();
+    assert_eq!(
+        calls.updated_drafts.len(),
+        1,
+        "retry must not update the sent draft again"
+    );
+    assert_eq!(
+        calls.sent_drafts,
+        vec!["draft-1"],
+        "retry must not resend Gmail draft"
     );
 }
 
@@ -2665,6 +3336,196 @@ fn daemon_push_blocks_ambiguous_gmail_draft_move_send_inside_larger_batch() {
 }
 
 #[test]
+fn daemon_push_blocks_complete_effect_gmail_draft_send_overlap_inside_larger_batch() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let first_path = Path::new("outbox/Send One.md");
+    let second_path = Path::new("outbox/Send Two.md");
+    let first_cache =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, first_path).expect("cache path");
+    let second_cache =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, second_path).expect("cache path");
+    fs::create_dir_all(first_cache.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &first_cache,
+        "---\nloc:\n  id: gmail-draft:draft-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Send One\nsubject: Send one subject\nto: [\"ann@example.com\"]\n---\nFirst body.\n",
+    )
+    .expect("first cache file");
+    fs::write(
+        &second_cache,
+        "---\nloc:\n  id: gmail-draft:draft-2\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Send Two\nsubject: Send two subject\nto: [\"bob@example.com\"]\n---\nSecond body.\n",
+    )
+    .expect("second cache file");
+
+    let draft_folder_id = RemoteId::new("gmail-folder:draft");
+    let outbox_folder_id = RemoteId::new("gmail-folder:outbox");
+    let first_remote_id = RemoteId::new("gmail-draft:draft-1");
+    let second_remote_id = RemoteId::new("gmail-draft:draft-2");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "gmail", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            outbox_folder_id.clone(),
+            EntityKind::Directory,
+            "outbox",
+            "outbox",
+        ))
+        .expect("save outbox folder");
+    for (remote_id, title, path, body) in [
+        (
+            first_remote_id.clone(),
+            "Original One",
+            first_path,
+            "Original one body.\n",
+        ),
+        (
+            second_remote_id.clone(),
+            "Original Two",
+            second_path,
+            "Original two body.\n",
+        ),
+    ] {
+        store
+            .save_entity(
+                EntityRecord::new(
+                    fixture.mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    title,
+                    path,
+                )
+                .with_hydration(HydrationState::Dirty),
+            )
+            .expect("save moved draft");
+        store
+            .save_shadow(
+                &fixture.mount_id,
+                ShadowDocument::from_synced_body(remote_id.clone(), body, 1, [RemoteId::new("body-1")])
+                    .expect("shadow")
+                    .with_frontmatter(format!("loc:\n  id: {}\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: {}\nsubject: {}\nto: [\"ann@example.com\"]\n", remote_id.0, title, title)),
+            )
+            .expect("save shadow");
+    }
+    for (local_id, remote_id, path, cache, title) in [
+        (
+            "move:draft-1-to-outbox",
+            first_remote_id.clone(),
+            first_path,
+            first_cache,
+            "Send One",
+        ),
+        (
+            "move:draft-2-to-outbox",
+            second_remote_id.clone(),
+            second_path,
+            second_cache,
+            "Send Two",
+        ),
+    ] {
+        store
+            .save_virtual_mutation(VirtualMutationRecord {
+                mount_id: fixture.mount_id.clone(),
+                local_id: local_id.to_string(),
+                mutation_kind: VirtualMutationKind::Move,
+                target_remote_id: Some(remote_id),
+                parent_remote_id: Some(outbox_folder_id.clone()),
+                original_path: Some(PathBuf::from("draft/Original.md")),
+                projected_path: path.to_path_buf(),
+                title: title.to_string(),
+                content_path: Some(cache),
+                created_at: "2026-06-12T00:00:00Z".to_string(),
+                updated_at: "2026-06-12T00:00:00Z".to_string(),
+            })
+            .expect("save move mutation");
+    }
+    fs::create_dir_all(fixture.root.join("outbox")).expect("visible outbox folder");
+
+    let sent_remote_id = RemoteId::new("gmail-message:sent-1");
+    let applied_plan = PushPlan::new(
+        vec![first_remote_id.clone()],
+        vec![PushOperation::MoveEntity {
+            entity_id: first_remote_id.clone(),
+            new_parent_id: outbox_folder_id,
+            new_parent_kind: EntityKind::Directory,
+            new_title: "Send One".to_string(),
+            projected_path: first_path.to_path_buf(),
+        }],
+    );
+    let push_id = PushId("push-complete-gmail-draft-send-batch-overlap".to_string());
+    store
+        .append_journal(
+            JournalEntry::new(
+                push_id.clone(),
+                fixture.mount_id.clone(),
+                applied_plan.affected_entities.clone(),
+                applied_plan,
+                JournalStatus::Applied,
+            )
+            .with_apply_effects(vec![
+                JournalApplyEffect::ArchivedEntity {
+                    operation_id: PushOperationId("send-draft-archive".to_string()),
+                    operation_index: 0,
+                    entity_id: first_remote_id.clone(),
+                },
+                JournalApplyEffect::CreatedEntity {
+                    operation_id: PushOperationId("send-draft-sent".to_string()),
+                    operation_index: 0,
+                    parent_id: RemoteId::new("gmail-folder:sent"),
+                    entity_id: sent_remote_id,
+                },
+            ]),
+        )
+        .expect("append applied journal");
+    let source = FakePushSource::default()
+        .with_created_entity(
+            first_remote_id,
+            rendered_entity("gmail-draft:draft-1", "Original one body."),
+        )
+        .with_created_entity(
+            second_remote_id,
+            rendered_entity("gmail-draft:draft-2", "Original two body."),
+        );
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join("outbox"),
+            assume_yes: true,
+            confirm_dangerous: true,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("retry overlapping batch gmail draft send");
+
+    assert_eq!(report.action, PushJobAction::Failed);
+    assert_eq!(
+        source.applied_count(),
+        0,
+        "retry must not apply a broader batch containing an already-sent Gmail draft"
+    );
+    assert_eq!(report.push_id.as_ref(), Some(&push_id));
+    let error = report.error.expect("guardrail error");
+    assert_eq!(error.code, "guardrail");
+    assert!(error.message.contains("already applied"));
+}
+
+#[test]
 fn daemon_push_blocks_failed_gmail_send_recovery_lookup_without_reapplying() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
@@ -3504,6 +4365,120 @@ fn moved_entity_reconciliation_requires_effect_and_changed_id_and_retains_intent
             JournalStatus::Failed(_)
         ));
     }
+}
+
+#[test]
+fn non_gmail_move_with_gmail_shaped_ids_still_requires_moved_entity_effect() {
+    let (fixture, state_root, mut store) = pending_move_execution_store_for_connector("notion");
+    let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+    let source_path = Path::new("Team B/Roadmap.md");
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::write(
+        &cache_path,
+        render_canonical_markdown(&CanonicalDocument::new(
+            "loc:\n  id: gmail-draft:draft-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
+            markdown_body("Old body."),
+        )),
+    )
+    .expect("write colliding cache");
+    store
+        .delete_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("delete default moved entity");
+    store
+        .delete_virtual_mutation(&fixture.mount_id, "move:page-1")
+        .expect("delete default move");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("gmail-folder:outbox"),
+            EntityKind::Directory,
+            "outbox",
+            "Outbox",
+        ))
+        .expect("save colliding outbox parent");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("gmail-folder:sent"),
+            EntityKind::Directory,
+            "sent",
+            "Sent",
+        ))
+        .expect("save colliding sent parent");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                draft_remote_id.clone(),
+                EntityKind::Page,
+                "Roadmap",
+                source_path,
+            )
+            .with_hydration(HydrationState::Dirty)
+            .with_remote_edited_at("2026-06-10T00:00:00Z"),
+        )
+        .expect("save gmail-shaped entity");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            shadow(draft_remote_id.as_str(), "Old body."),
+        )
+        .expect("save gmail-shaped shadow");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:gmail-draft:draft-1".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(draft_remote_id.clone()),
+            parent_remote_id: Some(RemoteId::new("gmail-folder:outbox")),
+            original_path: Some(PathBuf::from("Team A/Roadmap.md")),
+            projected_path: source_path.to_path_buf(),
+            title: "Roadmap".to_string(),
+            content_path: None,
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save gmail-shaped move");
+    let source = FakePushSource::default()
+        .with_created_entity(
+            RemoteId::new("gmail-draft:draft-1"),
+            rendered_entity("gmail-draft:draft-1", "Old body."),
+        )
+        .with_created_entity(
+            RemoteId::new("gmail-message:sent-1"),
+            rendered_entity("gmail-message:sent-1", "Sent body."),
+        )
+        .with_apply_effects(vec![
+            JournalApplyEffect::ArchivedEntity {
+                operation_id: PushOperationId("op-move".to_string()),
+                operation_index: 0,
+                entity_id: draft_remote_id,
+            },
+            JournalApplyEffect::CreatedEntity {
+                operation_id: PushOperationId("op-move".to_string()),
+                operation_index: 0,
+                parent_id: RemoteId::new("gmail-folder:sent"),
+                entity_id: RemoteId::new("gmail-message:sent-1"),
+            },
+        ])
+        .with_changed_remote_ids(Vec::new());
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: true,
+            confirm_dangerous: true,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("execute non-gmail colliding move");
+
+    assert_eq!(report.action, PushJobAction::Failed);
+    let journal = store.list_journal().unwrap();
+    assert!(matches!(journal[0].status, JournalStatus::Failed(_)));
 }
 
 #[test]
@@ -4416,6 +5391,408 @@ fn rendered_gmail_entity(
         remote_edited_at: Some(remote_version),
         assets: Vec::new(),
     }
+}
+
+fn gmail_draft_store(
+    fixture: &PushFixture,
+    connector: &GmailConnector,
+    draft_remote_id: &RemoteId,
+    source_path: &Path,
+) -> InMemoryStateStore {
+    let mut store = InMemoryStateStore::new();
+    seed_gmail_draft_store(&mut store, fixture, connector, draft_remote_id, source_path);
+    store
+}
+
+fn seed_gmail_draft_store<S>(
+    store: &mut S,
+    fixture: &PushFixture,
+    connector: &GmailConnector,
+    draft_remote_id: &RemoteId,
+    source_path: &Path,
+) where
+    S: MountRepository + EntityRepository + ShadowRepository,
+{
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "gmail", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    for (remote_id, title, path) in [
+        ("gmail-folder:draft", "draft", "draft"),
+        ("gmail-folder:outbox", "outbox", "outbox"),
+        ("gmail-folder:sent", "sent", "sent"),
+    ] {
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new(remote_id),
+                EntityKind::Directory,
+                title,
+                path,
+            ))
+            .expect("save gmail folder");
+    }
+    let rendered = connector
+        .fetch_render(&locality_core::hydration::HydrationRequest::new(
+            fixture.mount_id.clone(),
+            draft_remote_id.clone(),
+            source_path.to_path_buf(),
+            HydrationState::Hydrated,
+            locality_core::hydration::HydrationReason::ExplicitPull,
+        ))
+        .expect("render remote draft");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                draft_remote_id.clone(),
+                EntityKind::Page,
+                "Remote Draft",
+                source_path,
+            )
+            .with_hydration(HydrationState::Dirty)
+            .with_remote_edited_at(
+                rendered
+                    .remote_edited_at
+                    .as_deref()
+                    .expect("draft remote version"),
+            ),
+        )
+        .expect("save draft entity");
+    store
+        .save_shadow(&fixture.mount_id, rendered.shadow)
+        .expect("save draft shadow");
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RecordingGmailCalls {
+    call_log: Vec<String>,
+    updated_drafts: Vec<(String, String)>,
+    sent_drafts: Vec<String>,
+}
+
+#[derive(Debug)]
+struct RecordingGmailApi {
+    state: Mutex<RecordingGmailState>,
+}
+
+#[derive(Debug)]
+struct RecordingGmailState {
+    calls: RecordingGmailCalls,
+    drafts: BTreeMap<String, GmailDraft>,
+    sent_messages: BTreeMap<String, GmailMessage>,
+    sent_fetch_failures: BTreeMap<String, usize>,
+}
+
+impl RecordingGmailApi {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RecordingGmailState {
+                calls: RecordingGmailCalls::default(),
+                drafts: BTreeMap::from([(
+                    "draft-1".to_string(),
+                    GmailDraft {
+                        id: "draft-1".to_string(),
+                        message: gmail_test_message(
+                            "draft-message-1",
+                            &["DRAFT"],
+                            "Remote Draft",
+                            "ann@example.com",
+                            "Remote body.\n",
+                            "1720900000000",
+                        ),
+                    },
+                )]),
+                sent_messages: BTreeMap::new(),
+                sent_fetch_failures: BTreeMap::new(),
+            }),
+        }
+    }
+
+    fn with_sent_fetch_failures(mut self, remote_id: &RemoteId, failures: usize) -> Self {
+        self.state
+            .get_mut()
+            .expect("gmail state")
+            .sent_fetch_failures
+            .insert(remote_id.as_str().to_string(), failures);
+        self
+    }
+
+    fn calls(&self) -> RecordingGmailCalls {
+        self.state.lock().expect("gmail state").calls.clone()
+    }
+}
+
+impl GmailApi for RecordingGmailApi {
+    fn list_messages(
+        &self,
+        _label_id: &str,
+        _max_results: u32,
+        _page_token: Option<&str>,
+        _query: Option<&str>,
+    ) -> LocalityResult<GmailMessageList> {
+        Ok(GmailMessageList::default())
+    }
+
+    fn list_threads(
+        &self,
+        _label_id: &str,
+        _max_results: u32,
+        _page_token: Option<&str>,
+        _query: Option<&str>,
+    ) -> LocalityResult<GmailThreadList> {
+        Ok(GmailThreadList::default())
+    }
+
+    fn get_message_metadata(&self, message_id: &str) -> LocalityResult<GmailMessage> {
+        self.get_message_full(message_id)
+    }
+
+    fn get_message_full(&self, message_id: &str) -> LocalityResult<GmailMessage> {
+        let mut state = self.state.lock().expect("gmail state");
+        if let Some(remaining) = state.sent_fetch_failures.get_mut(message_id)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Err(LocalityError::InvalidState(
+                "injected gmail sent readback failure".to_string(),
+            ));
+        }
+        state
+            .sent_messages
+            .get(message_id)
+            .cloned()
+            .ok_or_else(|| LocalityError::InvalidState(format!("missing message `{message_id}`")))
+    }
+
+    fn get_thread_metadata(&self, thread_id: &str) -> LocalityResult<GmailThread> {
+        Ok(GmailThread {
+            id: thread_id.to_string(),
+            history_id: Some("h1".to_string()),
+            messages: Vec::new(),
+        })
+    }
+
+    fn get_thread_full(&self, thread_id: &str) -> LocalityResult<GmailThread> {
+        self.get_thread_metadata(thread_id)
+    }
+
+    fn get_attachment(
+        &self,
+        _message_id: &str,
+        _attachment_id: &str,
+    ) -> LocalityResult<GmailMessagePartBody> {
+        Ok(GmailMessagePartBody::default())
+    }
+
+    fn list_drafts(
+        &self,
+        _max_results: u32,
+        _page_token: Option<&str>,
+        _query: Option<&str>,
+    ) -> LocalityResult<GmailDraftList> {
+        Ok(GmailDraftList::default())
+    }
+
+    fn get_draft_full(&self, draft_id: &str) -> LocalityResult<GmailDraft> {
+        self.state
+            .lock()
+            .expect("gmail state")
+            .drafts
+            .get(draft_id)
+            .cloned()
+            .ok_or_else(|| LocalityError::InvalidState(format!("missing draft `{draft_id}`")))
+    }
+
+    fn create_draft(&self, _request: GmailDraftCreateRequest) -> LocalityResult<GmailDraft> {
+        Err(LocalityError::InvalidState(
+            "unexpected draft create".to_string(),
+        ))
+    }
+
+    fn update_draft(
+        &self,
+        draft_id: &str,
+        request: GmailDraftUpdateRequest,
+    ) -> LocalityResult<GmailDraft> {
+        let mut state = self.state.lock().expect("gmail state");
+        state
+            .calls
+            .call_log
+            .push(format!("update_draft:{draft_id}"));
+        state
+            .calls
+            .updated_drafts
+            .push((draft_id.to_string(), request.message.raw.clone()));
+        let updated = GmailDraft {
+            id: draft_id.to_string(),
+            message: gmail_message_from_raw_mime(
+                &format!("updated-draft-message-{draft_id}"),
+                &["DRAFT"],
+                &request.message.raw,
+                "1720900000001",
+            ),
+        };
+        state.drafts.insert(draft_id.to_string(), updated.clone());
+        Ok(updated)
+    }
+
+    fn send_message(&self, _request: GmailMessageSendRequest) -> LocalityResult<GmailMessage> {
+        Err(LocalityError::InvalidState(
+            "unexpected message send".to_string(),
+        ))
+    }
+
+    fn send_draft(&self, request: GmailDraftSendRequest) -> LocalityResult<GmailMessage> {
+        let mut state = self.state.lock().expect("gmail state");
+        state
+            .calls
+            .call_log
+            .push(format!("send_draft:{}", request.id));
+        state.calls.sent_drafts.push(request.id.clone());
+        let draft = state.drafts.remove(&request.id).ok_or_else(|| {
+            LocalityError::InvalidState(format!("missing draft `{}`", request.id))
+        })?;
+        let subject = gmail_header(&draft.message, "subject").unwrap_or("Sent Draft");
+        let to = gmail_header(&draft.message, "to").unwrap_or("user@example.com");
+        let body = gmail_message_body(&draft.message);
+        let sent = gmail_test_message(
+            "gmail-message:sent-1",
+            &["SENT"],
+            subject,
+            to,
+            &body,
+            "1720900001000",
+        );
+        state
+            .sent_messages
+            .insert("gmail-message:sent-1".to_string(), sent.clone());
+        Ok(sent)
+    }
+}
+
+fn gmail_message_from_raw_mime(
+    id: &str,
+    labels: &[&str],
+    raw: &str,
+    internal_date: &str,
+) -> GmailMessage {
+    let mime = decode_raw_mime(raw);
+    let (headers, body) = split_raw_mime(&mime);
+    let subject = headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("subject"))
+        .map(|header| header.value.as_str())
+        .unwrap_or("(no subject)");
+    let to = headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("to"))
+        .map(|header| header.value.as_str())
+        .unwrap_or("");
+    gmail_test_message(id, labels, subject, to, &body, internal_date)
+}
+
+fn split_raw_mime(mime: &str) -> (Vec<GmailHeader>, String) {
+    let normalized = mime.replace("\r\n", "\n");
+    let (head, body) = normalized
+        .split_once("\n\n")
+        .unwrap_or((normalized.as_str(), ""));
+    let headers = head
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some(GmailHeader {
+                name: name.trim().to_string(),
+                value: value.trim().to_string(),
+            })
+        })
+        .collect();
+    (headers, body.to_string())
+}
+
+fn decode_raw_mime(raw: &str) -> String {
+    String::from_utf8(
+        URL_SAFE_NO_PAD
+            .decode(raw.as_bytes())
+            .or_else(|_| URL_SAFE.decode(raw.as_bytes()))
+            .expect("decode raw mime"),
+    )
+    .expect("raw mime utf8")
+}
+
+fn gmail_test_message(
+    id: &str,
+    labels: &[&str],
+    subject: &str,
+    to: &str,
+    body: &str,
+    internal_date: &str,
+) -> GmailMessage {
+    GmailMessage {
+        id: id.to_string(),
+        thread_id: Some(format!("{id}-thread")),
+        label_ids: labels.iter().map(|label| (*label).to_string()).collect(),
+        snippet: None,
+        internal_date: Some(internal_date.to_string()),
+        payload: Some(GmailMessagePart {
+            part_id: None,
+            mime_type: Some("text/plain".to_string()),
+            filename: None,
+            headers: vec![
+                GmailHeader {
+                    name: "From".to_string(),
+                    value: "Ann <ann@example.com>".to_string(),
+                },
+                GmailHeader {
+                    name: "To".to_string(),
+                    value: to.to_string(),
+                },
+                GmailHeader {
+                    name: "Subject".to_string(),
+                    value: subject.to_string(),
+                },
+                GmailHeader {
+                    name: "Date".to_string(),
+                    value: "Tue, 14 Jul 2026 09:30:00 +0000".to_string(),
+                },
+            ],
+            body: Some(GmailMessagePartBody {
+                size: Some(body.len() as u64),
+                data: Some(URL_SAFE_NO_PAD.encode(body.as_bytes())),
+                attachment_id: None,
+            }),
+            parts: Vec::new(),
+        }),
+        raw: None,
+    }
+}
+
+fn gmail_header<'a>(message: &'a GmailMessage, name: &str) -> Option<&'a str> {
+    message
+        .payload
+        .as_ref()?
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .map(|header| header.value.as_str())
+}
+
+fn gmail_message_body(message: &GmailMessage) -> String {
+    let data = message
+        .payload
+        .as_ref()
+        .and_then(|part| part.body.as_ref())
+        .and_then(|body| body.data.as_deref())
+        .unwrap_or("");
+    String::from_utf8(
+        URL_SAFE_NO_PAD
+            .decode(data.as_bytes())
+            .or_else(|_| URL_SAFE.decode(data.as_bytes()))
+            .expect("decode gmail body"),
+    )
+    .expect("gmail body utf8")
 }
 
 fn rendered_google_calendar_entity(
