@@ -2225,35 +2225,28 @@ fn prepare_gmail_draft_update_plans_properties_and_body_without_create() {
     assert_eq!(prepared.pipeline.guardrail, GuardrailDecision::Proceed);
     assert!(prepared.pipeline.validation.is_clean());
     let plan = prepared.pipeline.plan.expect("plan");
-    assert!(
-        !plan
-            .operations
-            .iter()
-            .any(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+    assert_eq!(
+        plan.operations,
+        vec![
+            PushOperation::UpdateProperties {
+                entity_id: RemoteId::new("gmail-draft:draft-1"),
+                properties: BTreeMap::from([
+                    (
+                        "subject".to_string(),
+                        PropertyValue::String("Edited subject".to_string()),
+                    ),
+                    (
+                        "to".to_string(),
+                        PropertyValue::List(vec!["beth@example.com".to_string()]),
+                    ),
+                ]),
+            },
+            PushOperation::UpdateEntityBody {
+                entity_id: RemoteId::new("gmail-draft:draft-1"),
+                body: "Edited body.\n".to_string(),
+            },
+        ]
     );
-    assert!(plan.operations.iter().any(|operation| matches!(
-        operation,
-        PushOperation::UpdateProperties {
-            entity_id,
-            properties,
-        } if entity_id == &RemoteId::new("gmail-draft:draft-1")
-            && properties == &BTreeMap::from([
-                (
-                    "subject".to_string(),
-                    PropertyValue::String("Edited subject".to_string()),
-                ),
-                (
-                    "to".to_string(),
-                    PropertyValue::List(vec!["beth@example.com".to_string()]),
-                ),
-            ])
-    )));
-    assert!(plan.operations.iter().any(|operation| matches!(
-        operation,
-        PushOperation::UpdateEntityBody { entity_id, body }
-            if entity_id == &RemoteId::new("gmail-draft:draft-1")
-                && body == "Edited body.\n"
-    )));
 }
 
 #[test]
