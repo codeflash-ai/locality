@@ -868,7 +868,10 @@ message_id="$(json_field "$push_report" "changed_remote_ids.0" 2>/dev/null || tr
 if [[ -z "$message_id" ]]; then
   live_fail "Gmail push report did not include changed_remote_ids.0"
 fi
-if [[ "$message_id" == gmail-message:* ]]; then
+if [[ "$message_id" == gmail-draft:* ]]; then
+  draft_id="${message_id#gmail-draft:}"
+  raw_message_id=""
+elif [[ "$message_id" == gmail-message:* ]]; then
   raw_message_id="${message_id#gmail-message:}"
 else
   raw_message_id="$message_id"
