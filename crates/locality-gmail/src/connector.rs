@@ -29,10 +29,11 @@ use crate::dto::{
 use crate::oauth::GMAIL_CONNECTOR_ID;
 use crate::render::{
     GmailDraftDocument, GmailNativeBundle, GmailThreadMessageNativeBundle, GmailThreadNativeBundle,
-    build_draft_mime_with_message_id, message_frontmatter, message_frontmatter_with_entity_id,
-    parse_thread_message_remote_id, parse_thread_remote_id, raw_message_base64url, remote_version,
-    render_gmail_message, render_gmail_thread, render_gmail_thread_message,
-    thread_message_remote_id, thread_remote_id, thread_remote_version,
+    build_draft_mime_with_message_id, draft_remote_id, message_frontmatter,
+    message_frontmatter_with_entity_id, parse_draft_remote_id, parse_thread_message_remote_id,
+    parse_thread_remote_id, raw_message_base64url, remote_version, render_gmail_message,
+    render_gmail_thread, render_gmail_thread_message, thread_message_remote_id, thread_remote_id,
+    thread_remote_version,
 };
 use crate::settings::{GmailMountSettings, GmailProjectionView};
 
@@ -41,15 +42,6 @@ const INBOX_FOLDER_ID: &str = "gmail-folder:inbox";
 const SENT_FOLDER_ID: &str = "gmail-folder:sent";
 const DRAFT_FOLDER_ID: &str = "gmail-folder:draft";
 const OUTBOX_FOLDER_ID: &str = "gmail-folder:outbox";
-const DRAFT_REMOTE_PREFIX: &str = "gmail-draft:";
-
-fn draft_remote_id(draft_id: &str) -> RemoteId {
-    RemoteId::new(format!("{DRAFT_REMOTE_PREFIX}{draft_id}"))
-}
-
-fn parse_draft_remote_id(remote_id: &RemoteId) -> Option<&str> {
-    remote_id.as_str().strip_prefix(DRAFT_REMOTE_PREFIX)
-}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct GmailConfig {
@@ -837,20 +829,41 @@ fn list_draft_entries(
     mount_id: &MountId,
     parent_path: &Path,
 ) -> LocalityResult<Vec<TreeEntry>> {
+    let Some(query) = gmail_recent_query(settings) else {
+        let list = api.list_drafts(GMAIL_PAGE_SIZE, None, None)?;
+        return draft_refs_to_entries(mount_id, parent_path, list.drafts);
+    };
+
     let mut entries = Vec::new();
     let mut page_token: Option<String> = None;
-    let query = gmail_recent_query(settings);
+    let mut seen_page_tokens = BTreeSet::new();
     loop {
-        let list = api.list_drafts(GMAIL_PAGE_SIZE, page_token.as_deref(), query.as_deref())?;
+        let list = api.list_drafts(GMAIL_PAGE_SIZE, page_token.as_deref(), Some(&query))?;
         for draft in list.drafts {
             entries.push(draft_entry(mount_id, parent_path, draft.id, draft.message)?);
         }
-        match list.next_page_token {
-            Some(next) => page_token = Some(next),
-            None => break,
+        let Some(next) = list.next_page_token else {
+            break;
+        };
+        if !seen_page_tokens.insert(next.clone()) {
+            return Err(LocalityError::InvalidState(format!(
+                "gmail pagination returned repeated page token `{next}` for drafts"
+            )));
         }
+        page_token = Some(next);
     }
     Ok(entries)
+}
+
+fn draft_refs_to_entries(
+    mount_id: &MountId,
+    parent_path: &Path,
+    drafts: Vec<crate::dto::GmailDraftRef>,
+) -> LocalityResult<Vec<TreeEntry>> {
+    drafts
+        .into_iter()
+        .map(|draft| draft_entry(mount_id, parent_path, draft.id, draft.message))
+        .collect()
 }
 
 fn list_thread_entries(
@@ -1538,6 +1551,58 @@ mod tests {
     }
 
     #[test]
+    fn enumerate_without_date_window_reads_only_first_draft_page() {
+        let api = Arc::new(FakeGmailApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.paged_drafts.insert(
+                None,
+                GmailDraftList {
+                    drafts: vec![GmailDraftRef {
+                        id: "draft-1".to_string(),
+                        message: message_fixture("draft-msg-1"),
+                    }],
+                    next_page_token: Some("next-draft".to_string()),
+                    result_size_estimate: Some(2),
+                },
+            );
+            calls.paged_drafts.insert(
+                Some("next-draft".to_string()),
+                GmailDraftList {
+                    drafts: vec![GmailDraftRef {
+                        id: "draft-2".to_string(),
+                        message: message_fixture("draft-msg-2"),
+                    }],
+                    next_page_token: None,
+                    result_size_estimate: Some(2),
+                },
+            );
+        }
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+
+        let entries = connector
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("gmail-main"),
+                cursor: None,
+            })
+            .expect("enumerate");
+
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.remote_id == RemoteId::new("gmail-draft:draft-1"))
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.remote_id == RemoteId::new("gmail-draft:draft-2"))
+        );
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.draft_list_page_tokens, vec![None]);
+        assert!(calls.draft_list_queries.is_empty());
+    }
+
+    #[test]
     fn enumerate_with_date_window_rejects_repeated_page_token() {
         let api = Arc::new(FakeGmailApi::default());
         {
@@ -1583,6 +1648,59 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("repeated page token"));
         assert!(message.contains("same-token"));
+    }
+
+    #[test]
+    fn enumerate_with_date_window_rejects_repeated_draft_page_token() {
+        let api = Arc::new(FakeGmailApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.panic_after_draft_list_calls = Some(2);
+            calls.paged_drafts.insert(
+                None,
+                GmailDraftList {
+                    drafts: vec![GmailDraftRef {
+                        id: "draft-1".to_string(),
+                        message: message_fixture("draft-msg-1"),
+                    }],
+                    next_page_token: Some("same-draft-token".to_string()),
+                    result_size_estimate: Some(2),
+                },
+            );
+            calls.paged_drafts.insert(
+                Some("same-draft-token".to_string()),
+                GmailDraftList {
+                    drafts: vec![GmailDraftRef {
+                        id: "draft-2".to_string(),
+                        message: message_fixture("draft-msg-2"),
+                    }],
+                    next_page_token: Some("same-draft-token".to_string()),
+                    result_size_estimate: Some(2),
+                },
+            );
+        }
+        let settings =
+            GmailMountSettings::with_date_window("2026-07-01", "2026-07-15").expect("settings");
+        let connector = GmailConnector::with_api(
+            GmailConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+
+        let error = connector
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("gmail-main"),
+                cursor: None,
+            })
+            .expect_err("repeated draft page token should fail");
+
+        let message = error.to_string();
+        assert!(message.contains("repeated page token"));
+        assert!(message.contains("same-draft-token"));
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(
+            calls.draft_list_page_tokens,
+            vec![None, Some("same-draft-token".to_string())]
+        );
     }
 
     #[test]
@@ -1891,6 +2009,33 @@ mod tests {
         let calls = api.calls.lock().expect("calls");
         assert_eq!(calls.draft_full_ids, vec!["draft-1".to_string()]);
         assert!(calls.message_metadata_ids.is_empty());
+    }
+
+    #[test]
+    fn observe_legacy_draft_message_remote_id_still_works() {
+        let api = Arc::new(FakeGmailApi::default());
+        api.calls
+            .lock()
+            .expect("calls")
+            .message_labels
+            .insert("draft-msg-1".to_string(), vec!["DRAFT".to_string()]);
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+
+        let observation = connector
+            .observe(ObserveRequest {
+                mount_id: MountId::new("gmail-main"),
+                remote_id: RemoteId::new("draft-msg-1"),
+            })
+            .expect("observe legacy draft");
+
+        assert_eq!(
+            observation.parent_remote_id,
+            Some(RemoteId::new("gmail-folder:draft"))
+        );
+        assert_eq!(observation.remote_id, RemoteId::new("draft-msg-1"));
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.message_metadata_ids, vec!["draft-msg-1".to_string()]);
+        assert!(calls.draft_full_ids.is_empty());
     }
 
     #[test]
@@ -2712,6 +2857,8 @@ mod tests {
         draft_list_max_results: Vec<u32>,
         draft_list_page_tokens: Vec<Option<String>>,
         draft_list_queries: Vec<String>,
+        paged_drafts: std::collections::BTreeMap<Option<String>, GmailDraftList>,
+        panic_after_draft_list_calls: Option<usize>,
         panic_after_list_calls: Option<usize>,
         sent_search_results: std::collections::BTreeMap<String, String>,
         sent_search_results_after_send: std::collections::BTreeMap<String, String>,
@@ -2913,8 +3060,21 @@ mod tests {
             calls
                 .draft_list_page_tokens
                 .push(page_token.map(str::to_string));
+            if let Some(limit) = calls.panic_after_draft_list_calls {
+                assert!(
+                    calls.draft_list_max_results.len() <= limit,
+                    "list_drafts exceeded call limit {limit}"
+                );
+            }
             if let Some(query) = query {
                 calls.draft_list_queries.push(query.to_string());
+            }
+            if let Some(page) = calls
+                .paged_drafts
+                .get(&page_token.map(str::to_string))
+                .cloned()
+            {
+                return Ok(page);
             }
             Ok(GmailDraftList {
                 drafts: vec![GmailDraftRef {

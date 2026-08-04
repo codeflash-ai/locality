@@ -89,6 +89,16 @@ pub fn parse_thread_remote_id(remote_id: &RemoteId) -> Option<(&str, &str)> {
     rest.split_once(':')
 }
 
+const DRAFT_REMOTE_PREFIX: &str = "gmail-draft:";
+
+pub(crate) fn draft_remote_id(draft_id: &str) -> RemoteId {
+    RemoteId::new(format!("{DRAFT_REMOTE_PREFIX}{draft_id}"))
+}
+
+pub(crate) fn parse_draft_remote_id(remote_id: &RemoteId) -> Option<&str> {
+    remote_id.as_str().strip_prefix(DRAFT_REMOTE_PREFIX)
+}
+
 pub fn thread_message_remote_id(mailbox: &str, thread_id: &str, message_id: &str) -> RemoteId {
     RemoteId::new(format!(
         "gmail-thread-message:{mailbox}:{thread_id}:{message_id}"
@@ -198,7 +208,7 @@ pub(crate) fn message_frontmatter_with_entity_id(
 
 fn gmail_bundle_entity_id(bundle: &GmailNativeBundle) -> RemoteId {
     match &bundle.draft_id {
-        Some(draft_id) => RemoteId::new(format!("gmail-draft:{draft_id}")),
+        Some(draft_id) => draft_remote_id(draft_id),
         None => RemoteId::new(bundle.message.id.clone()),
     }
 }
