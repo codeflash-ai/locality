@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "${LOCALITY_LIVE_GMAIL_VFS:-}" != "1" ]]; then
-  echo "skip: set LOCALITY_LIVE_GMAIL_VFS=1 to run the live Gmail VFS test"
-  exit 0
-fi
-
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck source=tests/live_connector_common.sh
 source "$script_dir/live_connector_common.sh"
 
-require_linux_fuse
-require_live_env \
-  LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON \
-  LOCALITY_GMAIL_LIVE_TO_EMAIL
+if [[ "${LOCALITY_LIVE_GMAIL_SELFTEST:-}" != "1" ]]; then
+  if [[ "${LOCALITY_LIVE_GMAIL_VFS:-}" != "1" ]]; then
+    echo "skip: set LOCALITY_LIVE_GMAIL_VFS=1 to run the live Gmail VFS test"
+    exit 0
+  fi
 
-if ! command -v curl >/dev/null 2>&1; then
-  live_fail "curl is not installed"
+  require_linux_fuse
+  require_live_env \
+    LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON \
+    LOCALITY_GMAIL_LIVE_TO_EMAIL
+
+  if ! command -v curl >/dev/null 2>&1; then
+    live_fail "curl is not installed"
+  fi
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  live_fail "python3 is not installed"
 fi
 
 loc_bin="${LOCALITY_BIN:-./target/debug/loc}"
@@ -303,36 +309,6 @@ if token:
 PY
 }
 
-gmail_draft_subject_matches() {
-  local draft_json_path="$1"
-  local expected_subject="$2"
-
-  python3 - "$draft_json_path" "$expected_subject" <<'PY'
-import json
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-expected_subject = sys.argv[2]
-try:
-    data = json.loads(path.read_text(encoding="utf-8"))
-except Exception:
-    raise SystemExit(1)
-message = data.get("message")
-if not isinstance(message, dict):
-    raise SystemExit(1)
-payload = message.get("payload")
-if not isinstance(payload, dict):
-    raise SystemExit(1)
-for header in payload.get("headers") or []:
-    if not isinstance(header, dict):
-        continue
-    if header.get("name", "").lower() == "subject" and header.get("value") == expected_subject:
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
-}
-
 gmail_message_subject_body_matches() {
   local message_json_path="$1"
   local expected_subject="$2"
@@ -396,6 +372,14 @@ if expected_body_marker in body_text:
     raise SystemExit(0)
 raise SystemExit(1)
 PY
+}
+
+gmail_draft_subject_body_matches() {
+  local draft_json_path="$1"
+  local expected_subject="$2"
+  local expected_body_marker="$3"
+
+  gmail_message_subject_body_matches "$draft_json_path" "$expected_subject" "$expected_body_marker" draft
 }
 
 rewrite_gmail_markdown_subject_body() {
@@ -611,15 +595,14 @@ resolve_created_gmail_draft_id() {
     if [[ -n "$raw_message_id" ]]; then
       draft_id="$(find_gmail_draft_id "$drafts_list_report" "$raw_message_id" 2>/dev/null || true)"
     fi
-    if [[ -z "$draft_id" && -n "${subject:-}" ]]; then
+    if [[ -z "$draft_id" && -n "${subject:-}" && -n "${marker:-}" ]]; then
       while IFS= read -r candidate_draft_id; do
         [[ -z "$candidate_draft_id" ]] && continue
         if curl -fsS --get "https://gmail.googleapis.com/gmail/v1/users/me/drafts/$candidate_draft_id" \
           -H "Authorization: Bearer $access_token" \
-          --data-urlencode "format=metadata" \
-          --data-urlencode "metadataHeaders=Subject" \
+          --data-urlencode "format=full" \
           >"$draft_get_report" 2>>"$command_log" \
-          && gmail_draft_subject_matches "$draft_get_report" "$subject"; then
+          && gmail_draft_subject_body_matches "$draft_get_report" "$subject" "$marker"; then
           draft_id="$candidate_draft_id"
           break
         fi
@@ -730,6 +713,68 @@ cleanup() {
     rm -rf "$tmp_root"
   fi
 }
+
+run_gmail_helper_selftest() {
+  local selftest_subject="Locality Gmail helper self-test subject"
+  local selftest_marker="Locality Gmail helper self-test body marker"
+  local encoded_marker
+  local draft_json="$tmp_root/selftest-draft.json"
+  local message_json="$tmp_root/selftest-message.json"
+
+  encoded_marker="$(python3 - "$selftest_marker" <<'PY'
+import base64
+import sys
+
+print(base64.urlsafe_b64encode(sys.argv[1].encode("utf-8")).decode("ascii").rstrip("="))
+PY
+)"
+
+  cat >"$draft_json" <<JSON
+{
+  "message": {
+    "payload": {
+      "mimeType": "text/plain",
+      "headers": [
+        {"name": "Subject", "value": "$selftest_subject"}
+      ],
+      "body": {"data": "$encoded_marker"}
+    }
+  }
+}
+JSON
+
+  cat >"$message_json" <<JSON
+{
+  "payload": {
+    "mimeType": "text/plain",
+    "headers": [
+      {"name": "Subject", "value": "$selftest_subject"}
+    ],
+    "body": {"data": "$encoded_marker"}
+  }
+}
+JSON
+
+  if ! gmail_draft_subject_body_matches "$draft_json" "$selftest_subject" "$selftest_marker"; then
+    live_fail "Gmail helper self-test rejected a matching draft subject/body marker"
+  fi
+  if gmail_draft_subject_body_matches "$draft_json" "$selftest_subject" "wrong body marker"; then
+    live_fail "Gmail helper self-test accepted a draft with the wrong body marker"
+  fi
+  if gmail_draft_subject_body_matches "$draft_json" "wrong subject" "$selftest_marker"; then
+    live_fail "Gmail helper self-test accepted a draft with the wrong subject"
+  fi
+  if ! gmail_message_subject_body_matches "$message_json" "$selftest_subject" "$selftest_marker" message; then
+    live_fail "Gmail helper self-test rejected a matching message subject/body marker"
+  fi
+}
+
+if [[ "${LOCALITY_LIVE_GMAIL_SELFTEST:-}" == "1" ]]; then
+  trap 'rm -rf "$tmp_root"' EXIT
+  run_gmail_helper_selftest
+  echo "live Gmail helper self-test passed"
+  exit 0
+fi
 
 trap on_error ERR
 trap cleanup EXIT
@@ -889,6 +934,7 @@ if [[ "${LOCALITY_LIVE_GMAIL_SEND:-0}" == "1" ]]; then
   draft_deleted=0
   draft_cleanup_needed=1
   subject="$remote_subject"
+  marker="$remote_marker"
   printf -- '---\nto:\n  - "%s"\nsubject: "%s"\n---\n%s\n' \
     "$LOCALITY_GMAIL_LIVE_TO_EMAIL" \
     "$remote_subject" \
@@ -958,10 +1004,6 @@ if [[ "${LOCALITY_LIVE_GMAIL_SEND:-0}" == "1" ]]; then
   LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$remote_outbox_path" \
     >"$remote_draft_send_push_report" 2>>"$command_log"
   assert_json_ok "$remote_draft_send_push_report" "Gmail remote draft send push report"
-  remote_sent_message_id="$(json_field "$remote_draft_send_push_report" "changed_remote_ids.0" 2>/dev/null || true)"
-  if [[ "$remote_sent_message_id" == gmail-message:* ]]; then
-    remote_sent_message_id="${remote_sent_message_id#gmail-message:}"
-  fi
   draft_deleted=1
   draft_cleanup_needed=0
   draft_id=""
@@ -972,9 +1014,7 @@ if [[ "${LOCALITY_LIVE_GMAIL_SEND:-0}" == "1" ]]; then
   if [[ -z "$verified_remote_sent_id" ]]; then
     live_fail "sent Gmail remote draft message with updated content was not visible through Gmail API"
   fi
-  if [[ -z "$remote_sent_message_id" ]]; then
-    remote_sent_message_id="$verified_remote_sent_id"
-  fi
+  remote_sent_message_id="$verified_remote_sent_id"
 
   step="trashing sent Gmail remote draft scratch message"
   trash_gmail_message "$remote_sent_message_id" required
