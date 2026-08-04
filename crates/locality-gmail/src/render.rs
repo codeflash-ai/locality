@@ -235,7 +235,7 @@ fn message_frontmatter_with_attachment_state(
         .unwrap_or_default();
 
     format!(
-        "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\ngmail:\n  mailbox: {}\n{}  message_id: {}\n  thread_id: {}\n  labels: [{}]\n{}from: {}\nto: [{}]\ncc: [{}]\nbcc: []\nsubject: {}\ndate: {}\n",
+        "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\ngmail:\n  mailbox: {}\n{}  message_id: {}\n  thread_id: {}\n  labels: [{}]\n{}from: {}\nto: [{}]\ncc: [{}]\nbcc: [{}]\nsubject: {}\ndate: {}\n",
         yaml_scalar(entity_id.as_str()),
         GMAIL_CONNECTOR_ID,
         yaml_scalar(&version),
@@ -255,6 +255,7 @@ fn message_frontmatter_with_attachment_state(
         yaml_scalar(headers.get("from").map(String::as_str).unwrap_or("")),
         yaml_list_items(headers.get("to").map(String::as_str).unwrap_or("")),
         yaml_list_items(headers.get("cc").map(String::as_str).unwrap_or("")),
+        yaml_list_items(headers.get("bcc").map(String::as_str).unwrap_or("")),
         yaml_scalar(&subject),
         yaml_scalar(headers.get("date").map(String::as_str).unwrap_or("")),
     )
@@ -666,6 +667,7 @@ mod tests {
         assert!(rendered.document.frontmatter.contains("connector: gmail"));
         assert!(rendered.document.frontmatter.contains("mailbox: \"inbox\""));
         assert!(rendered.document.frontmatter.contains("attachments: []"));
+        assert!(rendered.document.frontmatter.contains("bcc: []"));
         assert!(rendered.document.frontmatter.contains("subject: \"Hello\""));
         assert_eq!(rendered.document.body, "Hello from Gmail.\n");
         assert_eq!(rendered.shadow.entity_id.as_str(), "msg-1");

@@ -546,7 +546,7 @@ fn gmail_send_replay_plan_can_be_ambiguous(plan: &PushPlan) -> bool {
             .operations
             .iter()
             .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
-            || !gmail_draft_send_moves(plan).is_empty())
+            || !gmail_draft_send_move_entity_ids(plan).is_empty())
 }
 
 fn ambiguous_gmail_send_plans_match(left: &PushPlan, right: &PushPlan) -> bool {
@@ -555,29 +555,28 @@ fn ambiguous_gmail_send_plans_match(left: &PushPlan, right: &PushPlan) -> bool {
         return true;
     }
 
-    let mut left_moves = gmail_draft_send_moves(left);
-    let mut right_moves = gmail_draft_send_moves(right);
-    if right_moves.is_empty() {
+    let left_ids = gmail_draft_send_move_entity_ids(left);
+    let right_ids = gmail_draft_send_move_entity_ids(right);
+    if left_ids.is_empty() || right_ids.is_empty() {
         return false;
     }
-    left_moves.sort();
-    right_moves.sort();
-    left_moves == right_moves
+    right_ids
+        .into_iter()
+        .any(|right_id| left_ids.contains(&right_id))
 }
 
-fn gmail_draft_send_moves(plan: &PushPlan) -> Vec<(&RemoteId, &RemoteId, &PathBuf)> {
+fn gmail_draft_send_move_entity_ids(plan: &PushPlan) -> BTreeSet<&RemoteId> {
     plan.operations
         .iter()
         .filter_map(|operation| match operation {
             PushOperation::MoveEntity {
                 entity_id,
                 new_parent_id,
-                projected_path,
                 ..
             } if entity_id.0.starts_with("gmail-draft:")
                 && new_parent_id.0 == "gmail-folder:outbox" =>
             {
-                Some((entity_id, new_parent_id, projected_path))
+                Some(entity_id)
             }
             _ => None,
         })
