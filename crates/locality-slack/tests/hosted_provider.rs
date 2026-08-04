@@ -12,12 +12,14 @@ use locality_slack::portable::hosted::{
     HostedSlackDrivePendingReasonV1, HostedSlackHistoryPageV1, HostedSlackInstallationBinding,
     HostedSlackObservedChannelAuthorityV1, HostedSlackObservedInstallationIdentity,
     HostedSlackPollCheckpointV1, HostedSlackPollError, HostedSlackPollKindV1,
-    HostedSlackPollPhaseV1, HostedSlackProviderError, HostedSlackProviderFuture,
-    HostedSlackProviderMessagePageV1, HostedSlackProviderMessageV1, HostedSlackProviderPort,
-    HostedSlackProviderRequestV1, HostedSlackRepliesPageV1, RawHostedSlackFileMetadata,
-    RawHostedSlackMessage, RawHostedSlackNativeSnapshot, RawHostedSlackUser,
-    decode_hosted_slack_history_page_v1, decode_hosted_slack_poll_checkpoint_v1,
-    decode_hosted_slack_replies_page_v1, drive_hosted_slack_poll_v1,
+    HostedSlackPollPhaseV1, HostedSlackProviderCoordinationScopeV1,
+    HostedSlackProviderCoordinationScopeV2, HostedSlackProviderError, HostedSlackProviderFuture,
+    HostedSlackProviderMessagePageV1, HostedSlackProviderMessageV1, HostedSlackProviderOperationV1,
+    HostedSlackProviderPort, HostedSlackProviderRequestV1, HostedSlackRepliesPageV1,
+    HttpHostedSlackProvider, RawHostedSlackFileMetadata, RawHostedSlackMessage,
+    RawHostedSlackNativeSnapshot, RawHostedSlackUser, decode_hosted_slack_history_page_v1,
+    decode_hosted_slack_poll_checkpoint_v1, decode_hosted_slack_replies_page_v1,
+    drive_hosted_slack_poll_v1,
 };
 
 const SELECTOR: &[u8] =
@@ -44,6 +46,10 @@ const CURSOR_CONFLICT_TRANSCRIPT: &[u8] =
     include_bytes!("../fixtures/hosted-v1/provider-v1/cursor-conflict-transcript-v1.json");
 const RESUMED_HISTORY_TRANSCRIPT: &[u8] =
     include_bytes!("../fixtures/hosted-v1/provider-v1/resumed-history-transcript-v1.json");
+const COORDINATION_SCOPE_V1: &[u8] =
+    include_bytes!("../fixtures/hosted-v1/provider-v1/coordination-scope-v1.json");
+const COORDINATION_SCOPE_V2: &[u8] =
+    include_bytes!("../fixtures/hosted-v1/provider-v1/coordination-scope-v2.json");
 
 #[derive(Debug)]
 struct FakeProvider {
@@ -219,6 +225,101 @@ fn observed() -> HostedSlackObservedInstallationIdentity {
         enterprise_install: binding.enterprise_install,
         bot_user_id: binding.bot_user_id,
         oauth_subject_id: binding.oauth_subject_id,
+    }
+}
+
+#[test]
+fn coordination_scope_fixtures_preserve_v1_and_add_exact_v2() {
+    let provider = HttpHostedSlackProvider::with_base_url(
+        "xoxb-coordination-fixture",
+        observed(),
+        "https://scope.invalid",
+    )
+    .unwrap();
+    let operation = HostedSlackProviderOperationV1::ConversationsHistory;
+
+    let legacy: HostedSlackProviderCoordinationScopeV1 =
+        serde_json::from_slice(COORDINATION_SCOPE_V1).unwrap();
+    assert_eq!(
+        legacy,
+        HostedSlackProviderCoordinationScopeV1 {
+            team_id: "T08LOCALITY1".to_string(),
+            operation,
+        }
+    );
+    assert_eq!(legacy, provider.coordination_scope(operation));
+    assert_eq!(
+        serde_json::to_string(&legacy).unwrap(),
+        std::str::from_utf8(COORDINATION_SCOPE_V1)
+            .unwrap()
+            .trim_end()
+    );
+
+    let exact = provider.coordination_scope_v2(operation);
+    assert_eq!(
+        serde_json::to_string(&exact).unwrap(),
+        std::str::from_utf8(COORDINATION_SCOPE_V2)
+            .unwrap()
+            .trim_end()
+    );
+    assert_eq!(
+        serde_json::from_slice::<HostedSlackProviderCoordinationScopeV2>(COORDINATION_SCOPE_V2)
+            .unwrap(),
+        exact
+    );
+}
+
+#[test]
+fn every_provider_operation_maps_legacy_encoding_and_exact_request_endpoint() {
+    let cases = [
+        (
+            HostedSlackProviderOperationV1::VerifyInstallation,
+            "verify_installation",
+            "auth.test",
+        ),
+        (
+            HostedSlackProviderOperationV1::ConversationsList,
+            "conversations_list",
+            "conversations.list",
+        ),
+        (
+            HostedSlackProviderOperationV1::ConversationsInfo,
+            "conversations_info",
+            "conversations.info",
+        ),
+        (
+            HostedSlackProviderOperationV1::ConversationsHistory,
+            "conversations_history",
+            "conversations.history",
+        ),
+        (
+            HostedSlackProviderOperationV1::ConversationsReplies,
+            "conversations_replies",
+            "conversations.replies",
+        ),
+        (
+            HostedSlackProviderOperationV1::UsersInfo,
+            "users_info",
+            "users.info",
+        ),
+        (
+            HostedSlackProviderOperationV1::FilesInfo,
+            "files_info",
+            "files.info",
+        ),
+    ];
+
+    for (operation, legacy_encoding, exact_endpoint) in cases {
+        assert_eq!(
+            serde_json::to_string(&operation).unwrap(),
+            format!(r#""{legacy_encoding}""#)
+        );
+        let method = operation.api_method();
+        assert_eq!(method.as_str(), exact_endpoint);
+        assert_eq!(
+            serde_json::to_string(&method).unwrap(),
+            format!(r#""{exact_endpoint}""#)
+        );
     }
 }
 

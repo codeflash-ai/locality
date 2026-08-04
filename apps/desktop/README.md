@@ -100,4 +100,31 @@ Notion mount creation and multi-file push orchestration, are tracked in
 The Hosted settings panel is an explicitly manual generation-2 materializer
 preview. It accepts an API origin, absolute destination, and Workspace Profile
 key for one invocation; it is not canonical Desktop source/mount integration
-and does not persist hosted credentials.
+and does not persist hosted credentials. The destination remains the exact
+whole-root ephemeral publication requested by the user. Before invoking the
+materializer, Desktop uses the shared host-binding resolver and rejects any
+destination that overlaps a configured persistent mount root. The inspection
+runs off the async UI thread, opens existing mount state read-only without
+schema migration, and is repeated at the materializer's prepublication
+boundary. It recognizes locally resolvable filesystem aliases, but does not
+provide a global lock against a mount created after the final inspection.
+
+Desktop-created virtual mounts persist a stable workspace identity, trusted
+workspace root, projection/domain identity, and layout sequence through the
+shared CLI coordinator. Creation reporting and Desktop path matching use the
+same binding resolver as CLI. Missing and released v1 bindings still resolve
+through exact `MountConfig.root`. Existing-source account or source changes from
+either surface enter the shared quiesced remount coordinator, which persists a
+daemon fence, drains supervision, commits source-state cleanup, and restores
+supervision before clearing the fence. Its version-3 recovery journal records
+the exact recovery ID, original and staged paths, and filesystem identities, so
+either Desktop startup or a later CLI invocation can reconcile the same crash.
+The CLI and Desktop share an OS-level exclusive recovery lock; owner/generation
+metadata is checked before fence deletion. Desktop also revalidates exact
+identity and emptiness after each staging rename, preserving a raced
+replacement in quarantine and failing closed.
+CLI remounts fail closed while dirty/conflicted entities or pending virtual
+creates/renames exist, retain an equivalent existing host-root spelling, and
+reject virtual-to-plain conversion until an explicit projection migration owns
+the layout-1 binding transition. Target rename/removal and root-relocation
+lifecycle remain future coordinator work.

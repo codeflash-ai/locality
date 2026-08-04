@@ -423,9 +423,12 @@ This removes the need for scattered `cfg(target_os)` logic in command parsing.
 ### Portable Workspace Binding
 
 The durable mount ID remains the source and File Provider identity. Physical
-placement is separate metadata: each mount has a versioned `workspace_binding`
-containing the portable workspace-layout version and one validated mount target.
-The binding never stores an absolute host path as identity.
+placement is separate metadata: each layout-1 mount binding contains a stable
+host-local `WorkspaceId`, the portable workspace-layout version, and one
+validated mount target. A separate `WorkspaceHostBinding` stores that
+workspace's trusted absolute root, stable projection/domain identity, and
+monotonic layout sequence. The absolute root is local placement, never portable
+identity or backend authority.
 
 Desktop, CLI, and daemon paths resolve as:
 
@@ -437,9 +440,127 @@ The host workspace root may therefore be the macOS File Provider URL on one
 machine and `~/Locality` for CLI or Linux FUSE on another without changing the
 mount ID, mount target, logical paths, pending journals, or synced shadows.
 Legacy mount rows are upgraded in place by deriving a portable target from the
-old mount-root basename. Unicode-equivalent target collisions receive stable
-suffixes in mount-ID order; the legacy absolute root remains readable during
-the compatibility window.
+old mount-root basename only when the owning coordinator supplies one trusted
+workspace root and the old root is its direct child. The basename must already
+be a valid `MountTarget` and must be unique by the portable collision key.
+Invalid roots, roots under an ambiguous parent, and every member of a collision
+remain layout 0. Migration never sanitizes, suffixes, reparents, renames, or
+moves a legacy root.
+
+`WorkspaceHostBindingResolver` is the shared coordinator contract. Its exact
+entry points are:
+
+```rust
+let resolver = WorkspaceHostBindingResolver::new(platform);
+let plan = resolver.plan_workspace_migration(host_binding, &mounts)?;
+let root = resolver.resolve_ephemeral_publication_root(&requested_root, &active_mounts)?;
+```
+
+Here `mounts` and `active_mounts` are `&[LegacyWorkspaceMount]`. Desktop or
+another persistent owner may persist only `plan.layout1_bindings()` and must
+continue resolving every `plan.layout0_mounts()` entry through the exact legacy
+`MountConfig.root`. The ephemeral method returns the exact requested whole root
+and never appends a mount target. Its platform-neutral form rejects equal,
+ancestor, and descendant overlap under macOS, Linux, or Windows lexical
+semantics. On the running host, the publication guard additionally resolves
+existing filesystem aliases: Unix symlinks plus device/inode anchors, and
+Windows canonical junction/reparse paths plus volume and 128-bit file
+identities. Case folding detects portable target collisions but never by itself
+proves two host paths equivalent; persisted spelling is retained only after
+canonical or native identity proof, including on case-sensitive APFS and for
+Windows Unicode names.
+
+SQLite schema v27 cannot prove that any prerelease binding came from a persisted
+trusted workspace root and coordinator-owned atomic migration. It therefore
+deletes every prerelease binding row and leaves all upgraded mounts in layout 0.
+It does not change `mounts.root` or filesystem content. A mount without a
+binding is valid layout 0 state, not corrupt or rebuildable metadata.
+`save_mount` never promotes a new mount from a coincidental common parent;
+layout 1 begins only when an owning coordinator supplies its trusted workspace
+root, accepts the resolver plan, and explicitly persists the binding.
+
+Workspace-binding component v4 remains within schema v27. It adds the separate
+host-binding and remount-recovery tables and preserves released
+component-v2/v3 and v1 mount-binding rows. Those legacy rows continue to resolve
+through the exact `MountConfig.root`. New virtual mounts atomically commit the
+host record and accepted mount binding; the commit requires the derived root to
+equal the preserved mount root, freezes workspace/root/projection identity, and
+advances the layout sequence for each new mount. CLI and Desktop then use the
+same repository resolver: layout-1 rows derive `<trusted root>/<target>`, while
+missing and v1 rows retain the legacy root.
+
+CLI and Desktop account/source remounts also use one quiesced lifecycle
+coordinator. It durably fences daemon startup before supervision is suspended,
+drains the active daemon, runs the surface's atomic projection/source cleanup,
+reconciles cleanup recovery, restores supervision, and only then removes the
+fence and restarts the daemon. A drain or restore failure therefore cannot
+briefly expose a cleared fence while supervision is still disabled.
+The fence is paired with one shared OS-level exclusive coordinator lock. CLI
+and Desktop retain that lock across active remounts and complete recovery
+passes; each new fence carries an owner and random generation, and removal
+rechecks the exact bytes under the lock. A competing process therefore cannot
+recover through an active remount or delete a successor's fence generation.
+
+Both surfaces use the same version-3 append-only recovery records. Each marker
+is named by its exact recovery ID and binds every staging directory and moved
+path to its filesystem identity. Prepared outcomes restore the exact old cache;
+committed outcomes collect it. Startup never searches by a name prefix or
+recursively removes an unrecorded directory, and an identity mismatch remains
+fenced for review. Both JSONL readers ignore one unterminated final append,
+including valid JSON, because the newline is the commit boundary. The CLI may
+discard an outcome-less empty or torn first record because no staging action
+was authorized; malformed newline-terminated or interior records fail closed.
+On Windows, recursive cleanup compares the journal identity with the retained
+no-delete-sharing root handle before traversing it. Restart
+reconciliation restores daemon-manager supervision before durably removing the
+startup fence, so a failed restore continues to block daemon startup. CLI
+source changes additionally fail closed on dirty or
+conflicted entities and pending virtual creates or renames. A virtual-to-plain
+change is rejected until a dedicated migration can atomically retire its
+layout-1 binding.
+
+Desktop staging also verifies the renamed object's exact identity and required
+emptiness after the no-replace rename. A source replacement or newly non-empty
+directory at that boundary is left in the recorded staging quarantine and the
+remount fails closed; it is never treated as the object authorized for cleanup.
+Prepared rollback applies the same rule in reverse: it verifies the restored
+identity after the no-replace rename, and returns a raced replacement or symlink
+to the recorded staging quarantine instead of leaving it at the user-visible
+path.
+
+Virtual-move cleanup is an artifact-state teardown. The source quarantine,
+source identity anchor, destination identity anchor, and destination binding
+are each removed idempotently, with destination identity/content revalidation
+when an earlier boundary already completed. The primary cleanup intent is the
+last durable record deleted, so every crash boundary retains enough state for a
+retry and never authorizes deletion of a replacement source or destination.
+If a crash lands after the source anchor and cleanup intent are durable but
+before `begin_virtual_move`, replay abandons that intent only when the mutation
+and every publication artifact are absent and the exact source identity is
+still in place. It then prepares the move again; any ambiguity remains
+fail-closed recovery state.
+
+On Unix, identity-bound deletion first performs a no-replace rename into a
+random mode-0700 sibling quarantine with a durable device/inode manifest. Its
+name and manifest also bind the trusted root's device/inode, so concurrent
+roots sharing a parent cannot collect or block one another. Only that private,
+descriptor-held namespace is recursively collected. A bounded startup scan
+completes quarantines left between rename and unlink; malformed, replaced, or
+excessive entries fail closed instead of accumulating unchecked sensitive
+payloads.
+
+Sandbox overlap inspection opens the mount database read-only and supports old
+`mounts(mount_id, root)` schemas without initializing, migrating, or repairing
+state. CLI and Desktop inspect once before network work and again after staging,
+immediately before the publication primitive. The second generation-2 check is
+inside the destination publication lock; generation-1 checks run immediately
+before the descriptor-relative/no-replace rename. Both generations reopen the
+visible parent path and compare its filesystem identity with the retained
+publication-parent descriptor at the commit boundary, so retargeting an
+ancestor symlink or reparse path after overlap inspection fails closed. There is not yet one lock
+shared by mount creation and sandbox publication, so a mount committed after
+the final read remains a narrow race; callers must still allocate dedicated
+sandbox roots rather than relying on this guard as global coordination.
 
 Changing a host workspace root is not a metadata-store operation. The store can
 only reject unsafe requests when it sees dirty/conflicted entities, unsettled
@@ -452,6 +573,12 @@ metadata layer never silently updates `mounts.root`.
 Persisted binding targets are likewise immutable through the metadata API.
 Exact saves are idempotent, while changing a target is reserved for a future
 coordinator-owned compare-and-swap workflow that can prove the move completed.
+
+Desktop mount creation and path matching now route accepted virtual mounts
+through the shared binding resolver. Existing layout-0 and v1 mounts continue
+on their exact legacy roots. Full target rename/removal, workspace relocation,
+change-anchor replay, and projection lifecycle reconciliation remain future
+owning-coordinator work; this increment does not move files or reset domains.
 
 ## Desktop Packaging
 

@@ -1,4 +1,7 @@
 /target/
+/experiment/launch-readiness-*/
+/experiment/codex-locality-comparison/
+/experiment/claude-locality-comparison/
 node_modules/
 dist/
 /.loc/

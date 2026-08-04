@@ -9,6 +9,7 @@ pub mod compatibility;
 pub mod credentials;
 pub mod discovery;
 pub mod error;
+pub mod generation_delivery;
 pub mod live_mode;
 pub mod memory;
 pub mod records;
@@ -31,6 +32,15 @@ pub use discovery::{
     PreparedDiscoveryTransaction, TransactionalDiscoveryCommit, discovery_auto_save_candidate,
 };
 pub use error::{StoreError, StoreResult};
+pub use generation_delivery::{
+    GenerationApplyJournalRecord, GenerationApplyOutcome, GenerationApplyStatus,
+    GenerationBaselineSeedRecord, GenerationBaselineSeedRecordV2, GenerationDeliveryRepository,
+    GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord,
+    GenerationInodeEvidenceResolution, GenerationPathRecord, GenerationPathState,
+    GenerationRetainedInodeRecord, GenerationTransportSelectionBinding,
+    NegotiatedGenerationApplyJournalRecord, ObservedGenerationRecord, ObservedGenerationRecordV2,
+    PreparedGenerationApply, PreparedGenerationApplyV2, PreparedGenerationApplyV3,
+};
 pub use live_mode::{
     LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountLiveModeStateChangeError,
     is_live_mode_state_change_signal_path, live_mode_state_change_signal_path,
@@ -51,14 +61,18 @@ pub use repository::{
     FreshnessStateRepository, HydrationJobRepository, JournalRepository,
     MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
     RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
-    VirtualMutationRepository, WorkspaceBindingRepository,
+    VirtualMutationRepository, WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
 };
 pub use reset::{
     LocalStateResetCredentialError, LocalStateResetError, LocalStateResetStorageReport,
-    connection_secret_refs, reset_locality_state_storage,
+    connection_secret_refs, reset_locality_state_storage, reset_locality_state_storage_preserving,
 };
 pub use sqlite::SqliteStateStore;
 pub use workspace_binding::{
-    WORKSPACE_BINDING_LAYOUT_VERSION, WORKSPACE_BINDING_VERSION, WorkspaceBinding,
-    WorkspaceBindingError, WorkspaceBindingRecord, WorkspaceRebindBlocker,
+    LEGACY_WORKSPACE_BINDING_VERSION, LegacyLayout0Mount, LegacyLayout0Reason,
+    LegacyWorkspaceMount, WORKSPACE_BINDING_LAYOUT_VERSION, WORKSPACE_BINDING_VERSION,
+    WORKSPACE_HOST_BINDING_VERSION, WorkspaceBinding, WorkspaceBindingError,
+    WorkspaceBindingMigrationPlan, WorkspaceBindingRecord, WorkspaceHostBinding,
+    WorkspaceHostBindingError, WorkspaceHostBindingResolver, WorkspaceHostPlatform, WorkspaceId,
+    WorkspaceProjectionIdentity, WorkspaceRebindBlocker, host_paths_equivalent,
 };

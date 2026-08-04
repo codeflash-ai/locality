@@ -11,12 +11,17 @@ use std::time::{Duration, Instant};
 
 use loc_cli::sandbox::{
     SandboxBootstrapToken, SandboxContentEncodingPreference, SandboxInitError, SandboxInitOptions,
-    SandboxProfileKey, resolve_bootstrap_token, run_sandbox_init, run_sandbox_init_with_encoding,
+    SandboxProfileKey, resolve_bootstrap_token, resolve_sandbox_init_options_at_state_root,
+    run_sandbox_init, run_sandbox_init_with_encoding, run_sandbox_init_with_encoding_at_state_root,
     run_sandbox_init_with_profile_key,
 };
+use locality_core::model::MountId;
 use locality_core::portable::{
     ExportAttemptId, LogicalPath, ProjectionFileKind, ProjectionId, SessionId, SourceAction,
     SourceConnectionId, SourceGenerationId,
+};
+use locality_protocol::freshness_wait::{
+    FRESHNESS_WAIT_ATTEMPT_V1_GOLDEN_JSON, FreshnessWaitAttemptRequest,
 };
 use locality_protocol::workspace_api_v2::{
     WORKSPACE_EXPORT_OFFER_V2_GOLDEN_JSON, WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON,
@@ -35,11 +40,13 @@ use locality_protocol::{
     SessionProtocolError, StaleSessionBehavior, TarContentEncoding, TarExportOffer,
     canonical_export_inventory_sha256, canonical_writable_metadata_sha256,
 };
+use locality_store::{MountConfig, MountRepository, ProjectionMode, SqliteStateStore};
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::ReplicaMaterializationLimits;
 use localityd::workspace_materializer::{
     WorkspaceMaterializationLimits, WorkspaceOwnershipCapability, WorkspacePublicationCheckpoint,
-    WorkspacePublicationHooks, publish_staged_workspace_with_hooks, stage_workspace_archive,
+    WorkspacePublicationHooks, materialize_workspace_archive_durable_with_hooks,
+    publish_staged_workspace_with_hooks, stage_workspace_archive,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -89,6 +96,8 @@ struct ResponseFixture {
     split_after: Option<(usize, Duration)>,
     body_chunk_size: Option<usize>,
     staging_gate: Option<(PathBuf, PathBuf, PathBuf)>,
+    mount_after_staging: Option<(PathBuf, MountConfig)>,
+    body_from_request: Option<fn(&CapturedRequest) -> Vec<u8>>,
 }
 
 impl ResponseFixture {
@@ -101,6 +110,8 @@ impl ResponseFixture {
             split_after: None,
             body_chunk_size: None,
             staging_gate: None,
+            mount_after_staging: None,
+            body_from_request: None,
         }
     }
 
@@ -116,6 +127,8 @@ impl ResponseFixture {
             split_after: None,
             body_chunk_size: None,
             staging_gate: None,
+            mount_after_staging: None,
+            body_from_request: None,
         }
     }
 
@@ -158,6 +171,24 @@ impl ResponseFixture {
         self.staging_gate = Some((parent, logical_path, destination));
         self
     }
+
+    fn with_mount_after_staging(mut self, state_root: PathBuf, mount: MountConfig) -> Self {
+        self.mount_after_staging = Some((state_root, mount));
+        self
+    }
+
+    fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+        self.headers.push((name, value));
+        self
+    }
+
+    fn with_body_from_request(
+        mut self,
+        body_from_request: fn(&CapturedRequest) -> Vec<u8>,
+    ) -> Self {
+        self.body_from_request = Some(body_from_request);
+        self
+    }
 }
 
 struct MockServer {
@@ -175,7 +206,7 @@ impl MockServer {
         let address = listener.local_addr().expect("mock address");
         let (sender, requests) = mpsc::channel();
         let handle = thread::spawn(move || {
-            for response in responses {
+            for mut response in responses {
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let mut stream = loop {
                     match listener.accept() {
@@ -193,6 +224,9 @@ impl MockServer {
                     }
                 };
                 let request = read_request(&mut stream);
+                if let Some(body_from_request) = response.body_from_request {
+                    response.body = body_from_request(&request);
+                }
                 sender.send(request).expect("capture request");
                 write_response(&mut stream, response);
             }
@@ -223,6 +257,180 @@ impl Drop for MockServer {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[test]
+fn sandbox_root_binding_preserves_whole_root_and_rejects_active_workspace_overlap() {
+    let directory = TestDirectory::new("host-binding");
+    let state_root = directory.0.join("state");
+    let active_root = directory.0.join("Locality/notion");
+    fs::create_dir_all(&active_root).expect("create active root");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open state");
+    store
+        .save_mount(
+            MountConfig::new(MountId::new("notion"), "notion", &active_root)
+                .projection(ProjectionMode::PlainFiles),
+        )
+        .expect("save active mount");
+    drop(store);
+
+    let requested = active_root.join("sandbox");
+    let error = resolve_sandbox_init_options_at_state_root(
+        SandboxInitOptions {
+            api_url: "https://workspace.example.test".to_string(),
+            root: requested,
+        },
+        &state_root,
+    )
+    .expect_err("active workspace overlap must fail");
+    assert!(matches!(error, SandboxInitError::HostBinding(_)));
+
+    let isolated_root = directory.0.join("isolated-sandbox");
+    let resolved = resolve_sandbox_init_options_at_state_root(
+        SandboxInitOptions {
+            api_url: "https://workspace.example.test".to_string(),
+            root: isolated_root.clone(),
+        },
+        &state_root,
+    )
+    .expect("isolated whole-root binding");
+    assert_eq!(resolved.root, isolated_root);
+}
+
+#[test]
+fn cli_sandbox_init_rejects_publication_inside_active_mount_before_network() {
+    let directory = TestDirectory::new("cli-active-root");
+    let state_root = directory.0.join("state");
+    let active_root = directory.0.join("Locality/notion");
+    fs::create_dir_all(&active_root).expect("create active root");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open state");
+    store
+        .save_mount(MountConfig::new(
+            MountId::new("notion"),
+            "notion",
+            &active_root,
+        ))
+        .expect("save active mount");
+    drop(store);
+
+    let requested_root = active_root.join("sandbox").to_string_lossy().into_owned();
+    let output = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .args([
+            "sandbox",
+            "init",
+            "--api-url",
+            "http://127.0.0.1:9",
+            "--root",
+            &requested_root,
+        ])
+        .env("LOCALITY_STATE_DIR", &state_root)
+        .env("LOCALITY_BOOTSTRAP_TOKEN", "sealed-token")
+        .output()
+        .expect("run loc sandbox init");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr UTF-8");
+    assert!(
+        stderr.contains("overlaps active mount `notion`"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("backend request"), "{stderr}");
+}
+
+#[test]
+fn sandbox_revalidates_mount_overlap_after_staging_before_publication() {
+    let directory = TestDirectory::new("late-mount-overlap");
+    let state_root = directory.0.join("state");
+    let destination = directory.root();
+    let tar = tar_file(b"readme.md", b"staged\n");
+    let capability = capability();
+    let status = ready_status(
+        capability.session_id.clone(),
+        COMPONENT_VERSIONS,
+        &tar,
+        BTreeSet::from([TarContentEncoding::Identity]),
+    );
+    let response =
+        ResponseFixture::streaming_export("identity", tar, 512 + 4, Duration::from_millis(100))
+            .with_staging_gate(
+                destination
+                    .parent()
+                    .expect("destination parent")
+                    .to_path_buf(),
+                PathBuf::from("readme.md"),
+                destination.clone(),
+            )
+            .with_mount_after_staging(
+                state_root.clone(),
+                MountConfig::new(MountId::new("late-active"), "notion", &directory.0),
+            );
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        response,
+    ]);
+
+    let error = run_sandbox_init_with_encoding_at_state_root(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: destination.clone(),
+        },
+        &state_root,
+        SandboxBootstrapToken::new("late-overlap-token").expect("token"),
+        SandboxContentEncodingPreference::Identity,
+    )
+    .expect_err("late active mount must stop publication");
+
+    assert_eq!(error.code(), "materialization_failed");
+    assert!(
+        error
+            .to_string()
+            .contains("overlaps active mount `late-active`")
+    );
+    assert!(
+        !destination.exists(),
+        "guard failure must leave root unpublished"
+    );
+}
+
+#[test]
+fn generation2_prepublication_check_runs_under_durable_publication_path() {
+    let directory = TestDirectory::new("workspace-v2-prepublication-check");
+    let (session, offer, tar) = workspace_v2_fixture();
+    let ownership = WorkspaceOwnershipCapability::new([0x44; 32]);
+    let mut hooks = RejectBeforePublication;
+
+    let error = materialize_workspace_archive_durable_with_hooks(
+        ReplicaArchive::new(ReplicaArchiveEncoding::Identity, Cursor::new(tar)),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &session,
+        &offer,
+        &ownership,
+        &mut hooks,
+    )
+    .expect_err("prepublication rejection must stop generation 2");
+
+    assert!(error.to_string().contains("prepublication check failed"));
+    assert!(!directory.root().exists());
+    assert!(
+        !directory
+            .0
+            .join(".locality-replica.publication.json")
+            .exists()
+    );
+}
+
+struct RejectBeforePublication;
+
+impl WorkspacePublicationHooks for RejectBeforePublication {
+    fn before_publication(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("injected prepublication rejection"))
+    }
+
+    fn checkpoint(&mut self, _checkpoint: WorkspacePublicationCheckpoint) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -271,7 +479,7 @@ fn loopback_identity_bootstrap_sends_only_sealed_requests_and_materializes() {
     assert_eq!(bootstrap.headers.get("accept").unwrap(), "application/json");
     assert_eq!(
         bootstrap.headers.get("user-agent").unwrap(),
-        "locality-loc/0.3.6"
+        concat!("locality-loc/", env!("CARGO_PKG_VERSION"))
     );
     assert_eq!(
         bootstrap.headers.get("content-type").unwrap(),
@@ -916,6 +1124,283 @@ fn generation1_profile_existing_root_preserves_early_destination_exists_without_
     server.assert_no_request();
 }
 
+#[test]
+fn generation2_profile_waits_for_freshness_before_export() {
+    let directory = TestDirectory::new("workspace-v2-freshness-wait");
+    let (session, offer, tar) = workspace_v2_fixture();
+    let compressed = zstd::stream::encode_all(tar.as_slice(), 1).expect("compress workspace tar");
+    let initial_status = workspace_v2_bootstrapping_status();
+    let ready_status: Value = serde_json::from_slice(WORKSPACE_SESSION_STATUS_V2_GOLDEN_JSON)
+        .expect("ready workspace status");
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&initial_status),
+        ResponseFixture::json(&serde_json::json!({}))
+            .with_header("Date", "Fri, 31 Jul 2026 12:00:08 GMT")
+            .with_body_from_request(waiting_freshness_attempt),
+        ResponseFixture::json(&serde_json::json!({}))
+            .with_header("Date", "Fri, 31 Jul 2026 12:00:10 GMT")
+            .with_body_from_request(satisfied_freshness_attempt),
+        ResponseFixture::json(&ready_status),
+        ResponseFixture::json(&offer),
+        ResponseFixture::export("zstd", compressed),
+    ]);
+
+    let report = run_sandbox_init_with_profile_key(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxProfileKey::new("a".repeat(64)).expect("profile key"),
+        SandboxContentEncodingPreference::Automatic,
+    )
+    .expect("freshness wait reaches the workspace export");
+
+    assert_eq!(report.files, 2);
+    let negotiation = server.request();
+    let initial_status_request = server.request();
+    let first_wait = server.request();
+    let second_wait = server.request();
+    let final_status_request = server.request();
+    let export_attempt = server.request();
+    let export = server.request();
+    assert_eq!(negotiation.path, "/v2/workspace-profile-sessions");
+    assert_eq!(initial_status_request.path, "/v2/sessions/session-scope-7");
+    assert_eq!(
+        first_wait.path,
+        "/v2/sessions/session-scope-7/freshness-wait-attempts"
+    );
+    assert_eq!(first_wait.method, "POST");
+    assert_eq!(first_wait.path, second_wait.path);
+    assert_eq!(first_wait.body, second_wait.body);
+    let request = FreshnessWaitAttemptRequest::decode_json(&first_wait.body)
+        .expect("typed freshness wait request");
+    assert_eq!(request.session_id, SessionId::new("session-scope-7"));
+    assert!(request.capabilities.supports_freshness_wait());
+    assert_eq!(
+        first_wait.headers.get("authorization").unwrap(),
+        "Bearer opaque-session-capability"
+    );
+    assert_eq!(final_status_request.path, initial_status_request.path);
+    assert_eq!(
+        export_attempt.path,
+        "/v2/sessions/session-scope-7/export-attempts"
+    );
+    assert!(export.path.ends_with("/export"));
+    server.assert_no_request();
+}
+
+#[test]
+fn generation2_profile_does_not_wait_for_unrelated_bootstrapping() {
+    let directory = TestDirectory::new("workspace-v2-unrelated-bootstrapping");
+    let session = WorkspaceProfileSessionV2::decode_json(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON)
+        .expect("workspace session fixture");
+    let mut status = workspace_v2_bootstrapping_status();
+    status["error"]["code"] = serde_json::json!("unavailable");
+    status["error"]["message"] = serde_json::json!("an unrelated dependency is unavailable");
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&status),
+    ]);
+
+    let error = run_sandbox_init_with_profile_key(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxProfileKey::new("a".repeat(64)).expect("profile key"),
+        SandboxContentEncodingPreference::Automatic,
+    )
+    .expect_err("unrelated bootstrapping must preserve immediate not-ready behavior");
+
+    assert_eq!(error.code(), "session_not_ready");
+    assert!(error.to_string().contains("Bootstrapping (Unavailable)"));
+    let _negotiation = server.request();
+    let _status = server.request();
+    server.assert_no_request();
+}
+
+#[test]
+fn generation2_profile_anchors_deadline_when_wait_headers_arrive() {
+    let directory = TestDirectory::new("workspace-v2-wait-header-deadline");
+    let (session, offer, tar) = workspace_v2_fixture();
+    let compressed = zstd::stream::encode_all(tar.as_slice(), 1).expect("compress workspace tar");
+    let ready_status: Value = serde_json::from_slice(WORKSPACE_SESSION_STATUS_V2_GOLDEN_JSON)
+        .expect("ready workspace status");
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&workspace_v2_bootstrapping_status()),
+        ResponseFixture::json(&serde_json::json!({}))
+            .with_header("Date", "Fri, 31 Jul 2026 12:00:08 GMT")
+            .with_body_from_request(short_deadline_waiting_freshness_attempt)
+            .with_split_after(0, Duration::from_millis(2_100)),
+        ResponseFixture::json(&ready_status),
+        ResponseFixture::json(&offer),
+        ResponseFixture::export("zstd", compressed),
+    ]);
+
+    let report = run_sandbox_init_with_profile_key(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxProfileKey::new("a".repeat(64)).expect("profile key"),
+        SandboxContentEncodingPreference::Automatic,
+    )
+    .expect("body transfer after the server deadline must not extend the wait");
+
+    assert_eq!(report.files, 2);
+    let _negotiation = server.request();
+    let _status = server.request();
+    let wait = server.request();
+    let final_status = server.request();
+    let export_attempt = server.request();
+    let export = server.request();
+    assert!(wait.path.ends_with("/freshness-wait-attempts"));
+    assert_eq!(final_status.path, "/v2/sessions/session-scope-7");
+    assert!(export_attempt.path.ends_with("/export-attempts"));
+    assert!(export.path.ends_with("/export"));
+    server.assert_no_request();
+}
+
+#[test]
+fn generation2_profile_preserves_session_not_ready_when_wait_route_is_unavailable() {
+    let directory = TestDirectory::new("workspace-v2-no-freshness-route");
+    let session = WorkspaceProfileSessionV2::decode_json(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON)
+        .expect("workspace session fixture");
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&workspace_v2_bootstrapping_status()),
+        ResponseFixture::json(&serde_json::json!({})).with_status("404 Not Found"),
+    ]);
+
+    let error = run_sandbox_init_with_profile_key(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxProfileKey::new("a".repeat(64)).expect("profile key"),
+        SandboxContentEncodingPreference::Automatic,
+    )
+    .expect_err("missing optional wait route retains immediate not-ready behavior");
+
+    assert_eq!(error.code(), "session_not_ready");
+    assert!(error.to_string().contains("Bootstrapping (Stale)"));
+    let _negotiation = server.request();
+    let _status = server.request();
+    let wait = server.request();
+    assert_eq!(
+        wait.path,
+        "/v2/sessions/session-scope-7/freshness-wait-attempts"
+    );
+    server.assert_no_request();
+}
+
+#[test]
+fn generation2_profile_rejects_invalid_freshness_retry_advice() {
+    let directory = TestDirectory::new("workspace-v2-invalid-freshness-retry");
+    let session = WorkspaceProfileSessionV2::decode_json(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON)
+        .expect("workspace session fixture");
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&workspace_v2_bootstrapping_status()),
+        ResponseFixture::json(&serde_json::json!({}))
+            .with_header("Date", "Fri, 31 Jul 2026 12:00:08 GMT")
+            .with_body_from_request(invalid_retry_freshness_attempt),
+    ]);
+
+    let error = run_sandbox_init_with_profile_key(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxProfileKey::new("a".repeat(64)).expect("profile key"),
+        SandboxContentEncodingPreference::Automatic,
+    )
+    .expect_err("invalid typed poll advice must fail closed");
+
+    assert_eq!(error.code(), "backend_protocol_invalid");
+    assert!(
+        error
+            .to_string()
+            .contains("invalid freshness wait retry metadata"),
+        "{error}"
+    );
+    for _ in 0..3 {
+        let _ = server.request();
+    }
+    server.assert_no_request();
+}
+
+#[test]
+fn generation2_profile_rejects_mismatched_freshness_requirement() {
+    let directory = TestDirectory::new("workspace-v2-mismatched-freshness-requirement");
+    let session = WorkspaceProfileSessionV2::decode_json(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON)
+        .expect("workspace session fixture");
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&workspace_v2_bootstrapping_status()),
+        ResponseFixture::json(&serde_json::json!({}))
+            .with_header("Date", "Fri, 31 Jul 2026 12:00:08 GMT")
+            .with_body_from_request(mismatched_requirement_freshness_attempt),
+    ]);
+
+    let error = run_sandbox_init_with_profile_key(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxProfileKey::new("a".repeat(64)).expect("profile key"),
+        SandboxContentEncodingPreference::Automatic,
+    )
+    .expect_err("wait attempts must preserve the initiating freshness requirement");
+
+    assert_eq!(error.code(), "backend_protocol_invalid");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match the initiating session status"),
+        "{error}"
+    );
+    for _ in 0..3 {
+        let _ = server.request();
+    }
+    server.assert_no_request();
+}
+
+#[test]
+fn generation2_terminal_freshness_failure_uses_existing_session_error_surface() {
+    let directory = TestDirectory::new("workspace-v2-freshness-failed");
+    let session = WorkspaceProfileSessionV2::decode_json(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON)
+        .expect("workspace session fixture");
+    let final_status = workspace_v2_bootstrapping_status();
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&session).with_status("201 Created"),
+        ResponseFixture::json(&workspace_v2_bootstrapping_status()),
+        ResponseFixture::json(&serde_json::json!({}))
+            .with_header("Date", "Fri, 31 Jul 2026 12:00:10 GMT")
+            .with_body_from_request(failed_freshness_attempt),
+        ResponseFixture::json(&final_status),
+    ]);
+
+    let error = run_sandbox_init_with_profile_key(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxProfileKey::new("a".repeat(64)).expect("profile key"),
+        SandboxContentEncodingPreference::Automatic,
+    )
+    .expect_err("terminal wait failure remains a session not-ready result");
+
+    assert_eq!(error.code(), "session_not_ready");
+    assert!(error.to_string().contains("Bootstrapping (Stale)"));
+    for _ in 0..4 {
+        let _ = server.request();
+    }
+    server.assert_no_request();
+}
+
 #[cfg(all(
     unix,
     any(target_vendor = "apple", target_os = "linux", target_os = "android")
@@ -1483,6 +1968,8 @@ fn bearer_authenticated_redirect_is_not_followed() {
             split_after: None,
             body_chunk_size: None,
             staging_gate: None,
+            mount_after_staging: None,
+            body_from_request: None,
         },
     ]);
 
@@ -1658,6 +2145,8 @@ fn version_session_offer_media_and_response_encoding_are_validated() {
                 split_after: None,
                 body_chunk_size: None,
                 staging_gate: None,
+                mount_after_staging: None,
+                body_from_request: None,
             }),
             "backend_protocol_invalid",
         ),
@@ -1763,6 +2252,7 @@ fn cli_forced_identity_reports_encoding_without_leaking_environment_token() {
             "identity",
             "--json",
         ])
+        .env("LOCALITY_STATE_DIR", directory.0.join("state"))
         .env("LOCALITY_BOOTSTRAP_TOKEN", "cli-bootstrap-secret")
         .output()
         .expect("run loc sandbox init");
@@ -1829,6 +2319,7 @@ fn cli_profile_has_stable_monotonic_phases_and_no_request_details() {
             "--profile",
             "--json",
         ])
+        .env("LOCALITY_STATE_DIR", directory.0.join("state"))
         .env("LOCALITY_BOOTSTRAP_TOKEN", "profile-bootstrap-secret")
         .output()
         .expect("run profiled loc sandbox init");
@@ -1948,6 +2439,7 @@ fn cli_profile_failure_prints_completed_phases_and_total() {
             "zstd",
             "--profile",
         ])
+        .env("LOCALITY_STATE_DIR", directory.0.join("state"))
         .env("LOCALITY_BOOTSTRAP_TOKEN", "failed-profile-secret")
         .output()
         .expect("run failing profiled loc sandbox init");
@@ -2496,6 +2988,103 @@ fn workspace_v2_fixture() -> (WorkspaceProfileSessionV2, WorkspaceExportOfferV2,
     )
 }
 
+fn workspace_v2_bootstrapping_status() -> Value {
+    let mut status: Value = serde_json::from_slice(WORKSPACE_SESSION_STATUS_V2_GOLDEN_JSON)
+        .expect("workspace status fixture");
+    status["state"] = Value::String("bootstrapping".to_string());
+    status["export_attempt_limits"] = Value::Null;
+    status["error"] = serde_json::json!({
+        "code": "stale",
+        "message": "the selected source is stale",
+        "retriable": true,
+        "retry_after_seconds": 1
+    });
+    status
+}
+
+fn waiting_freshness_attempt(request: &CapturedRequest) -> Vec<u8> {
+    freshness_attempt_for_request(request, "waiting")
+}
+
+fn short_deadline_waiting_freshness_attempt(request: &CapturedRequest) -> Vec<u8> {
+    let mut attempt: Value = serde_json::from_slice(&waiting_freshness_attempt(request))
+        .expect("waiting freshness fixture");
+    attempt["created_at"] = serde_json::json!("2026-07-31T11:59:40Z");
+    attempt["original_deadline_at"] = serde_json::json!("2026-07-31T12:00:10Z");
+    attempt["poll"]["retry"]["retry_after_seconds"] = serde_json::json!(1);
+    serde_json::to_vec(&attempt).expect("serialize short-deadline freshness response")
+}
+
+fn satisfied_freshness_attempt(request: &CapturedRequest) -> Vec<u8> {
+    freshness_attempt_for_request(request, "satisfied")
+}
+
+fn failed_freshness_attempt(request: &CapturedRequest) -> Vec<u8> {
+    freshness_attempt_for_request(request, "failed")
+}
+
+fn invalid_retry_freshness_attempt(request: &CapturedRequest) -> Vec<u8> {
+    freshness_attempt_for_request(request, "invalid_retry")
+}
+
+fn mismatched_requirement_freshness_attempt(request: &CapturedRequest) -> Vec<u8> {
+    let mut attempt: Value = serde_json::from_slice(&waiting_freshness_attempt(request))
+        .expect("waiting freshness fixture");
+    attempt["freshness_requirement"]["max_age_seconds"] = serde_json::json!(301);
+    serde_json::to_vec(&attempt).expect("serialize mismatched freshness response")
+}
+
+fn freshness_attempt_for_request(request: &CapturedRequest, outcome: &str) -> Vec<u8> {
+    let wait_request = FreshnessWaitAttemptRequest::decode_json(&request.body)
+        .expect("server decodes freshness wait request");
+    let mut attempt: Value = serde_json::from_slice(FRESHNESS_WAIT_ATTEMPT_V1_GOLDEN_JSON)
+        .expect("freshness wait fixture");
+    attempt["session_id"] = Value::String(wait_request.session_id.as_str().to_string());
+    attempt["idempotency_key"] = Value::String(wait_request.idempotency_key);
+    match outcome {
+        "waiting" => {
+            attempt["sequence"] = serde_json::json!(3);
+            attempt["poll"]["retry"]["retry_after_seconds"] = serde_json::json!(1);
+        }
+        "invalid_retry" => {
+            attempt["sequence"] = serde_json::json!(3);
+            attempt["poll"]["retry"]["retry_after_seconds"] = serde_json::json!(0);
+        }
+        "satisfied" => {
+            attempt["sequence"] = serde_json::json!(4);
+            attempt["source_targets"][0]["applied_epoch"] = serde_json::json!("44");
+            attempt["source_targets"][0]["state"] = serde_json::json!("satisfied");
+            attempt["source_targets"][0]["reason"] = Value::Null;
+            attempt["source_targets"][0]["retry"] = Value::Null;
+            attempt["state"] = serde_json::json!("terminal");
+            attempt["poll"] = Value::Null;
+            attempt["terminal"] = serde_json::json!({
+                "outcome": "satisfied",
+                "completed_at": "2026-07-31T12:00:10Z"
+            });
+            attempt["updated_at"] = serde_json::json!("2026-07-31T12:00:10Z");
+        }
+        "failed" => {
+            attempt["sequence"] = serde_json::json!(3);
+            attempt["source_targets"][0]["state"] = serde_json::json!("failed");
+            attempt["source_targets"][0]["reason"] = serde_json::json!("provider_unavailable");
+            attempt["source_targets"][0]["retry"] = serde_json::json!({
+                "class": "after_delay",
+                "retry_after_seconds": 5
+            });
+            attempt["state"] = serde_json::json!("terminal");
+            attempt["poll"] = Value::Null;
+            attempt["terminal"] = serde_json::json!({
+                "outcome": "failed",
+                "completed_at": "2026-07-31T12:00:10Z"
+            });
+            attempt["updated_at"] = serde_json::json!("2026-07-31T12:00:10Z");
+        }
+        other => panic!("unknown freshness outcome {other}"),
+    }
+    serde_json::to_vec(&attempt).expect("serialize freshness wait response")
+}
+
 fn workspace_v2_server(
     session: &WorkspaceProfileSessionV2,
     offer: &WorkspaceExportOfferV2,
@@ -2724,6 +3313,13 @@ fn write_response(stream: &mut TcpStream, response: ResponseFixture) {
                     "materializer did not stage the first file while the response was paused"
                 );
                 thread::sleep(Duration::from_millis(2));
+            }
+            if let Some((state_root, mount)) = &response.mount_after_staging {
+                let mut store =
+                    SqliteStateStore::open(state_root.clone()).expect("open staged test state");
+                store
+                    .save_mount(mount.clone())
+                    .expect("save mount after staging");
             }
         }
         thread::sleep(pause);

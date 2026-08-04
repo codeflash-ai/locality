@@ -37,6 +37,27 @@ pub enum ConflictResolution {
     Edited(PathBuf),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThreeWayTextMerge {
+    Clean(String),
+    Conflict(String),
+}
+
+/// Deterministic line-oriented three-way merge for portable text payloads.
+/// Disjoint edits are combined; overlapping edits are returned with explicit
+/// conflict markers so callers can preserve the original local file instead.
+pub fn merge_text_with_base(base: &str, local: &str, remote: &str) -> ThreeWayTextMerge {
+    let merged = render_conflict_marker_body_with_base(base, local, remote);
+    if merged.contains(CONFLICT_LOCAL_MARKER)
+        && merged.contains(CONFLICT_SEPARATOR_MARKER)
+        && merged.contains(CONFLICT_REMOTE_MARKER)
+    {
+        ThreeWayTextMerge::Conflict(merged)
+    } else {
+        ThreeWayTextMerge::Clean(merged)
+    }
+}
+
 pub fn render_inline_conflict_markdown(
     local_contents: &str,
     remote_document: &CanonicalDocument,

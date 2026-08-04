@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://locality.dev/schemas/connector-registry-v1.json",
+  "title": "Locality connector registry v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$schema", "schema_version", "connectors"],
+  "properties": {
+    "$schema": {"const": "./registry.schema.json"},
+    "schema_version": {"const": 1},
+    "connectors": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {"$ref": "#/$defs/connector"}
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "connector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "display_name",
+        "crate",
+        "default_profile_id",
+        "default_connection_id",
+        "profiles",
+        "mount",
+        "capabilities",
+        "push_operations",
+        "membership_operations",
+        "projection",
+        "ui"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "version": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 80,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*\\.v[1-9][0-9]*$"
+        },
+        "display_name": {"type": "string", "minLength": 1, "maxLength": 80},
+        "crate": {
+          "type": "string",
+          "minLength": 17,
+          "maxLength": 96,
+          "pattern": "^crates/locality-[a-z0-9]+(?:-[a-z0-9]+)*$"
+        },
+        "default_profile_id": {"$ref": "#/$defs/identifier"},
+        "default_connection_id": {"$ref": "#/$defs/identifier"},
+        "profiles": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {"$ref": "#/$defs/profile"}
+        },
+        "mount": {"$ref": "#/$defs/mount"},
+        "capabilities": {"$ref": "#/$defs/capabilities"},
+        "push_operations": {
+          "type": "array",
+          "maxItems": 12,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/push_operation"}
+        },
+        "membership_operations": {
+          "type": "array",
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {"enum": ["join_public_channels"]}
+        },
+        "projection": {"$ref": "#/$defs/projection"},
+        "ui": {"$ref": "#/$defs/ui"}
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "display_name", "auth_kind", "scopes", "actions"],
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "display_name": {"type": "string", "minLength": 1, "maxLength": 80},
+        "auth_kind": {"enum": ["oauth", "token", "api_key"]},
+        "scopes": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 256}
+        },
+        "actions": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {"enum": ["read", "write", "create", "send"]}
+        }
+      }
+    },
+    "mount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "default_id",
+        "read_only",
+        "default_projection_mode",
+        "default_settings",
+        "settings_schema"
+      ],
+      "properties": {
+        "default_id": {"$ref": "#/$defs/identifier"},
+        "read_only": {"type": "boolean"},
+        "default_projection_mode": {
+          "enum": ["plain_files", "macos_file_provider", "linux_fuse", "windows_cloud_files"]
+        },
+        "default_settings": {"type": "object", "maxProperties": 64},
+        "settings_schema": {"type": "object", "minProperties": 1, "maxProperties": 64}
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supports_block_updates",
+        "supports_entity_body_updates",
+        "supports_databases",
+        "supports_oauth",
+        "supports_remote_observation",
+        "supports_lazy_child_enumeration",
+        "supports_media_download",
+        "supports_undo",
+        "supports_batch_observation"
+      ],
+      "properties": {
+        "supports_block_updates": {"type": "boolean"},
+        "supports_entity_body_updates": {"type": "boolean"},
+        "supports_databases": {"type": "boolean"},
+        "supports_oauth": {"type": "boolean"},
+        "supports_remote_observation": {"type": "boolean"},
+        "supports_lazy_child_enumeration": {"type": "boolean"},
+        "supports_media_download": {"type": "boolean"},
+        "supports_undo": {"type": "boolean"},
+        "supports_batch_observation": {"type": "boolean"}
+      }
+    },
+    "push_operation": {
+      "enum": [
+        "update_block",
+        "replace_block",
+        "append_block",
+        "move_block",
+        "update_media",
+        "archive_block",
+        "archive_entity",
+        "update_entity_body",
+        "update_properties",
+        "move_entity",
+        "create_entity",
+        "create_database"
+      ]
+    },
+    "projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_root_create_parent_kind",
+        "create_entity_parent_kinds",
+        "move_entity_parent_kinds",
+        "body_diff_mode",
+        "virtual_rename_policy",
+        "periodic_discovery_seconds",
+        "max_background_discovery_workers"
+      ],
+      "properties": {
+        "source_root_create_parent_kind": {
+          "oneOf": [{"$ref": "#/$defs/entity_kind"}, {"type": "null"}]
+        },
+        "create_entity_parent_kinds": {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/entity_kind"}
+        },
+        "move_entity_parent_kinds": {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/entity_kind"}
+        },
+        "body_diff_mode": {"enum": ["block", "whole_entity"]},
+        "virtual_rename_policy": {"enum": ["filename_derived", "preserve_canonical"]},
+        "periodic_discovery_seconds": {
+          "type": ["integer", "null"],
+          "minimum": 30,
+          "maximum": 86400
+        },
+        "max_background_discovery_workers": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32
+        }
+      }
+    },
+    "entity_kind": {"enum": ["page", "database", "directory"]},
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["icon", "docs_slug"],
+      "properties": {
+        "icon": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 80,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*\\.svg$"
+        },
+        "docs_slug": {"$ref": "#/$defs/identifier"}
+      }
+    }
+  }
+}

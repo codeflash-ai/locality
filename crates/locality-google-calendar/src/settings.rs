@@ -8,7 +8,7 @@ const DEFAULT_PAST_DAYS: i64 = 30;
 const DEFAULT_FUTURE_DAYS: i64 = 180;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GoogleCalendarMountSettings {
     pub google_calendar: GoogleCalendarSettings,
 }
@@ -60,7 +60,7 @@ impl GoogleCalendarMountSettings {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GoogleCalendarSettings {
     pub date_window: Option<GoogleCalendarDateWindow>,
 }
@@ -83,6 +83,7 @@ impl<'de> Deserialize<'de> for GoogleCalendarDateWindow {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct RawGoogleCalendarDateWindow {
             after: String,
             before: String,
@@ -300,5 +301,19 @@ mod tests {
         assert!(GoogleCalendarMountSettings::with_date_window("2026-02-30", "2026-07-31").is_err());
         assert!(GoogleCalendarMountSettings::with_date_window("2026-07-31", "2026-07-31").is_err());
         assert!(GoogleCalendarMountSettings::with_date_window("2026-08-01", "2026-07-31").is_err());
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected_at_every_settings_level() {
+        for value in [
+            r#"{"unexpected":true}"#,
+            r#"{"google_calendar":{"unexpected":true}}"#,
+            r#"{"google_calendar":{"date_window":{"after":"2026-07-01","before":"2026-07-31","unexpected":true}}}"#,
+        ] {
+            assert!(
+                GoogleCalendarMountSettings::from_json(value).is_err(),
+                "unknown field accepted in {value}"
+            );
+        }
     }
 }

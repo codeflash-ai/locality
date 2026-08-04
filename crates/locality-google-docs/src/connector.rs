@@ -31,10 +31,20 @@ use crate::render::{
     GoogleDocsNativeBundle, combined_remote_version, document_frontmatter, render_google_document,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GoogleDocsConfig {
     pub access_token: String,
     pub workspace_folder_id: Option<RemoteId>,
+}
+
+impl std::fmt::Debug for GoogleDocsConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GoogleDocsConfig")
+            .field("access_token", &"<redacted>")
+            .field("workspace_folder_id", &self.workspace_folder_id)
+            .finish()
+    }
 }
 
 impl GoogleDocsConfig {

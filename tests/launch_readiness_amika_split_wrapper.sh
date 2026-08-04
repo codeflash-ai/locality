@@ -24,8 +24,20 @@ assert_not_contains() {
 }
 
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-launch-readiness-amika-wrapper-test.XXXXXX")"
+repo_default_out=""
+repo_old_default_out=""
+repo_wrong_plural_out=""
 cleanup() {
   rm -rf "$tmp_root"
+  if [ -n "$repo_default_out" ]; then
+    rm -rf "$repo_default_out"
+  fi
+  if [ -n "$repo_old_default_out" ]; then
+    rm -rf "$repo_old_default_out"
+  fi
+  if [ -n "$repo_wrong_plural_out" ]; then
+    rm -rf "$repo_wrong_plural_out"
+  fi
 }
 trap cleanup EXIT
 
@@ -103,9 +115,9 @@ PATH="${fake_bin}:$PATH" \
 
 assert_contains "$run_default_out/run.env" "locality_sandbox=aseem-locality"
 assert_contains "$run_default_out/run.env" "mcp_sandbox=aseem-mcp"
-assert_contains "$run_default_out/run.env" "remote_worktree=/home/amika/workspace/locality-launch-readiness-testrun"
-assert_contains "$run_default_out/run.env" "locality_remote_out_dir=/home/amika/workspace/locality-launch-readiness-testrun/target/launch-readiness-testrun-locality"
-assert_contains "$run_default_out/run.env" "mcp_remote_out_dir=/home/amika/workspace/locality-launch-readiness-testrun/target/launch-readiness-testrun-mcp"
+assert_contains "$run_default_out/run.env" "remote_worktree=/home/ubuntu/workspace/locality-launch-readiness-testrun"
+assert_contains "$run_default_out/run.env" "locality_remote_out_dir=/home/ubuntu/workspace/locality-launch-readiness-testrun/experiment/launch-readiness-testrun-locality"
+assert_contains "$run_default_out/run.env" "mcp_remote_out_dir=/home/ubuntu/workspace/locality-launch-readiness-testrun/experiment/launch-readiness-testrun-mcp"
 assert_contains "$run_default_out/run.env" "remote_loc_bin=/usr/bin/loc"
 assert_contains "$run_default_out/run.env" "sync_artifacts=0"
 assert_contains "$run_default_out/run.env" "strategy_execution=parallel"
@@ -122,6 +134,26 @@ assert_contains "$fake_log" "--scenario"
 assert_contains "$fake_log" "scenario2"
 assert_not_contains "$fake_log" "test-with-notion-connector"
 assert_not_contains "$fake_log" "onyx-falcon"
+
+default_run_id="default-local-output"
+repo_default_out="$ROOT/experiment/launch-readiness-amika/$default_run_id"
+repo_old_default_out="$ROOT/target/launch-readiness-amika/$default_run_id"
+repo_wrong_plural_out="$ROOT/experiments/launch-readiness-amika/$default_run_id"
+rm -rf "$repo_default_out" "$repo_old_default_out" "$repo_wrong_plural_out"
+
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="${tmp_root}/default-local-out.log" \
+  RUN_ID="$default_run_id" \
+  SYNC_ARTIFACTS=0 \
+  CODEX_MODEL="fake-model" \
+  CODEX_REASONING_EFFORT="low" \
+  CODEX_EXEC_TIMEOUT_SECONDS=12 \
+  "$WRAPPER" --scenario scenario2 >/dev/null
+
+test -f "$repo_default_out/run.env" || fail "default LOCAL_OUT_DIR should write to experiment"
+test ! -e "$repo_old_default_out/run.env" || fail "default LOCAL_OUT_DIR should not write to target"
+test ! -e "$repo_wrong_plural_out/run.env" || fail "default LOCAL_OUT_DIR should not write to experiments"
+assert_contains "$repo_default_out/run.env" "remote_worktree=/home/ubuntu/workspace/locality-launch-readiness-$default_run_id"
 
 custom_log="${tmp_root}/custom-amika.log"
 custom_out="${tmp_root}/custom-out"

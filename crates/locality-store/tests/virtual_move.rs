@@ -24,6 +24,75 @@ fn virtual_move_transition_is_atomic_in_sqlite() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[test]
+fn sqlite_virtual_move_pointer_round_trips_non_utf8_across_restarts() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = temp_root("loc-store-virtual-move-non-utf8");
+    let mount_id = MountId::new("linear-non-utf8");
+    let old_path = root.join(OsString::from_vec(b"old-\xff.md".to_vec()));
+    let new_path = root.join(OsString::from_vec(b"new-\xfe.md".to_vec()));
+    let mutation = VirtualMutationRecord {
+        mount_id: mount_id.clone(),
+        local_id: "move:non-utf8".to_string(),
+        mutation_kind: VirtualMutationKind::Move,
+        target_remote_id: Some(RemoteId::new("issue-non-utf8")),
+        parent_remote_id: None,
+        original_path: Some(PathBuf::from("old.md")),
+        projected_path: PathBuf::from("new.md"),
+        title: "Non UTF-8".to_string(),
+        content_path: Some(old_path.clone()),
+        created_at: "1".to_string(),
+        updated_at: "1".to_string(),
+    };
+
+    let mut store = SqliteStateStore::open(root.clone()).expect("open store");
+    store
+        .save_mount(MountConfig::new(
+            mount_id.clone(),
+            "linear",
+            root.join("mount"),
+        ))
+        .expect("save mount");
+    store
+        .save_virtual_mutation(mutation)
+        .expect("save exact native pointer");
+    drop(store);
+
+    let mut restarted = SqliteStateStore::open(root.clone()).expect("restart store");
+    assert_eq!(
+        restarted
+            .get_virtual_mutation(&mount_id, "move:non-utf8")
+            .expect("read pointer")
+            .expect("mutation")
+            .content_path,
+        Some(old_path.clone())
+    );
+    restarted
+        .finalize_virtual_move_content(
+            &mount_id,
+            "move:non-utf8",
+            Some(&old_path),
+            new_path.clone(),
+            "2",
+        )
+        .expect("finalize exact native pointer");
+    drop(restarted);
+
+    let restarted = SqliteStateStore::open(root.clone()).expect("restart finalized store");
+    assert_eq!(
+        restarted
+            .get_virtual_mutation(&mount_id, "move:non-utf8")
+            .expect("read finalized pointer")
+            .expect("mutation")
+            .content_path,
+        Some(new_path)
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn exercise_virtual_move_transition<S>(store: &mut S)
 where
     S: EntityRepository

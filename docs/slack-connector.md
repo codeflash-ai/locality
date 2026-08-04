@@ -12,15 +12,22 @@ loc mount slack ~/Locality/slack-main
 ```
 
 Locality requests Slack's `channels:join` scope. Mounts whose `--types` include
-`public_channel` join public channels before reading history. This mutates
-Slack membership for the connected app. Private channels still require an
-explicit Slack invite.
+`public_channel` join public channels before reading history by default. This
+mutates Slack membership for the connected app, and the manifest describes it
+separately as `membership_operations: ["join_public_channels"]`. It is not a
+content push operation and does not grant message or file write support.
+Private channels still require an explicit Slack invite.
 
 The default Slack connector settings are:
 
 ```json
 {"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"],"auto_join_public_channels":true}}
 ```
+
+Set `auto_join_public_channels` to `false` in mount settings to avoid the
+membership mutation. Unjoined public channels are then omitted rather than
+joined or projected; public channels where the app is already a member remain
+readable.
 
 ## OAuth scopes
 
@@ -74,6 +81,19 @@ strictest documented history page size while keeping FUSE reads bounded enough
 to open threaded conversations. Marketplace apps and internal customer-built
 apps may have different provider limits, but Locality still treats Slack 429
 responses as provider cooldowns.
+
+The hosted provider scopes its process-local gates and cooldowns by the
+non-secret Slack app ID, team ID, and exact Web API method. New durable hosts
+use `HostedSlackProviderCoordinationScopeV2` for the same exact identity.
+`HostedSlackProviderCoordinationScopeV1` and the existing
+`coordination_scope(operation)` API retain their original team-and-operation
+wire contract for compatibility.
+
+During a durable cooldown migration, hosts must continue reading and honoring
+unexpired V1 records while writing new cooldowns under V2 keys. A V1 key cannot
+be safely rewritten as V2 because it contains no app ID; V1 records should age
+out under their original broader scope instead of being silently dropped or
+assigned to an app.
 
 Freshness checks use the bounded conversation history and user metadata payload.
 Thread reply bodies are expanded when `recent.md` hydrates, so reply-only edits

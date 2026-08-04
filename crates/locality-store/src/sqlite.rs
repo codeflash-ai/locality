@@ -6,6 +6,7 @@
 //! until query needs justify normalization.
 
 use std::collections::BTreeSet;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,6 +21,10 @@ use locality_core::planner::{PlanSummary, PushOperation, PushPlan};
 use locality_core::readable_diff::ReadableDiffOutput;
 use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::shadow::ShadowDocument;
+use locality_protocol::freshness_delivery::{GenerationDelta, MAX_DELIVERY_ID_BYTES};
+use locality_protocol::generation_baseline::{
+    GenerationBaselineRefreshModeV1, GenerationBaselineSourceV1,
+};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -38,6 +43,15 @@ use crate::discovery::{
     reservation_changed, transaction_missing, validate_envelope_version,
 };
 use crate::error::{StoreError, StoreResult};
+use crate::generation_delivery::{
+    GENERATION_DELIVERY_COMPONENT_VERSION, GenerationApplyJournalRecord, GenerationApplyOutcome,
+    GenerationApplyStatus, GenerationBaselineSeedRecord, GenerationBaselineSeedRecordV2,
+    GenerationDeliveryRepository, GenerationInodeEvidenceConflictUpdate,
+    GenerationInodeEvidenceRecord, GenerationInodeEvidenceResolution, GenerationPathRecord,
+    GenerationPathState, GenerationRetainedInodeRecord, GenerationTransportSelectionBinding,
+    NegotiatedGenerationApplyJournalRecord, ObservedGenerationRecord, ObservedGenerationRecordV2,
+    PreparedGenerationApply, PreparedGenerationApplyV2, PreparedGenerationApplyV3,
+};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
@@ -51,18 +65,21 @@ use crate::repository::{
     FreshnessStateRepository, HydrationJobRepository, JournalRepository,
     MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
     RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
-    VirtualMutationRepository, WorkspaceBindingRepository, validate_virtual_move_transition,
-    virtual_move_content_changed, virtual_move_missing,
+    VirtualMutationRepository, WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
+    validate_virtual_move_transition, virtual_move_content_changed, virtual_move_missing,
 };
 use crate::workspace_binding::{
-    WorkspaceBinding, WorkspaceBindingRecord, WorkspaceRebindBlocker, binding_from_legacy_mount,
-    unique_binding,
+    LegacyWorkspaceMount, WorkspaceBinding, WorkspaceBindingRecord, WorkspaceHostBinding,
+    WorkspaceHostBindingResolver, WorkspaceId, WorkspaceRebindBlocker, host_paths_equivalent,
+    legacy_mount_collision_key, legacy_mount_collision_key_for_host,
 };
+use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 27;
 const ENTITY_SEARCH_COMPONENT_VERSION: i64 = 2;
 const JOURNALS_COMPONENT_VERSION: i64 = 3;
+const VIRTUAL_MUTATIONS_COMPONENT_VERSION: i64 = 4;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const RETIRED_NOTION_WORKSPACE_ROOTS_COMPONENT_ID: &str = "projection:notion_workspace_roots";
@@ -149,8 +166,8 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "durable:virtual_mutations",
         component_kind: "durable_json",
-        current_version: 3,
-        min_reader_version: 3,
+        current_version: VIRTUAL_MUTATIONS_COMPONENT_VERSION,
+        min_reader_version: VIRTUAL_MUTATIONS_COMPONENT_VERSION,
         required: true,
         rebuildable: false,
         data_json: "{}",
@@ -176,11 +193,11 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "durable:workspace_bindings",
         component_kind: "durable_json",
-        current_version: 1,
-        min_reader_version: 1,
+        current_version: 4,
+        min_reader_version: 4,
         required: true,
         rebuildable: false,
-        data_json: "{\"format\":\"workspace_binding.v1\"}",
+        data_json: "{\"format\":\"workspace_binding.v2\",\"layout_0_without_binding\":true,\"legacy_v1_readable\":true,\"target_scope\":\"workspace_id\",\"remount_recovery\":\"v1\"}",
     },
     StateComponentDefinition {
         component_id: "durable:metadata_discovery",
@@ -196,6 +213,15 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
         component_kind: "durable_transaction",
         current_version: 1,
         min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
+        component_id: "durable:generation_delivery",
+        component_kind: "durable_transaction",
+        current_version: GENERATION_DELIVERY_COMPONENT_VERSION,
+        min_reader_version: GENERATION_DELIVERY_COMPONENT_VERSION,
         required: true,
         rebuildable: false,
         data_json: "{}",
@@ -239,6 +265,34 @@ impl SqliteStateStore {
         inspect_state_compatibility(root)
     }
 
+    /// Read configured mount roots without creating, migrating, or repairing
+    /// Locality state. This intentionally supports older schemas whose `mounts`
+    /// table already has the stable `mount_id` and `root` columns.
+    pub fn inspect_mount_roots_read_only(
+        root: impl AsRef<Path>,
+    ) -> StoreResult<Vec<LegacyWorkspaceMount>> {
+        let db_path = root.as_ref().join(DB_FILE);
+        if !db_path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        if !table_exists(&connection, "mounts")? {
+            return Err(StoreError::StateCompatibility(
+                "state database has no readable mounts table".to_string(),
+            ));
+        }
+        let mut statement =
+            connection.prepare("SELECT mount_id, root FROM mounts ORDER BY mount_id")?;
+        let rows = statement.query_map([], |row| {
+            Ok(LegacyWorkspaceMount::new(
+                MountId(row.get::<_, String>(0)?),
+                PathBuf::from(row.get::<_, String>(1)?),
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn open(root: PathBuf) -> StoreResult<Self> {
         std::fs::create_dir_all(&root)?;
         let db_path = root.join(DB_FILE);
@@ -250,8 +304,11 @@ impl SqliteStateStore {
     }
 
     pub fn clear_mount_source_state(&mut self, mount_id: &MountId) -> StoreResult<()> {
-        let connection = self.connection()?;
-        clear_mount_source_state(&connection, mount_id)
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        clear_mount_source_state(&transaction, mount_id)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     fn connection(&self) -> StoreResult<Connection> {
@@ -267,10 +324,2324 @@ impl SqliteStateStore {
     }
 }
 
+fn generation_path_state_label(state: GenerationPathState) -> &'static str {
+    match state {
+        GenerationPathState::Clean => "clean",
+        GenerationPathState::Dirty => "dirty",
+        GenerationPathState::Conflicted => "conflicted",
+    }
+}
+
+fn parse_generation_path_state(value: &str) -> StoreResult<GenerationPathState> {
+    match value {
+        "clean" => Ok(GenerationPathState::Clean),
+        "dirty" => Ok(GenerationPathState::Dirty),
+        "conflicted" => Ok(GenerationPathState::Conflicted),
+        _ => Err(StoreError::InvalidState(format!(
+            "unknown generation path state `{value}`"
+        ))),
+    }
+}
+
+fn generation_baseline_refresh_mode_label(mode: GenerationBaselineRefreshModeV1) -> &'static str {
+    match mode {
+        GenerationBaselineRefreshModeV1::GenerationDeltaV1 => "generation_delta_v1",
+        GenerationBaselineRefreshModeV1::FullExportOnly => "full_export_only",
+    }
+}
+
+fn parse_generation_baseline_refresh_mode(
+    value: &str,
+) -> StoreResult<GenerationBaselineRefreshModeV1> {
+    match value {
+        "generation_delta_v1" => Ok(GenerationBaselineRefreshModeV1::GenerationDeltaV1),
+        "full_export_only" => Ok(GenerationBaselineRefreshModeV1::FullExportOnly),
+        _ => Err(StoreError::InvalidState(format!(
+            "unknown generation baseline refresh mode `{value}`"
+        ))),
+    }
+}
+
+fn generation_seed_refresh_mode(
+    observed: &ObservedGenerationRecord,
+    paths: &[GenerationPathRecord],
+) -> GenerationBaselineRefreshModeV1 {
+    let identifiers_fit = !observed.mount_id.as_str().is_empty()
+        && observed.mount_id.as_str().len() <= MAX_DELIVERY_ID_BYTES
+        && !observed.source_connection_id.as_str().is_empty()
+        && observed.source_connection_id.as_str().len() <= MAX_DELIVERY_ID_BYTES
+        && observed.generation_id.as_str().len() <= MAX_DELIVERY_ID_BYTES
+        && paths.iter().all(|path| {
+            !path.projection_id.as_str().is_empty()
+                && path.projection_id.as_str().len() <= MAX_DELIVERY_ID_BYTES
+                && path
+                    .base_identity
+                    .iter()
+                    .chain(path.incoming_identity.iter())
+                    .all(|identity| identity.validate().is_ok())
+        });
+    if identifiers_fit {
+        GenerationBaselineRefreshModeV1::GenerationDeltaV1
+    } else {
+        GenerationBaselineRefreshModeV1::FullExportOnly
+    }
+}
+
+fn observed_generation_from_row(
+    row: (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        Option<String>,
+        String,
+    ),
+) -> StoreResult<ObservedGenerationRecord> {
+    Ok(ObservedGenerationRecord {
+        mount_id: MountId::new(row.0),
+        source_connection_id: locality_core::portable::SourceConnectionId::new(row.1),
+        generation_id: locality_core::portable::SourceGenerationId::new(row.2)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        inventory_sha256: row.3,
+        workspace_layout_version: u16::try_from(row.4).map_err(|_| {
+            StoreError::InvalidState("invalid stored workspace layout version".to_string())
+        })?,
+        workspace_layout_digest: row.5,
+        last_receipt_sha256: row.6,
+        updated_at: row.7,
+    })
+}
+
+fn select_observed_generation(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Option<ObservedGenerationRecord>> {
+    let mut records = list_observed_generations_from_connection(connection, mount_id)?;
+    match records.len() {
+        0 => Ok(None),
+        1 => Ok(records.pop()),
+        _ => Err(StoreError::InvalidState(format!(
+            "mount `{}` has multiple observed generation sources; use a source-explicit repository method",
+            mount_id.0
+        ))),
+    }
+}
+
+fn select_observed_generation_for_source(
+    connection: &Connection,
+    mount_id: &MountId,
+    source_connection_id: &locality_core::portable::SourceConnectionId,
+) -> StoreResult<Option<ObservedGenerationRecord>> {
+    connection
+        .query_row(
+            "SELECT mount_id, source_connection_id, generation_id, inventory_sha256,
+                    workspace_layout_version, workspace_layout_digest,
+                    last_receipt_sha256, updated_at
+             FROM observed_generations
+             WHERE mount_id = ?1 AND source_connection_id = ?2",
+            params![mount_id.0.as_str(), source_connection_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(observed_generation_from_row)
+        .transpose()
+}
+
+fn select_observed_generation_for_source_v2(
+    connection: &Connection,
+    mount_id: &MountId,
+    source_connection_id: &locality_core::portable::SourceConnectionId,
+) -> StoreResult<Option<ObservedGenerationRecordV2>> {
+    connection
+        .query_row(
+            "SELECT mount_id, source_connection_id, generation_id, inventory_sha256,
+                    workspace_layout_version, workspace_layout_digest,
+                    last_receipt_sha256, updated_at, refresh_mode
+             FROM observed_generations
+             WHERE mount_id = ?1 AND source_connection_id = ?2",
+            params![mount_id.0.as_str(), source_connection_id.as_str()],
+            |row| {
+                Ok((
+                    (
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ),
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(row, refresh_mode)| {
+            Ok(ObservedGenerationRecordV2::new(
+                observed_generation_from_row(row)?,
+                parse_generation_baseline_refresh_mode(&refresh_mode)?,
+            ))
+        })
+        .transpose()
+}
+
+fn list_observed_generations_from_connection(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Vec<ObservedGenerationRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT mount_id, source_connection_id, generation_id, inventory_sha256,
+                workspace_layout_version, workspace_layout_digest,
+                last_receipt_sha256, updated_at
+         FROM observed_generations
+         WHERE mount_id = ?1
+         ORDER BY source_connection_id",
+    )?;
+    let rows = statement.query_map(params![mount_id.0.as_str()], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+        ))
+    })?;
+    rows.map(|row| observed_generation_from_row(row?)).collect()
+}
+
+fn list_observed_generations_v2_from_connection(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Vec<ObservedGenerationRecordV2>> {
+    let mut statement = connection.prepare(
+        "SELECT mount_id, source_connection_id, generation_id, inventory_sha256,
+                workspace_layout_version, workspace_layout_digest,
+                last_receipt_sha256, updated_at, refresh_mode
+         FROM observed_generations
+         WHERE mount_id = ?1
+         ORDER BY source_connection_id",
+    )?;
+    let rows = statement.query_map(params![mount_id.0.as_str()], |row| {
+        Ok((
+            (
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ),
+            row.get::<_, String>(8)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (observed, refresh_mode) = row?;
+        Ok(ObservedGenerationRecordV2::new(
+            observed_generation_from_row(observed)?,
+            parse_generation_baseline_refresh_mode(&refresh_mode)?,
+        ))
+    })
+    .collect()
+}
+
+fn generation_path_from_row(
+    row: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        String,
+        Option<String>,
+        String,
+    ),
+) -> StoreResult<GenerationPathRecord> {
+    Ok(GenerationPathRecord {
+        mount_id: MountId::new(row.0),
+        projection_id: locality_core::portable::ProjectionId::new(row.1),
+        logical_path: row.2,
+        local_logical_path: row.3,
+        base_generation_id: locality_core::portable::SourceGenerationId::new(row.4)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        base_identity: row.5.map(|value| from_json(&value)).transpose()?,
+        base_payload_delta_id: row.6,
+        base_payload_entry_index: row
+            .7
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    StoreError::InvalidState("negative generation base payload index".to_string())
+                })
+            })
+            .transpose()?,
+        conflict_payload_delta_id: row.8,
+        conflict_payload_entry_index: row
+            .9
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    StoreError::InvalidState(
+                        "negative generation conflict payload index".to_string(),
+                    )
+                })
+            })
+            .transpose()?,
+        state: parse_generation_path_state(&row.10)?,
+        incoming_identity: row.11.map(|value| from_json(&value)).transpose()?,
+        updated_at: row.12,
+    })
+}
+
+fn select_generation_path(
+    connection: &Connection,
+    mount_id: &MountId,
+    source_connection_id: &locality_core::portable::SourceConnectionId,
+    projection_id: &locality_core::portable::ProjectionId,
+) -> StoreResult<Option<GenerationPathRecord>> {
+    connection
+        .query_row(
+            "SELECT mount_id, projection_id, logical_path, local_logical_path, base_generation_id,
+                    base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                    conflict_payload_delta_id, conflict_payload_entry_index,
+                    state, incoming_identity_json, updated_at
+             FROM generation_paths
+             WHERE mount_id = ?1 AND source_connection_id = ?2 AND projection_id = ?3",
+            params![
+                mount_id.0.as_str(),
+                source_connection_id.as_str(),
+                projection_id.as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(generation_path_from_row)
+        .transpose()
+}
+
+fn list_generation_paths_from_connection(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Vec<GenerationPathRecord>> {
+    let mut observed = list_observed_generations_from_connection(connection, mount_id)?;
+    match observed.len() {
+        0 => Ok(Vec::new()),
+        1 => list_generation_paths_for_source_from_connection(
+            connection,
+            mount_id,
+            &observed
+                .pop()
+                .expect("one source was checked")
+                .source_connection_id,
+        ),
+        _ => Err(StoreError::InvalidState(format!(
+            "mount `{}` has multiple observed generation sources; use a source-explicit repository method",
+            mount_id.0
+        ))),
+    }
+}
+
+fn list_generation_paths_for_source_from_connection(
+    connection: &Connection,
+    mount_id: &MountId,
+    source_connection_id: &locality_core::portable::SourceConnectionId,
+) -> StoreResult<Vec<GenerationPathRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT mount_id, projection_id, logical_path, local_logical_path, base_generation_id,
+                base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                conflict_payload_delta_id, conflict_payload_entry_index,
+                state, incoming_identity_json, updated_at
+         FROM generation_paths
+         WHERE mount_id = ?1 AND source_connection_id = ?2
+         ORDER BY projection_id",
+    )?;
+    let rows = statement.query_map(
+        params![mount_id.0.as_str(), source_connection_id.as_str()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+            ))
+        },
+    )?;
+    rows.map(|row| generation_path_from_row(row?)).collect()
+}
+
+fn list_all_generation_paths_from_connection(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Vec<GenerationPathRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT mount_id, projection_id, logical_path, local_logical_path, base_generation_id,
+                base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                conflict_payload_delta_id, conflict_payload_entry_index,
+                state, incoming_identity_json, updated_at
+         FROM generation_paths WHERE mount_id = ?1 ORDER BY projection_id",
+    )?;
+    let rows = statement.query_map(params![mount_id.0.as_str()], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+            row.get(10)?,
+            row.get(11)?,
+            row.get(12)?,
+        ))
+    })?;
+    rows.map(|row| generation_path_from_row(row?)).collect()
+}
+
+struct StoredGenerationApply {
+    journal: GenerationApplyJournalRecord,
+    selection_binding: GenerationTransportSelectionBinding,
+    acknowledgment_required: bool,
+    acknowledged_at: Option<String>,
+}
+
+impl Deref for StoredGenerationApply {
+    type Target = GenerationApplyJournalRecord;
+
+    fn deref(&self) -> &Self::Target {
+        &self.journal
+    }
+}
+
+fn generation_apply_from_connection(
+    connection: &Connection,
+    delta_id: &str,
+) -> StoreResult<Option<StoredGenerationApply>> {
+    let row = connection
+        .query_row(
+            "SELECT mount_id, delta_json, receipt_json, receipt_sha256,
+                    selected_capabilities_json, selection_binding, acknowledgment_required,
+                    acknowledged_at, stage_root, status, active, created_at, updated_at, completed_at
+             FROM generation_apply_journals WHERE delta_id = ?1",
+            params![delta_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, bool>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, bool>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let mut outcomes = Vec::new();
+    let mut statement = connection.prepare(
+        "SELECT entry_index, outcome_json
+         FROM generation_apply_outcomes WHERE delta_id = ?1 ORDER BY entry_index",
+    )?;
+    let rows = statement.query_map(params![delta_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (entry_index, outcome_json) = row?;
+        outcomes.push((
+            u64::try_from(entry_index).map_err(|_| {
+                StoreError::InvalidState("negative generation outcome index".to_string())
+            })?,
+            from_json(&outcome_json)?,
+        ));
+    }
+    let delta: GenerationDelta = from_json(&row.1)?;
+    if delta.mount_id.as_str() != row.0 {
+        return Err(StoreError::InvalidState(format!(
+            "generation apply `{delta_id}` mount relation does not match its delta"
+        )));
+    }
+    let status = GenerationApplyStatus::parse(&row.9)?;
+    let selection_binding = match row.5.as_str() {
+        "bound" => {
+            let selected_capabilities: GenerationTransportCapabilities = from_json(&row.4)?;
+            selected_capabilities
+                .validate()
+                .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+            if selected_capabilities.terminal_receipt_acknowledgments != row.6 {
+                return Err(StoreError::InvalidState(format!(
+                    "generation apply `{delta_id}` acknowledgment selection does not match its journal"
+                )));
+            }
+            GenerationTransportSelectionBinding::Bound(selected_capabilities)
+        }
+        "pre_binding_completed" if status == GenerationApplyStatus::Completed && !row.10 => {
+            GenerationTransportSelectionBinding::PreBindingCompleted {
+                terminal_receipt_acknowledgments: row.6,
+            }
+        }
+        binding => {
+            return Err(StoreError::InvalidState(format!(
+                "generation apply `{delta_id}` has invalid transport selection binding `{binding}`"
+            )));
+        }
+    };
+    Ok(Some(StoredGenerationApply {
+        selection_binding,
+        acknowledgment_required: row.6,
+        acknowledged_at: row.7,
+        journal: GenerationApplyJournalRecord {
+            delta,
+            receipt: from_json(&row.2)?,
+            receipt_sha256: row.3,
+            stage_root: row.8,
+            status,
+            outcomes,
+            created_at: row.11,
+            updated_at: row.12,
+            completed_at: row.13,
+        },
+    }))
+}
+
+fn validate_seed_generation(
+    observed: &ObservedGenerationRecord,
+    paths: &[GenerationPathRecord],
+) -> StoreResult<()> {
+    if observed.workspace_layout_version == 0
+        || observed.workspace_layout_digest.is_empty()
+        || observed.inventory_sha256.is_empty()
+        || observed.updated_at.is_empty()
+    {
+        return Err(StoreError::InvalidState(
+            "observed generation has incomplete metadata".to_string(),
+        ));
+    }
+    let mut projections = BTreeSet::new();
+    let mut logical_paths = BTreeSet::new();
+    let mut local_paths = BTreeSet::new();
+    let mut inventory = Vec::with_capacity(paths.len());
+    for path in paths {
+        let logical_path = locality_core::portable::LogicalPath::new(path.logical_path.clone())
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+        let local_path = locality_core::portable::LogicalPath::new(path.local_logical_path.clone())
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+        if path.mount_id != observed.mount_id
+            || path.base_generation_id != observed.generation_id
+            || path.updated_at.is_empty()
+            || !projections.insert(path.projection_id.clone())
+            || !logical_paths.insert(logical_path.portable_collision_key())
+            || !local_paths.insert(local_path.portable_collision_key())
+        {
+            return Err(StoreError::InvalidState(
+                "generation path seed does not match its observed generation".to_string(),
+            ));
+        }
+        let Some(identity) = &path.base_identity else {
+            return Err(StoreError::InvalidState(
+                "generation baseline path has no clean base identity".to_string(),
+            ));
+        };
+        if identity.projection_id != path.projection_id
+            || identity.logical_path.as_str() != path.logical_path
+        {
+            return Err(StoreError::InvalidState(
+                "generation path base identity does not match its row".to_string(),
+            ));
+        }
+        if path.state != GenerationPathState::Clean
+            || path.local_logical_path != path.logical_path
+            || path.incoming_identity.is_some()
+            || path.base_payload_delta_id.is_some()
+            || path.base_payload_entry_index.is_some()
+            || path.conflict_payload_delta_id.is_some()
+            || path.conflict_payload_entry_index.is_some()
+        {
+            return Err(StoreError::InvalidState(
+                "generation baseline path is not a complete clean base".to_string(),
+            ));
+        }
+        inventory.push(identity.clone());
+    }
+    inventory.sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
+    let baseline_source = GenerationBaselineSourceV1::new(
+        observed.source_connection_id.clone(),
+        observed.generation_id.clone(),
+        inventory,
+    )
+    .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+    if baseline_source.target_inventory_sha256() != observed.inventory_sha256 {
+        return Err(StoreError::InvalidState(
+            "observed generation inventory does not match its complete path identities".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+impl GenerationDeliveryRepository for SqliteStateStore {
+    fn seed_observed_generation(
+        &mut self,
+        observed: ObservedGenerationRecord,
+        paths: Vec<GenerationPathRecord>,
+    ) -> StoreResult<()> {
+        let existing =
+            list_observed_generations_from_connection(&self.connection()?, &observed.mount_id)?;
+        if existing
+            .iter()
+            .any(|record| record.source_connection_id != observed.source_connection_id)
+        {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` has multiple observed generation sources; use atomic multi-source baseline seeding",
+                observed.mount_id.0
+            )));
+        }
+        self.seed_observed_generations_v2(vec![GenerationBaselineSeedRecordV2::new(
+            GenerationBaselineSeedRecord::new(observed, paths),
+            GenerationBaselineRefreshModeV1::GenerationDeltaV1,
+        )])
+    }
+
+    fn seed_observed_generations(
+        &mut self,
+        seeds: Vec<GenerationBaselineSeedRecord>,
+    ) -> StoreResult<()> {
+        self.seed_observed_generations_v2(
+            seeds
+                .into_iter()
+                .map(|seed| {
+                    GenerationBaselineSeedRecordV2::new(
+                        seed,
+                        GenerationBaselineRefreshModeV1::GenerationDeltaV1,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn seed_observed_generations_v2(
+        &mut self,
+        mut seeds: Vec<GenerationBaselineSeedRecordV2>,
+    ) -> StoreResult<()> {
+        let mut baseline_layout = None;
+        for seed in &mut seeds {
+            validate_seed_generation(&seed.seed.observed, &seed.seed.paths)?;
+            let layout = (
+                seed.seed.observed.workspace_layout_version,
+                seed.seed.observed.workspace_layout_digest.clone(),
+            );
+            match &baseline_layout {
+                Some(existing) if existing != &layout => {
+                    return Err(StoreError::InvalidState(
+                        "generation baseline mounts do not share one workspace layout".to_string(),
+                    ));
+                }
+                None => baseline_layout = Some(layout),
+                Some(_) => {}
+            }
+            let expected_mode = generation_seed_refresh_mode(&seed.seed.observed, &seed.seed.paths);
+            if seed.refresh_mode != expected_mode {
+                return Err(StoreError::InvalidState(format!(
+                    "mount `{}` source `{}` baseline refresh mode does not match its generation state",
+                    seed.seed.observed.mount_id.0,
+                    seed.seed.observed.source_connection_id.as_str()
+                )));
+            }
+            seed.seed
+                .paths
+                .sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
+        }
+        seeds.sort_by(|left, right| {
+            left.seed
+                .observed
+                .mount_id
+                .cmp(&right.seed.observed.mount_id)
+                .then_with(|| {
+                    left.seed
+                        .observed
+                        .source_connection_id
+                        .cmp(&right.seed.observed.source_connection_id)
+                })
+        });
+        let mut source_pairs = BTreeSet::new();
+        if seeds.iter().any(|seed| {
+            !source_pairs.insert((
+                seed.seed.observed.mount_id.clone(),
+                seed.seed.observed.source_connection_id.clone(),
+            ))
+        }) {
+            return Err(StoreError::InvalidState(
+                "generation baseline repeats a mount/source record".to_string(),
+            ));
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for seed in &seeds {
+            let mount_exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mounts WHERE mount_id = ?1)",
+                params![seed.seed.observed.mount_id.0.as_str()],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !mount_exists {
+                return Err(StoreError::MountMissing(
+                    seed.seed.observed.mount_id.clone(),
+                ));
+            }
+        }
+
+        let mounts = seeds
+            .iter()
+            .map(|seed| seed.seed.observed.mount_id.clone())
+            .collect::<BTreeSet<_>>();
+        for mount_id in &mounts {
+            let active: Option<String> = transaction
+                .query_row(
+                    "SELECT delta_id FROM generation_apply_journals
+                     WHERE mount_id = ?1 AND active = 1 ORDER BY delta_id LIMIT 1",
+                    params![mount_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(delta_id) = active {
+                return Err(StoreError::InvalidState(format!(
+                    "mount `{}` cannot seed a generation baseline while apply `{delta_id}` is active",
+                    mount_id.0
+                )));
+            }
+
+            // BEGIN IMMEDIATE serializes competing seeders. Once any source
+            // exists, the batch must name the complete durable source set;
+            // the exact record, inventory, layout, mode, and path checks below
+            // then bind the replay to that same baseline.
+            let existing_sources =
+                list_observed_generations_from_connection(&transaction, mount_id)?
+                    .into_iter()
+                    .map(|record| record.source_connection_id)
+                    .collect::<BTreeSet<_>>();
+            let incoming_sources = seeds
+                .iter()
+                .filter(|seed| &seed.seed.observed.mount_id == mount_id)
+                .map(|seed| seed.seed.observed.source_connection_id.clone())
+                .collect::<BTreeSet<_>>();
+            if !existing_sources.is_empty() && existing_sources != incoming_sources {
+                return Err(StoreError::InvalidState(format!(
+                    "mount `{}` already has a generation baseline; replay must include every exact source",
+                    mount_id.0
+                )));
+            }
+        }
+
+        // Validate every replay before inserting any new source. This keeps a
+        // mixed exact/changed batch closed and transactionally invisible.
+        let mut insert_indexes = Vec::new();
+        for (index, seed) in seeds.iter().enumerate() {
+            if let Some(existing) = select_observed_generation_for_source(
+                &transaction,
+                &seed.seed.observed.mount_id,
+                &seed.seed.observed.source_connection_id,
+            )? {
+                let existing_v2 = select_observed_generation_for_source_v2(
+                    &transaction,
+                    &seed.seed.observed.mount_id,
+                    &seed.seed.observed.source_connection_id,
+                )?
+                .expect("the same observed row was selected");
+                let existing_paths = list_generation_paths_for_source_from_connection(
+                    &transaction,
+                    &seed.seed.observed.mount_id,
+                    &seed.seed.observed.source_connection_id,
+                )?;
+                if existing != seed.seed.observed
+                    || existing_v2.refresh_mode != seed.refresh_mode
+                    || existing_paths != seed.seed.paths
+                {
+                    return Err(StoreError::InvalidState(format!(
+                        "mount `{}` source `{}` already has a different observed generation",
+                        seed.seed.observed.mount_id.0,
+                        seed.seed.observed.source_connection_id.as_str()
+                    )));
+                }
+            } else {
+                insert_indexes.push(index);
+            }
+        }
+
+        // Projection IDs and both remote and local portable paths remain
+        // mount-wide namespaces even when their source heads are independent.
+        let mut projections = BTreeSet::new();
+        let mut logical_paths = BTreeSet::new();
+        let mut local_paths = BTreeSet::new();
+        for mount_id in &mounts {
+            for path in list_all_generation_paths_from_connection(&transaction, mount_id)? {
+                projections.insert((mount_id.clone(), path.projection_id));
+                logical_paths.insert((
+                    mount_id.clone(),
+                    locality_core::portable::LogicalPath::new(path.logical_path)
+                        .map_err(|error| StoreError::InvalidState(error.to_string()))?
+                        .portable_collision_key(),
+                ));
+                local_paths.insert((
+                    mount_id.clone(),
+                    locality_core::portable::LogicalPath::new(path.local_logical_path)
+                        .map_err(|error| StoreError::InvalidState(error.to_string()))?
+                        .portable_collision_key(),
+                ));
+            }
+        }
+        for &index in &insert_indexes {
+            let seed = &seeds[index];
+            for path in &seed.seed.paths {
+                let logical = locality_core::portable::LogicalPath::new(path.logical_path.clone())
+                    .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+                let local =
+                    locality_core::portable::LogicalPath::new(path.local_logical_path.clone())
+                        .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+                if !projections.insert((
+                    seed.seed.observed.mount_id.clone(),
+                    path.projection_id.clone(),
+                )) || !logical_paths.insert((
+                    seed.seed.observed.mount_id.clone(),
+                    logical.portable_collision_key(),
+                )) || !local_paths.insert((
+                    seed.seed.observed.mount_id.clone(),
+                    local.portable_collision_key(),
+                )) {
+                    return Err(StoreError::InvalidState(format!(
+                        "mount `{}` generation baseline has a projection or path collision",
+                        seed.seed.observed.mount_id.0
+                    )));
+                }
+            }
+        }
+
+        for index in insert_indexes {
+            let seed = &seeds[index];
+            let observed = &seed.seed.observed;
+            transaction.execute(
+                "INSERT INTO observed_generations (
+                    mount_id, source_connection_id, generation_id, inventory_sha256,
+                    workspace_layout_version, workspace_layout_digest,
+                    last_receipt_sha256, updated_at, refresh_mode
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    observed.mount_id.0.as_str(),
+                    observed.source_connection_id.as_str(),
+                    observed.generation_id.as_str(),
+                    observed.inventory_sha256.as_str(),
+                    observed.workspace_layout_version,
+                    observed.workspace_layout_digest.as_str(),
+                    observed.last_receipt_sha256.as_deref(),
+                    observed.updated_at.as_str(),
+                    generation_baseline_refresh_mode_label(seed.refresh_mode),
+                ],
+            )?;
+            for path in &seed.seed.paths {
+                transaction.execute(
+                    "INSERT INTO generation_paths (
+                        mount_id, source_connection_id, projection_id, logical_path,
+                        local_logical_path, base_generation_id, base_identity_json,
+                        base_payload_delta_id, base_payload_entry_index,
+                        conflict_payload_delta_id, conflict_payload_entry_index,
+                        state, incoming_identity_json, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    params![
+                        path.mount_id.0.as_str(),
+                        observed.source_connection_id.as_str(),
+                        path.projection_id.as_str(),
+                        path.logical_path.as_str(),
+                        path.local_logical_path.as_str(),
+                        path.base_generation_id.as_str(),
+                        path.base_identity.as_ref().map(to_json).transpose()?,
+                        path.base_payload_delta_id.as_deref(),
+                        path.base_payload_entry_index
+                            .map(i64::try_from)
+                            .transpose()
+                            .map_err(|_| StoreError::InvalidState(
+                                "generation base payload index is too large".to_string()
+                            ))?,
+                        path.conflict_payload_delta_id.as_deref(),
+                        path.conflict_payload_entry_index
+                            .map(i64::try_from)
+                            .transpose()
+                            .map_err(|_| StoreError::InvalidState(
+                                "generation conflict payload index is too large".to_string()
+                            ))?,
+                        generation_path_state_label(path.state),
+                        path.incoming_identity.as_ref().map(to_json).transpose()?,
+                        path.updated_at.as_str(),
+                    ],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn get_observed_generation(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Option<ObservedGenerationRecord>> {
+        select_observed_generation(&self.connection()?, mount_id)
+    }
+
+    fn get_observed_generation_for_source(
+        &self,
+        mount_id: &MountId,
+        source_connection_id: &locality_core::portable::SourceConnectionId,
+    ) -> StoreResult<Option<ObservedGenerationRecord>> {
+        select_observed_generation_for_source(&self.connection()?, mount_id, source_connection_id)
+    }
+
+    fn get_observed_generation_for_source_v2(
+        &self,
+        mount_id: &MountId,
+        source_connection_id: &locality_core::portable::SourceConnectionId,
+    ) -> StoreResult<Option<ObservedGenerationRecordV2>> {
+        select_observed_generation_for_source_v2(
+            &self.connection()?,
+            mount_id,
+            source_connection_id,
+        )
+    }
+
+    fn list_observed_generations(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<ObservedGenerationRecord>> {
+        list_observed_generations_from_connection(&self.connection()?, mount_id)
+    }
+
+    fn list_observed_generations_v2(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<ObservedGenerationRecordV2>> {
+        list_observed_generations_v2_from_connection(&self.connection()?, mount_id)
+    }
+
+    fn list_generation_paths(&self, mount_id: &MountId) -> StoreResult<Vec<GenerationPathRecord>> {
+        list_generation_paths_from_connection(&self.connection()?, mount_id)
+    }
+
+    fn list_generation_paths_for_source(
+        &self,
+        mount_id: &MountId,
+        source_connection_id: &locality_core::portable::SourceConnectionId,
+    ) -> StoreResult<Vec<GenerationPathRecord>> {
+        list_generation_paths_for_source_from_connection(
+            &self.connection()?,
+            mount_id,
+            source_connection_id,
+        )
+    }
+
+    fn reset_observed_generation_source(
+        &mut self,
+        mount_id: &MountId,
+        source_connection_id: &locality_core::portable::SourceConnectionId,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active_or_unacknowledged: Option<String> = transaction
+            .query_row(
+                "SELECT delta_id FROM generation_apply_journals
+                 WHERE mount_id = ?1
+                   AND (
+                       active = 1
+                       OR (
+                           source_connection_id = ?2
+                           AND acknowledgment_required = 1
+                           AND acknowledged_at IS NULL
+                       )
+                   )
+                 ORDER BY delta_id LIMIT 1",
+                params![mount_id.as_str(), source_connection_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(delta_id) = active_or_unacknowledged {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` source `{}` cannot reset generation delivery while apply `{delta_id}` is active or unacknowledged",
+                mount_id.0,
+                source_connection_id.as_str()
+            )));
+        }
+        let preserved_path: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT projection_id, state FROM generation_paths
+                 WHERE mount_id = ?1 AND source_connection_id = ?2
+                   AND state IN ('dirty', 'conflicted')
+                 ORDER BY projection_id LIMIT 1",
+                params![mount_id.as_str(), source_connection_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((projection_id, state)) = preserved_path {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` source `{}` cannot reset generation path `{projection_id}` while it is {state}",
+                mount_id.0,
+                source_connection_id.as_str()
+            )));
+        }
+        let retained_inode: Option<String> = transaction
+            .query_row(
+                "SELECT evidence.logical_path
+                 FROM generation_inode_evidence AS evidence
+                 JOIN generation_apply_journals AS journals
+                   ON journals.delta_id = evidence.delta_id
+                 WHERE journals.mount_id = ?1 AND journals.source_connection_id = ?2
+                 ORDER BY evidence.logical_path LIMIT 1",
+                params![mount_id.as_str(), source_connection_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(logical_path) = retained_inode {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` source `{}` cannot reset while displaced inode evidence for `{logical_path}` is retained",
+                mount_id.0,
+                source_connection_id.as_str()
+            )));
+        }
+        transaction.execute(
+            "DELETE FROM generation_apply_journals
+             WHERE mount_id = ?1 AND source_connection_id = ?2 AND active = 0",
+            params![mount_id.as_str(), source_connection_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM observed_generations
+             WHERE mount_id = ?1 AND source_connection_id = ?2",
+            params![mount_id.as_str(), source_connection_id.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn reserve_generation_apply(
+        &mut self,
+        prepared: PreparedGenerationApply,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        self.reserve_generation_apply_v2(PreparedGenerationApplyV2::new(prepared, false))
+    }
+
+    fn reserve_generation_apply_v2(
+        &mut self,
+        prepared: PreparedGenerationApplyV2,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        let mut selected_capabilities = GenerationTransportCapabilities::legacy();
+        selected_capabilities.terminal_receipt_acknowledgments = prepared.acknowledgment_required;
+        self.reserve_generation_apply_v3(PreparedGenerationApplyV3::new(
+            prepared.apply,
+            selected_capabilities,
+        ))
+        .map(|record| record.apply)
+    }
+
+    fn reserve_generation_apply_v3(
+        &mut self,
+        prepared: PreparedGenerationApplyV3,
+    ) -> StoreResult<NegotiatedGenerationApplyJournalRecord> {
+        prepared
+            .selected_capabilities
+            .validate()
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+        let selected_capabilities = prepared.selected_capabilities;
+        let acknowledgment_required = selected_capabilities.terminal_receipt_acknowledgments;
+        let prepared = prepared.apply;
+        prepared.validate()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) =
+            generation_apply_from_connection(&transaction, &prepared.delta.delta_id)?
+        {
+            let immutable_apply_matches = existing.delta == prepared.delta
+                && existing.receipt == prepared.receipt
+                && existing.receipt_sha256 == prepared.receipt_sha256
+                && existing.stage_root == prepared.stage_root
+                && existing.created_at == prepared.created_at;
+            let selection_matches = match &existing.selection_binding {
+                GenerationTransportSelectionBinding::Bound(bound) => {
+                    bound == &selected_capabilities
+                        && existing.acknowledgment_required == acknowledgment_required
+                }
+                GenerationTransportSelectionBinding::PreBindingCompleted { .. } => {
+                    existing.status == GenerationApplyStatus::Completed
+                }
+            };
+            if immutable_apply_matches && selection_matches {
+                transaction.commit()?;
+                return Ok(NegotiatedGenerationApplyJournalRecord {
+                    apply: existing.journal,
+                    selection_binding: existing.selection_binding,
+                });
+            }
+            return Err(StoreError::InvalidState(format!(
+                "generation apply `{}` replay changed its immutable payload",
+                prepared.delta.delta_id
+            )));
+        }
+
+        let mount_id = MountId::new(prepared.delta.mount_id.as_str());
+        let observed = select_observed_generation_for_source_v2(
+            &transaction,
+            &mount_id,
+            &prepared.delta.source_connection_id,
+        )?
+        .ok_or_else(|| {
+            StoreError::InvalidState(format!(
+                "mount `{}` source `{}` has no observed generation",
+                prepared.delta.mount_id,
+                prepared.delta.source_connection_id.as_str()
+            ))
+        })?;
+        if observed.refresh_mode != GenerationBaselineRefreshModeV1::GenerationDeltaV1 {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` source `{}` requires a full export",
+                prepared.delta.mount_id,
+                prepared.delta.source_connection_id.as_str()
+            )));
+        }
+        let observed = observed.observed;
+        if observed.generation_id != prepared.delta.base_generation_id
+            || observed.workspace_layout_version != prepared.delta.workspace_layout_version
+            || observed.workspace_layout_digest != prepared.delta.workspace_layout_digest.as_str()
+        {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` generation or layout does not match delta base",
+                prepared.delta.mount_id
+            )));
+        }
+        for entry in &prepared.delta.entries {
+            if let Some(old) = &entry.old {
+                let path = select_generation_path(
+                    &transaction,
+                    &mount_id,
+                    &prepared.delta.source_connection_id,
+                    &old.projection_id,
+                )?
+                .ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "delta old projection `{}` has no local merge base",
+                        old.projection_id.as_str()
+                    ))
+                })?;
+                let expected = if path.state == GenerationPathState::Conflicted {
+                    path.incoming_identity.as_ref()
+                } else {
+                    path.base_identity.as_ref()
+                };
+                if expected != Some(old) {
+                    return Err(StoreError::InvalidState(format!(
+                        "delta old projection `{}` does not match local merge state",
+                        old.projection_id.as_str()
+                    )));
+                }
+            }
+        }
+        let active: Option<String> = transaction
+            .query_row(
+                "SELECT delta_id FROM generation_apply_journals
+                 WHERE mount_id = ?1 AND active = 1",
+                params![prepared.delta.mount_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(active) = active {
+            return Err(StoreError::InvalidState(format!(
+                "mount already has active generation apply `{active}`"
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO generation_apply_journals (
+                delta_id, mount_id, source_connection_id, base_generation_id,
+                target_generation_id, delta_json, receipt_json, receipt_sha256,
+                selected_capabilities_json, selection_binding, acknowledgment_required, acknowledged_at,
+                stage_root, status, active, created_at, updated_at, completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'bound', ?10, NULL, ?11, 'staged', 1, ?12, ?12, NULL)",
+            params![
+                prepared.delta.delta_id.as_str(),
+                prepared.delta.mount_id.as_str(),
+                prepared.delta.source_connection_id.as_str(),
+                prepared.delta.base_generation_id.as_str(),
+                prepared.delta.target_generation_id.as_str(),
+                to_json(&prepared.delta)?,
+                to_json(&prepared.receipt)?,
+                prepared.receipt_sha256.as_str(),
+                to_json(&selected_capabilities)?,
+                acknowledgment_required,
+                prepared.stage_root.as_str(),
+                prepared.created_at.as_str(),
+            ],
+        )?;
+        let record = generation_apply_from_connection(&transaction, &prepared.delta.delta_id)?
+            .expect("inserted generation journal exists");
+        transaction.commit()?;
+        Ok(NegotiatedGenerationApplyJournalRecord {
+            apply: record.journal,
+            selection_binding: record.selection_binding,
+        })
+    }
+
+    fn mark_generation_apply_started(
+        &mut self,
+        delta_id: &str,
+        updated_at: &str,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        let connection = self.connection()?;
+        let existing =
+            generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if existing.status == GenerationApplyStatus::Completed {
+            return Ok(existing.journal);
+        }
+        connection.execute(
+            "UPDATE generation_apply_journals
+             SET status = 'applying', updated_at = ?2
+             WHERE delta_id = ?1 AND active = 1",
+            params![delta_id, updated_at],
+        )?;
+        generation_apply_from_connection(&connection, delta_id)?
+            .map(|stored| stored.journal)
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` disappeared"))
+            })
+    }
+
+    fn record_generation_apply_outcome(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+        outcome: GenerationApplyOutcome,
+        updated_at: &str,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let journal =
+            generation_apply_from_connection(&transaction, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status == GenerationApplyStatus::Completed {
+            let exact = journal
+                .outcomes
+                .iter()
+                .find(|(index, _)| *index == entry_index)
+                .is_some_and(|(_, existing)| existing == &outcome);
+            return if exact {
+                Ok(journal.journal)
+            } else {
+                Err(StoreError::InvalidState(format!(
+                    "completed generation apply `{delta_id}` outcome changed"
+                )))
+            };
+        }
+        if entry_index >= journal.delta.entries.len() as u64 {
+            return Err(StoreError::InvalidState(format!(
+                "generation apply `{delta_id}` outcome index is out of bounds"
+            )));
+        }
+        if let Some((_, existing)) = journal
+            .outcomes
+            .iter()
+            .find(|(index, _)| *index == entry_index)
+        {
+            return if existing == &outcome {
+                Ok(journal.journal)
+            } else {
+                Err(StoreError::InvalidState(format!(
+                    "generation apply `{delta_id}` outcome replay changed"
+                )))
+            };
+        }
+        transaction.execute(
+            "INSERT INTO generation_apply_outcomes (delta_id, entry_index, outcome_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                delta_id,
+                i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                    "generation apply outcome index is too large".to_string()
+                ))?,
+                to_json(&outcome)?,
+                updated_at
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE generation_apply_journals SET status = 'applying', updated_at = ?2
+             WHERE delta_id = ?1 AND active = 1",
+            params![delta_id, updated_at],
+        )?;
+        let updated = generation_apply_from_connection(&transaction, delta_id)?
+            .expect("generation journal remains present");
+        transaction.commit()?;
+        Ok(updated.journal)
+    }
+
+    fn get_generation_apply(
+        &self,
+        delta_id: &str,
+    ) -> StoreResult<Option<GenerationApplyJournalRecord>> {
+        Ok(
+            generation_apply_from_connection(&self.connection()?, delta_id)?
+                .map(|stored| stored.journal),
+        )
+    }
+
+    fn get_generation_apply_v2(
+        &self,
+        delta_id: &str,
+    ) -> StoreResult<Option<NegotiatedGenerationApplyJournalRecord>> {
+        Ok(
+            generation_apply_from_connection(&self.connection()?, delta_id)?.map(|stored| {
+                NegotiatedGenerationApplyJournalRecord {
+                    apply: stored.journal,
+                    selection_binding: stored.selection_binding,
+                }
+            }),
+        )
+    }
+
+    fn list_active_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        let connection = self.connection()?;
+        let delta_ids = {
+            let mut statement = connection.prepare(
+                "SELECT delta_id FROM generation_apply_journals WHERE active = 1 ORDER BY delta_id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        delta_ids
+            .iter()
+            .map(|delta_id| {
+                generation_apply_from_connection(&connection, delta_id)?
+                    .map(|stored| stored.journal)
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "active generation apply `{delta_id}` disappeared"
+                        ))
+                    })
+            })
+            .collect()
+    }
+
+    fn list_active_generation_applies_for_mount(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        let connection = self.connection()?;
+        let delta_ids = {
+            let mut statement = connection.prepare(
+                "SELECT delta_id FROM generation_apply_journals
+                 WHERE mount_id = ?1 AND active = 1 ORDER BY delta_id",
+            )?;
+            statement
+                .query_map(params![mount_id.as_str()], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        delta_ids
+            .iter()
+            .map(|delta_id| {
+                generation_apply_from_connection(&connection, delta_id)?
+                    .map(|stored| stored.journal)
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "active generation apply `{delta_id}` disappeared"
+                        ))
+                    })
+            })
+            .collect()
+    }
+
+    fn list_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        let connection = self.connection()?;
+        let delta_ids = {
+            let mut statement = connection.prepare(
+                "SELECT delta_id FROM generation_apply_journals ORDER BY created_at, delta_id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        delta_ids
+            .iter()
+            .map(|delta_id| {
+                generation_apply_from_connection(&connection, delta_id)?
+                    .map(|stored| stored.journal)
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "generation apply `{delta_id}` disappeared"
+                        ))
+                    })
+            })
+            .collect()
+    }
+
+    fn list_pending_generation_acknowledgments(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        let connection = self.connection()?;
+        let delta_ids = {
+            let mut statement = connection.prepare(
+                "SELECT delta_id FROM generation_apply_journals
+                 WHERE mount_id = ?1 AND status = 'completed'
+                   AND acknowledgment_required = 1 AND acknowledged_at IS NULL
+                 ORDER BY completed_at, delta_id",
+            )?;
+            statement
+                .query_map(params![mount_id.as_str()], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        delta_ids
+            .iter()
+            .map(|delta_id| {
+                generation_apply_from_connection(&connection, delta_id)?
+                    .map(|stored| stored.journal)
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "pending generation acknowledgment `{delta_id}` disappeared"
+                        ))
+                    })
+            })
+            .collect()
+    }
+
+    fn list_pending_generation_acknowledgments_for_source(
+        &self,
+        mount_id: &MountId,
+        source_connection_id: &locality_core::portable::SourceConnectionId,
+    ) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        let connection = self.connection()?;
+        let delta_ids = {
+            let mut statement = connection.prepare(
+                "SELECT delta_id FROM generation_apply_journals
+                 WHERE mount_id = ?1 AND source_connection_id = ?2
+                   AND status = 'completed'
+                   AND acknowledgment_required = 1 AND acknowledged_at IS NULL
+                 ORDER BY completed_at, delta_id",
+            )?;
+            statement
+                .query_map(
+                    params![mount_id.as_str(), source_connection_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        delta_ids
+            .iter()
+            .map(|delta_id| {
+                generation_apply_from_connection(&connection, delta_id)?
+                    .map(|stored| stored.journal)
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "pending generation acknowledgment `{delta_id}` disappeared"
+                        ))
+                    })
+            })
+            .collect()
+    }
+
+    fn mark_generation_acknowledged(
+        &mut self,
+        delta_id: &str,
+        receipt_sha256: &str,
+        acknowledged_at: &str,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        if acknowledged_at.is_empty() {
+            return Err(StoreError::InvalidState(
+                "generation acknowledgment timestamp must not be empty".to_string(),
+            ));
+        }
+        let connection = self.connection()?;
+        let journal =
+            generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status != GenerationApplyStatus::Completed
+            || !journal.acknowledgment_required
+            || journal.receipt_sha256 != receipt_sha256
+        {
+            return Err(StoreError::InvalidState(format!(
+                "generation acknowledgment `{delta_id}` does not match a completed required receipt"
+            )));
+        }
+        if journal.acknowledged_at.is_some() {
+            return Ok(journal.journal);
+        }
+        let changed = connection.execute(
+            "UPDATE generation_apply_journals
+             SET acknowledged_at = ?3, updated_at = ?3
+             WHERE delta_id = ?1 AND receipt_sha256 = ?2
+               AND status = 'completed' AND acknowledgment_required = 1
+               AND acknowledged_at IS NULL",
+            params![delta_id, receipt_sha256, acknowledged_at],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(format!(
+                "generation acknowledgment `{delta_id}` changed concurrently"
+            )));
+        }
+        generation_apply_from_connection(&connection, delta_id)?
+            .map(|stored| stored.journal)
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "acknowledged generation apply `{delta_id}` disappeared"
+                ))
+            })
+    }
+
+    fn record_generation_inode_evidence(
+        &mut self,
+        evidence: GenerationInodeEvidenceRecord,
+    ) -> StoreResult<()> {
+        // The SQL column names predate the captured-reservation model and stay
+        // stable for schema compatibility. They store captured snapshots, not
+        // live post-resolution filesystem fingerprints or disk usage.
+        if evidence.resolved_at.is_some() {
+            return Err(StoreError::InvalidState(
+                "new generation inode evidence cannot start resolved".to_string(),
+            ));
+        }
+        let connection = self.connection()?;
+        let entry_index = i64::try_from(evidence.entry_index).map_err(|_| {
+            StoreError::InvalidState("generation evidence index is too large".to_string())
+        })?;
+        let byte_length = i64::try_from(evidence.captured_byte_length).map_err(|_| {
+            StoreError::InvalidState("generation evidence length is too large".to_string())
+        })?;
+        let changed = connection.execute(
+            "INSERT INTO generation_inode_evidence (
+                delta_id, entry_index, mount_id, logical_path, evidence_name,
+                expected_sha256, byte_length, base_payload_delta_id,
+                base_payload_entry_index, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(delta_id, entry_index) DO NOTHING",
+            params![
+                evidence.delta_id.as_str(),
+                entry_index,
+                evidence.mount_id.0.as_str(),
+                evidence.logical_path.as_str(),
+                evidence.evidence_name.as_str(),
+                evidence.captured_sha256.as_str(),
+                byte_length,
+                evidence.base_payload_delta_id.as_deref(),
+                evidence
+                    .base_payload_entry_index
+                    .map(i64::try_from)
+                    .transpose()
+                    .map_err(|_| StoreError::InvalidState(
+                        "generation evidence base payload index is too large".to_string()
+                    ))?,
+                evidence.created_at.as_str(),
+            ],
+        )?;
+        if changed == 0 {
+            let exact: bool = connection.query_row(
+                "SELECT mount_id = ?3 AND logical_path = ?4 AND evidence_name = ?5
+                        AND expected_sha256 = ?6 AND byte_length = ?7
+                        AND base_payload_delta_id IS ?8 AND base_payload_entry_index IS ?9
+                        AND created_at = ?10
+                        AND visible_evidence_name IS NULL
+                        AND visible_expected_sha256 IS NULL
+                        AND visible_byte_length IS NULL
+                        AND resolved_at IS NULL
+                 FROM generation_inode_evidence WHERE delta_id = ?1 AND entry_index = ?2",
+                params![
+                    evidence.delta_id.as_str(),
+                    entry_index,
+                    evidence.mount_id.0.as_str(),
+                    evidence.logical_path.as_str(),
+                    evidence.evidence_name.as_str(),
+                    evidence.captured_sha256.as_str(),
+                    byte_length,
+                    evidence.base_payload_delta_id.as_deref(),
+                    evidence
+                        .base_payload_entry_index
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| StoreError::InvalidState(
+                            "generation evidence base payload index is too large".to_string()
+                        ))?,
+                    evidence.created_at.as_str(),
+                ],
+                |row| row.get(0),
+            )?;
+            if !exact {
+                return Err(StoreError::InvalidState(
+                    "generation inode evidence replay changed".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn list_generation_inode_evidence(&self) -> StoreResult<Vec<GenerationInodeEvidenceRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT delta_id, entry_index, mount_id, logical_path, evidence_name,
+                    expected_sha256, byte_length, visible_evidence_name,
+                    visible_expected_sha256, visible_byte_length,
+                    base_payload_delta_id, base_payload_entry_index, resolved_at, created_at
+             FROM generation_inode_evidence ORDER BY created_at, delta_id, entry_index",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<i64>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, String>(13)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let row = row?;
+            Ok(GenerationInodeEvidenceRecord {
+                delta_id: row.0,
+                entry_index: u64::try_from(row.1).map_err(|_| {
+                    StoreError::InvalidState("negative generation evidence index".to_string())
+                })?,
+                mount_id: MountId::new(row.2),
+                logical_path: row.3,
+                evidence_name: row.4,
+                captured_sha256: row.5,
+                captured_byte_length: u64::try_from(row.6).map_err(|_| {
+                    StoreError::InvalidState("negative generation evidence length".to_string())
+                })?,
+                visible_evidence: match (row.7, row.8, row.9) {
+                    (Some(evidence_name), Some(captured_sha256), Some(captured_byte_length)) => {
+                        Some(GenerationRetainedInodeRecord {
+                            evidence_name,
+                            captured_sha256,
+                            captured_byte_length: u64::try_from(captured_byte_length).map_err(
+                                |_| {
+                                    StoreError::InvalidState(
+                                        "negative visible generation evidence length".to_string(),
+                                    )
+                                },
+                            )?,
+                        })
+                    }
+                    (None, None, None) => None,
+                    _ => {
+                        return Err(StoreError::InvalidState(
+                            "partial visible generation inode evidence".to_string(),
+                        ));
+                    }
+                },
+                base_payload_delta_id: row.10,
+                base_payload_entry_index: row
+                    .11
+                    .map(|value| {
+                        u64::try_from(value).map_err(|_| {
+                            StoreError::InvalidState(
+                                "negative generation evidence base payload index".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?,
+                resolved_at: row.12,
+                created_at: row.13,
+            })
+        })
+        .collect()
+    }
+
+    fn mark_generation_inode_evidence_conflict(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+        update: GenerationInodeEvidenceConflictUpdate,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let journal =
+            generation_apply_from_connection(&transaction, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status != GenerationApplyStatus::Completed {
+            return Err(StoreError::InvalidState(
+                "late inode conflict requires a completed generation apply".to_string(),
+            ));
+        }
+        let entry = journal
+            .delta
+            .entries
+            .get(entry_index as usize)
+            .ok_or_else(|| {
+                StoreError::InvalidState("generation evidence index is out of bounds".to_string())
+            })?;
+        let old = entry.old.as_ref().ok_or_else(|| {
+            StoreError::InvalidState("generation evidence entry has no old identity".to_string())
+        })?;
+        let was_over_quota = journal
+            .outcomes
+            .iter()
+            .find(|(index, _)| *index == entry_index)
+            .is_some_and(|(_, outcome)| {
+                matches!(outcome, GenerationApplyOutcome::ConflictOverQuota { .. })
+            });
+        let incoming = entry.new.as_ref();
+        let existing = select_generation_path(
+            &transaction,
+            &MountId::new(journal.delta.mount_id.as_str()),
+            &journal.delta.source_connection_id,
+            &old.projection_id,
+        )?;
+        let (evidence_base_delta_id, evidence_base_entry_index): (Option<String>, Option<i64>) =
+            transaction
+                .query_row(
+                    "SELECT base_payload_delta_id, base_payload_entry_index
+                     FROM generation_inode_evidence
+                     WHERE delta_id = ?1 AND entry_index = ?2",
+                    params![
+                        delta_id,
+                        i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                            "generation evidence index is too large".to_string()
+                        ))?
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    StoreError::InvalidState(
+                        "generation inode evidence disappeared during conflict conversion"
+                            .to_string(),
+                    )
+                })?;
+        let remote_logical_path =
+            incoming.map_or(&old.logical_path, |identity| &identity.logical_path);
+        let local_logical_path = existing.as_ref().map_or(old.logical_path.as_str(), |path| {
+            path.local_logical_path.as_str()
+        });
+        let conflict_payload_delta_id = incoming.filter(|_| !was_over_quota).map(|_| delta_id);
+        let conflict_payload_entry_index = incoming
+            .filter(|_| !was_over_quota)
+            .map(|_| i64::try_from(entry_index))
+            .transpose()
+            .map_err(|_| {
+                StoreError::InvalidState("generation evidence index is too large".to_string())
+            })?;
+        let changed = transaction.execute(
+            "INSERT INTO generation_paths (
+                mount_id, source_connection_id, projection_id, logical_path,
+                local_logical_path, base_generation_id, base_identity_json,
+                base_payload_delta_id, base_payload_entry_index,
+                conflict_payload_delta_id, conflict_payload_entry_index,
+                state, incoming_identity_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                       'conflicted', ?12, ?13)
+             ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                logical_path = excluded.logical_path,
+                local_logical_path = excluded.local_logical_path,
+                base_generation_id = excluded.base_generation_id,
+                base_identity_json = excluded.base_identity_json,
+                base_payload_delta_id = excluded.base_payload_delta_id,
+                base_payload_entry_index = excluded.base_payload_entry_index,
+                conflict_payload_delta_id = excluded.conflict_payload_delta_id,
+                conflict_payload_entry_index = excluded.conflict_payload_entry_index,
+                state = 'conflicted', incoming_identity_json = excluded.incoming_identity_json,
+                updated_at = excluded.updated_at
+             WHERE generation_paths.source_connection_id = excluded.source_connection_id",
+            params![
+                journal.delta.mount_id.as_str(),
+                journal.delta.source_connection_id.as_str(),
+                old.projection_id.as_str(),
+                remote_logical_path.as_str(),
+                local_logical_path,
+                journal.delta.base_generation_id.as_str(),
+                to_json(old)?,
+                evidence_base_delta_id,
+                evidence_base_entry_index,
+                conflict_payload_delta_id,
+                conflict_payload_entry_index,
+                incoming.map(to_json).transpose()?,
+                update.updated_at.as_str(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(
+                "generation inode conflict crossed a source-owned projection".to_string(),
+            ));
+        }
+        let converted_outcome = if was_over_quota {
+            GenerationApplyOutcome::ConflictOverQuota {
+                local_sha256: Some(update.local_sha256.clone()),
+                incoming_identity: incoming.cloned(),
+            }
+        } else {
+            GenerationApplyOutcome::Conflict {
+                local_sha256: Some(update.local_sha256.clone()),
+                incoming_identity: incoming.cloned(),
+            }
+        };
+        transaction.execute(
+            "UPDATE generation_apply_outcomes SET outcome_json = ?3, updated_at = ?4
+             WHERE delta_id = ?1 AND entry_index = ?2",
+            params![
+                delta_id,
+                i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                    "generation evidence index is too large".to_string()
+                ))?,
+                to_json(&converted_outcome)?,
+                update.updated_at.as_str(),
+            ],
+        )?;
+        let byte_length = i64::try_from(update.captured_byte_length).map_err(|_| {
+            StoreError::InvalidState("generation evidence length is too large".to_string())
+        })?;
+        let visible_byte_length = update
+            .visible_evidence
+            .as_ref()
+            .map(|visible| i64::try_from(visible.captured_byte_length))
+            .transpose()
+            .map_err(|_| {
+                StoreError::InvalidState(
+                    "visible generation evidence length is too large".to_string(),
+                )
+            })?;
+        transaction.execute(
+            "UPDATE generation_inode_evidence
+             SET expected_sha256 = ?3, byte_length = ?4,
+                 visible_evidence_name = ?5, visible_expected_sha256 = ?6,
+                 visible_byte_length = ?7, resolved_at = NULL
+             WHERE delta_id = ?1 AND entry_index = ?2",
+            params![
+                delta_id,
+                i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                    "generation evidence index is too large".to_string()
+                ))?,
+                update.captured_sha256.as_str(),
+                byte_length,
+                update
+                    .visible_evidence
+                    .as_ref()
+                    .map(|visible| visible.evidence_name.as_str()),
+                update
+                    .visible_evidence
+                    .as_ref()
+                    .map(|visible| visible.captured_sha256.as_str()),
+                visible_byte_length,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn mark_generation_inode_evidence_resolved(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+        resolution: GenerationInodeEvidenceResolution,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let journal =
+            generation_apply_from_connection(&transaction, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status != GenerationApplyStatus::Completed {
+            return Err(StoreError::InvalidState(
+                "inode evidence resolution requires a completed generation apply".to_string(),
+            ));
+        }
+        let entry = journal
+            .delta
+            .entries
+            .get(entry_index as usize)
+            .ok_or_else(|| {
+                StoreError::InvalidState("generation evidence index is out of bounds".to_string())
+            })?;
+        let new = entry.new.as_ref().ok_or_else(|| {
+            StoreError::InvalidState(
+                "retained inode resolution requires an incoming identity".to_string(),
+            )
+        })?;
+        let index = i64::try_from(entry_index).map_err(|_| {
+            StoreError::InvalidState("generation evidence index is too large".to_string())
+        })?;
+        let byte_length = i64::try_from(resolution.captured_byte_length).map_err(|_| {
+            StoreError::InvalidState("generation evidence length is too large".to_string())
+        })?;
+        let visible_byte_length =
+            i64::try_from(resolution.visible_captured_byte_length).map_err(|_| {
+                StoreError::InvalidState(
+                    "visible generation evidence length is too large".to_string(),
+                )
+            })?;
+        let exact_evidence: bool = transaction
+            .query_row(
+                "SELECT expected_sha256 = ?3 AND byte_length = ?4
+                        AND visible_expected_sha256 = ?5
+                        AND visible_byte_length = ?6
+                 FROM generation_inode_evidence
+                 WHERE delta_id = ?1 AND entry_index = ?2
+                       AND visible_evidence_name IS NOT NULL
+                       AND resolved_at IS NULL",
+                params![
+                    delta_id,
+                    index,
+                    resolution.captured_sha256.as_str(),
+                    byte_length,
+                    resolution.visible_captured_sha256.as_str(),
+                    visible_byte_length,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::InvalidState(
+                    "generation inode evidence disappeared during resolution".to_string(),
+                )
+            })?;
+        if !exact_evidence {
+            return Err(StoreError::InvalidState(
+                "generation inode evidence changed during resolution".to_string(),
+            ));
+        }
+        let existing = select_generation_path(
+            &transaction,
+            &MountId::new(journal.delta.mount_id.as_str()),
+            &journal.delta.source_connection_id,
+            &new.projection_id,
+        )?;
+        let local_logical_path = existing.as_ref().map_or(new.logical_path.as_str(), |path| {
+            path.local_logical_path.as_str()
+        });
+        let changed = transaction.execute(
+            "INSERT INTO generation_paths (
+                mount_id, source_connection_id, projection_id, logical_path,
+                local_logical_path, base_generation_id, base_identity_json,
+                base_payload_delta_id, base_payload_entry_index,
+                conflict_payload_delta_id, conflict_payload_entry_index,
+                state, incoming_identity_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL,
+                       'dirty', NULL, ?10)
+             ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                logical_path = excluded.logical_path,
+                local_logical_path = excluded.local_logical_path,
+                base_generation_id = excluded.base_generation_id,
+                base_identity_json = excluded.base_identity_json,
+                base_payload_delta_id = excluded.base_payload_delta_id,
+                base_payload_entry_index = excluded.base_payload_entry_index,
+                conflict_payload_delta_id = NULL,
+                conflict_payload_entry_index = NULL,
+                state = 'dirty', incoming_identity_json = NULL,
+                updated_at = excluded.updated_at
+             WHERE generation_paths.source_connection_id = excluded.source_connection_id",
+            params![
+                journal.delta.mount_id.as_str(),
+                journal.delta.source_connection_id.as_str(),
+                new.projection_id.as_str(),
+                new.logical_path.as_str(),
+                local_logical_path,
+                journal.delta.target_generation_id.as_str(),
+                to_json(new)?,
+                delta_id,
+                index,
+                resolution.updated_at.as_str(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(
+                "generation inode resolution crossed a source-owned projection".to_string(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE generation_apply_outcomes
+             SET outcome_json = ?3, updated_at = ?4
+             WHERE delta_id = ?1 AND entry_index = ?2",
+            params![
+                delta_id,
+                index,
+                to_json(&GenerationApplyOutcome::Merged)?,
+                resolution.updated_at.as_str(),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE generation_inode_evidence
+             SET resolved_at = ?3
+             WHERE delta_id = ?1 AND entry_index = ?2",
+            params![delta_id, index, resolution.updated_at.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn remove_generation_inode_evidence(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+    ) -> StoreResult<()> {
+        self.connection()?.execute(
+            "DELETE FROM generation_inode_evidence WHERE delta_id = ?1 AND entry_index = ?2",
+            params![
+                delta_id,
+                i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                    "generation evidence index is too large".to_string()
+                ))?
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn complete_generation_apply(
+        &mut self,
+        delta_id: &str,
+        completed_at: &str,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let journal =
+            generation_apply_from_connection(&transaction, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status == GenerationApplyStatus::Completed {
+            transaction.commit()?;
+            return Ok(journal.journal);
+        }
+        if journal.outcomes.len() != journal.delta.entries.len()
+            || journal
+                .outcomes
+                .iter()
+                .enumerate()
+                .any(|(expected, (actual, _))| *actual != expected as u64)
+        {
+            return Err(StoreError::InvalidState(format!(
+                "generation apply `{delta_id}` does not have one outcome per entry"
+            )));
+        }
+
+        let mount_id = MountId::new(journal.delta.mount_id.as_str());
+        for (entry_index, (entry, (_, outcome))) in journal
+            .delta
+            .entries
+            .iter()
+            .zip(&journal.outcomes)
+            .enumerate()
+        {
+            match outcome {
+                GenerationApplyOutcome::Applied => {
+                    let new = entry.new.as_ref().ok_or_else(|| {
+                        StoreError::InvalidState("applied outcome has no new identity".to_string())
+                    })?;
+                    let changed = transaction.execute(
+                        "INSERT INTO generation_paths (
+                            mount_id, source_connection_id, projection_id, logical_path,
+                            local_logical_path, base_generation_id,
+                            base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                            conflict_payload_delta_id, conflict_payload_entry_index,
+                            state, incoming_identity_json, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8,
+                                   NULL, NULL, 'clean', NULL, ?9)
+                         ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                            logical_path = excluded.logical_path,
+                            local_logical_path = excluded.local_logical_path,
+                            base_generation_id = excluded.base_generation_id,
+                            base_identity_json = excluded.base_identity_json,
+                            base_payload_delta_id = excluded.base_payload_delta_id,
+                            base_payload_entry_index = excluded.base_payload_entry_index,
+                            conflict_payload_delta_id = NULL,
+                            conflict_payload_entry_index = NULL,
+                            state = 'clean', incoming_identity_json = NULL,
+                            updated_at = excluded.updated_at
+                         WHERE generation_paths.source_connection_id = excluded.source_connection_id",
+                        params![
+                            mount_id.0.as_str(),
+                            journal.delta.source_connection_id.as_str(),
+                            new.projection_id.as_str(),
+                            new.logical_path.as_str(),
+                            journal.delta.target_generation_id.as_str(),
+                            to_json(new)?,
+                            journal.delta.delta_id.as_str(),
+                            i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                                "generation entry index is too large".to_string()
+                            ))?,
+                            completed_at,
+                        ],
+                    )?;
+                    if changed != 1 {
+                        return Err(StoreError::InvalidState(
+                            "generation apply crossed a source-owned projection".to_string(),
+                        ));
+                    }
+                }
+                GenerationApplyOutcome::Merged => {
+                    let new = entry.new.as_ref().ok_or_else(|| {
+                        StoreError::InvalidState("merged outcome has no new identity".to_string())
+                    })?;
+                    let changed = transaction.execute(
+                        "INSERT INTO generation_paths (
+                            mount_id, source_connection_id, projection_id, logical_path,
+                            local_logical_path, base_generation_id,
+                            base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                            conflict_payload_delta_id, conflict_payload_entry_index,
+                            state, incoming_identity_json, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8,
+                                   NULL, NULL, 'dirty', NULL, ?9)
+                         ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                            logical_path = excluded.logical_path,
+                            local_logical_path = excluded.local_logical_path,
+                            base_generation_id = excluded.base_generation_id,
+                            base_identity_json = excluded.base_identity_json,
+                            base_payload_delta_id = excluded.base_payload_delta_id,
+                            base_payload_entry_index = excluded.base_payload_entry_index,
+                            conflict_payload_delta_id = NULL,
+                            conflict_payload_entry_index = NULL,
+                            state = 'dirty', incoming_identity_json = NULL,
+                            updated_at = excluded.updated_at
+                         WHERE generation_paths.source_connection_id = excluded.source_connection_id",
+                        params![
+                            mount_id.0.as_str(),
+                            journal.delta.source_connection_id.as_str(),
+                            new.projection_id.as_str(),
+                            new.logical_path.as_str(),
+                            journal.delta.target_generation_id.as_str(),
+                            to_json(new)?,
+                            journal.delta.delta_id.as_str(),
+                            i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                                "generation entry index is too large".to_string()
+                            ))?,
+                            completed_at,
+                        ],
+                    )?;
+                    if changed != 1 {
+                        return Err(StoreError::InvalidState(
+                            "generation apply crossed a source-owned projection".to_string(),
+                        ));
+                    }
+                }
+                GenerationApplyOutcome::Deleted => {
+                    let old = entry.old.as_ref().ok_or_else(|| {
+                        StoreError::InvalidState("deleted outcome has no old identity".to_string())
+                    })?;
+                    if entry.new.is_some() {
+                        return Err(StoreError::InvalidState(
+                            "deleted outcome names a non-deletion entry".to_string(),
+                        ));
+                    }
+                    let changed = transaction.execute(
+                        "DELETE FROM generation_paths
+                         WHERE mount_id = ?1 AND source_connection_id = ?2 AND projection_id = ?3",
+                        params![
+                            mount_id.0.as_str(),
+                            journal.delta.source_connection_id.as_str(),
+                            old.projection_id.as_str()
+                        ],
+                    )?;
+                    if changed != 1 {
+                        return Err(StoreError::InvalidState(
+                            "generation deletion crossed a source-owned projection".to_string(),
+                        ));
+                    }
+                }
+                GenerationApplyOutcome::Conflict {
+                    local_sha256: _,
+                    incoming_identity,
+                }
+                | GenerationApplyOutcome::ConflictOverQuota {
+                    local_sha256: _,
+                    incoming_identity,
+                } => {
+                    let projection_id = entry
+                        .projection_id()
+                        .expect("validated delta entry has projection identity");
+                    let existing = select_generation_path(
+                        &transaction,
+                        &mount_id,
+                        &journal.delta.source_connection_id,
+                        projection_id,
+                    )?;
+                    let logical_path = entry
+                        .new
+                        .as_ref()
+                        .or(entry.old.as_ref())
+                        .expect("validated delta entry has identity")
+                        .logical_path
+                        .as_str();
+                    let local_logical_path = existing
+                        .as_ref()
+                        .map_or(logical_path, |path| path.local_logical_path.as_str());
+                    let base_generation_id = existing
+                        .as_ref()
+                        .map_or(&journal.delta.base_generation_id, |path| {
+                            &path.base_generation_id
+                        });
+                    let base_identity = existing
+                        .as_ref()
+                        .and_then(|path| path.base_identity.as_ref())
+                        .or(entry.old.as_ref());
+                    let base_payload_delta_id = existing
+                        .as_ref()
+                        .and_then(|path| path.base_payload_delta_id.as_deref());
+                    let base_payload_entry_index = existing
+                        .as_ref()
+                        .and_then(|path| path.base_payload_entry_index)
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| {
+                            StoreError::InvalidState(
+                                "generation base payload index is too large".to_string(),
+                            )
+                        })?;
+                    let retains_conflict_payload =
+                        matches!(outcome, GenerationApplyOutcome::Conflict { .. })
+                            && entry.new.is_some();
+                    let changed = transaction.execute(
+                        "INSERT INTO generation_paths (
+                            mount_id, source_connection_id, projection_id, logical_path,
+                            local_logical_path, base_generation_id, base_identity_json,
+                            base_payload_delta_id, base_payload_entry_index,
+                            conflict_payload_delta_id, conflict_payload_entry_index,
+                            state, incoming_identity_json, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                                   ?11, 'conflicted', ?12, ?13)
+                         ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                            logical_path = excluded.logical_path,
+                            local_logical_path = excluded.local_logical_path,
+                            base_payload_delta_id = excluded.base_payload_delta_id,
+                            base_payload_entry_index = excluded.base_payload_entry_index,
+                            conflict_payload_delta_id = excluded.conflict_payload_delta_id,
+                            conflict_payload_entry_index = excluded.conflict_payload_entry_index,
+                            state = 'conflicted',
+                            incoming_identity_json = excluded.incoming_identity_json,
+                            updated_at = excluded.updated_at
+                         WHERE generation_paths.source_connection_id = excluded.source_connection_id",
+                        params![
+                            mount_id.0.as_str(),
+                            journal.delta.source_connection_id.as_str(),
+                            projection_id.as_str(),
+                            logical_path,
+                            local_logical_path,
+                            base_generation_id.as_str(),
+                            base_identity.map(to_json).transpose()?,
+                            base_payload_delta_id,
+                            base_payload_entry_index,
+                            retains_conflict_payload.then_some(journal.delta.delta_id.as_str()),
+                            retains_conflict_payload.then_some(
+                                i64::try_from(entry_index).map_err(
+                                    |_| StoreError::InvalidState(
+                                        "generation conflict payload index is too large"
+                                            .to_string()
+                                    )
+                                )?
+                            ),
+                            incoming_identity.as_ref().map(to_json).transpose()?,
+                            completed_at,
+                        ],
+                    )?;
+                    if changed != 1 {
+                        return Err(StoreError::InvalidState(
+                            "generation conflict crossed a source-owned projection".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        let changed = transaction.execute(
+            "UPDATE observed_generations
+             SET generation_id = ?2, inventory_sha256 = ?3,
+                 workspace_layout_version = ?4, workspace_layout_digest = ?5,
+                 last_receipt_sha256 = ?6, updated_at = ?7
+             WHERE mount_id = ?1 AND source_connection_id = ?8 AND generation_id = ?9",
+            params![
+                mount_id.0.as_str(),
+                journal.delta.target_generation_id.as_str(),
+                journal.delta.target_inventory_sha256.as_str(),
+                journal.delta.workspace_layout_version,
+                journal.delta.workspace_layout_digest.as_str(),
+                journal.receipt_sha256.as_str(),
+                completed_at,
+                journal.delta.source_connection_id.as_str(),
+                journal.delta.base_generation_id.as_str(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` observed generation changed during apply",
+                mount_id.0
+            )));
+        }
+        transaction.execute(
+            "UPDATE generation_apply_journals
+             SET status = 'completed', active = 0, updated_at = ?2, completed_at = ?2
+             WHERE delta_id = ?1 AND active = 1",
+            params![delta_id, completed_at],
+        )?;
+        let completed = generation_apply_from_connection(&transaction, delta_id)?
+            .expect("completed generation journal remains present");
+        transaction.commit()?;
+        Ok(completed.journal)
+    }
+}
+
 impl MountRepository for SqliteStateStore {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = transaction
             .query_row(
                 "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json
@@ -293,7 +2664,6 @@ impl MountRepository for SqliteStateStore {
             .optional()?
             .map(mount_from_row)
             .transpose()?;
-        let is_new_mount = existing.is_none();
         if existing
             .as_ref()
             .is_some_and(|existing| mount_source_identity_changed(existing, &mount))
@@ -323,7 +2693,6 @@ impl MountRepository for SqliteStateStore {
                 mount.settings_json.as_str(),
             ],
         )?;
-        ensure_workspace_binding_for_mount(&transaction, &mount, is_new_mount)?;
         transaction.commit()?;
         Ok(())
     }
@@ -380,6 +2749,11 @@ impl MountRepository for SqliteStateStore {
 
 impl WorkspaceBindingRepository for SqliteStateStore {
     fn save_workspace_binding(&mut self, record: WorkspaceBindingRecord) -> StoreResult<()> {
+        if record.binding.workspace_id().is_some() {
+            return Err(StoreError::InvalidState(
+                "layout-1 workspace bindings require an atomic host-binding commit".to_string(),
+            ));
+        }
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let mount_exists = transaction.query_row(
@@ -392,14 +2766,20 @@ impl WorkspaceBindingRepository for SqliteStateStore {
         }
         let existing = transaction
             .query_row(
-                "SELECT binding_json, target_collision_key
+                "SELECT workspace_id, binding_json, target_collision_key
                  FROM workspace_bindings
                  WHERE mount_id = ?1",
                 params![record.mount_id.0.as_str()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?
-            .map(workspace_binding_from_row)
+            .map(workspace_binding_from_persisted_row)
             .transpose()?;
         if let Some(existing) = existing {
             if existing == record.binding {
@@ -412,15 +2792,44 @@ impl WorkspaceBindingRepository for SqliteStateStore {
             });
         }
         let collision_key = record.binding.collision_key();
-        let collision = transaction
-            .query_row(
-                "SELECT mount_id
-                 FROM workspace_bindings
-                 WHERE target_collision_key = ?1 AND mount_id <> ?2",
-                params![collision_key.as_str(), record.mount_id.0.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+        let collision = {
+            let mut statement = transaction.prepare(
+                "SELECT m.mount_id, m.root, b.binding_json, b.target_collision_key
+                 FROM mounts m
+                 LEFT JOIN workspace_bindings b ON b.mount_id = m.mount_id
+                 WHERE m.mount_id <> ?1
+                 ORDER BY m.mount_id",
+            )?;
+            let rows = statement.query_map(params![record.mount_id.0.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            let mut collision = None;
+            for row in rows {
+                let (mount_id, root, binding_json, stored_collision_key) = row?;
+                let existing_collision_key = match (binding_json, stored_collision_key) {
+                    (Some(binding_json), Some(stored_collision_key)) => Some(
+                        workspace_binding_from_row((binding_json, stored_collision_key))?
+                            .collision_key(),
+                    ),
+                    (None, None) => legacy_mount_collision_key(&root),
+                    _ => {
+                        return Err(StoreError::InvalidState(
+                            "workspace binding row is partially present".to_string(),
+                        ));
+                    }
+                };
+                if existing_collision_key.as_deref() == Some(collision_key.as_str()) {
+                    collision = Some(mount_id);
+                    break;
+                }
+            }
+            collision
+        };
         if let Some(existing_mount_id) = collision {
             return Err(StoreError::WorkspaceMountTargetCollision {
                 target: record.binding.mount_target().as_str().to_string(),
@@ -428,8 +2837,9 @@ impl WorkspaceBindingRepository for SqliteStateStore {
             });
         }
         transaction.execute(
-            "INSERT INTO workspace_bindings (mount_id, binding_json, target_collision_key)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO workspace_bindings (
+                mount_id, workspace_id, binding_json, target_collision_key
+             ) VALUES (?1, NULL, ?2, ?3)",
             params![
                 record.mount_id.0.as_str(),
                 to_json(&record.binding)?,
@@ -444,39 +2854,267 @@ impl WorkspaceBindingRepository for SqliteStateStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT binding_json, target_collision_key
+                "SELECT workspace_id, binding_json, target_collision_key
                  FROM workspace_bindings
                  WHERE mount_id = ?1",
                 params![mount_id.0.as_str()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?
-            .map(workspace_binding_from_row)
+            .map(workspace_binding_from_persisted_row)
             .transpose()
     }
 
     fn load_workspace_bindings(&self) -> StoreResult<Vec<WorkspaceBindingRecord>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT mount_id, binding_json, target_collision_key
+            "SELECT mount_id, workspace_id, binding_json, target_collision_key
              FROM workspace_bindings
              ORDER BY mount_id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         rows.map(|row| {
-            let (mount_id, binding_json, collision_key) = row?;
+            let (mount_id, workspace_id, binding_json, collision_key) = row?;
             Ok(WorkspaceBindingRecord::new(
                 MountId(mount_id),
-                workspace_binding_from_row((binding_json, collision_key))?,
+                workspace_binding_from_persisted_row((workspace_id, binding_json, collision_key))?,
             ))
         })
         .collect()
+    }
+
+    fn commit_workspace_binding(
+        &mut self,
+        host_binding: WorkspaceHostBinding,
+        record: WorkspaceBindingRecord,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mount = mount_from_connection(&transaction, &record.mount_id)?
+            .ok_or_else(|| StoreError::MountMissing(record.mount_id.clone()))?;
+        commit_workspace_binding_in_transaction(&transaction, &mount, &host_binding, &record)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn save_mount_with_workspace_binding(
+        &mut self,
+        mount: MountConfig,
+        host_binding: WorkspaceHostBinding,
+        record: WorkspaceBindingRecord,
+    ) -> StoreResult<()> {
+        if mount.mount_id != record.mount_id {
+            return Err(StoreError::InvalidState(
+                "mount and workspace binding identities do not match".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = mount_from_connection(&transaction, &mount.mount_id)?;
+        validate_workspace_binding_commit(&mount, &host_binding, &record)?;
+        if existing
+            .as_ref()
+            .is_some_and(|existing| mount_source_identity_changed(existing, &mount))
+        {
+            clear_mount_source_state(&transaction, &mount.mount_id)?;
+        }
+        save_mount_row(&transaction, &mount)?;
+        commit_workspace_binding_in_transaction(&transaction, &mount, &host_binding, &record)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn save_mount_with_workspace_binding_and_cleanup(
+        &mut self,
+        mount: MountConfig,
+        host_binding: WorkspaceHostBinding,
+        record: WorkspaceBindingRecord,
+        cleanup: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<()> {
+        if mount.mount_id != record.mount_id {
+            return Err(StoreError::InvalidState(
+                "mount and workspace binding identities do not match".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prepared = {
+            let mut statement = transaction.prepare(
+                "SELECT recovery_id FROM workspace_remount_recoveries
+                 WHERE mount_id = ?1 AND committed = 0",
+            )?;
+            statement
+                .query_map(params![mount.mount_id.as_str()], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let [recovery_id] = prepared.as_slice() else {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` must have exactly one prepared workspace remount recovery",
+                mount.mount_id.as_str()
+            )));
+        };
+        validate_workspace_binding_commit(&mount, &host_binding, &record)?;
+        clear_mount_source_state_after_durable_preservation(&transaction, &mount.mount_id)?;
+        save_mount_row(&transaction, &mount)?;
+        commit_workspace_binding_in_transaction(&transaction, &mount, &host_binding, &record)?;
+        cleanup()?;
+        let updated = transaction.execute(
+            "UPDATE workspace_remount_recoveries
+             SET committed = 1
+             WHERE recovery_id = ?1 AND mount_id = ?2 AND committed = 0",
+            params![recovery_id, mount.mount_id.as_str()],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::InvalidState(format!(
+                "workspace remount recovery `{recovery_id}` lost its prepared outcome"
+            )));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn begin_workspace_remount_recovery(
+        &mut self,
+        recovery_id: &str,
+        mount_id: &MountId,
+    ) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        let existing = connection
+            .query_row(
+                "SELECT mount_id, committed FROM workspace_remount_recoveries
+                 WHERE recovery_id = ?1",
+                params![recovery_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((existing_mount_id, 0)) if existing_mount_id == mount_id.as_str() => Ok(()),
+            Some(_) => Err(StoreError::InvalidState(format!(
+                "workspace remount recovery `{recovery_id}` already exists with different state"
+            ))),
+            None => connection
+                .execute(
+                    "INSERT INTO workspace_remount_recoveries (
+                        recovery_id, mount_id, committed
+                     ) VALUES (?1, ?2, 0)",
+                    params![recovery_id, mount_id.as_str()],
+                )
+                .map(|_| ())
+                .map_err(|error| {
+                    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                        StoreError::InvalidState(format!(
+                            "mount `{}` already has a workspace remount recovery",
+                            mount_id.as_str()
+                        ))
+                    } else {
+                        error.into()
+                    }
+                }),
+        }
+    }
+
+    fn get_workspace_remount_recovery(
+        &self,
+        recovery_id: &str,
+    ) -> StoreResult<Option<(MountId, WorkspaceRemountRecoveryOutcome)>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT mount_id, committed FROM workspace_remount_recoveries
+                 WHERE recovery_id = ?1",
+                params![recovery_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .map(|(mount_id, committed)| match committed {
+                0 => Ok((
+                    MountId::new(mount_id),
+                    WorkspaceRemountRecoveryOutcome::Prepared,
+                )),
+                1 => Ok((
+                    MountId::new(mount_id),
+                    WorkspaceRemountRecoveryOutcome::Committed,
+                )),
+                _ => Err(StoreError::InvalidState(format!(
+                    "workspace remount recovery `{recovery_id}` has invalid outcome"
+                ))),
+            })
+            .transpose()
+    }
+
+    fn list_workspace_remount_recoveries(
+        &self,
+    ) -> StoreResult<Vec<(String, MountId, WorkspaceRemountRecoveryOutcome)>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT recovery_id, mount_id, committed
+             FROM workspace_remount_recoveries ORDER BY recovery_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .map(|row| {
+                let (recovery_id, mount_id, committed) = row?;
+                let outcome = match committed {
+                    0 => WorkspaceRemountRecoveryOutcome::Prepared,
+                    1 => WorkspaceRemountRecoveryOutcome::Committed,
+                    _ => {
+                        return Err(StoreError::InvalidState(format!(
+                            "workspace remount recovery `{recovery_id}` has invalid outcome"
+                        )));
+                    }
+                };
+                Ok((recovery_id, MountId::new(mount_id), outcome))
+            })
+            .collect()
+    }
+
+    fn finish_workspace_remount_recovery(&mut self, recovery_id: &str) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.execute(
+            "DELETE FROM workspace_remount_recoveries WHERE recovery_id = ?1",
+            params![recovery_id],
+        )?;
+        Ok(())
+    }
+
+    fn get_workspace_host_binding(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> StoreResult<Option<WorkspaceHostBinding>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT binding_json FROM workspace_host_bindings WHERE workspace_id = ?1",
+                params![workspace_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|json| workspace_host_binding_from_row(&json))
+            .transpose()
     }
 
     fn check_workspace_rebind(&self, mount_id: &MountId) -> StoreResult<()> {
@@ -2046,7 +4684,7 @@ impl VirtualMutationRepository for SqliteStateStore {
                 mutation
                     .content_path
                     .as_ref()
-                    .map(|path| path_to_text(path)),
+                    .map(|path| native_path_to_text(path)),
                 mutation.created_at,
                 mutation.updated_at,
             ],
@@ -2227,7 +4865,7 @@ impl VirtualMoveRepository for SqliteStateStore {
                 mutation
                     .content_path
                     .as_ref()
-                    .map(|path| path_to_text(path)),
+                    .map(|path| native_path_to_text(path)),
                 mutation.created_at,
                 mutation.updated_at,
             ],
@@ -2269,7 +4907,7 @@ impl VirtualMoveRepository for SqliteStateStore {
             params![
                 mount_id.0,
                 local_id,
-                path_to_text(&content_path),
+                native_path_to_text(&content_path),
                 updated_at
             ],
         )?;
@@ -2689,7 +5327,130 @@ fn mount_source_identity_changed(existing: &MountConfig, next: &MountConfig) -> 
 }
 
 fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> StoreResult<()> {
+    clear_mount_source_state_with_policy(connection, mount_id, false)
+}
+
+/// Coordinator-only source reset used after Desktop has durably copied every
+/// pending local mutation into the remount recovery directory.
+fn clear_mount_source_state_after_durable_preservation(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<()> {
+    clear_mount_source_state_with_policy(connection, mount_id, true)
+}
+
+fn clear_mount_source_state_with_policy(
+    connection: &Connection,
+    mount_id: &MountId,
+    local_mutations_were_durably_preserved: bool,
+) -> StoreResult<()> {
+    let pending_virtual_mutation: Option<String> = connection
+        .query_row(
+            "SELECT local_id FROM virtual_mutations WHERE mount_id = ?1 LIMIT 1",
+            params![&mount_id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(local_id) = pending_virtual_mutation
+        && !local_mutations_were_durably_preserved
+    {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` cannot change source while virtual mutation `{local_id}` is pending",
+            mount_id.0
+        )));
+    }
+    let unsettled_push = {
+        let mut statement = connection.prepare(
+            "SELECT push_id, status_json FROM journals WHERE mount_id = ?1 ORDER BY push_id",
+        )?;
+        let rows = statement.query_map(params![&mount_id.0], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut unsettled = None;
+        for row in rows {
+            let (push_id, status_json) = row?;
+            let status: JournalStatus = from_json(&status_json)?;
+            if status.is_unsettled() {
+                unsettled = Some(push_id);
+                break;
+            }
+        }
+        unsettled
+    };
+    if let Some(push_id) = unsettled_push {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` cannot change source while push journal `{push_id}` is unsettled",
+            mount_id.0
+        )));
+    }
+    let active_delta: Option<String> = connection
+        .query_row(
+            "SELECT delta_id FROM generation_apply_journals
+             WHERE mount_id = ?1 AND active = 1 LIMIT 1",
+            params![&mount_id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(delta_id) = active_delta {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` has active generation apply `{delta_id}`",
+            mount_id.0
+        )));
+    }
+    let pending_acknowledgment: Option<String> = connection
+        .query_row(
+            "SELECT delta_id FROM generation_apply_journals
+             WHERE mount_id = ?1 AND status = 'completed'
+               AND acknowledgment_required = 1 AND acknowledged_at IS NULL
+             LIMIT 1",
+            params![&mount_id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(delta_id) = pending_acknowledgment {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` has pending terminal acknowledgment for generation apply `{delta_id}`",
+            mount_id.0
+        )));
+    }
+    let preserved_path: Option<(String, String)> = connection
+        .query_row(
+            "SELECT projection_id, state FROM generation_paths
+             WHERE mount_id = ?1 AND state IN ('dirty', 'conflicted') LIMIT 1",
+            params![&mount_id.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((projection_id, state)) = preserved_path {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` cannot change source while generation path `{projection_id}` is {state}",
+            mount_id.0
+        )));
+    }
+    let retained_inode: Option<String> = connection
+        .query_row(
+            "SELECT evidence.logical_path
+             FROM generation_inode_evidence AS evidence
+             WHERE evidence.mount_id = ?1 LIMIT 1",
+            params![&mount_id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(logical_path) = retained_inode {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` cannot change source while displaced inode evidence for `{logical_path}` is retained",
+            mount_id.0
+        )));
+    }
+    // Retire only completed clean lineage in the same transaction as the
+    // source reset. Active, dirty, and conflicted lineage is preserved above.
+    connection.execute(
+        "DELETE FROM generation_apply_journals WHERE mount_id = ?1 AND active = 0",
+        params![&mount_id.0],
+    )?;
     for table in [
+        "generation_paths",
+        "observed_generations",
         "entities",
         "shadows",
         "hydration_jobs",
@@ -2899,6 +5660,7 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
         });
     }
     if user_version == SCHEMA_VERSION {
+        migrate_workspace_bindings_component_to_v4(connection)?;
         ensure_state_components_safe_before_mutation(connection, user_version)?;
         validate_workspace_bindings(connection)?;
         retire_removed_state_components(connection)?;
@@ -2907,8 +5669,9 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
         migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
         migrate_journals_component_to_v3(connection)?;
-        migrate_virtual_mutations_component_to_v3(connection)?;
+        migrate_virtual_mutations_component_to_v4(connection)?;
         migrate_entity_search_component_to_v2(connection)?;
+        migrate_generation_delivery_to_v7(connection, None, true)?;
         return Ok(());
     }
 
@@ -3174,8 +5937,84 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
             readable_diff_json TEXT,
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS observed_generations (
+            mount_id TEXT NOT NULL,
+            source_connection_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            inventory_sha256 TEXT NOT NULL,
+            workspace_layout_version INTEGER NOT NULL CHECK (workspace_layout_version > 0),
+            workspace_layout_digest TEXT NOT NULL,
+            last_receipt_sha256 TEXT,
+            updated_at TEXT NOT NULL,
+            refresh_mode TEXT NOT NULL
+                CHECK (refresh_mode IN ('generation_delta_v1', 'full_export_only')),
+            PRIMARY KEY (mount_id, source_connection_id),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_paths (
+            mount_id TEXT NOT NULL,
+            source_connection_id TEXT NOT NULL,
+            projection_id TEXT NOT NULL,
+            logical_path TEXT NOT NULL,
+            local_logical_path TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            base_identity_json TEXT,
+            base_payload_delta_id TEXT,
+            base_payload_entry_index INTEGER CHECK (base_payload_entry_index >= 0),
+            conflict_payload_delta_id TEXT,
+            conflict_payload_entry_index INTEGER CHECK (conflict_payload_entry_index >= 0),
+            state TEXT NOT NULL CHECK (state IN ('clean', 'dirty', 'conflicted')),
+            incoming_identity_json TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (mount_id, projection_id),
+            UNIQUE (mount_id, logical_path),
+            UNIQUE (mount_id, local_logical_path),
+            FOREIGN KEY (mount_id, source_connection_id)
+                REFERENCES observed_generations(mount_id, source_connection_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_apply_journals (
+            delta_id TEXT PRIMARY KEY,
+            mount_id TEXT NOT NULL,
+            source_connection_id TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            target_generation_id TEXT NOT NULL,
+            delta_json TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            receipt_sha256 TEXT NOT NULL,
+            selected_capabilities_json TEXT NOT NULL DEFAULT '{}',
+            selection_binding TEXT NOT NULL DEFAULT 'bound'
+                CHECK (selection_binding IN ('bound', 'pre_binding_unknown', 'pre_binding_completed')),
+            acknowledgment_required INTEGER NOT NULL DEFAULT 0
+                CHECK (acknowledgment_required IN (0, 1)),
+            acknowledged_at TEXT,
+            stage_root TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('staged', 'applying', 'completed')),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            CHECK (
+                (active = 0 AND status = 'completed' AND completed_at IS NOT NULL)
+                OR (active = 1 AND status IN ('staged', 'applying') AND completed_at IS NULL)
+            ),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_apply_outcomes (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            outcome_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE
+        );
         ",
     )?;
+    ensure_generation_active_index_for_schema(connection)?;
 
     if user_version < 2 && !column_exists(connection, "journals", "preimages_json")? {
         connection.execute_batch(
@@ -3440,11 +6279,69 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
         }
     }
 
+    if user_version < 21 {
+        create_generation_delivery_tables(connection)?;
+        if user_version >= 13 {
+            record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+        }
+    }
+
+    if user_version == 21 && !column_exists(connection, "generation_apply_journals", "mount_id")? {
+        migrate_generation_delivery_journals_to_mount_relation(connection)?;
+        record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+    }
+
+    if user_version < SCHEMA_VERSION {
+        migrate_generation_delivery_to_v7(
+            connection,
+            (user_version >= 21).then_some(user_version),
+            user_version >= 21,
+        )?;
+    }
+
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
         migrate_workspace_bindings_schema_v21(connection, user_version)?;
     }
 
+    Ok(())
+}
+
+fn migrate_workspace_bindings_component_to_v4(connection: &mut Connection) -> StoreResult<()> {
+    if !table_exists(connection, "state_components")? {
+        return Ok(());
+    }
+    let version = connection
+        .query_row(
+            "SELECT version FROM state_components WHERE component_id = 'durable:workspace_bindings'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let needs_table_migration = table_exists(connection, "workspace_bindings")?
+        && !column_exists(connection, "workspace_bindings", "workspace_id")?;
+    if !matches!(version, Some(2 | 3)) && !needs_table_migration {
+        return Ok(());
+    }
+
+    ensure_state_components_safe_before_mutation(connection, SCHEMA_VERSION)?;
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    create_workspace_host_bindings_table(&transaction)?;
+    migrate_workspace_bindings_table_to_v3(&transaction)?;
+    create_workspace_remount_recoveries_table(&transaction)?;
+    if matches!(version, Some(2 | 3)) {
+        transaction.execute(
+            "UPDATE state_components
+             SET version = 4,
+                 min_reader_version = 4,
+                 data_json = ?1
+             WHERE component_id = 'durable:workspace_bindings' AND version IN (2, 3)",
+            params!["{\"format\":\"workspace_binding.v2\",\"layout_0_without_binding\":true,\"legacy_v1_readable\":true,\"target_scope\":\"workspace_id\",\"remount_recovery\":\"v1\"}"],
+        )?;
+    }
+    validate_workspace_bindings(&transaction)?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -3508,6 +6405,13 @@ fn state_component_issue_allows_schema_migration(
         issue,
         StateCompatibilityIssue::OlderComponent {
             component_id,
+            found,
+            current: GENERATION_DELIVERY_COMPONENT_VERSION,
+        } if component_id == "durable:generation_delivery" && matches!(*found, 1..=6)
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
             found: 1,
             current: LINUX_FUSE_PROJECTION_LAYOUT_VERSION,
         } if component_id == "projection:linux_fuse"
@@ -3530,8 +6434,8 @@ fn state_component_issue_allows_schema_migration(
         StateCompatibilityIssue::OlderComponent {
             component_id,
             found,
-            current: 3,
-        } if component_id == "durable:virtual_mutations" && matches!(*found, 1 | 2)
+            current: VIRTUAL_MUTATIONS_COMPONENT_VERSION,
+        } if component_id == "durable:virtual_mutations" && matches!(*found, 1 | 2 | 3)
     ) || matches!(
         issue,
         StateCompatibilityIssue::OlderComponent {
@@ -3562,7 +6466,20 @@ fn state_component_issue_allows_schema_migration(
     ) || matches!(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
-            if user_version < 21 && component_id == "durable:workspace_bindings"
+            if user_version < 22 && component_id == "durable:generation_delivery"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
+            found,
+            current: 4,
+        } if component_id == "durable:workspace_bindings"
+            && ((matches!(*found, 2 | 3) && user_version == SCHEMA_VERSION)
+                || (matches!(*found, 1 | 2 | 3) && user_version < SCHEMA_VERSION))
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::MissingComponent { component_id }
+            if user_version < SCHEMA_VERSION && component_id == "durable:workspace_bindings"
     )
 }
 
@@ -3594,8 +6511,12 @@ fn migrate_workspace_bindings_schema_v21(
         MissingProjectionComponent::TreatAsV1,
     )?;
     migrate_entity_search_component_to_v2(&transaction)?;
-    create_workspace_bindings_table(&transaction)?;
-    backfill_legacy_workspace_bindings(&transaction)?;
+    create_workspace_host_bindings_table(&transaction)?;
+    migrate_workspace_bindings_table_to_v3(&transaction)?;
+    create_workspace_remount_recoveries_table(&transaction)?;
+    if user_version < 27 {
+        discard_untrusted_legacy_workspace_bindings(&transaction)?;
+    }
     seed_current_state_components(&transaction)?;
     record_schema_migration(&transaction, user_version, SCHEMA_VERSION)?;
     transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -3608,43 +6529,101 @@ fn create_workspace_bindings_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS workspace_bindings (
             mount_id TEXT PRIMARY KEY,
+            workspace_id TEXT,
             binding_json TEXT NOT NULL,
-            target_collision_key TEXT NOT NULL UNIQUE,
+            target_collision_key TEXT NOT NULL,
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id) REFERENCES workspace_host_bindings(workspace_id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS workspace_bindings_workspace_target_unique
+            ON workspace_bindings(workspace_id, target_collision_key)
+            WHERE workspace_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS workspace_bindings_legacy_target_unique
+            ON workspace_bindings(target_collision_key)
+            WHERE workspace_id IS NULL;",
+    )?;
+    Ok(())
+}
+
+fn create_workspace_remount_recoveries_table(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspace_remount_recoveries (
+            recovery_id TEXT PRIMARY KEY,
+            mount_id TEXT NOT NULL,
+            committed INTEGER NOT NULL CHECK (committed IN (0, 1)),
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS workspace_remount_recoveries_mount_unique
+            ON workspace_remount_recoveries(mount_id);",
+    )?;
+    Ok(())
+}
+
+fn migrate_workspace_bindings_table_to_v3(connection: &Connection) -> StoreResult<()> {
+    if !table_exists(connection, "workspace_bindings")? {
+        create_workspace_bindings_table(connection)?;
+        return Ok(());
+    }
+    if column_exists(connection, "workspace_bindings", "workspace_id")? {
+        create_workspace_bindings_table(connection)?;
+        return Ok(());
+    }
+
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT mount_id, binding_json, target_collision_key
+             FROM workspace_bindings
+             ORDER BY mount_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    connection.execute_batch(
+        "ALTER TABLE workspace_bindings RENAME TO workspace_bindings_component_v2;",
+    )?;
+    create_workspace_bindings_table(connection)?;
+    for (mount_id, binding_json, collision_key) in rows {
+        let binding = workspace_binding_from_row((binding_json.clone(), collision_key.clone()))?;
+        connection.execute(
+            "INSERT INTO workspace_bindings (
+                mount_id, workspace_id, binding_json, target_collision_key
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                mount_id,
+                binding.workspace_id().map(WorkspaceId::as_str),
+                binding_json,
+                collision_key,
+            ],
+        )?;
+    }
+    connection.execute_batch("DROP TABLE workspace_bindings_component_v2;")?;
+    Ok(())
+}
+
+fn create_workspace_host_bindings_table(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspace_host_bindings (
+            workspace_id TEXT PRIMARY KEY,
+            binding_json TEXT NOT NULL
         );",
     )?;
     Ok(())
 }
 
-fn backfill_legacy_workspace_bindings(connection: &Connection) -> StoreResult<()> {
+fn discard_untrusted_legacy_workspace_bindings(connection: &Connection) -> StoreResult<()> {
     create_workspace_bindings_table(connection)?;
-    let missing_mounts = {
-        let mut statement = connection.prepare(
-            "SELECT m.mount_id, m.connector, m.root, m.remote_root_id, m.read_only,
-                    m.projection_json, m.connection_id, m.settings_json
-             FROM mounts m
-             LEFT JOIN workspace_bindings b ON b.mount_id = m.mount_id
-             WHERE b.mount_id IS NULL
-             ORDER BY m.mount_id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, String>(7)?,
-            ))
-        })?;
-        rows.map(|row| mount_from_row(row?))
-            .collect::<StoreResult<Vec<_>>>()?
-    };
-    for mount in missing_mounts {
-        ensure_workspace_binding_for_mount(connection, &mount, true)?;
-    }
+    // Version 1 bindings were inferred without a persisted trusted workspace
+    // identity. Schema migration cannot distinguish them from coordinator-owned
+    // records, so every legacy row remains layout 0 until an owning coordinator
+    // performs an atomic migration with its trusted root.
+    connection.execute("DELETE FROM workspace_bindings", [])?;
     validate_workspace_bindings(connection)?;
     Ok(())
 }
@@ -3655,74 +6634,65 @@ fn validate_workspace_bindings(connection: &Connection) -> StoreResult<()> {
             "missing required non-rebuildable workspace binding table".to_string(),
         ));
     }
-    let missing_binding = connection
-        .query_row(
-            "SELECT m.mount_id
-             FROM mounts m
-             LEFT JOIN workspace_bindings b ON b.mount_id = m.mount_id
-             WHERE b.mount_id IS NULL
-             ORDER BY m.mount_id
-             LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if let Some(mount_id) = missing_binding {
-        return Err(StoreError::StateCompatibility(format!(
-            "missing required non-rebuildable workspace binding for mount `{mount_id}`"
-        )));
+    if !table_exists(connection, "workspace_host_bindings")? {
+        return Err(StoreError::StateCompatibility(
+            "missing required non-rebuildable workspace host binding table".to_string(),
+        ));
+    }
+    let mut host_statement = connection.prepare(
+        "SELECT workspace_id, binding_json
+         FROM workspace_host_bindings
+         ORDER BY workspace_id",
+    )?;
+    let host_rows = host_statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut host_ids = BTreeSet::new();
+    for row in host_rows {
+        let (workspace_id, binding_json) = row?;
+        let host_binding = workspace_host_binding_from_row(&binding_json)?;
+        if host_binding.workspace_id().as_str() != workspace_id {
+            return Err(StoreError::InvalidState(
+                "workspace host binding key does not match its metadata".to_string(),
+            ));
+        }
+        host_ids.insert(workspace_id);
     }
     let mut statement = connection.prepare(
-        "SELECT binding_json, target_collision_key
+        "SELECT mount_id, workspace_id, binding_json, target_collision_key
          FROM workspace_bindings
          ORDER BY mount_id",
     )?;
     let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
     })?;
     for row in rows {
-        workspace_binding_from_row(row?)?;
+        let (mount_id, workspace_id, binding_json, collision_key) = row?;
+        let binding =
+            workspace_binding_from_persisted_row((workspace_id, binding_json, collision_key))?;
+        if let Some(workspace_id) = binding.workspace_id()
+            && !host_ids.contains(workspace_id.as_str())
+        {
+            return Err(StoreError::InvalidState(format!(
+                "workspace binding for mount `{mount_id}` references missing workspace `{}`",
+                workspace_id.as_str()
+            )));
+        }
     }
     Ok(())
 }
 
-fn ensure_workspace_binding_for_mount(
-    connection: &Connection,
-    mount: &MountConfig,
-    allow_legacy_or_new_binding: bool,
-) -> StoreResult<()> {
-    let exists = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM workspace_bindings WHERE mount_id = ?1)",
-        params![mount.mount_id.0.as_str()],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if exists {
-        return Ok(());
-    }
-    if !allow_legacy_or_new_binding {
-        return Err(StoreError::WorkspaceBindingMissing(mount.mount_id.clone()));
-    }
-
-    let used_collision_keys = {
-        let mut statement =
-            connection.prepare("SELECT target_collision_key FROM workspace_bindings")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<BTreeSet<_>>>()?
-    };
-    let binding = unique_binding(
-        binding_from_legacy_mount(&mount.mount_id, &mount.root),
-        &used_collision_keys,
-    );
-    connection.execute(
-        "INSERT INTO workspace_bindings (mount_id, binding_json, target_collision_key)
-         VALUES (?1, ?2, ?3)",
-        params![
-            mount.mount_id.0.as_str(),
-            to_json(&binding)?,
-            binding.collision_key(),
-        ],
-    )?;
-    Ok(())
+fn workspace_host_binding_from_row(binding_json: &str) -> StoreResult<WorkspaceHostBinding> {
+    serde_json::from_str::<WorkspaceHostBinding>(binding_json).map_err(|error| {
+        StoreError::StateCompatibility(format!(
+            "workspace host binding metadata is not readable by this binary; update required or repair invalid metadata: {error}"
+        ))
+    })
 }
 
 fn workspace_binding_from_row(row: (String, String)) -> StoreResult<WorkspaceBinding> {
@@ -3737,6 +6707,279 @@ fn workspace_binding_from_row(row: (String, String)) -> StoreResult<WorkspaceBin
         ));
     }
     Ok(binding)
+}
+
+fn workspace_binding_from_persisted_row(
+    row: (Option<String>, String, String),
+) -> StoreResult<WorkspaceBinding> {
+    let (stored_workspace_id, binding_json, collision_key) = row;
+    let binding = workspace_binding_from_row((binding_json, collision_key))?;
+    if binding.workspace_id().map(WorkspaceId::as_str) != stored_workspace_id.as_deref() {
+        return Err(StoreError::InvalidState(
+            "workspace binding identity column does not match its metadata".to_string(),
+        ));
+    }
+    Ok(binding)
+}
+
+fn mount_from_connection(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Option<MountConfig>> {
+    connection
+        .query_row(
+            "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json
+             FROM mounts WHERE mount_id = ?1",
+            params![mount_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(mount_from_row)
+        .transpose()
+}
+
+fn save_mount_row(connection: &Connection, mount: &MountConfig) -> StoreResult<()> {
+    connection.execute(
+        "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(mount_id) DO UPDATE SET
+            connector = excluded.connector,
+            root = excluded.root,
+            remote_root_id = excluded.remote_root_id,
+            read_only = excluded.read_only,
+            projection_json = excluded.projection_json,
+            connection_id = excluded.connection_id,
+            settings_json = excluded.settings_json",
+        params![
+            mount.mount_id.as_str(),
+            &mount.connector,
+            path_to_text(&mount.root),
+            mount.remote_root_id.as_ref().map(|remote_id| remote_id.0.as_str()),
+            bool_to_int(mount.read_only),
+            to_json(&mount.projection)?,
+            mount.connection_id.as_ref().map(|connection_id| connection_id.0.as_str()),
+            mount.settings_json.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_workspace_binding_commit(
+    mount: &MountConfig,
+    host_binding: &WorkspaceHostBinding,
+    record: &WorkspaceBindingRecord,
+) -> StoreResult<()> {
+    let workspace_id = record.binding.workspace_id().ok_or_else(|| {
+        StoreError::InvalidState(
+            "atomic workspace commit requires a layout-1 mount binding".to_string(),
+        )
+    })?;
+    if record.mount_id != mount.mount_id || workspace_id != host_binding.workspace_id() {
+        return Err(StoreError::InvalidState(
+            "workspace mount binding does not match its mount or host identity".to_string(),
+        ));
+    }
+    let resolved_root = host_binding.mount_root(record.binding.mount_target());
+    if !host_paths_equivalent(
+        crate::WorkspaceHostPlatform::current(),
+        &resolved_root,
+        &mount.root,
+    ) {
+        return Err(StoreError::InvalidState(format!(
+            "workspace binding for mount `{}` resolves to `{}` instead of its preserved root `{}`",
+            record.mount_id.as_str(),
+            resolved_root.display(),
+            mount.root.display()
+        )));
+    }
+    WorkspaceHostBindingResolver::current()
+        .validate_persistent_mount_root(host_binding, &resolved_root, record.binding.mount_target())
+        .map_err(|error| StoreError::InvalidState(error.to_string()))
+}
+
+fn commit_workspace_binding_in_transaction(
+    connection: &Connection,
+    mount: &MountConfig,
+    host_binding: &WorkspaceHostBinding,
+    record: &WorkspaceBindingRecord,
+) -> StoreResult<()> {
+    validate_workspace_binding_commit(mount, host_binding, record)?;
+    let workspace_id = record
+        .binding
+        .workspace_id()
+        .expect("validated layout-1 workspace binding");
+    let existing_binding = connection
+        .query_row(
+            "SELECT workspace_id, binding_json, target_collision_key
+             FROM workspace_bindings WHERE mount_id = ?1",
+            params![record.mount_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(workspace_binding_from_persisted_row)
+        .transpose()?;
+    let exact_replay = existing_binding.as_ref() == Some(&record.binding);
+    let safe_v1_upgrade = existing_binding.as_ref().is_some_and(|existing| {
+        existing.workspace_id().is_none()
+            && existing.mount_target() == record.binding.mount_target()
+    });
+    if let Some(existing) = &existing_binding
+        && !exact_replay
+        && !safe_v1_upgrade
+    {
+        return Err(StoreError::WorkspaceBindingTargetImmutable {
+            mount_id: record.mount_id.clone(),
+            existing_target: existing.mount_target().as_str().to_string(),
+            requested_target: record.binding.mount_target().as_str().to_string(),
+        });
+    }
+
+    let existing_host = connection
+        .query_row(
+            "SELECT binding_json FROM workspace_host_bindings WHERE workspace_id = ?1",
+            params![workspace_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| workspace_host_binding_from_row(&json))
+        .transpose()?;
+    if let Some(existing_host) = &existing_host {
+        if !host_paths_equivalent(
+            crate::WorkspaceHostPlatform::current(),
+            existing_host.trusted_workspace_root(),
+            host_binding.trusted_workspace_root(),
+        ) || existing_host.projection_identity() != host_binding.projection_identity()
+        {
+            return Err(StoreError::InvalidState(format!(
+                "workspace `{}` host root or projection identity is immutable outside an owning coordinator",
+                workspace_id.as_str()
+            )));
+        }
+        let expected_sequence = if exact_replay {
+            existing_host.layout_sequence()
+        } else {
+            existing_host
+                .next_layout_sequence()
+                .map_err(|error| StoreError::InvalidState(error.to_string()))?
+        };
+        if host_binding.layout_sequence() != expected_sequence {
+            return Err(StoreError::InvalidState(format!(
+                "workspace `{}` layout sequence must be {expected_sequence}, got {}",
+                workspace_id.as_str(),
+                host_binding.layout_sequence()
+            )));
+        }
+    } else if host_binding.layout_sequence() != 1 {
+        return Err(StoreError::InvalidState(format!(
+            "new workspace `{}` must start at layout sequence 1",
+            workspace_id.as_str()
+        )));
+    }
+    let persisted_host = if let Some(existing_host) = &existing_host {
+        WorkspaceHostBinding::new(
+            crate::WorkspaceHostPlatform::current(),
+            workspace_id.clone(),
+            existing_host.trusted_workspace_root().to_path_buf(),
+            host_binding.projection_identity().clone(),
+            host_binding.layout_sequence(),
+        )
+        .map_err(|error| StoreError::InvalidState(error.to_string()))?
+    } else {
+        host_binding.clone()
+    };
+
+    if !exact_replay {
+        let collision_key = record.binding.collision_key();
+        let mut statement = connection.prepare(
+            "SELECT m.mount_id, m.root, b.workspace_id, b.binding_json, b.target_collision_key
+             FROM mounts m
+             LEFT JOIN workspace_bindings b ON b.mount_id = m.mount_id
+             WHERE m.mount_id <> ?1
+             ORDER BY m.mount_id",
+        )?;
+        let rows = statement.query_map(params![record.mount_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                PathBuf::from(row.get::<_, String>(1)?),
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (mount_id, root, stored_workspace_id, binding_json, stored_collision_key) = row?;
+            let existing_collision_key = match (binding_json, stored_collision_key) {
+                (Some(binding_json), Some(stored_collision_key)) => {
+                    let binding = workspace_binding_from_persisted_row((
+                        stored_workspace_id,
+                        binding_json,
+                        stored_collision_key,
+                    ))?;
+                    match binding.workspace_id() {
+                        Some(existing_workspace_id) if existing_workspace_id == workspace_id => {
+                            Some(binding.collision_key())
+                        }
+                        Some(_) => None,
+                        None => legacy_mount_collision_key_for_host(&persisted_host, &root),
+                    }
+                }
+                (None, None) => legacy_mount_collision_key_for_host(&persisted_host, &root),
+                _ => {
+                    return Err(StoreError::InvalidState(
+                        "workspace binding row is partially present".to_string(),
+                    ));
+                }
+            };
+            if existing_collision_key.as_deref() == Some(collision_key.as_str()) {
+                return Err(StoreError::WorkspaceMountTargetCollision {
+                    target: record.binding.mount_target().as_str().to_string(),
+                    existing_mount_id: MountId(mount_id),
+                });
+            }
+        }
+    }
+
+    connection.execute(
+        "INSERT INTO workspace_host_bindings (workspace_id, binding_json)
+         VALUES (?1, ?2)
+         ON CONFLICT(workspace_id) DO UPDATE SET binding_json = excluded.binding_json",
+        params![workspace_id.as_str(), to_json(&persisted_host)?],
+    )?;
+    if !exact_replay {
+        connection.execute(
+            "INSERT INTO workspace_bindings (
+                mount_id, workspace_id, binding_json, target_collision_key
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(mount_id) DO UPDATE SET
+                workspace_id = excluded.workspace_id,
+                binding_json = excluded.binding_json,
+                target_collision_key = excluded.target_collision_key",
+            params![
+                record.mount_id.as_str(),
+                workspace_id.as_str(),
+                to_json(&record.binding)?,
+                record.binding.collision_key(),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn mount_from_row(row: MountRow) -> StoreResult<MountConfig> {
@@ -3942,7 +7185,7 @@ fn virtual_mutation_from_row(row: VirtualMutationRow) -> StoreResult<VirtualMuta
         original_path: row.5.map(PathBuf::from),
         projected_path: PathBuf::from(row.6),
         title: row.7,
-        content_path: row.8.map(PathBuf::from),
+        content_path: row.8.map(|path| native_path_from_text(&path)).transpose()?,
         created_at: row.9,
         updated_at: row.10,
     })
@@ -4437,6 +7680,198 @@ fn create_state_management_tables(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+fn migrate_generation_delivery_journals_to_mount_relation(
+    connection: &Connection,
+) -> StoreResult<()> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE generation_apply_outcomes RENAME TO generation_apply_outcomes_v21;
+         ALTER TABLE generation_apply_journals RENAME TO generation_apply_journals_v21;
+         DROP INDEX IF EXISTS generation_apply_one_active_per_source;
+         DROP INDEX IF EXISTS generation_apply_one_active_per_mount;
+
+         CREATE TABLE generation_apply_journals (
+            delta_id TEXT PRIMARY KEY,
+            mount_id TEXT NOT NULL,
+            source_connection_id TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            target_generation_id TEXT NOT NULL,
+            delta_json TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            receipt_sha256 TEXT NOT NULL,
+            selected_capabilities_json TEXT NOT NULL DEFAULT '{}',
+            selection_binding TEXT NOT NULL DEFAULT 'pre_binding_unknown'
+                CHECK (selection_binding IN ('bound', 'pre_binding_unknown', 'pre_binding_completed')),
+            acknowledgment_required INTEGER NOT NULL DEFAULT 0
+                CHECK (acknowledgment_required IN (0, 1)),
+            acknowledged_at TEXT,
+            stage_root TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('staged', 'applying', 'completed')),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            CHECK (
+                (active = 0 AND status = 'completed' AND completed_at IS NOT NULL)
+                OR (active = 1 AND status IN ('staged', 'applying') AND completed_at IS NULL)
+            ),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+         );
+
+         INSERT INTO generation_apply_journals (
+            delta_id, mount_id, source_connection_id, base_generation_id,
+            target_generation_id, delta_json, receipt_json, receipt_sha256,
+            stage_root, status, active, created_at, updated_at, completed_at
+         )
+         SELECT delta_id, json_extract(delta_json, '$.mount_id'), source_connection_id,
+                base_generation_id, target_generation_id, delta_json, receipt_json,
+                receipt_sha256, stage_root, status, active, created_at, updated_at,
+                completed_at
+         FROM generation_apply_journals_v21;
+
+         CREATE UNIQUE INDEX generation_apply_one_active_per_mount
+         ON generation_apply_journals(mount_id)
+         WHERE active = 1;
+
+         CREATE TABLE generation_apply_outcomes (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            outcome_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE
+         );
+         INSERT INTO generation_apply_outcomes
+         SELECT delta_id, entry_index, outcome_json, updated_at
+         FROM generation_apply_outcomes_v21;
+
+         DROP TABLE generation_apply_outcomes_v21;
+         DROP TABLE generation_apply_journals_v21;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS observed_generations (
+            mount_id TEXT NOT NULL,
+            source_connection_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            inventory_sha256 TEXT NOT NULL,
+            workspace_layout_version INTEGER NOT NULL CHECK (workspace_layout_version > 0),
+            workspace_layout_digest TEXT NOT NULL,
+            last_receipt_sha256 TEXT,
+            updated_at TEXT NOT NULL,
+            refresh_mode TEXT NOT NULL
+                CHECK (refresh_mode IN ('generation_delta_v1', 'full_export_only')),
+            PRIMARY KEY (mount_id, source_connection_id),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_paths (
+            mount_id TEXT NOT NULL,
+            source_connection_id TEXT NOT NULL,
+            projection_id TEXT NOT NULL,
+            logical_path TEXT NOT NULL,
+            local_logical_path TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            base_identity_json TEXT,
+            base_payload_delta_id TEXT,
+            base_payload_entry_index INTEGER CHECK (base_payload_entry_index >= 0),
+            conflict_payload_delta_id TEXT,
+            conflict_payload_entry_index INTEGER CHECK (conflict_payload_entry_index >= 0),
+            state TEXT NOT NULL CHECK (state IN ('clean', 'dirty', 'conflicted')),
+            incoming_identity_json TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (mount_id, projection_id),
+            UNIQUE (mount_id, logical_path),
+            UNIQUE (mount_id, local_logical_path),
+            FOREIGN KEY (mount_id, source_connection_id)
+                REFERENCES observed_generations(mount_id, source_connection_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_apply_journals (
+            delta_id TEXT PRIMARY KEY,
+            mount_id TEXT NOT NULL,
+            source_connection_id TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            target_generation_id TEXT NOT NULL,
+            delta_json TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            receipt_sha256 TEXT NOT NULL,
+            selected_capabilities_json TEXT NOT NULL DEFAULT '{}',
+            selection_binding TEXT NOT NULL DEFAULT 'bound'
+                CHECK (selection_binding IN ('bound', 'pre_binding_unknown', 'pre_binding_completed')),
+            acknowledgment_required INTEGER NOT NULL DEFAULT 0
+                CHECK (acknowledgment_required IN (0, 1)),
+            acknowledged_at TEXT,
+            stage_root TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('staged', 'applying', 'completed')),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            CHECK (
+                (active = 0 AND status = 'completed' AND completed_at IS NOT NULL)
+                OR (active = 1 AND status IN ('staged', 'applying') AND completed_at IS NULL)
+            ),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_apply_outcomes (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            outcome_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_inode_evidence (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            mount_id TEXT NOT NULL,
+            logical_path TEXT NOT NULL,
+            evidence_name TEXT NOT NULL,
+            expected_sha256 TEXT NOT NULL,
+            byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+            visible_evidence_name TEXT,
+            visible_expected_sha256 TEXT,
+            visible_byte_length INTEGER CHECK (visible_byte_length >= 0),
+            base_payload_delta_id TEXT,
+            base_payload_entry_index INTEGER CHECK (base_payload_entry_index >= 0),
+            resolved_at TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE,
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+        ",
+    )?;
+    ensure_generation_active_index_for_schema(connection)?;
+    Ok(())
+}
+
+fn ensure_generation_active_index_for_schema(connection: &Connection) -> StoreResult<()> {
+    if column_exists(connection, "generation_apply_journals", "mount_id")? {
+        if !index_exists(connection, "generation_apply_one_active_per_source")? {
+            connection.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS generation_apply_one_active_per_mount
+                 ON generation_apply_journals(mount_id) WHERE active = 1;",
+            )?;
+        }
+    } else {
+        connection.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS generation_apply_one_active_per_source
+             ON generation_apply_journals(source_connection_id) WHERE active = 1;",
+        )?;
+    }
+    Ok(())
+}
+
 fn migrate_linux_fuse_projection_layout_to_v2(
     connection: &Connection,
     pre_state_components_schema: bool,
@@ -4465,8 +7900,811 @@ fn migrate_windows_cloud_files_projection_layout_to_v2(
     )
 }
 
-fn migrate_virtual_mutations_component_to_v3(connection: &Connection) -> StoreResult<()> {
+fn migrate_virtual_mutations_component_to_v4(connection: &Connection) -> StoreResult<()> {
     migrate_state_component_to_current(connection, "durable:virtual_mutations")
+}
+
+fn migrate_generation_delivery_component_to_v7(connection: &Connection) -> StoreResult<()> {
+    migrate_state_component_to_current(connection, "durable:generation_delivery")
+}
+
+fn migrate_generation_delivery_to_v7(
+    connection: &Connection,
+    record_from_schema: Option<i64>,
+    update_component: bool,
+) -> StoreResult<()> {
+    if record_from_schema.is_none()
+        && generation_delivery_storage_v7_is_complete(connection)?
+        && (!update_component || generation_delivery_component_is_current(connection)?)
+    {
+        return Ok(());
+    }
+    let selected_capabilities_preexisted = column_exists(
+        connection,
+        "generation_apply_journals",
+        "selected_capabilities_json",
+    )?;
+    let finalized_inode_evidence_preexisted =
+        column_exists(
+            connection,
+            "generation_inode_evidence",
+            "visible_evidence_name",
+        )? && column_exists(connection, "generation_inode_evidence", "resolved_at")?;
+    let transaction = connection.unchecked_transaction()?;
+    migrate_generation_delivery_storage_to_v2(&transaction)?;
+    migrate_generation_delivery_storage_to_v3(&transaction)?;
+    migrate_generation_delivery_storage_to_v4(&transaction)?;
+    migrate_generation_delivery_storage_to_v5(&transaction)?;
+    migrate_generation_delivery_storage_to_v6(
+        &transaction,
+        selected_capabilities_preexisted,
+        finalized_inode_evidence_preexisted,
+    )?;
+    verify_generation_delivery_storage_v6(&transaction)?;
+    migrate_generation_delivery_storage_to_v7(&transaction)?;
+    verify_generation_delivery_storage_v7(&transaction)?;
+    if update_component {
+        migrate_generation_delivery_component_to_v7(&transaction)?;
+    }
+    if let Some(from) = record_from_schema {
+        record_schema_migration(&transaction, from, SCHEMA_VERSION)?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn generation_delivery_component_is_current(connection: &Connection) -> StoreResult<bool> {
+    connection
+        .query_row(
+            "SELECT version = ?2 AND min_reader_version = ?2
+             FROM state_components WHERE component_id = ?1",
+            params![
+                "durable:generation_delivery",
+                GENERATION_DELIVERY_COMPONENT_VERSION
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(false))
+        .map_err(Into::into)
+}
+
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> StoreResult<()> {
+    if !column_exists(connection, table, column)? {
+        connection.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+        ))?;
+    }
+    Ok(())
+}
+
+fn migrate_generation_delivery_storage_to_v2(connection: &Connection) -> StoreResult<()> {
+    add_column_if_missing(
+        connection,
+        "generation_paths",
+        "base_payload_delta_id",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_paths",
+        "base_payload_entry_index",
+        "INTEGER CHECK (base_payload_entry_index >= 0)",
+    )?;
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS generation_inode_evidence (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            mount_id TEXT NOT NULL,
+            logical_path TEXT NOT NULL,
+            evidence_name TEXT NOT NULL,
+            expected_sha256 TEXT NOT NULL,
+            byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+            visible_evidence_name TEXT,
+            visible_expected_sha256 TEXT,
+            visible_byte_length INTEGER CHECK (visible_byte_length >= 0),
+            resolved_at TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE,
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+         );",
+    )?;
+    Ok(())
+}
+
+fn migrate_generation_delivery_storage_to_v3(connection: &Connection) -> StoreResult<()> {
+    add_column_if_missing(connection, "generation_paths", "local_logical_path", "TEXT")?;
+    connection.execute(
+        "UPDATE generation_paths SET local_logical_path = logical_path
+         WHERE local_logical_path IS NULL",
+        [],
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_paths",
+        "conflict_payload_delta_id",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_paths",
+        "conflict_payload_entry_index",
+        "INTEGER CHECK (conflict_payload_entry_index >= 0)",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "base_payload_delta_id",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "base_payload_entry_index",
+        "INTEGER CHECK (base_payload_entry_index >= 0)",
+    )?;
+    Ok(())
+}
+
+fn migrate_generation_delivery_storage_to_v4(connection: &Connection) -> StoreResult<()> {
+    add_column_if_missing(
+        connection,
+        "generation_apply_journals",
+        "acknowledgment_required",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (acknowledgment_required IN (0, 1))",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_apply_journals",
+        "acknowledged_at",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "visible_evidence_name",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "visible_expected_sha256",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "visible_byte_length",
+        "INTEGER CHECK (visible_byte_length >= 0)",
+    )?;
+    Ok(())
+}
+
+fn migrate_generation_delivery_storage_to_v5(connection: &Connection) -> StoreResult<()> {
+    add_column_if_missing(
+        connection,
+        "generation_apply_journals",
+        "selected_capabilities_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    connection.execute(
+        "UPDATE generation_apply_journals
+         SET selected_capabilities_json =
+             '{\"format_version\":1,\"minimum_reader_version\":1,\"terminal_receipt_acknowledgments\":true}'
+         WHERE acknowledgment_required = 1
+           AND selected_capabilities_json = '{}'",
+        [],
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "resolved_at",
+        "TEXT",
+    )?;
+    connection.execute(
+        "UPDATE generation_inode_evidence
+         SET resolved_at = (
+             SELECT outcomes.updated_at
+             FROM generation_apply_outcomes AS outcomes
+             WHERE outcomes.delta_id = generation_inode_evidence.delta_id
+               AND outcomes.entry_index = generation_inode_evidence.entry_index
+               AND json_extract(outcomes.outcome_json, '$.kind') = 'merged'
+         )
+         WHERE resolved_at IS NULL
+           AND visible_evidence_name IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM generation_apply_outcomes AS outcomes
+               WHERE outcomes.delta_id = generation_inode_evidence.delta_id
+                 AND outcomes.entry_index = generation_inode_evidence.entry_index
+                 AND json_extract(outcomes.outcome_json, '$.kind') = 'merged'
+           )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migrate_generation_delivery_storage_to_v6(
+    connection: &Connection,
+    selected_capabilities_preexisted: bool,
+    finalized_inode_evidence_preexisted: bool,
+) -> StoreResult<()> {
+    let prior_component_version = if table_exists(connection, "state_components")? {
+        connection
+            .query_row(
+                "SELECT version FROM state_components
+                 WHERE component_id = 'durable:generation_delivery'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+    } else {
+        None
+    };
+    let selected_capabilities_preexisted = selected_capabilities_preexisted
+        && prior_component_version.is_some_and(|version| version >= 5);
+    add_column_if_missing(
+        connection,
+        "generation_apply_journals",
+        "selection_binding",
+        "TEXT NOT NULL DEFAULT 'pre_binding_unknown' CHECK (selection_binding IN ('bound', 'pre_binding_unknown', 'pre_binding_completed'))",
+    )?;
+
+    let candidates = {
+        let mut statement = connection.prepare(
+            "SELECT delta_id, status, active, selected_capabilities_json,
+                    acknowledgment_required
+             FROM generation_apply_journals
+             WHERE selection_binding = 'pre_binding_unknown'
+             ORDER BY delta_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for (delta_id, status, active, selected_json, acknowledgment_required) in candidates {
+        let known_legacy_binding = (prior_component_version.is_some_and(|version| version <= 3)
+            || (prior_component_version == Some(5)
+                && finalized_inode_evidence_preexisted
+                && !selected_capabilities_preexisted))
+            && !acknowledgment_required;
+        let recoverable_persisted_binding = selected_capabilities_preexisted
+            && from_json::<GenerationTransportCapabilities>(&selected_json)
+                .ok()
+                .filter(|selected| {
+                    (selected.body_windows.is_some() || selected.generation_pin_leases.is_some())
+                        && selected.terminal_receipt_acknowledgments == acknowledgment_required
+                        && selected.validate().is_ok()
+                })
+                .is_some();
+        let recoverable_binding = known_legacy_binding || recoverable_persisted_binding;
+        if recoverable_binding {
+            connection.execute(
+                "UPDATE generation_apply_journals
+                 SET selected_capabilities_json = CASE
+                         WHEN ?2 THEN '{}' ELSE selected_capabilities_json END,
+                     selection_binding = 'bound'
+                 WHERE delta_id = ?1",
+                params![delta_id, known_legacy_binding],
+            )?;
+        } else if status == "completed" && !active {
+            connection.execute(
+                "UPDATE generation_apply_journals
+                 SET selection_binding = 'pre_binding_completed'
+                 WHERE delta_id = ?1",
+                params![delta_id],
+            )?;
+        } else {
+            return Err(StoreError::InvalidState(format!(
+                "active generation apply `{delta_id}` has no complete immutable transport selection; complete it with the prerelease database reader before retrying this migration"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn migrate_generation_delivery_storage_to_v7(connection: &Connection) -> StoreResult<()> {
+    if generation_delivery_storage_v7_is_complete(connection)? {
+        return Ok(());
+    }
+    let already_multi_source =
+        column_exists(connection, "generation_paths", "source_connection_id")?
+            && table_primary_key_columns(connection, "observed_generations")?
+                == ["mount_id", "source_connection_id"];
+    if already_multi_source {
+        add_column_if_missing(
+            connection,
+            "observed_generations",
+            "refresh_mode",
+            "TEXT NOT NULL DEFAULT 'full_export_only' CHECK (refresh_mode IN ('generation_delta_v1', 'full_export_only'))",
+        )?;
+        backfill_generation_refresh_modes(connection)?;
+        migrate_generation_active_index_to_mount(connection)?;
+        return Ok(());
+    }
+    if !generation_delivery_storage_v6_is_complete(connection)? {
+        return Err(StoreError::InvalidState(
+            "generation delivery v7 migration requires complete v6 storage".to_string(),
+        ));
+    }
+    connection.execute_batch(
+        "ALTER TABLE generation_paths RENAME TO generation_paths_v6;
+         ALTER TABLE observed_generations RENAME TO observed_generations_v6;
+
+         CREATE TABLE observed_generations (
+            mount_id TEXT NOT NULL,
+            source_connection_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            inventory_sha256 TEXT NOT NULL,
+            workspace_layout_version INTEGER NOT NULL CHECK (workspace_layout_version > 0),
+            workspace_layout_digest TEXT NOT NULL,
+            last_receipt_sha256 TEXT,
+            updated_at TEXT NOT NULL,
+            refresh_mode TEXT NOT NULL
+                CHECK (refresh_mode IN ('generation_delta_v1', 'full_export_only')),
+            PRIMARY KEY (mount_id, source_connection_id),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+         );
+
+         INSERT INTO observed_generations (
+            mount_id, source_connection_id, generation_id, inventory_sha256,
+            workspace_layout_version, workspace_layout_digest,
+            last_receipt_sha256, updated_at, refresh_mode
+         )
+         SELECT mount_id, source_connection_id, generation_id, inventory_sha256,
+                workspace_layout_version, workspace_layout_digest,
+                last_receipt_sha256, updated_at, 'full_export_only'
+         FROM observed_generations_v6;
+
+         CREATE TABLE generation_paths (
+            mount_id TEXT NOT NULL,
+            source_connection_id TEXT NOT NULL,
+            projection_id TEXT NOT NULL,
+            logical_path TEXT NOT NULL,
+            local_logical_path TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            base_identity_json TEXT,
+            base_payload_delta_id TEXT,
+            base_payload_entry_index INTEGER CHECK (base_payload_entry_index >= 0),
+            conflict_payload_delta_id TEXT,
+            conflict_payload_entry_index INTEGER CHECK (conflict_payload_entry_index >= 0),
+            state TEXT NOT NULL CHECK (state IN ('clean', 'dirty', 'conflicted')),
+            incoming_identity_json TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (mount_id, projection_id),
+            UNIQUE (mount_id, logical_path),
+            UNIQUE (mount_id, local_logical_path),
+            FOREIGN KEY (mount_id, source_connection_id)
+                REFERENCES observed_generations(mount_id, source_connection_id)
+                ON DELETE CASCADE
+         );
+
+         INSERT INTO generation_paths (
+            mount_id, source_connection_id, projection_id, logical_path,
+            local_logical_path, base_generation_id, base_identity_json,
+            base_payload_delta_id, base_payload_entry_index,
+            conflict_payload_delta_id, conflict_payload_entry_index,
+            state, incoming_identity_json, updated_at
+         )
+         SELECT paths.mount_id, observed.source_connection_id,
+                paths.projection_id, paths.logical_path, paths.local_logical_path,
+                paths.base_generation_id, paths.base_identity_json,
+                paths.base_payload_delta_id, paths.base_payload_entry_index,
+                paths.conflict_payload_delta_id, paths.conflict_payload_entry_index,
+                paths.state, paths.incoming_identity_json, paths.updated_at
+         FROM generation_paths_v6 AS paths
+         JOIN observed_generations_v6 AS observed
+           ON observed.mount_id = paths.mount_id;
+
+         DROP TABLE generation_paths_v6;
+         DROP TABLE observed_generations_v6;",
+    )?;
+    backfill_generation_refresh_modes(connection)?;
+    migrate_generation_active_index_to_mount(connection)?;
+    Ok(())
+}
+
+fn backfill_generation_refresh_modes(connection: &Connection) -> StoreResult<()> {
+    let observed = {
+        let mut statement = connection.prepare(
+            "SELECT mount_id, source_connection_id, generation_id, inventory_sha256,
+                    workspace_layout_version, workspace_layout_digest,
+                    last_receipt_sha256, updated_at
+             FROM observed_generations ORDER BY mount_id, source_connection_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for row in observed {
+        let observed = observed_generation_from_row(row)?;
+        let paths = list_generation_paths_for_source_from_connection(
+            connection,
+            &observed.mount_id,
+            &observed.source_connection_id,
+        )?;
+        let mode = generation_seed_refresh_mode(&observed, &paths);
+        connection.execute(
+            "UPDATE observed_generations SET refresh_mode = ?3
+             WHERE mount_id = ?1 AND source_connection_id = ?2",
+            params![
+                observed.mount_id.as_str(),
+                observed.source_connection_id.as_str(),
+                generation_baseline_refresh_mode_label(mode),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_generation_active_index_to_mount(connection: &Connection) -> StoreResult<()> {
+    let duplicate_mount: Option<(String, i64)> = connection
+        .query_row(
+            "SELECT mount_id, COUNT(*) FROM generation_apply_journals
+             WHERE active = 1 GROUP BY mount_id HAVING COUNT(*) > 1
+             ORDER BY mount_id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((mount_id, count)) = duplicate_mount {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{mount_id}` has {count} active generation applies; complete all but one with the prerelease reader before retrying migration"
+        )));
+    }
+    connection.execute_batch(
+        "DROP INDEX IF EXISTS generation_apply_one_active_per_source;
+         DROP INDEX IF EXISTS generation_apply_one_active_per_mount;
+         CREATE UNIQUE INDEX generation_apply_one_active_per_mount
+         ON generation_apply_journals(mount_id) WHERE active = 1;",
+    )?;
+    Ok(())
+}
+
+fn table_primary_key_columns(connection: &Connection, table: &str) -> StoreResult<Vec<String>> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut columns = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(5)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|row| match row {
+            Ok((0, _)) => None,
+            other => Some(other),
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    columns.sort_by_key(|(ordinal, _)| *ordinal);
+    Ok(columns.into_iter().map(|(_, name)| name).collect())
+}
+
+fn table_has_unique_columns(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> StoreResult<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA index_list({table})"))?;
+    let indexes = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (index, unique) in indexes {
+        if !unique {
+            continue;
+        }
+        let escaped = index.replace('"', "\"\"");
+        let mut columns_statement =
+            connection.prepare(&format!("PRAGMA index_info(\"{escaped}\")"))?;
+        let columns = columns_statement
+            .query_map([], |row| row.get::<_, String>(2))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if columns
+            .iter()
+            .map(String::as_str)
+            .eq(expected.iter().copied())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn index_exists(connection: &Connection, index: &str) -> StoreResult<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1
+             )",
+            params![index],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn generation_paths_have_source_foreign_key(connection: &Connection) -> StoreResult<bool> {
+    let mut statement = connection.prepare("PRAGMA foreign_key_list(generation_paths)")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows.iter().any(|first| {
+        first.1 == 0
+            && first.2 == "observed_generations"
+            && first.3 == "mount_id"
+            && first.4 == "mount_id"
+            && first.5 == "CASCADE"
+            && rows.iter().any(|second| {
+                second.0 == first.0
+                    && second.1 == 1
+                    && second.2 == "observed_generations"
+                    && second.3 == "source_connection_id"
+                    && second.4 == "source_connection_id"
+                    && second.5 == "CASCADE"
+            })
+    }))
+}
+
+fn verify_generation_delivery_storage_v7(connection: &Connection) -> StoreResult<()> {
+    if generation_delivery_storage_v7_is_complete(connection)? {
+        return Ok(());
+    }
+    Err(StoreError::InvalidState(
+        "generation delivery migration left incomplete multi-source storage".to_string(),
+    ))
+}
+
+fn generation_delivery_storage_v7_is_complete(connection: &Connection) -> StoreResult<bool> {
+    if !generation_delivery_storage_v6_is_complete(connection)?
+        || !column_exists(connection, "generation_paths", "source_connection_id")?
+        || !column_exists(connection, "observed_generations", "refresh_mode")?
+        || table_primary_key_columns(connection, "observed_generations")?
+            != ["mount_id", "source_connection_id"]
+        || !table_has_unique_columns(
+            connection,
+            "generation_paths",
+            &["mount_id", "projection_id"],
+        )?
+        || !table_has_unique_columns(
+            connection,
+            "generation_paths",
+            &["mount_id", "logical_path"],
+        )?
+        || !table_has_unique_columns(
+            connection,
+            "generation_paths",
+            &["mount_id", "local_logical_path"],
+        )?
+        || !generation_paths_have_source_foreign_key(connection)?
+        || !table_has_unique_columns(connection, "generation_apply_journals", &["mount_id"])?
+        || index_exists(connection, "generation_apply_one_active_per_source")?
+    {
+        return Ok(false);
+    }
+    let invalid_source_binding: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_paths AS paths
+            LEFT JOIN observed_generations AS observed
+              ON observed.mount_id = paths.mount_id
+             AND observed.source_connection_id = paths.source_connection_id
+            WHERE observed.mount_id IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let invalid_refresh_mode: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM observed_generations
+            WHERE refresh_mode NOT IN ('generation_delta_v1', 'full_export_only')
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!invalid_source_binding && !invalid_refresh_mode)
+}
+
+fn verify_generation_delivery_storage_v6(connection: &Connection) -> StoreResult<()> {
+    if generation_delivery_storage_v6_is_complete(connection)? {
+        return Ok(());
+    }
+    for (table, columns) in [
+        (
+            "generation_paths",
+            &[
+                "base_payload_delta_id",
+                "base_payload_entry_index",
+                "local_logical_path",
+                "conflict_payload_delta_id",
+                "conflict_payload_entry_index",
+            ][..],
+        ),
+        (
+            "generation_inode_evidence",
+            &[
+                "base_payload_delta_id",
+                "base_payload_entry_index",
+                "visible_evidence_name",
+                "visible_expected_sha256",
+                "visible_byte_length",
+                "resolved_at",
+            ][..],
+        ),
+        (
+            "generation_apply_journals",
+            &[
+                "acknowledgment_required",
+                "acknowledged_at",
+                "selected_capabilities_json",
+                "selection_binding",
+            ][..],
+        ),
+    ] {
+        for column in columns {
+            if !column_exists(connection, table, column)? {
+                return Err(StoreError::InvalidState(format!(
+                    "generation delivery migration left `{table}.{column}` incomplete"
+                )));
+            }
+        }
+    }
+    let null_local_path: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_paths WHERE local_logical_path IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if null_local_path {
+        return Err(StoreError::InvalidState(
+            "generation delivery migration left a null local logical path".to_string(),
+        ));
+    }
+    let partial_visible_evidence: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_inode_evidence
+            WHERE (visible_evidence_name IS NULL)
+                != (visible_expected_sha256 IS NULL)
+               OR (visible_evidence_name IS NULL) != (visible_byte_length IS NULL)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if partial_visible_evidence {
+        return Err(StoreError::InvalidState(
+            "generation delivery migration left partial visible inode evidence".to_string(),
+        ));
+    }
+    let invalid_tombstone: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_inode_evidence
+            WHERE resolved_at IS NOT NULL AND visible_evidence_name IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_tombstone {
+        return Err(StoreError::InvalidState(
+            "generation delivery migration left a tombstone without both retained inodes"
+                .to_string(),
+        ));
+    }
+    if !generation_delivery_storage_v6_is_complete(connection)? {
+        return Err(StoreError::InvalidState(
+            "generation delivery migration left an unsafe transport selection binding".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn generation_delivery_storage_v6_is_complete(connection: &Connection) -> StoreResult<bool> {
+    for (table, columns) in [
+        (
+            "generation_paths",
+            &[
+                "base_payload_delta_id",
+                "base_payload_entry_index",
+                "local_logical_path",
+                "conflict_payload_delta_id",
+                "conflict_payload_entry_index",
+            ][..],
+        ),
+        (
+            "generation_inode_evidence",
+            &[
+                "base_payload_delta_id",
+                "base_payload_entry_index",
+                "visible_evidence_name",
+                "visible_expected_sha256",
+                "visible_byte_length",
+                "resolved_at",
+            ][..],
+        ),
+        (
+            "generation_apply_journals",
+            &[
+                "acknowledgment_required",
+                "acknowledged_at",
+                "selected_capabilities_json",
+                "selection_binding",
+            ][..],
+        ),
+    ] {
+        for column in columns {
+            if !column_exists(connection, table, column)? {
+                return Ok(false);
+            }
+        }
+    }
+    let null_local_path: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_paths WHERE local_logical_path IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if null_local_path {
+        return Ok(false);
+    }
+    let invalid_binding: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_apply_journals
+            WHERE selection_binding NOT IN ('bound', 'pre_binding_completed')
+               OR (selection_binding = 'pre_binding_completed'
+                   AND (status != 'completed' OR active != 0))
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let partial_visible_evidence: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_inode_evidence
+            WHERE (visible_evidence_name IS NULL)
+                != (visible_expected_sha256 IS NULL)
+               OR (visible_evidence_name IS NULL) != (visible_byte_length IS NULL)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let invalid_tombstone: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_inode_evidence
+            WHERE resolved_at IS NOT NULL AND visible_evidence_name IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!invalid_binding && !partial_visible_evidence && !invalid_tombstone)
 }
 
 fn migrate_journals_component_to_v3(connection: &Connection) -> StoreResult<()> {
@@ -5686,6 +9924,112 @@ fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
 
 fn path_to_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+const NATIVE_PATH_ENCODING_PREFIX: &str = "locality-native-path-v1:";
+
+fn native_path_to_text(path: &Path) -> String {
+    if let Some(path) = path.to_str() {
+        return format!(
+            "{NATIVE_PATH_ENCODING_PREFIX}utf8:{}",
+            encode_hex(path.as_bytes())
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        return format!(
+            "{NATIVE_PATH_ENCODING_PREFIX}unix:{}",
+            encode_hex(path.as_os_str().as_bytes())
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let bytes = path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        return format!(
+            "{NATIVE_PATH_ENCODING_PREFIX}windows:{}",
+            encode_hex(&bytes)
+        );
+    }
+    #[cfg(not(any(unix, windows)))]
+    unreachable!("non-UTF-8 native paths are unsupported on this platform")
+}
+
+fn native_path_from_text(encoded: &str) -> StoreResult<PathBuf> {
+    let Some(encoded) = encoded.strip_prefix(NATIVE_PATH_ENCODING_PREFIX) else {
+        return Ok(PathBuf::from(encoded));
+    };
+    let (kind, bytes) = encoded.split_once(':').ok_or_else(|| {
+        StoreError::InvalidState("invalid durable native path encoding".to_string())
+    })?;
+    let bytes = decode_hex(bytes)?;
+    match kind {
+        "utf8" => String::from_utf8(bytes).map(PathBuf::from).map_err(|_| {
+            StoreError::InvalidState("durable native UTF-8 path is invalid".to_string())
+        }),
+        #[cfg(unix)]
+        "unix" => {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            Ok(PathBuf::from(OsString::from_vec(bytes)))
+        }
+        #[cfg(windows)]
+        "windows" => {
+            use std::ffi::OsString;
+            use std::os::windows::ffi::OsStringExt;
+            if bytes.len() % 2 != 0 {
+                return Err(StoreError::InvalidState(
+                    "durable native Windows path has an odd byte count".to_string(),
+                ));
+            }
+            let wide = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>();
+            Ok(PathBuf::from(OsString::from_wide(&wide)))
+        }
+        _ => Err(StoreError::InvalidState(format!(
+            "durable native path encoding `{kind}` is unsupported on this host"
+        ))),
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex(encoded: &str) -> StoreResult<Vec<u8>> {
+    if encoded.len() % 2 != 0 {
+        return Err(StoreError::InvalidState(
+            "durable native path has an odd hex length".to_string(),
+        ));
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16);
+            let low = (pair[1] as char).to_digit(16);
+            match (high, low) {
+                (Some(high), Some(low)) => Ok(((high << 4) | low) as u8),
+                _ => Err(StoreError::InvalidState(
+                    "durable native path contains invalid hex".to_string(),
+                )),
+            }
+        })
+        .collect()
 }
 
 fn logical_path_to_text(path: &Path) -> String {

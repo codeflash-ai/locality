@@ -230,7 +230,7 @@ CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low \
 ```
 
 By default this is artifact-only. It writes local Markdown reports under
-`target/launch-readiness-amika/<run-id>/artifacts/{locality,notion-mcp}` after
+`experiment/launch-readiness-amika/<run-id>/artifacts/{locality,notion-mcp}` after
 syncing the remote sandbox `OUT_DIR`s back to the local machine. It does not
 create Notion pages, write mounted report pages, run `loc diff`, or push.
 
@@ -285,12 +285,12 @@ RUNS=5 CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low \
 
 Each split wrapper run writes local metadata to:
 
-`target/launch-readiness-amika/<run-id>/`
+`experiment/launch-readiness-amika/<run-id>/`
 
 The synced benchmark artifacts are under:
 
-`target/launch-readiness-amika/<run-id>/artifacts/locality/`
-`target/launch-readiness-amika/<run-id>/artifacts/notion-mcp/`
+`experiment/launch-readiness-amika/<run-id>/artifacts/locality/`
+`experiment/launch-readiness-amika/<run-id>/artifacts/notion-mcp/`
 
 Important artifacts:
 
@@ -323,13 +323,19 @@ Important artifacts:
 - `scenarios/<scenario>/locality.snakeviz.stats.md` and `scenarios/<scenario>/notion-mcp.snakeviz.stats.md` - text summary of the SnakeViz profile frames.
 - `token-usage/by-trial-scenario/*.{svg,png}` - stacked token-usage charts
   with one Locality bar and one MCP bar for each trial/scenario pair.
+- `token-usage/by-scenario-average/*.{svg,png}` - stacked token-usage charts
+  with each scenario averaged across available trials.
 - `token-usage/average.{svg,png}` - stacked token-usage chart averaged over
   paired scenarios and trials.
 - `token-usage/cost/by-trial-scenario/*.{svg,png}` - stacked cost charts using
   the same token buckets and one Locality/MCP bar pair per trial/scenario.
+- `token-usage/cost/by-scenario-average/*.{svg,png}` - stacked cost charts
+  with each scenario averaged across available trials.
 - `token-usage/cost/average.{svg,png}` - stacked cost chart averaged over
   paired scenarios and trials.
 - `token-usage/token-usage.tsv`, `token-usage/cost-usage.tsv`, and
+  `token-usage/scenario-average-token-usage.tsv`,
+  `token-usage/scenario-average-cost-usage.tsv`, and
   `token-usage/token-usage.json` - chart data, cost data, pricing, and manifest.
 - `deep-dive.md` - local wrapper report that indexes each scenario/strategy
   with phase timings, event counts, token totals, tool buckets, chronological
@@ -353,12 +359,12 @@ a completed run with:
 
 ```bash
 python3 experiment/locality-mcp-comparison/scripts/codex-events-to-trace.py \
-  target/launch-readiness-amika/<run-id>/artifacts/locality/scenarios/<scenario>/locality-codex-events.jsonl \
-  target/launch-readiness-amika/<run-id>/artifacts/locality/scenarios/<scenario>/locality
+  experiment/launch-readiness-amika/<run-id>/artifacts/locality/scenarios/<scenario>/locality-codex-events.jsonl \
+  experiment/launch-readiness-amika/<run-id>/artifacts/locality/scenarios/<scenario>/locality
 
 python3 experiment/locality-mcp-comparison/scripts/codex-events-to-trace.py \
-  target/launch-readiness-amika/<run-id>/artifacts/notion-mcp/scenarios/<scenario>/notion-mcp-codex-events.jsonl \
-  target/launch-readiness-amika/<run-id>/artifacts/notion-mcp/scenarios/<scenario>/notion-mcp
+  experiment/launch-readiness-amika/<run-id>/artifacts/notion-mcp/scenarios/<scenario>/notion-mcp-codex-events.jsonl \
+  experiment/launch-readiness-amika/<run-id>/artifacts/notion-mcp/scenarios/<scenario>/notion-mcp
 ```
 
 When live hook `harness.phase` records are present, the generated Speedscope
@@ -370,8 +376,8 @@ Generate Locality span artifacts for a raw trace manually with:
 
 ```bash
 python3 experiment/locality-mcp-comparison/scripts/locality-trace-to-speedscope.py \
-  target/launch-readiness-amika/<run-id>/artifacts/locality/scenarios/<scenario>/locality-agent-locality-trace.jsonl \
-  target/launch-readiness-amika/<run-id>/artifacts/locality/scenarios/<scenario>/locality-agent-locality-trace
+  experiment/launch-readiness-amika/<run-id>/artifacts/locality/scenarios/<scenario>/locality-agent-locality-trace.jsonl \
+  experiment/launch-readiness-amika/<run-id>/artifacts/locality/scenarios/<scenario>/locality-agent-locality-trace
 ```
 
 Use the Locality trace files to answer questions the Codex event graph cannot:

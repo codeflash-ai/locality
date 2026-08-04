@@ -1,0 +1,81 @@
+{
+  "delivery": {
+    "format_version": 1,
+    "minimum_reader_version": 1,
+    "status": "delivery",
+    "mount_id": "mount-alpha",
+    "source_connection_id": "source-018f4f6e",
+    "observed_generation_id": "generation-0007",
+    "selected_capabilities": {
+      "format_version": 1,
+      "minimum_reader_version": 1,
+      "terminal_receipt_acknowledgments": false
+    },
+    "delivery": {
+      "delta": {
+        "format_version": 1,
+        "minimum_reader_version": 1,
+        "delta_id": "delta-poll-v1",
+        "mount_id": "mount-alpha",
+        "source_connection_id": "source-018f4f6e",
+        "base_generation_id": "generation-0007",
+        "target_generation_id": "generation-0008",
+        "target_complete": true,
+        "target_inventory_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "workspace_layout_version": 1,
+        "workspace_layout_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "entries": []
+      },
+      "terminal_receipt": {
+        "format_version": 1,
+        "minimum_reader_version": 1,
+        "delta_id": "delta-poll-v1",
+        "mount_id": "mount-alpha",
+        "source_connection_id": "source-018f4f6e",
+        "base_generation_id": "generation-0007",
+        "target_generation_id": "generation-0008",
+        "target_inventory_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "workspace_layout_version": 1,
+        "workspace_layout_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "delta_sha256": "sha256:a1cd1c4a8991079dde82b0464c584f53f3135fce469a3bcb213aaa99cd957a55",
+        "entry_count": 0,
+        "changed_content_bytes": 0,
+        "authorization_epoch": "42",
+        "completed_at": "2026-07-31T12:34:56Z"
+      }
+    }
+  },
+  "no_delivery": {
+    "format_version": 1,
+    "minimum_reader_version": 1,
+    "status": "no_delivery",
+    "mount_id": "mount-alpha",
+    "source_connection_id": "source-018f4f6e",
+    "observed_generation_id": "generation-0007",
+    "selected_capabilities": {
+      "format_version": 1,
+      "minimum_reader_version": 1,
+      "terminal_receipt_acknowledgments": false
+    }
+  },
+  "error": {
+    "format_version": 1,
+    "minimum_reader_version": 1,
+    "status": "error",
+    "mount_id": "mount-alpha",
+    "source_connection_id": "source-018f4f6e",
+    "observed_generation_id": "generation-0007",
+    "selected_capabilities": {
+      "format_version": 1,
+      "minimum_reader_version": 1,
+      "terminal_receipt_acknowledgments": false
+    },
+    "error": {
+      "reason": "provider_unavailable",
+      "retry": {
+        "class": "after_delay",
+        "retry_after_seconds": 30
+      }
+    }
+  }
+}

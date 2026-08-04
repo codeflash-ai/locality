@@ -1,0 +1,51 @@
+{
+  "format_version": 1,
+  "minimum_reader_version": 1,
+  "delta_id": "delta-018f4f6e",
+  "mount_id": "mount-alpha",
+  "source_connection_id": "source-018f4f6e",
+  "base_generation_id": "generation-0007",
+  "target_generation_id": "generation-0008",
+  "target_complete": true,
+  "target_inventory_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "workspace_layout_version": 1,
+  "workspace_layout_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "entries": [
+    {
+      "old": null,
+      "new": {
+        "projection_id": "projection-1",
+        "logical_path": "Engineering/new.md",
+        "content_version_id": "content-3",
+        "content_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "byte_length": 3
+      }
+    },
+    {
+      "old": {
+        "projection_id": "projection-2",
+        "logical_path": "Engineering/roadmap.md",
+        "content_version_id": "content-1",
+        "content_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "byte_length": 11
+      },
+      "new": {
+        "projection_id": "projection-2",
+        "logical_path": "Engineering/roadmap.md",
+        "content_version_id": "content-2",
+        "content_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "byte_length": 12
+      }
+    },
+    {
+      "old": {
+        "projection_id": "projection-9",
+        "logical_path": "Sales/old.md",
+        "content_version_id": "content-9",
+        "content_sha256": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+        "byte_length": 9
+      },
+      "new": null
+    }
+  ]
+}

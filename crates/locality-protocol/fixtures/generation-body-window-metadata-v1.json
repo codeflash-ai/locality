@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "minimum_reader_version": 1,
+  "delta_id": "delta-018f4f6e",
+  "terminal_receipt_sha256": "sha256:3ec8d4089470a2e4620d65c03a01635c028200982c94dfbc2e34eac95e2370b1",
+  "content": {
+    "projection_id": "projection-2",
+    "logical_path": "Engineering/roadmap.md",
+    "content_version_id": "content-2",
+    "content_sha256": "sha256:7509e5bda0c762d2bac7f90d758b5b2263fa01ccbc542ab5e3df163be08e6ca9",
+    "byte_length": 12
+  },
+  "range": {
+    "offset": 0,
+    "length": 8,
+    "complete": false
+  },
+  "window_sha256": "sha256:2850459f91fca1b8ca435e518708137a0eee63750d71056a67d700eb3d3ae9c9"
+}

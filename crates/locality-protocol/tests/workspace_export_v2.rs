@@ -14,8 +14,8 @@ use locality_protocol::workspace_export_v2::{
     WorkspaceArchiveEntryKindV2, WorkspaceArchiveMemberV2, WorkspaceAuthorizedExportEntryV2,
     WorkspaceExportCompletionReceiptV2, WorkspaceExportControlMetadataV2,
     WorkspaceExportTerminalControlV2, WorkspaceExportV2Error, WorkspaceMaterializationPlanV2,
-    WorkspaceNamespacedExportRecordV2, WorkspaceNamespacedInventoryV2,
-    WorkspaceScopeSourceAuthorityV2,
+    WorkspaceMaterializationPlanWithInventoryV2, WorkspaceNamespacedExportRecordV2,
+    WorkspaceNamespacedInventoryV2, WorkspaceScopeSourceAuthorityV2,
 };
 use locality_protocol::workspace_layout::{SESSION_LAYOUT_V1_GOLDEN_JSON, SessionLayout};
 use locality_protocol::{
@@ -222,6 +222,9 @@ fn namespaced_inventory_golden_is_deterministic_and_keeps_empty_targets() {
         &offer(),
     )
     .expect("inventory golden");
+    decoded
+        .validate_against_export(&session_layout(), &offer())
+        .expect("inventory must recompute against the exact layout and offer");
     assert_eq!(decoded, inventory);
     assert_eq!(
         exact_pretty_json(&decoded),
@@ -400,6 +403,61 @@ fn pure_materialization_plan_maps_without_a_host_root_and_preserves_logical_path
             "serialized host root marker {forbidden}"
         );
     }
+}
+
+#[test]
+fn combined_planner_returns_the_exact_inventory_used_for_the_plan() {
+    let planned = WorkspaceMaterializationPlanWithInventoryV2::plan(
+        &session(),
+        &offer(),
+        &terminal_control(),
+        &archive_members(),
+    )
+    .expect("combined materialization plan");
+
+    assert_eq!(planned.inventory(), &inventory());
+    assert_eq!(planned.materialization_plan().entries().len(), 6);
+    let (plan, returned_inventory) = planned.into_parts();
+    assert_eq!(
+        plan.entries()[4].member_path,
+        "Sales/Projects/Roadmap/page.md"
+    );
+    assert_eq!(
+        returned_inventory.inventory_sha256(),
+        inventory().inventory_sha256()
+    );
+}
+
+#[test]
+fn combined_planner_structurally_builds_one_inventory_without_authorized_entry_clones() {
+    let source = include_str!("../src/workspace_export_v2.rs");
+    let combined_start = source
+        .find("impl WorkspaceMaterializationPlanWithInventoryV2 {")
+        .expect("combined planner implementation");
+    let combined_end = source[combined_start..]
+        .find("\n#[derive(Clone, Debug, PartialEq, Eq)]\npub enum WorkspaceExportV2Error")
+        .expect("combined planner implementation end");
+    let combined = &source[combined_start..combined_start + combined_end];
+
+    assert_eq!(
+        combined.matches("let inventory = plan_inventory(").count(),
+        1
+    );
+    assert!(!combined.contains("WorkspaceNamespacedInventoryV2::plan("));
+    assert!(!combined.contains("authorized_entries"));
+    assert!(!combined.contains("authorized_entry.clone()"));
+
+    let inventory_start = source
+        .find("fn plan_inventory<'a>(")
+        .expect("inventory planner implementation");
+    let inventory_end = source[inventory_start..]
+        .find("\nfn canonical_inventory_preimage(")
+        .expect("inventory planner implementation end");
+    let inventory_planner = &source[inventory_start..inventory_start + inventory_end];
+    assert!(
+        inventory_planner.contains("IntoIterator<Item = &'a WorkspaceAuthorizedExportEntryV2>")
+    );
+    assert!(!inventory_planner.contains("entry.clone()"));
 }
 
 #[test]

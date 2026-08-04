@@ -365,7 +365,11 @@ assert_contains "${tmp_root}/converter.snakeviz.stats.md" "command:mcp:notion:AP
 assert_not_contains "${tmp_root}/converter.perfetto.json" "unknown_command"
 
 split_token_root="${tmp_root}/split-token"
-mkdir -p "$split_token_root/run1/artifacts/locality" "$split_token_root/run1/artifacts/notion-mcp"
+mkdir -p \
+  "$split_token_root/run1/artifacts/locality" \
+  "$split_token_root/run1/artifacts/notion-mcp" \
+  "$split_token_root/run2/artifacts/locality" \
+  "$split_token_root/run2/artifacts/notion-mcp"
 cat > "$split_token_root/run1/artifacts/locality/summary.json" <<'JSON'
 {
   "metrics": [],
@@ -406,23 +410,73 @@ cat > "$split_token_root/run1/artifacts/notion-mcp/summary.json" <<'JSON'
   }
 }
 JSON
+cat > "$split_token_root/run2/artifacts/locality/summary.json" <<'JSON'
+{
+  "metrics": [],
+  "scenarios": {
+    "scenario1": {
+      "agent_event_summaries": {
+        "locality": {
+          "usage": {
+            "input_tokens": 300,
+            "cached_input_tokens": 100,
+            "cache_write_input_tokens": 20,
+            "output_tokens": 30,
+            "reasoning_output_tokens": 10
+          }
+        }
+      }
+    }
+  }
+}
+JSON
+cat > "$split_token_root/run2/artifacts/notion-mcp/summary.json" <<'JSON'
+{
+  "metrics": [],
+  "scenarios": {
+    "scenario1": {
+      "agent_event_summaries": {
+        "notion-mcp": {
+          "usage": {
+            "input_tokens": 400,
+            "cached_input_tokens": 75,
+            "cache_write_input_tokens": 25,
+            "output_tokens": 40,
+            "reasoning_output_tokens": 8
+          }
+        }
+      }
+    }
+  }
+}
+JSON
 python3 "${ROOT}/experiment/locality-mcp-comparison/scripts/token-usage-charts.py" \
   "$split_token_root" "$split_token_root/token-usage" >/dev/null
 test -s "$split_token_root/token-usage/by-trial-scenario/run1__scenario1.svg" ||
   fail "missing split token usage scenario chart"
 assert_png "$split_token_root/token-usage/by-trial-scenario/run1__scenario1.png"
+test -s "$split_token_root/token-usage/by-scenario-average/scenario1.svg" ||
+  fail "missing split token usage scenario average chart"
+assert_png "$split_token_root/token-usage/by-scenario-average/scenario1.png"
 test -s "$split_token_root/token-usage/average.svg" ||
   fail "missing split token usage average chart"
 assert_png "$split_token_root/token-usage/average.png"
 test -s "$split_token_root/token-usage/cost/average.svg" ||
   fail "missing split token cost average chart"
 assert_png "$split_token_root/token-usage/cost/average.png"
+test -s "$split_token_root/token-usage/cost/by-scenario-average/scenario1.svg" ||
+  fail "missing split token cost scenario average chart"
+assert_png "$split_token_root/token-usage/cost/by-scenario-average/scenario1.png"
 assert_contains "$split_token_root/token-usage/token-usage.tsv" "run1"$'\t'"scenario1"$'\t'"locality"$'\t'"40"$'\t'"60"
 assert_contains "$split_token_root/token-usage/token-usage.tsv" "run1"$'\t'"scenario1"$'\t'"notion-mcp"$'\t'"150"$'\t'"50"
+assert_contains "$split_token_root/token-usage/scenario-average-token-usage.tsv" "scenario1"$'\t'"locality"$'\t'"2"$'\t'"110"
+assert_contains "$split_token_root/token-usage/scenario-average-token-usage.tsv" "scenario1"$'\t'"notion-mcp"$'\t'"2"$'\t'"225"
 assert_contains "$split_token_root/token-usage/cost-usage.tsv" "fresh_input_cost_usd"
 assert_contains "$split_token_root/token-usage/cost-usage.tsv" "notion-mcp"
 assert_contains "$split_token_root/token-usage/cost/average.svg" "Average Token Cost"
-assert_contains "$split_token_root/token-usage/token-usage.json" '"paired_trial_scenario_count": 1'
+assert_contains "$split_token_root/token-usage/token-usage.json" '"paired_trial_scenario_count": 2'
+assert_contains "$split_token_root/token-usage/token-usage.json" '"scenario_average_charts"'
+assert_contains "$split_token_root/token-usage/token-usage.json" '"scenario_average_chart_png"'
 assert_contains "$split_token_root/token-usage/token-usage.json" '"pricing_usd_per_1m_tokens"'
 assert_contains "$split_token_root/token-usage/token-usage.json" '"chart_png"'
 

@@ -55,6 +55,7 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
+            expect \
             patchelf \
             sqlite3
       - name: Report Linux FUSE coverage
@@ -67,10 +68,16 @@ jobs:
           fi
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
+      - name: Validate connector extension contracts
+        run: |
+          cargo test -p locality-connector --test manifest_contract --test conformance_testkit
+          cargo test -p localityd --test connector_manifest
       - name: Run Rust tests
         run: cargo test --workspace --all-targets
       - name: Run real Linux FUSE smoke test
         run: LOCALITY_FUSE_SMOKE=1 LOCALITY_FUSE_SMOKE_REQUIRED=1 tests/linux_fuse_smoke.sh
+      - name: Run Amika snapshot shell test
+        run: make test-init-amika-locality-snapshot
       - name: Install desktop dependencies
         run: npm ci
         working-directory: apps/desktop

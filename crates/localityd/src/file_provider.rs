@@ -1564,7 +1564,7 @@ fn persist_windows_cloud_files_projection_recovery_with_durable_publish(
     persist_windows_cloud_files_projection_recovery_with_durable_io(
         state_root,
         recovery,
-        write_new_file_durable,
+        |path, bytes| write_new_file_durable(state_root, path, bytes),
         durable_publish,
     )
 }
@@ -1577,7 +1577,13 @@ fn persist_windows_cloud_files_projection_recovery_with_durable_io(
 ) -> LocalityResult<()> {
     static MANIFEST_COUNTER: AtomicU64 = AtomicU64::new(0);
     let directory = windows_cloud_files_projection_recovery_manifest_dir(state_root);
-    create_dir_all_durable(&directory).map_err(LocalityError::from)?;
+    let state_root_parent = state_root.parent().ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "Locality state root `{}` has no trusted creation parent",
+            state_root.display()
+        ))
+    })?;
+    create_dir_all_durable(state_root_parent, &directory).map_err(LocalityError::from)?;
     let sequence = MANIFEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = directory.join(format!(
         "{}-r{:08}-{sequence}.json",
@@ -1602,7 +1608,7 @@ fn durably_publish_recovery_manifest(
             "recovery manifest destination is outside its directory",
         ));
     }
-    rename_noreplace_durable(temporary, destination)
+    rename_noreplace_durable(directory, temporary, directory, destination)
 }
 
 fn validate_windows_cloud_files_projection_recovery_version(
@@ -3500,6 +3506,7 @@ mod tests {
             Some(Path::new("restored/first.md")),
         )
         .expect("prepare source-present recovery");
+        assert!(state_root.is_dir(), "recovery creates the owned state root");
 
         let second_id = RemoteId::new("page-2");
         let second_source = access_root.join("second.md");
@@ -3547,6 +3554,7 @@ mod tests {
         let root = temp_root("loc-windows-recovery-directory-sync");
         let state_root = root.join("state");
         let access_root = root.join("provider/notion-main");
+        fs::create_dir_all(&state_root).expect("create state root");
         fs::create_dir_all(&access_root).expect("create access root");
         let source = access_root.join("page.md");
         fs::write(&source, "page").expect("write source");
@@ -3622,7 +3630,7 @@ mod tests {
                         fs::create_dir(temporary)?;
                         fs::write(temporary.join("foreign"), "foreign directory contents")?;
                     }
-                    write_new_file_durable(temporary, bytes)
+                    write_new_file_durable(&state_root, temporary, bytes)
                 },
                 |_, _, _| panic!("publish must not run after a create-new collision"),
             )
@@ -3701,7 +3709,7 @@ mod tests {
         let error = persist_windows_cloud_files_projection_recovery_with_durable_io(
             &state_root,
             &recovery,
-            write_new_file_durable,
+            |path, bytes| write_new_file_durable(&state_root, path, bytes),
             |temporary, destination, _| {
                 temporary_path.replace(Some(temporary.to_path_buf()));
                 destination_path.replace(Some(destination.to_path_buf()));
@@ -3744,7 +3752,7 @@ mod tests {
         let error = persist_windows_cloud_files_projection_recovery_with_durable_io(
             &state_root,
             &recovery,
-            write_new_file_durable,
+            |path, bytes| write_new_file_durable(&state_root, path, bytes),
             |temporary, destination, _| {
                 temporary_path.replace(Some(temporary.to_path_buf()));
                 destination_path.replace(Some(destination.to_path_buf()));
@@ -3784,6 +3792,7 @@ mod tests {
         let root = temp_root(label);
         let state_root = root.join("state");
         let access_root = root.join("provider/notion-main");
+        fs::create_dir_all(&state_root).expect("create state root");
         fs::create_dir_all(&access_root).expect("create access root");
         let source = access_root.join("page.md");
         fs::write(&source, "page").expect("write source");
@@ -3815,11 +3824,15 @@ mod tests {
         let manifest_dir = windows_cloud_files_projection_recovery_manifest_dir(&state_root);
         let synced = std::cell::RefCell::new(Vec::new());
 
-        crate::durable_fs::create_dir_all_durable_with_sync(&manifest_dir, |directory| {
-            assert!(directory.is_dir());
-            synced.borrow_mut().push(directory.to_path_buf());
-            Ok(())
-        })
+        crate::durable_fs::create_dir_all_durable_with_sync(
+            &state_root,
+            &manifest_dir,
+            |directory| {
+                assert!(directory.is_dir());
+                synced.borrow_mut().push(directory.to_path_buf());
+                Ok(())
+            },
+        )
         .expect("create and sync manifest directory ancestry");
 
         assert_eq!(
@@ -3882,6 +3895,7 @@ mod tests {
             Some(Path::new("restored/page.md")),
         )
         .expect("prepare recovery");
+        assert!(state_root.is_dir(), "recovery creates the owned state root");
         fs::rename(&source, &recovery.quarantine_path).expect("move payload to quarantine");
         inspect_windows_cloud_files_projection_recovery(&mut recovery);
         recovery.record_revision += 1;
@@ -3925,6 +3939,7 @@ mod tests {
 
         let repaired = repair_windows_cloud_files_projection_recoveries(&state_root, &access_root)
             .expect("discover orphan payload");
+        assert!(state_root.is_dir(), "recovery creates the owned state root");
         let orphan = repaired
             .iter()
             .find(|recovery| recovery.quarantine_path == orphan_path)

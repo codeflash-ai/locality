@@ -16,8 +16,10 @@ use locality_protocol::workspace_api_v2::{
     WorkspaceExportOfferV2, WorkspaceProfileSessionV2,
 };
 use locality_protocol::workspace_export_v2::{
-    WorkspaceAuthorizedExportEntryV2, WorkspaceExportCompletionReceiptV2,
+    WORKSPACE_EXPORT_TERMINAL_CONTROL_V2_GOLDEN_JSON, WorkspaceArchiveEntryKindV2,
+    WorkspaceArchiveMemberV2, WorkspaceAuthorizedExportEntryV2, WorkspaceExportCompletionReceiptV2,
     WorkspaceExportControlMetadataV2, WorkspaceExportTerminalControlV2,
+    WorkspaceMaterializationPlanWithInventoryV2, WorkspaceNamespacedExportRecordV2,
     WorkspaceNamespacedInventoryV2, WorkspaceScopeSourceAuthorityV2,
 };
 use locality_protocol::{
@@ -32,7 +34,8 @@ use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 )))]
 use localityd::replica_materializer::ReplicaMaterializationError;
 use localityd::workspace_archive::{
-    WorkspaceArchiveLimits, WorkspaceArchiveSink, validate_workspace_tar,
+    ValidatedWorkspaceArchive, WorkspaceArchiveLimits, WorkspaceArchiveSink,
+    validate_workspace_tar, validate_workspace_tar_with_inventory_v2,
 };
 use localityd::workspace_materializer::{
     PublishedWorkspace, StagedWorkspaceMaterialization, WorkspaceMaterializationError,
@@ -155,6 +158,7 @@ impl WorkspaceArchiveSink for MemorySink {
 struct Contract {
     session: WorkspaceProfileSessionV2,
     offer: WorkspaceExportOfferV2,
+    inventory: WorkspaceNamespacedInventoryV2,
     control: WorkspaceExportTerminalControlV2,
 }
 
@@ -164,14 +168,21 @@ fn fixture() -> Fixture {
 }
 
 fn contract(fixture: &Fixture) -> Contract {
-    let session: WorkspaceProfileSessionV2 =
-        serde_json::from_slice(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON).expect("session fixture");
     let scope_sources = vec![
         WorkspaceScopeSourceAuthorityV2::new(0, SourceConnectionId::new("source-notion")),
         WorkspaceScopeSourceAuthorityV2::new(1, SourceConnectionId::new("source-drive")),
         WorkspaceScopeSourceAuthorityV2::new(2, SourceConnectionId::new("source-notion")),
         WorkspaceScopeSourceAuthorityV2::new(3, SourceConnectionId::new("source-drive")),
     ];
+    contract_with_scope_sources(fixture, scope_sources)
+}
+
+fn contract_with_scope_sources(
+    fixture: &Fixture,
+    scope_sources: Vec<WorkspaceScopeSourceAuthorityV2>,
+) -> Contract {
+    let session: WorkspaceProfileSessionV2 =
+        serde_json::from_slice(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON).expect("session fixture");
     let mount_by_scope = session
         .session_layout()
         .entries()
@@ -210,6 +221,17 @@ fn contract(fixture: &Fixture) -> Contract {
 
     let mut offer_json: Value =
         serde_json::from_slice(WORKSPACE_EXPORT_OFFER_V2_GOLDEN_JSON).expect("offer JSON");
+    let directory_count = fixture.directories.len() as u64;
+    let file_count = fixture.files.len() as u64;
+    let content_bytes = fixture
+        .files
+        .iter()
+        .map(|file| file.content.len() as u64)
+        .sum::<u64>();
+    offer_json["offer"]["file_count"] = Value::from(file_count);
+    offer_json["offer"]["directory_count"] = Value::from(directory_count);
+    offer_json["offer"]["archive_entry_count"] = Value::from(directory_count + file_count + 1);
+    offer_json["offer"]["selected_content_bytes"] = Value::from(content_bytes);
     offer_json["offer"]["inventory_sha256"] = Value::String(format!("sha256:{}", "0".repeat(64)));
     let placeholder_offer: WorkspaceExportOfferV2 =
         serde_json::from_value(offer_json.clone()).expect("placeholder offer");
@@ -223,20 +245,27 @@ fn contract(fixture: &Fixture) -> Contract {
     offer_json["offer"]["inventory_sha256"] =
         Value::String(inventory.inventory_sha256().to_string());
 
+    let writable_entries = fixture
+        .files
+        .iter()
+        .find(|file| file.projection_id == "projection-roadmap")
+        .map(|file| WritableMetadataEntry {
+            projection_id: ProjectionId::new(&file.projection_id),
+            logical_path: LogicalPath::new(&file.logical_path).expect("logical path"),
+            source_remote_ids: vec![RemoteId::new("page-roadmap")],
+            delivered_content_sha256: sha256_label(file.content.as_bytes()),
+            provider_precondition: "opaque-v4".to_string(),
+            effective_actions: file.effective_actions.clone(),
+            baseline_required: true,
+        })
+        .into_iter()
+        .collect();
     let writable_metadata = ScopeAuthorizedWritableExportMetadata {
         versions: placeholder_offer.offer().versions,
         session_id: SessionId::new("session-scope-7"),
         export_attempt_id: ExportAttemptId::new("export-attempt-9").expect("attempt ID"),
         source_generations: placeholder_offer.offer().source_generations.clone(),
-        writable_entries: vec![WritableMetadataEntry {
-            projection_id: ProjectionId::new("projection-roadmap"),
-            logical_path: LogicalPath::new("Projects/Roadmap/page.md").expect("logical path"),
-            source_remote_ids: vec![RemoteId::new("page-roadmap")],
-            delivered_content_sha256: sha256_label(b"# Roadmap\n"),
-            provider_precondition: "opaque-v4".to_string(),
-            effective_actions: BTreeSet::from([SourceAction::Read, SourceAction::Update]),
-            baseline_required: true,
-        }],
+        writable_entries,
     };
     offer_json["offer"]["writable_metadata_sha256"] = Value::String(
         canonical_writable_metadata_sha256(&writable_metadata).expect("writable digest"),
@@ -290,6 +319,7 @@ fn contract(fixture: &Fixture) -> Contract {
     Contract {
         session,
         offer,
+        inventory,
         control,
     }
 }
@@ -396,13 +426,46 @@ fn append_member(
 }
 
 #[test]
+fn validated_workspace_archive_preserves_exhaustive_pattern_and_struct_literal_compatibility() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let validated = validate_workspace_tar(
+        &mut Cursor::new(archive(&fixture, &contract.control)),
+        &mut MemorySink::default(),
+        WorkspaceArchiveLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("validate through the original API");
+
+    let ValidatedWorkspaceArchive {
+        plan,
+        terminal_control,
+        archive_entries,
+        files,
+        directories,
+        content_bytes,
+    } = validated;
+    let rebuilt = ValidatedWorkspaceArchive {
+        plan,
+        terminal_control,
+        archive_entries,
+        files,
+        directories,
+        content_bytes,
+    };
+
+    assert_eq!(rebuilt.archive_entries, 7);
+}
+
+#[test]
 fn production_tar_adapter_executes_the_validated_namespaced_plan() {
     let fixture = fixture();
     let contract = contract(&fixture);
     let tar = archive(&fixture, &contract.control);
     let mut sink = MemorySink::default();
 
-    let validated = validate_workspace_tar(
+    let result = validate_workspace_tar_with_inventory_v2(
         &mut Cursor::new(tar),
         &mut sink,
         WorkspaceArchiveLimits::default(),
@@ -410,18 +473,362 @@ fn production_tar_adapter_executes_the_validated_namespaced_plan() {
         &contract.offer,
     )
     .expect("validate workspace archive");
+    let validated = result.validated();
+    let inventory = result.inventory();
 
     assert_eq!(validated.archive_entries, 7);
     assert_eq!(validated.directories, 4);
     assert_eq!(validated.files, 2);
     assert_eq!(validated.content_bytes, 17);
     assert_eq!(validated.plan.entries().len(), 6);
+    assert_eq!(inventory, &contract.inventory);
+    assert_eq!(
+        inventory
+            .records()
+            .iter()
+            .filter(|record| !matches!(record, WorkspaceNamespacedExportRecordV2::Control { .. }))
+            .map(WorkspaceNamespacedExportRecordV2::member_path)
+            .collect::<Vec<_>>(),
+        validated
+            .plan
+            .entries()
+            .iter()
+            .map(|entry| entry.member_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        inventory.inventory_sha256(),
+        validated.terminal_control.metadata.inventory_sha256()
+    );
     assert_eq!(sink.directories.len(), 4);
     assert_eq!(sink.files["Sales/README.md"], b"Public\n");
     assert!(
         !sink
             .files
             .contains_key(locality_protocol::RESERVED_EXPORT_METADATA_PATH)
+    );
+}
+
+#[test]
+fn exported_inventory_retains_empty_sources_across_shared_multi_source_mounts() {
+    let fixture = Fixture {
+        directories: vec![
+            FixtureDirectory {
+                path: "Engineering".to_string(),
+                scope_ordinal: None,
+            },
+            FixtureDirectory {
+                path: "Sales".to_string(),
+                scope_ordinal: None,
+            },
+        ],
+        files: Vec::new(),
+    };
+    let scope_sources = vec![
+        WorkspaceScopeSourceAuthorityV2::new(0, SourceConnectionId::new("source-notion")),
+        WorkspaceScopeSourceAuthorityV2::new(1, SourceConnectionId::new("source-drive")),
+        WorkspaceScopeSourceAuthorityV2::new(2, SourceConnectionId::new("source-drive")),
+        WorkspaceScopeSourceAuthorityV2::new(3, SourceConnectionId::new("source-notion")),
+    ];
+    let contract = contract_with_scope_sources(&fixture, scope_sources.clone());
+    let mut sink = MemorySink::default();
+
+    let result = validate_workspace_tar_with_inventory_v2(
+        &mut Cursor::new(archive(&fixture, &contract.control)),
+        &mut sink,
+        WorkspaceArchiveLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("validate empty shared-mount workspace archive");
+    let validated = result.validated();
+    let inventory = result.inventory();
+
+    assert_eq!(inventory, &contract.inventory);
+    assert_eq!(inventory.scope_sources(), scope_sources);
+    assert_eq!(inventory.file_count(), 0);
+    assert_eq!(inventory.directory_count(), 2);
+    assert_eq!(inventory.records().len(), 3);
+    assert_eq!(validated.plan.entries().len(), 2);
+
+    let mount_by_scope = contract
+        .session
+        .session_layout()
+        .entries()
+        .iter()
+        .map(|entry| (entry.scope_ordinal(), entry.mount_id().as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut sources_by_mount = BTreeMap::<_, BTreeSet<_>>::new();
+    for authority in inventory.scope_sources() {
+        sources_by_mount
+            .entry(mount_by_scope[&authority.scope_ordinal()])
+            .or_default()
+            .insert(authority.source_connection_id().as_str());
+    }
+    assert_eq!(sources_by_mount.len(), 2);
+    assert!(sources_by_mount.values().all(|sources| sources.len() == 2));
+}
+
+#[test]
+fn exported_inventory_is_portable_and_fails_closed_on_context_or_control_tampering() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let mut sink = MemorySink::default();
+    let result = validate_workspace_tar_with_inventory_v2(
+        &mut Cursor::new(archive(&fixture, &contract.control)),
+        &mut sink,
+        WorkspaceArchiveLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("validate portable inventory");
+    let inventory = result.inventory();
+    let encoded = serde_json::to_string(inventory).expect("serialize inventory");
+    assert!(!encoded.contains("provider_precondition"));
+    assert!(!encoded.contains("source_remote_ids"));
+    assert!(!encoded.contains("opaque-v4"));
+    assert!(!encoded.contains("page-roadmap"));
+    assert!(
+        inventory
+            .records()
+            .iter()
+            .all(|record| !record.member_path().starts_with('/'))
+    );
+
+    let mut other_session_json: Value =
+        serde_json::from_slice(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON).expect("session JSON");
+    other_session_json["session_id"] = Value::String("session-substituted".to_string());
+    let other_session: WorkspaceProfileSessionV2 =
+        serde_json::from_value(other_session_json).expect("substituted session");
+    let error = validate_workspace_tar_with_inventory_v2(
+        &mut Cursor::new(archive(&fixture, &contract.control)),
+        &mut MemorySink::default(),
+        WorkspaceArchiveLimits::default(),
+        &other_session,
+        &contract.offer,
+    )
+    .expect_err("inventory must remain bound to the verified session");
+    assert!(
+        error.to_string().contains("does not match session"),
+        "{error}"
+    );
+
+    let mut control_json = serde_json::to_value(&contract.control).expect("control JSON");
+    let substituted_digest = Value::String(format!("sha256:{}", "a".repeat(64)));
+    control_json["metadata"]["inventory_sha256"] = substituted_digest.clone();
+    control_json["completion_receipt"]["metadata"]["inventory_sha256"] = substituted_digest.clone();
+    control_json["completion_receipt"]["receipt"]["inventory_sha256"] = substituted_digest;
+    let tampered_control: WorkspaceExportTerminalControlV2 =
+        serde_json::from_value(control_json).expect("shape-valid tampered control");
+    let error = validate_workspace_tar_with_inventory_v2(
+        &mut Cursor::new(archive(&fixture, &tampered_control)),
+        &mut MemorySink::default(),
+        WorkspaceArchiveLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect_err("inventory must remain bound to terminal control");
+    assert!(
+        error
+            .to_string()
+            .contains("control metadata does not match"),
+        "{error}"
+    );
+}
+
+#[test]
+fn archive_limits_bound_the_inventory_that_can_be_returned() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    for (label, limits, expected) in [
+        (
+            "entries",
+            WorkspaceArchiveLimits {
+                max_entries: 6,
+                ..WorkspaceArchiveLimits::default()
+            },
+            "entry limit",
+        ),
+        (
+            "file bytes",
+            WorkspaceArchiveLimits {
+                max_file_bytes: 9,
+                ..WorkspaceArchiveLimits::default()
+            },
+            "file `Sales/Projects/Roadmap/page.md`",
+        ),
+        (
+            "content bytes",
+            WorkspaceArchiveLimits {
+                max_content_bytes: 16,
+                ..WorkspaceArchiveLimits::default()
+            },
+            "content is 17 bytes",
+        ),
+    ] {
+        let error = validate_workspace_tar_with_inventory_v2(
+            &mut Cursor::new(archive(&fixture, &contract.control)),
+            &mut MemorySink::default(),
+            limits,
+            &contract.session,
+            &contract.offer,
+        )
+        .expect_err("limit violation must not return an inventory");
+        assert!(
+            error.to_string().contains(expected),
+            "case {label}: {error}"
+        );
+    }
+}
+
+#[test]
+fn combined_planner_is_deterministic_at_the_default_archive_entry_ceiling() {
+    const EXPECTED_INVENTORY_SHA256: &str =
+        "sha256:d8c65c8ff5ece28960b3f6cbabbcd7033caea04e7f53b58de6d48ea3d2e10e99";
+
+    let archive_limits = WorkspaceArchiveLimits::default();
+    assert_eq!(archive_limits.max_entries, 100_000);
+    let archive_entry_count = usize::try_from(archive_limits.max_entries).unwrap();
+
+    let session: WorkspaceProfileSessionV2 =
+        serde_json::from_slice(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON).expect("session fixture");
+    let target_roots = session
+        .session_layout()
+        .entries()
+        .iter()
+        .map(|entry| entry.target().as_str().to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(target_roots.len(), 2);
+    let file_count = archive_entry_count - target_roots.len() - 1;
+
+    let mount_id = session
+        .session_layout()
+        .entries()
+        .iter()
+        .find(|entry| entry.scope_ordinal() == 0)
+        .expect("scope zero")
+        .mount_id()
+        .clone();
+    let effective_actions = BTreeSet::from([SourceAction::Read]);
+    let empty_sha256 = sha256_label(b"");
+    let authorized_entries = (0..file_count)
+        .map(|index| {
+            let logical_path = format!("f{index:05}.md");
+            WorkspaceAuthorizedExportEntryV2::File {
+                winning_scope_ordinal: 0,
+                mount_id: mount_id.clone(),
+                logical_path,
+                projection_id: ProjectionId::new(format!("p{index:05}")),
+                source_connection_id: SourceConnectionId::new("source-notion"),
+                file_kind: ProjectionFileKind::Markdown,
+                effective_actions: effective_actions.clone(),
+                content_sha256: empty_sha256.clone(),
+                byte_length: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut offer_json: Value =
+        serde_json::from_slice(WORKSPACE_EXPORT_OFFER_V2_GOLDEN_JSON).expect("offer JSON");
+    offer_json["offer"]["limits"]["max_files"] = Value::from(archive_limits.max_entries);
+    offer_json["offer"]["limits"]["max_directories"] = Value::from(archive_limits.max_entries);
+    offer_json["offer"]["file_count"] = Value::from(file_count as u64);
+    offer_json["offer"]["directory_count"] = Value::from(target_roots.len() as u64);
+    offer_json["offer"]["archive_entry_count"] = Value::from(archive_limits.max_entries);
+    offer_json["offer"]["selected_content_bytes"] = Value::from(0);
+    offer_json["offer"]["inventory_sha256"] = Value::String(EXPECTED_INVENTORY_SHA256.to_string());
+    let placeholder_offer: WorkspaceExportOfferV2 =
+        serde_json::from_value(offer_json.clone()).expect("placeholder offer");
+    let writable_metadata = ScopeAuthorizedWritableExportMetadata {
+        versions: placeholder_offer.offer().versions,
+        session_id: placeholder_offer.offer().session_id.clone(),
+        export_attempt_id: placeholder_offer.offer().export_attempt_id.clone(),
+        source_generations: placeholder_offer.offer().source_generations.clone(),
+        writable_entries: Vec::new(),
+    };
+    let writable_metadata_sha256 =
+        canonical_writable_metadata_sha256(&writable_metadata).expect("writable digest");
+    offer_json["offer"]["writable_metadata_sha256"] =
+        Value::String(writable_metadata_sha256.clone());
+    let offer: WorkspaceExportOfferV2 =
+        serde_json::from_value(offer_json).expect("maximum-scale offer");
+
+    let mut control_json: Value =
+        serde_json::from_slice(WORKSPACE_EXPORT_TERMINAL_CONTROL_V2_GOLDEN_JSON)
+            .expect("control JSON");
+    control_json["metadata"]["inventory_sha256"] =
+        Value::String(EXPECTED_INVENTORY_SHA256.to_string());
+    control_json["metadata"]["target_directories"][1]["directory_count"] = Value::from(1);
+    control_json["metadata"]["target_directories"][1]["file_count"] =
+        Value::from(file_count as u64);
+    control_json["metadata"]["target_directories"][1]["content_bytes"] = Value::from(0);
+    control_json["metadata"]["declared_file_count"] = Value::from(file_count as u64);
+    control_json["metadata"]["declared_directory_count"] = Value::from(target_roots.len() as u64);
+    control_json["metadata"]["declared_archive_entry_count"] =
+        Value::from(archive_limits.max_entries);
+    control_json["metadata"]["declared_content_bytes"] = Value::from(0);
+    control_json["writable_metadata"] =
+        serde_json::to_value(writable_metadata).expect("writable metadata JSON");
+    control_json["completion_receipt"]["metadata"] = control_json["metadata"].clone();
+    control_json["completion_receipt"]["receipt"]["inventory_sha256"] =
+        Value::String(EXPECTED_INVENTORY_SHA256.to_string());
+    control_json["completion_receipt"]["receipt"]["writable_metadata_sha256"] =
+        Value::String(writable_metadata_sha256);
+    control_json["completion_receipt"]["receipt"]["delivered_file_count"] =
+        Value::from(file_count as u64);
+    control_json["completion_receipt"]["receipt"]["delivered_directory_count"] =
+        Value::from(target_roots.len() as u64);
+    control_json["completion_receipt"]["receipt"]["delivered_archive_entry_count"] =
+        Value::from(archive_limits.max_entries);
+    control_json["completion_receipt"]["receipt"]["delivered_content_bytes"] = Value::from(0);
+    let control: WorkspaceExportTerminalControlV2 =
+        serde_json::from_value(control_json).expect("maximum-scale control");
+
+    let mut members = Vec::with_capacity(archive_entry_count);
+    members.extend(
+        target_roots
+            .into_iter()
+            .map(|target| WorkspaceArchiveMemberV2 {
+                kind: WorkspaceArchiveEntryKindV2::Directory,
+                member_path: target,
+                authorized_entry: None,
+            }),
+    );
+    members.extend(authorized_entries.into_iter().map(|authorized_entry| {
+        let WorkspaceAuthorizedExportEntryV2::File { logical_path, .. } = &authorized_entry else {
+            unreachable!("maximum-scale fixture contains only files");
+        };
+        let member_path = format!("Sales/{logical_path}");
+        WorkspaceArchiveMemberV2 {
+            kind: WorkspaceArchiveEntryKindV2::File,
+            member_path,
+            authorized_entry: Some(authorized_entry),
+        }
+    }));
+    members.push(WorkspaceArchiveMemberV2 {
+        kind: WorkspaceArchiveEntryKindV2::Control,
+        member_path: locality_protocol::RESERVED_EXPORT_METADATA_PATH.to_string(),
+        authorized_entry: None,
+    });
+    assert_eq!(members.len(), archive_entry_count);
+
+    let planned =
+        WorkspaceMaterializationPlanWithInventoryV2::plan(&session, &offer, &control, &members)
+            .expect("combined planner accepts the default archive ceiling");
+    assert_eq!(planned.inventory().records().len(), archive_entry_count);
+    assert_eq!(planned.inventory().file_count(), file_count as u64);
+    assert_eq!(planned.inventory().directory_count(), 2);
+    assert_eq!(
+        planned.inventory().archive_entry_count(),
+        archive_limits.max_entries
+    );
+    assert_eq!(
+        planned.materialization_plan().entries().len(),
+        archive_entry_count - 1
+    );
+    assert_eq!(
+        planned.inventory().inventory_sha256(),
+        EXPECTED_INVENTORY_SHA256
     );
 }
 
@@ -832,6 +1239,26 @@ struct PauseAtJournal {
 }
 
 #[cfg(unix)]
+struct RetargetAncestorBeforePublication {
+    visible: PathBuf,
+    replacement: PathBuf,
+}
+
+#[cfg(unix)]
+impl WorkspacePublicationHooks for RetargetAncestorBeforePublication {
+    fn before_publication(&mut self) -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        fs::remove_file(&self.visible)?;
+        symlink(&self.replacement, &self.visible)
+    }
+
+    fn checkpoint(&mut self, _checkpoint: WorkspacePublicationCheckpoint) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 struct ReplaceLockAtJournal {
     lock: PathBuf,
 }
@@ -1135,6 +1562,48 @@ fn publication_fails_closed_when_parent_is_renamed_and_replaced() {
 
     make_removable(&retained);
     fs::remove_dir_all(&retained).expect("remove retained parent");
+}
+
+#[cfg(unix)]
+#[test]
+fn generation2_rejects_ancestor_symlink_retarget_at_publication_commit() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("generation2-parent-retarget");
+    let original = directory.0.join("original");
+    let replacement = directory.0.join("replacement");
+    let original_parent = original.join("workspace");
+    let replacement_parent = replacement.join("workspace");
+    fs::create_dir_all(&original_parent).expect("create original parent");
+    fs::create_dir_all(&replacement_parent).expect("create replacement parent");
+    let visible = directory.0.join("visible");
+    symlink(&original, &visible).expect("create visible ancestor symlink");
+    let root = visible.join("workspace/Locality");
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &root,
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage publication through symlink ancestor");
+    let mut retarget = RetargetAncestorBeforePublication {
+        visible,
+        replacement,
+    };
+
+    let error =
+        publish_staged_workspace_with_hooks_secure(staged, &root, &test_ownership(), &mut retarget)
+            .expect_err("retargeted publication parent must fail closed");
+
+    assert!(error.to_string().contains("parent detached"), "{error}");
+    assert!(!original_parent.join("Locality").exists());
+    assert!(!replacement_parent.join("Locality").exists());
 }
 
 #[cfg(unix)]

@@ -1,0 +1,17 @@
+{
+  "format_version": 1,
+  "minimum_reader_version": 1,
+  "delta_id": "delta-018f4f6e",
+  "mount_id": "mount-alpha",
+  "source_connection_id": "source-018f4f6e",
+  "base_generation_id": "generation-0007",
+  "target_generation_id": "generation-0008",
+  "target_inventory_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "workspace_layout_version": 1,
+  "workspace_layout_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "delta_sha256": "sha256:fe077f9e39065345fac8c7692e421ef462145a645672e7a69c3c10adfec66572",
+  "entry_count": 3,
+  "changed_content_bytes": 15,
+  "authorization_epoch": "42",
+  "completed_at": "2026-07-31T12:34:56Z"
+}

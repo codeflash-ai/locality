@@ -40,12 +40,9 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 #[cfg(windows)]
-#[path = "windows_workspace_fs.rs"]
-mod windows_workspace_fs;
+pub(crate) use crate::windows_workspace_fs::read_regular_file_no_follow as read_windows_publication_state_file;
 #[cfg(windows)]
-pub(crate) use windows_workspace_fs::read_regular_file_no_follow as read_windows_publication_state_file;
-#[cfg(windows)]
-use windows_workspace_fs::{
+use crate::windows_workspace_fs::{
     WindowsDirectory, lock_file_exclusive as lock_windows_file_exclusive,
     set_file_read_only as set_windows_file_read_only,
 };
@@ -79,6 +76,8 @@ pub(crate) struct WorkspacePublicationLock {
     _lock_name: OsString,
     #[cfg(windows)]
     _file: fs::File,
+    #[cfg(windows)]
+    _parent: WindowsDirectory,
 }
 
 impl WorkspacePublicationLock {
@@ -111,7 +110,16 @@ impl WorkspacePublicationLock {
                 ));
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let visible = WindowsDirectory::open_absolute_read_only(parent_path)?;
+            if visible.identity()? != self._parent.identity()? {
+                return Err(io::Error::other(
+                    "workspace publication parent detached from its visible path",
+                ));
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         let _ = parent_path;
         Ok(())
     }
@@ -186,7 +194,10 @@ pub(crate) fn acquire_workspace_publication_lock(
         let parent = WindowsDirectory::open_absolute(parent_path)?;
         let file = parent.open_or_create_lock_file(OsStr::new(lock_name))?;
         lock_windows_file_exclusive(&file)?;
-        Ok(WorkspacePublicationLock { _file: file })
+        Ok(WorkspacePublicationLock {
+            _file: file,
+            _parent: parent,
+        })
     }
     #[cfg(any(
         not(any(unix, windows)),
@@ -479,7 +490,7 @@ pub fn materialize_replica_archive<Body: Read>(
     destination: &Path,
     limits: ReplicaMaterializationLimits,
 ) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
-    materialize_replica_archive_inner(archive, destination, limits, None)
+    materialize_replica_archive_inner(archive, destination, limits, None, &mut || Ok(()))
 }
 
 /// Validate, extract, receipt-check, and atomically publish one replica archive.
@@ -493,7 +504,23 @@ pub fn materialize_replica_archive_with_expected_receipt<Body: Read>(
     limits: ReplicaMaterializationLimits,
     expected: ExpectedReplicaMaterializationReceipt,
 ) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
-    materialize_replica_archive_inner(archive, destination, limits, Some(expected))
+    materialize_replica_archive_inner(archive, destination, limits, Some(expected), &mut || Ok(()))
+}
+
+/// Receipt-checked materialization with a final caller-owned safety check.
+/// The check runs after extraction and validation, immediately before the
+/// no-replace publication primitive.
+pub fn materialize_replica_archive_with_expected_receipt_and_prepublication_check<
+    Body: Read,
+    Check: FnMut() -> io::Result<()>,
+>(
+    archive: ReplicaArchive<Body>,
+    destination: &Path,
+    limits: ReplicaMaterializationLimits,
+    expected: ExpectedReplicaMaterializationReceipt,
+    mut check: Check,
+) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
+    materialize_replica_archive_inner(archive, destination, limits, Some(expected), &mut check)
 }
 
 /// Validate and atomically publish one scope-authorized v2 replica archive.
@@ -511,7 +538,36 @@ pub fn materialize_scope_authorized_replica_archive<Body: Read>(
     offer
         .validate()
         .map_err(|error| ReplicaMaterializationError::ScopeExport(error.to_string()))?;
-    materialize_scope_authorized_replica_archive_inner(archive, destination, limits, offer)
+    materialize_scope_authorized_replica_archive_inner(
+        archive,
+        destination,
+        limits,
+        offer,
+        &mut || Ok(()),
+    )
+}
+
+/// Scope-authorized materialization with a final caller-owned safety check.
+pub fn materialize_scope_authorized_replica_archive_with_prepublication_check<
+    Body: Read,
+    Check: FnMut() -> io::Result<()>,
+>(
+    archive: ReplicaArchive<Body>,
+    destination: &Path,
+    limits: ReplicaMaterializationLimits,
+    offer: &SealedExportOffer,
+    mut check: Check,
+) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
+    offer
+        .validate()
+        .map_err(|error| ReplicaMaterializationError::ScopeExport(error.to_string()))?;
+    materialize_scope_authorized_replica_archive_inner(
+        archive,
+        destination,
+        limits,
+        offer,
+        &mut check,
+    )
 }
 
 fn materialize_replica_archive_inner<Body: Read>(
@@ -519,6 +575,7 @@ fn materialize_replica_archive_inner<Body: Read>(
     destination: &Path,
     limits: ReplicaMaterializationLimits,
     expected: Option<ExpectedReplicaMaterializationReceipt>,
+    prepublication_check: &mut impl FnMut() -> io::Result<()>,
 ) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
     let parent = destination
         .parent()
@@ -605,6 +662,7 @@ fn materialize_replica_archive_inner<Body: Read>(
         ));
     }
     let staging_identity = staging.identity()?;
+    prepublication_check().map_err(ReplicaMaterializationError::Publish)?;
     staging.publish(destination, staging_identity)?;
     Ok(summary)
 }
@@ -614,6 +672,7 @@ fn materialize_scope_authorized_replica_archive_inner<Body: Read>(
     destination: &Path,
     limits: ReplicaMaterializationLimits,
     offer: &SealedExportOffer,
+    prepublication_check: &mut impl FnMut() -> io::Result<()>,
 ) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
     let parent = destination
         .parent()
@@ -692,6 +751,7 @@ fn materialize_scope_authorized_replica_archive_inner<Body: Read>(
         ));
     }
     let staging_identity = staging.identity()?;
+    prepublication_check().map_err(ReplicaMaterializationError::Publish)?;
     staging.publish(destination, staging_identity)?;
     // The hidden control member is an archive entry, but not a materialized
     // file or byte. `extract_scope_authorized_tar` already counted it here.
@@ -2047,7 +2107,7 @@ pub(crate) fn remove_workspace_generation(
         drop(validation_parent);
 
         let parent = WindowsDirectory::open_absolute(parent_path)?;
-        let root = parent.open_directory_for_cleanup(name)?;
+        let (root, root_sync) = parent.open_directory_for_cleanup_with_sync(name)?;
         if root.identity()? != expected {
             return Err(io::Error::other(
                 "workspace generation identity changed before cleanup",
@@ -2066,6 +2126,8 @@ pub(crate) fn remove_workspace_generation(
                 "workspace generation identity changed before removal",
             ));
         }
+        root_sync.sync()?;
+        drop(root_sync);
         root.mark_delete()?;
         parent.sync()
     }
@@ -2152,8 +2214,17 @@ pub(crate) fn repair_workspace_generation(
                 "workspace generation identity changed before mode repair",
             ));
         }
-        root.set_read_only()?;
-        root.sync()?;
+        let root_sync = with_windows_directory_read_only_restored(&root, || {
+            let root_sync = parent.open_directory_for_sync(name)?;
+            if root_sync.identity()? != expected {
+                return Err(io::Error::other(
+                    "workspace generation changed while opening durability handle",
+                ));
+            }
+            Ok(root_sync)
+        })?;
+        root_sync.sync()?;
+        drop(root_sync);
         if parent.open_directory_read_only(name)?.identity()? != expected {
             return Err(io::Error::other(
                 "workspace generation identity changed while mode was repaired",
@@ -2175,6 +2246,14 @@ pub(crate) fn repair_workspace_generation(
             .ok_or_else(|| io::Error::other("workspace generation has no parent"))?;
         sync_directory_if_supported(parent)
     }
+}
+
+#[cfg(windows)]
+fn with_windows_directory_read_only_restored<T>(
+    root: &WindowsDirectory,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    root.with_read_only_cleared_for_cleanup(operation)
 }
 
 pub(crate) struct StagingDirectory {
@@ -2285,6 +2364,29 @@ impl StagingDirectory {
         }
         #[cfg(not(unix))]
         let _ = lock;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn verify_visible_publication_parent(
+        &self,
+        parent_path: &Path,
+    ) -> Result<(), ReplicaMaterializationError> {
+        let visible = rustix::fs::open(
+            parent_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        let visible_identity = rustix::fs::fstat(&visible)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        let retained_identity = rustix::fs::fstat(&self.parent)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        if !same_file_identity(&visible_identity, &retained_identity) {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace publication parent detached from its visible path",
+            )));
+        }
         Ok(())
     }
 
@@ -2598,6 +2700,7 @@ impl StagingDirectory {
                 "workspace generation identity changed at exchange",
             )));
         }
+        self.verify_visible_publication_parent(&parent_path)?;
         let old_path = self.path.clone();
         rustix::fs::renameat_with(
             &self.parent,
@@ -2905,6 +3008,7 @@ impl StagingDirectory {
                 "workspace staging root identity changed immediately before publication",
             )));
         }
+        self.verify_visible_publication_parent(&parent_path)?;
 
         if let Err(error) = rename_directory_noreplace(&self.parent, &self.name, destination_name) {
             if error.kind() == io::ErrorKind::AlreadyExists {
@@ -3054,7 +3158,8 @@ impl Drop for StagingDirectory {
                     let _ = self
                         .root
                         .preflight_contents(&self.path, expected.device)
-                        .and_then(|()| self.root.remove_contents(&self.path, expected.device));
+                        .and_then(|()| self.root.remove_contents(&self.path, expected.device))
+                        .and_then(|()| self.root.sync());
                     if self
                         .parent
                         .open_directory_read_only(&self.name)
@@ -3082,6 +3187,110 @@ mod apple_tests {
     #[test]
     fn macos_mount_detection_rejects_the_filesystem_root() {
         assert!(workspace_root_is_mount_point(Path::new("/")).expect("inspect root mount"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_mode_repair_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn test_directory(label: &str) -> (PathBuf, PathBuf, WindowsDirectory, WindowsDirectory) {
+        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let parent_path = std::env::temp_dir().join(format!(
+            "locality-windows-mode-repair-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        let root_path = parent_path.join("generation");
+        fs::create_dir_all(&root_path).expect("create test generation");
+        let parent = WindowsDirectory::open_absolute(&parent_path).expect("open test parent");
+        let root = parent
+            .open_directory_for_attributes(OsStr::new("generation"))
+            .expect("open test generation");
+        root.set_read_only().expect("set initial read-only state");
+        (parent_path, root_path, parent, root)
+    }
+
+    fn cleanup_test_directory(
+        parent_path: PathBuf,
+        root_path: &Path,
+        parent: WindowsDirectory,
+        root: WindowsDirectory,
+    ) {
+        drop(root);
+        drop(parent);
+        let mut permissions = fs::metadata(root_path)
+            .expect("read cleanup permissions")
+            .permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(root_path, permissions).expect("clear cleanup read-only state");
+        fs::remove_dir_all(parent_path).expect("remove test directory");
+    }
+
+    #[test]
+    fn post_clear_sync_handle_error_restores_original_attribute_state() {
+        for original_read_only in [false, true] {
+            let (parent_path, root_path, parent, root) = test_directory("sync-open-error");
+            if !original_read_only {
+                root.clear_read_only().expect("make generation writable");
+            }
+
+            with_windows_directory_read_only_restored(&root, || {
+                parent
+                    .open_directory_for_sync(OsStr::new("missing-generation"))
+                    .map(drop)
+            })
+            .expect_err("missing durability handle must fail");
+
+            assert_eq!(
+                fs::metadata(&root_path)
+                    .expect("read restored metadata")
+                    .permissions()
+                    .readonly(),
+                original_read_only,
+                "the original attribute state is restored after handle-open errors"
+            );
+            cleanup_test_directory(parent_path, &root_path, parent, root);
+        }
+    }
+
+    #[test]
+    fn post_clear_identity_mismatch_restores_original_attribute_state() {
+        for original_read_only in [false, true] {
+            let (parent_path, root_path, parent, root) = test_directory("identity-mismatch");
+            if !original_read_only {
+                root.clear_read_only().expect("make generation writable");
+            }
+            fs::create_dir(parent_path.join("replacement-generation"))
+                .expect("create mismatched generation");
+            let expected = root.identity().expect("read expected identity");
+
+            with_windows_directory_read_only_restored(&root, || {
+                let replacement =
+                    parent.open_directory_for_sync(OsStr::new("replacement-generation"))?;
+                if replacement.identity()? != expected {
+                    return Err(io::Error::other(
+                        "workspace generation changed while opening durability handle",
+                    ));
+                }
+                drop(replacement);
+                Ok(())
+            })
+            .expect_err("mismatched identity must fail");
+
+            assert_eq!(
+                fs::metadata(&root_path)
+                    .expect("read restored metadata")
+                    .permissions()
+                    .readonly(),
+                original_read_only,
+                "the original attribute state is restored after identity mismatches"
+            );
+            cleanup_test_directory(parent_path, &root_path, parent, root);
+        }
     }
 }
 

@@ -52,7 +52,7 @@ AWS_LOCALITY_AMI_ID="${AWS_LOCALITY_AMI_ID:-}"
 AWS_MCP_AMI_ID="${AWS_MCP_AMI_ID:-}"
 AWS_TERMINATE_SUCCESS_INSTANCES="${AWS_TERMINATE_SUCCESS_INSTANCES:-1}"
 AWS_DELETE_AMIS_ON_SUCCESS="${AWS_DELETE_AMIS_ON_SUCCESS:-0}"
-BASE_OUT_DIR="${BASE_OUT_DIR:-$REPO_ROOT/target/launch-readiness-aws/$RUN_ID}"
+BASE_OUT_DIR="${BASE_OUT_DIR:-$REPO_ROOT/experiment/launch-readiness-aws/$RUN_ID}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 CODEX_EXEC_TIMEOUT_SECONDS="${CODEX_EXEC_TIMEOUT_SECONDS:-900}"
@@ -458,6 +458,17 @@ for trial in $(seq 1 "$TRIALS"); do
     overall_rc=1
   fi
 done
+
+if [ "$SYNC_ARTIFACTS" = "1" ]; then
+  if python3 "$SCRIPT_DIR/scripts/token-usage-charts.py" "$BASE_OUT_DIR" "$BASE_OUT_DIR/token-usage" >/dev/null; then
+    echo "Aggregate token usage charts: $BASE_OUT_DIR/token-usage"
+  else
+    echo "Failed to generate aggregate token usage charts for $BASE_OUT_DIR" >&2
+    if [ "$overall_rc" -eq 0 ]; then
+      overall_rc=1
+    fi
+  fi
+fi
 
 if [ "$overall_rc" -eq 0 ]; then
   echo "All AWS benchmark trials succeeded"
