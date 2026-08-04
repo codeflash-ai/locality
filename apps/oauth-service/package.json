@@ -13,7 +13,7 @@
     "check": "npm run typecheck && npm test"
   },
   "dependencies": {
-    "hono": "^4.12.31"
+    "hono": "^4.13.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260721.1",
@@ -22,10 +22,8 @@
     "wrangler": "^4.113.0"
   },
   "overrides": {
-    "sharp": "^0.35.3"
-  },
-  "overrides": {
-    "sharp": "0.35.3"
+    "sharp": "0.35.3",
+    "undici": "^8.10.0"
   },
   "engines": {
     "node": ">=22"
