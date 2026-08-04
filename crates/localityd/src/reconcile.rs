@@ -5,7 +5,7 @@
 //! decision by enumerating, refreshing local projections, and queueing hydration.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::canonical::{
@@ -29,6 +29,9 @@ use crate::hydration::HydrationEngine;
 use crate::scheduler::PullSchedulerTick;
 use crate::shadow_match::parsed_matches_shadow;
 use crate::virtual_fs::{repair_legacy_macos_content_root, virtual_fs_content_root};
+
+const GMAIL_CONNECTOR_ID: &str = "gmail";
+const GMAIL_DRAFT_REMOTE_PREFIX: &str = "gmail-draft:";
 
 pub trait ScheduledPullSource {
     fn enumerate_mount(&self, mount: &MountConfig) -> LocalityResult<Vec<TreeEntry>>;
@@ -228,7 +231,7 @@ where
                 }
             }
 
-            if let Some(reason) = entity_plan.queue_hydration {
+            if !skip_projection_refresh && let Some(reason) = entity_plan.queue_hydration {
                 hydration.queue(HydrationRequest::new(
                     mount.mount_id.clone(),
                     projected_entry.remote_id.clone(),
@@ -382,7 +385,7 @@ fn repair_gmail_draft_projection_after_identity_repair(
     replacement_frontmatter: &str,
     repair: &crate::gmail::GmailDraftIdentityRepair,
 ) -> LocalityResult<bool> {
-    if mount.projection.uses_virtual_filesystem() || repair.retired_legacy.is_none() {
+    if mount.projection.uses_virtual_filesystem() {
         return Ok(false);
     }
     if entry.kind != EntityKind::Page {
@@ -399,16 +402,23 @@ fn repair_gmail_draft_projection_after_identity_repair(
         Err(_) => return Ok(false),
     };
     if parsed.document.is_stub() {
+        let Some(legacy_remote_id) = legacy_stub_remote_id(mount, entry, &parsed, repair) else {
+            return Ok(false);
+        };
         if legacy_stub_frontmatter_has_no_local_drift(
             &parsed,
             entry,
             replacement_frontmatter,
-            repair,
+            legacy_remote_id,
         ) {
             write_atomic(&path, stub_markdown(entry)?)?;
             return Ok(false);
         }
         return Ok(true);
+    }
+
+    if repair.retired_legacy.is_none() {
+        return Ok(false);
     }
 
     let Some(retired_shadow) = repair.retired_shadow.as_ref() else {
@@ -428,16 +438,33 @@ fn repair_gmail_draft_projection_after_identity_repair(
     Ok(false)
 }
 
+fn legacy_stub_remote_id<'a>(
+    mount: &MountConfig,
+    entry: &TreeEntry,
+    parsed: &'a ParsedCanonicalDocument,
+    repair: &'a crate::gmail::GmailDraftIdentityRepair,
+) -> Option<&'a RemoteId> {
+    if let Some(legacy) = repair.retired_legacy.as_ref() {
+        return Some(&legacy.remote_id);
+    }
+
+    if !is_gmail_draft_projection_repair_candidate(mount, entry) {
+        return None;
+    }
+    let remote_id = parsed.remote_id()?;
+    if remote_id == &entry.remote_id || remote_id.as_str().contains(':') {
+        return None;
+    }
+    Some(remote_id)
+}
+
 fn legacy_stub_frontmatter_has_no_local_drift(
     parsed: &ParsedCanonicalDocument,
     entry: &TreeEntry,
     replacement_frontmatter: &str,
-    repair: &crate::gmail::GmailDraftIdentityRepair,
+    legacy_remote_id: &RemoteId,
 ) -> bool {
-    let Some(legacy) = repair.retired_legacy.as_ref() else {
-        return false;
-    };
-    if parsed.remote_id() != Some(&legacy.remote_id) {
+    if parsed.remote_id() != Some(legacy_remote_id) {
         return false;
     }
 
@@ -455,6 +482,22 @@ fn legacy_stub_frontmatter_has_no_local_drift(
     };
     loc.id = Some(entry.remote_id.clone());
     actual_frontmatter == expected.frontmatter
+}
+
+fn is_gmail_draft_projection_repair_candidate(mount: &MountConfig, entry: &TreeEntry) -> bool {
+    mount.connector == GMAIL_CONNECTOR_ID
+        && entry
+            .remote_id
+            .as_str()
+            .starts_with(GMAIL_DRAFT_REMOTE_PREFIX)
+        && is_direct_gmail_draft_path(&entry.path)
+}
+
+fn is_direct_gmail_draft_path(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(components.next(), Some(Component::Normal(component)) if component == "draft")
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
 }
 
 #[derive(Debug, Default)]
@@ -1068,19 +1111,25 @@ mod tests {
             poll_active: true,
             poll_cold: false,
         };
+        let mounts = vec![mount];
+        let policy = HydrationPolicy {
+            eager_under_page_count: Some(10),
+            ..HydrationPolicy::default()
+        };
 
         let report = reconcile_scheduled_pull(
             &mut store,
             &mut hydration,
-            &[mount],
+            &mounts,
             &tick,
             &source,
             &DefaultFetchScheduleStrategy,
-            &HydrationPolicy::default(),
+            &policy,
         )
         .expect("scheduled reconcile");
 
         assert_eq!(report.enumerated, 1);
+        assert_eq!(report.queued_hydrations, 0);
         assert_eq!(
             read_to_string(&root.join(&draft_path)).expect("read projection"),
             locally_edited_stub
@@ -1096,6 +1145,23 @@ mod tests {
                 .get_entity(&mount_id, &draft_remote_id)
                 .expect("draft lookup")
                 .is_some()
+        );
+        let report = reconcile_scheduled_pull(
+            &mut store,
+            &mut hydration,
+            &mounts,
+            &tick,
+            &source,
+            &DefaultFetchScheduleStrategy,
+            &policy,
+        )
+        .expect("second scheduled reconcile");
+
+        assert_eq!(report.enumerated, 1);
+        assert_eq!(report.queued_hydrations, 0);
+        assert_eq!(
+            read_to_string(&root.join(&draft_path)).expect("read projection after second pass"),
+            locally_edited_stub
         );
         let _ = std::fs::remove_dir_all(root);
     }
