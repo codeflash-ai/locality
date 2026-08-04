@@ -333,7 +333,7 @@ where
             .get_entity(&entry.mount_id, &entry.remote_id)
             .map_err(PullError::Store)?;
         let record = virtual_child_entity_record(entry, existing.as_ref());
-        store.save_entity(record).map_err(PullError::Store)?;
+        save_entity_after_gmail_draft_repair(store, mount, record)?;
     }
 
     Ok(PullReport {
@@ -456,7 +456,7 @@ where
             path: record.path.clone(),
             ..entry.clone()
         };
-        store.save_entity(record).map_err(PullError::Store)?;
+        save_entity_after_gmail_draft_repair(store, mount, record)?;
         rename_projection_if_needed(mount, existing.as_ref(), &projected_entry)?;
         if write_stub_if_needed(source, mount, &projected_entry, state_root)? {
             stubbed += 1;
@@ -757,7 +757,7 @@ where
             .get_entity(&entry.mount_id, &entry.remote_id)
             .map_err(PullError::Store)?;
         let record = virtual_child_entity_record(entry, existing.as_ref());
-        store.save_entity(record).map_err(PullError::Store)?;
+        save_entity_after_gmail_draft_repair(store, mount, record)?;
         if is_page {
             child_page_ids.push(child_id);
         }
@@ -884,7 +884,7 @@ where
                 remote_edited_at: record.remote_edited_at.clone(),
                 ..entry
             };
-            store.save_entity(record).map_err(PullError::Store)?;
+            save_entity_after_gmail_draft_repair(store, mount, record)?;
             if plain_files_directory_pull {
                 rename_projection_if_needed(mount, existing.as_ref(), &projected_entry)?;
             }
@@ -1136,7 +1136,7 @@ where
                 remote_edited_at: record.remote_edited_at.clone(),
                 ..entry
             };
-            store.save_entity(record).map_err(PullError::Store)?;
+            save_entity_after_gmail_draft_repair(store, mount, record)?;
             rename_projection_if_needed(mount, existing.as_ref(), &projected_entry)?;
             if write_stub_if_needed(source, mount, &projected_entry, state_root)? {
                 report.stubbed += 1;
@@ -1254,7 +1254,7 @@ where
                 .get_entity(&entry.mount_id, &entry.remote_id)
                 .map_err(PullError::Store)?;
             let record = virtual_child_entity_record(entry, existing.as_ref());
-            store.save_entity(record).map_err(PullError::Store)?;
+            save_entity_after_gmail_draft_repair(store, mount, record)?;
             if is_page {
                 child_page_ids.push(child_id);
             }
@@ -1293,6 +1293,19 @@ fn virtual_child_entity_record(entry: TreeEntry, existing: Option<&EntityRecord>
         }
     }
     record
+}
+
+fn save_entity_after_gmail_draft_repair<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    record: EntityRecord,
+) -> Result<(), PullError>
+where
+    S: EntityRepository,
+{
+    crate::gmail::repair_legacy_gmail_draft_message_id_collision(store, mount, &record)
+        .map_err(PullError::Store)?;
+    store.save_entity(record).map_err(PullError::Store)
 }
 
 #[derive(Debug)]
@@ -2702,10 +2715,10 @@ mod tests {
     use locality_core::shadow::{ShadowDocument, segment_markdown_body};
     use locality_store::{
         EntityRecord, EntityRepository, InMemoryStateStore, MountRepository, ProjectionMode,
-        ShadowRepository,
+        ShadowRepository, StoreError,
     };
 
-    use super::{can_replace_file, write_atomic};
+    use super::{PullError, can_replace_file, write_atomic};
     use crate::hydration::{HydratedAsset, HydratedAssetMedia, HydratedEntity, HydrationSource};
     use crate::source::{SourceAdapter, SourcePushValidator};
     use locality_store::MountConfig;
@@ -3185,6 +3198,111 @@ mod tests {
                 .expect("new thread lookup")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn pull_gmail_draft_repairs_legacy_message_id_entity_collision() {
+        let fixture = PullFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(fixture.mount_id.clone(), "gmail", fixture.root.clone());
+        store.save_mount(mount.clone()).expect("save mount");
+        let draft_path = "draft/1720900000000-hello-draft-msg-1.md";
+        let legacy_message_id = RemoteId::new("draft-msg-1");
+        let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    fixture.mount_id.clone(),
+                    legacy_message_id.clone(),
+                    EntityKind::Page,
+                    "Hello",
+                    draft_path,
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save legacy draft");
+        let source = FakePullSource::new(
+            vec![tree_entry(
+                &fixture.mount_id,
+                &draft_remote_id,
+                "Hello",
+                draft_path,
+                HydrationState::Stub,
+            )],
+            Vec::new(),
+        );
+
+        let report =
+            super::pull_mount_root(&mut store, &source, &mount, fixture.root.clone(), None)
+                .expect("pull root");
+
+        assert_eq!(report.enumerated, 1);
+        assert!(
+            store
+                .get_entity(&fixture.mount_id, &legacy_message_id)
+                .expect("legacy lookup")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_entity(&fixture.mount_id, &draft_remote_id)
+                .expect("draft lookup")
+                .expect("draft entity")
+                .path,
+            PathBuf::from(draft_path)
+        );
+    }
+
+    #[test]
+    fn pull_gmail_draft_does_not_repair_dirty_legacy_message_id_collision() {
+        for hydration in [HydrationState::Dirty, HydrationState::Conflicted] {
+            let fixture = PullFixture::new();
+            let mut store = InMemoryStateStore::new();
+            let mount = MountConfig::new(fixture.mount_id.clone(), "gmail", fixture.root.clone());
+            store.save_mount(mount.clone()).expect("save mount");
+            let draft_path = "draft/1720900000000-hello-draft-msg-1.md";
+            let legacy_message_id = RemoteId::new("draft-msg-1");
+            let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+            store
+                .save_entity(
+                    EntityRecord::new(
+                        fixture.mount_id.clone(),
+                        legacy_message_id.clone(),
+                        EntityKind::Page,
+                        "Hello",
+                        draft_path,
+                    )
+                    .with_hydration(hydration.clone()),
+                )
+                .expect("save dirty legacy draft");
+            let source = FakePullSource::new(
+                vec![tree_entry(
+                    &fixture.mount_id,
+                    &draft_remote_id,
+                    "Hello",
+                    draft_path,
+                    HydrationState::Stub,
+                )],
+                Vec::new(),
+            );
+
+            let error =
+                super::pull_mount_root(&mut store, &source, &mount, fixture.root.clone(), None)
+                    .expect_err("dirty legacy collision should not be repaired");
+
+            assert!(matches!(
+                error,
+                PullError::Store(StoreError::DuplicateEntityPath { .. })
+            ));
+            assert_eq!(
+                store
+                    .get_entity(&fixture.mount_id, &legacy_message_id)
+                    .expect("legacy lookup")
+                    .expect("legacy entity")
+                    .hydration,
+                hydration
+            );
+        }
     }
 
     #[test]

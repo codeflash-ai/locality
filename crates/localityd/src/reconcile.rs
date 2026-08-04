@@ -205,7 +205,7 @@ where
                 path: record.path.clone(),
                 ..entry.clone()
             };
-            store.save_entity(record)?;
+            save_entity_after_gmail_draft_repair(store, mount, record)?;
             rename_projection_if_needed(mount, existing.as_ref(), &projected_entry)?;
 
             match refresh_projection(source, mount, &projected_entry, state_root)? {
@@ -323,6 +323,19 @@ fn merged_entity_record(
     }
 
     record
+}
+
+fn save_entity_after_gmail_draft_repair<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    record: EntityRecord,
+) -> LocalityResult<()>
+where
+    S: EntityRepository,
+{
+    crate::gmail::repair_legacy_gmail_draft_message_id_collision(store, mount, &record)?;
+    store.save_entity(record)?;
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -691,11 +704,107 @@ fn read_to_string(path: &Path) -> LocalityResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use locality_core::model::MountId;
+    use locality_store::{EntityRepository, InMemoryStateStore, MountRepository};
+
+    struct NoopHydrationEngine;
+
+    impl HydrationEngine for NoopHydrationEngine {
+        fn queue(&mut self, _request: HydrationRequest) -> LocalityResult<()> {
+            Ok(())
+        }
+
+        fn drain_ready(&mut self) -> LocalityResult<usize> {
+            Ok(0)
+        }
+    }
+
+    struct StaticScheduledSource {
+        entries: Vec<TreeEntry>,
+    }
+
+    impl ScheduledPullSource for StaticScheduledSource {
+        fn enumerate_mount(&self, _mount: &MountConfig) -> LocalityResult<Vec<TreeEntry>> {
+            Ok(self.entries.clone())
+        }
+    }
+
+    #[test]
+    fn scheduled_pull_gmail_draft_repairs_legacy_message_id_entity_collision() {
+        let mount_id = MountId::new("gmail-main");
+        let root = std::env::temp_dir().join(format!(
+            "loc-scheduled-gmail-draft-repair-{}",
+            std::process::id()
+        ));
+        let mount = MountConfig::new(mount_id.clone(), "gmail", &root);
+        let draft_path = PathBuf::from("draft/1720900000000-hello-draft-msg-1.md");
+        let legacy_message_id = RemoteId::new("draft-msg-1");
+        let draft_remote_id = RemoteId::new("gmail-draft:draft-1");
+        let mut store = InMemoryStateStore::new();
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    legacy_message_id.clone(),
+                    EntityKind::Page,
+                    "Hello",
+                    &draft_path,
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save legacy draft");
+        let source = StaticScheduledSource {
+            entries: vec![TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: draft_remote_id.clone(),
+                kind: EntityKind::Page,
+                title: "Hello".to_string(),
+                path: draft_path.clone(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: None,
+                stub_frontmatter: None,
+            }],
+        };
+        let mut hydration = NoopHydrationEngine;
+        let tick = PullSchedulerTick {
+            poll_active: true,
+            poll_cold: false,
+        };
+
+        let report = reconcile_scheduled_pull(
+            &mut store,
+            &mut hydration,
+            &[mount],
+            &tick,
+            &source,
+            &DefaultFetchScheduleStrategy,
+            &HydrationPolicy::default(),
+        )
+        .expect("scheduled reconcile");
+
+        assert_eq!(report.enumerated, 1);
+        assert!(
+            store
+                .get_entity(&mount_id, &legacy_message_id)
+                .expect("legacy lookup")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_entity(&mount_id, &draft_remote_id)
+                .expect("draft lookup")
+                .expect("draft entity")
+                .path,
+            draft_path
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn virtual_schema_refresh_repairs_legacy_app_group_cache_before_write() {
-        use locality_core::model::MountId;
         use locality_store::ProjectionMode;
 
         struct SchemaSource;

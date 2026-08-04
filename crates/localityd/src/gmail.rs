@@ -5,7 +5,7 @@ use locality_connector::oauth_broker::OAuthBrokerRefresh;
 use locality_connector::{Connector, EnumerateRequest, FetchRequest};
 use locality_core::diff::property_value_from_frontmatter;
 use locality_core::hydration::HydrationRequest;
-use locality_core::model::{RemoteId, TreeEntry};
+use locality_core::model::{EntityKind, HydrationState, RemoteId, TreeEntry};
 use locality_core::planner::PropertyValue;
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
@@ -21,7 +21,7 @@ use locality_gmail::{
 };
 use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
-    CredentialStore, MountConfig,
+    CredentialStore, EntityRecord, EntityRepository, MountConfig, StoreResult,
 };
 
 use crate::hydration::{HydratedAsset, HydratedEntity, HydrationSource};
@@ -29,6 +29,7 @@ use crate::notion::ConnectorResolveError;
 use crate::source::{SourceAdapter, SourcePushValidator, SourceValidationContext};
 
 const GMAIL_CONNECT_COMMAND: &str = "loc connect gmail";
+const GMAIL_DRAFT_REMOTE_PREFIX: &str = "gmail-draft:";
 
 pub fn resolve_gmail_connector_for_mount<S>(
     store: &S,
@@ -71,6 +72,55 @@ where
         message,
         suggested_command: GMAIL_CONNECT_COMMAND.to_string(),
     })
+}
+
+pub(crate) fn repair_legacy_gmail_draft_message_id_collision<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    record: &EntityRecord,
+) -> StoreResult<()>
+where
+    S: EntityRepository + ?Sized,
+{
+    if !is_gmail_draft_identity_repair_candidate(mount, record) {
+        return Ok(());
+    }
+
+    let Some(occupant) = store.find_entity_by_path(&mount.mount_id, &record.path)? else {
+        return Ok(());
+    };
+    if occupant.remote_id == record.remote_id {
+        return Ok(());
+    }
+    if is_clean_legacy_gmail_draft_message_id(&occupant) {
+        store.delete_entity(&mount.mount_id, &occupant.remote_id)?;
+    }
+    Ok(())
+}
+
+fn is_gmail_draft_identity_repair_candidate(mount: &MountConfig, record: &EntityRecord) -> bool {
+    mount.connector == GMAIL_CONNECTOR_ID
+        && record
+            .remote_id
+            .as_str()
+            .starts_with(GMAIL_DRAFT_REMOTE_PREFIX)
+        && is_direct_gmail_draft_path(&record.path)
+}
+
+fn is_direct_gmail_draft_path(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(components.next(), Some(Component::Normal(component)) if component == "draft")
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
+}
+
+fn is_clean_legacy_gmail_draft_message_id(entity: &EntityRecord) -> bool {
+    entity.kind == EntityKind::Page
+        && !entity.remote_id.as_str().contains(':')
+        && !matches!(
+            entity.hydration,
+            HydrationState::Dirty | HydrationState::Conflicted
+        )
 }
 
 fn connector_from_connection(
