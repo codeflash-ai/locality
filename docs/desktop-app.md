@@ -308,7 +308,6 @@ Suggested command/API shape:
 
 ```text
 loc locate <url>
-loc search <query> --connector notion --json
 ```
 
 The CLI locate command should perform the same locate operations as the desktop
