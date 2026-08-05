@@ -364,16 +364,15 @@ fn source_guidance_teaches_common_cli_workflow() {
         );
         assert!(
             (guidance.contains("For discovery or research tasks, triage by path and title first")
-                && guidance.contains("If initial search gives no hits, refine the query and browse directory names before concluding context is unavailable")
+                && guidance.contains("If path/title triage gives no hits, narrow the scope or ask the user for a better starting point instead of relying on broad Locality search")
                 && guidance.contains("If useful results are outside a user-provided path or source scope, do not read them until the user permits it"))
                 || (guidance.contains("for discovery, triage path/title first")
-                    && guidance.contains("refine empty searches, browse directories")
+                    && guidance.contains("browse directories")
                     && guidance.contains("report out-of-scope results without reading them unless permitted")),
             "{connector} missing discovery triage, empty search, or source-scope guidance"
         );
         for command in [
             "loc info .",
-            "loc search <query>",
             "loc status <path>",
             "loc inspect <path>",
             "loc diff <path>",

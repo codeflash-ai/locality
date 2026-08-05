@@ -52,7 +52,7 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert!(agents.contains("including nested directories"));
     assert!(agents.contains("Browse directories normally"));
     assert!(agents.contains("Common Locality CLI workflow:"));
-    assert!(agents.contains("loc search <query>"));
+    assert!(!agents.contains("loc search <query>"));
     assert!(agents.contains("Locality hydrates online-only files on open"));
     assert!(agents.contains("loc status <path>"));
     assert!(agents.contains("loc inspect <path>"));
@@ -62,7 +62,7 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert!(agents.contains("ask the user to open it while you wait"));
     assert!(agents.contains("Read the nearest `AGENTS.md` before connector-specific work"));
     assert!(agents.contains("for discovery, triage path/title first"));
-    assert!(agents.contains("refine empty searches, browse directories"));
+    assert!(agents.contains("browse directories"));
     assert!(agents.contains("report out-of-scope results without reading them unless permitted"));
     assert!(agents.contains("loc live-mode status <file>"));
     assert!(agents.contains("loc mv <source> <dest>"));

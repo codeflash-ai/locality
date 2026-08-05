@@ -67,14 +67,13 @@ loc pull ~/Locality/notion-main
 
 ## 4. Find a page
 
-Use the desktop search or the CLI metadata search:
+Use the desktop locate input for known Notion URLs or page titles, or browse the mounted folders directly:
 
 ```bash
-loc search "Launch Plan" --connector notion
-loc search "https://www.notion.so/..." --connector notion
+loc locate "https://www.notion.so/..."
 ```
 
-Open the returned `page.md` in an editor or pass the path to an agent.
+Open the resolved `page.md` in an editor, or pass a concrete mounted path to an agent.
 
 ## 5. Edit and review
 
