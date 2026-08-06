@@ -37,26 +37,58 @@ TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 fake_bin="${TMPDIR}/fake_bin"
-fake_remote_home="${TMPDIR}/remote_home"
+fake_remote_home="${TMPDIR}/remote home"
 fake_log="${TMPDIR}/fake.log"
 mkdir -p "$fake_bin" "$fake_remote_home/workspace/locality/.git" "$fake_remote_home/workspace/locality-internal/.git"
 : > "$fake_log"
 
+fake_locality_repo_q="$(printf '%q' "${fake_remote_home}/workspace/locality")"
+fake_internal_repo_q="$(printf '%q' "${fake_remote_home}/workspace/locality-internal")"
+
 cat > "${fake_bin}/amika" <<'FAKE_AMIKA'
 #!/usr/bin/env bash
 set -euo pipefail
-printf 'amika %s\n' "$*" >> "$FAKE_LOG"
+log_args() {
+  local first=1
+  for arg in "$@"; do
+    if [[ "$first" -eq 1 ]]; then
+      first=0
+    else
+      printf ' ' >> "$FAKE_LOG"
+    fi
+    printf '%q' "$arg" >> "$FAKE_LOG"
+  done
+  printf '\n' >> "$FAKE_LOG"
+}
+printf 'amika ' >> "$FAKE_LOG"
+log_args "$@"
 test "${1:-}" = "sandbox" || { echo "expected amika sandbox" >&2; exit 1; }
 test "${2:-}" = "ssh" || { echo "expected amika sandbox ssh" >&2; exit 1; }
 test "${3:-}" = "fake-machine" || { echo "expected fake-machine sandbox" >&2; exit 1; }
 shift 3
-HOME="$FAKE_REMOTE_HOME" PATH="$FAKE_BIN:$PATH" bash -lc "$*"
+test "${1:-}" = "--" || { echo "expected -- before remote command" >&2; exit 1; }
+shift
+test "$#" -eq 1 || { echo "expected single remote shell command" >&2; exit 1; }
+HOME="$FAKE_REMOTE_HOME" PATH="$FAKE_BIN:$PATH" bash -lc "$1"
 FAKE_AMIKA
 
 cat > "${fake_bin}/loc" <<'FAKE_LOC'
 #!/usr/bin/env bash
 set -euo pipefail
-printf 'loc %s\n' "$*" >> "$FAKE_LOG"
+log_args() {
+  local first=1
+  for arg in "$@"; do
+    if [[ "$first" -eq 1 ]]; then
+      first=0
+    else
+      printf ' ' >> "$FAKE_LOG"
+    fi
+    printf '%q' "$arg" >> "$FAKE_LOG"
+  done
+  printf '\n' >> "$FAKE_LOG"
+}
+printf 'loc ' >> "$FAKE_LOG"
+log_args "$@"
 
 if [[ "${1:-}" = "connections" && "${2:-}" = "--json" ]]; then
   cat <<'JSON'
@@ -83,6 +115,8 @@ if [[ "${1:-}" = "mount" ]]; then
       ;;
     notion)
       printf '# Standup parent\n' > "$root/page.md"
+      mkdir -p "$root/child"
+      printf '# Child page\n' > "$root/child/page.md"
       ;;
     *)
       echo "unexpected mount ${2:-}" >&2
@@ -105,7 +139,20 @@ FAKE_LOC
 cat > "${fake_bin}/git" <<'FAKE_GIT'
 #!/usr/bin/env bash
 set -euo pipefail
-printf 'git %s\n' "$*" >> "$FAKE_LOG"
+log_args() {
+  local first=1
+  for arg in "$@"; do
+    if [[ "$first" -eq 1 ]]; then
+      first=0
+    else
+      printf ' ' >> "$FAKE_LOG"
+    fi
+    printf '%q' "$arg" >> "$FAKE_LOG"
+  done
+  printf '\n' >> "$FAKE_LOG"
+}
+printf 'git ' >> "$FAKE_LOG"
+log_args "$@"
 
 if [[ "${1:-}" = "-C" ]]; then
   shift 2
@@ -117,9 +164,8 @@ case "${1:-}" in
     printf 'true\n'
     ;;
   remote)
-    test "${2:-}" = "get-url"
-    test "${3:-}" = "origin"
-    printf 'https://github.com/codeflash-ai/locality.git\n'
+    echo "origin URL must not be captured" >&2
+    exit 1
     ;;
   fetch)
     test "${2:-}" = "--prune"
@@ -141,10 +187,26 @@ FAKE_GIT
 cat > "${fake_bin}/codex" <<'FAKE_CODEX'
 #!/usr/bin/env bash
 set -euo pipefail
-printf 'codex %s\n' "$*" >> "$FAKE_LOG"
+log_args() {
+  local first=1
+  for arg in "$@"; do
+    if [[ "$first" -eq 1 ]]; then
+      first=0
+    else
+      printf ' ' >> "$FAKE_LOG"
+    fi
+    printf '%q' "$arg" >> "$FAKE_LOG"
+  done
+  printf '\n' >> "$FAKE_LOG"
+}
+printf 'codex ' >> "$FAKE_LOG"
+log_args "$@"
 test "${1:-}" = "exec"
 test -n "${STANDUP_ARTIFACT_FILE:-}"
 test -n "${STANDUP_TRACE_FILE:-}"
+test -s "${STANDUP_EVIDENCE_DIR:-}/hydration.jsonl"
+grep -F -q '/notion/page.md' "$STANDUP_EVIDENCE_DIR/hydration.jsonl"
+grep -F -q '/notion/child/page.md' "$STANDUP_EVIDENCE_DIR/hydration.jsonl"
 printf '# Standup\n' > "$STANDUP_ARTIFACT_FILE"
 printf '# Trace\n' > "$STANDUP_TRACE_FILE"
 printf '{"type":"turn.completed"}\n'
@@ -152,21 +214,26 @@ FAKE_CODEX
 
 chmod +x "${fake_bin}/amika" "${fake_bin}/loc" "${fake_bin}/git" "${fake_bin}/codex"
 
-PATH="$fake_bin:$PATH" \
-FAKE_BIN="$fake_bin" \
-FAKE_LOG="$fake_log" \
-FAKE_REMOTE_HOME="$fake_remote_home" \
-NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
-"$RUNNER" --sandbox fake-machine
+runner_output="$(
+  PATH="$fake_bin:$PATH" \
+  FAKE_BIN="$fake_bin" \
+  FAKE_LOG="$fake_log" \
+  FAKE_REMOTE_HOME="$fake_remote_home" \
+  NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
+  "$RUNNER" --sandbox fake-machine
+)"
+
+printf '%s\n' "$runner_output" | grep -F -q '{"type":"turn.completed"}' && fail "runner leaked raw codex event JSON"
 
 assert_file_contains "$fake_log" "loc connections --json"
 assert_file_contains "$fake_log" "loc mount linear"
 assert_file_contains "$fake_log" "loc mount slack"
-assert_file_contains "$fake_log" "--types private_channel,im,mpim"
+assert_file_contains "$fake_log" "--types"
+assert_file_contains "$fake_log" "private_channel"
 assert_file_contains "$fake_log" "loc mount notion"
 assert_file_contains "$fake_log" "loc pull"
-assert_file_contains "$fake_log" "git -C ${fake_remote_home}/workspace/locality log"
-assert_file_contains "$fake_log" "git -C ${fake_remote_home}/workspace/locality-internal log"
+assert_file_contains "$fake_log" "git -C ${fake_locality_repo_q} log"
+assert_file_contains "$fake_log" "git -C ${fake_internal_repo_q} log"
 assert_file_contains "$fake_log" "codex exec"
 
 printf 'successful runner contract passed\n'

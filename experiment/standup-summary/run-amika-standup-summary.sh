@@ -81,7 +81,13 @@ shell_quote() {
   printf '%q' "$1"
 }
 
-worker_b64="$(b64 <<'REMOTE_WORKER'
+amika_sandbox_ssh() {
+  local machine="$1"
+  shift
+  amika sandbox ssh "${amika_flags[@]}" "$machine" "$@"
+}
+
+remote_script_b64="$(b64 <<'REMOTE_WORKER'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -94,23 +100,30 @@ require_tool() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required tool: $1"
 }
 
+run_id="${1:?run id required}"
+loc_bin="${2:?loc bin required}"
+code_model="${3:?codex model required}"
+code_effort="${4:?codex reasoning effort required}"
+code_timeout="${5:?codex timeout required}"
+slack_types="${6:?slack types required}"
+standup_date="${7:?standup date required}"
+standup_since_iso="${8:?standup since required}"
+standup_until_iso="${9:?standup until required}"
+notion_parent_page_id="${10:?notion parent page id required}"
+linear_connection_id_explicit="${11:-}"
+slack_connection_id_explicit="${12:-}"
+notion_connection_id_explicit="${13:-}"
+locality_repo_dir_arg="${14:-}"
+locality_internal_repo_dir_arg="${15:-}"
+remote_run_root_arg="${16:-}"
+prompt_b64_arg="${17:?prompt required}"
+
 require_tool python3
 require_tool git
 require_tool codex
-require_tool "$LOC_BIN"
+require_tool "$loc_bin"
 
-run_id="${RUN_ID:?}"
-loc_bin="${LOC_BIN:?}"
-code_model="${CODEX_MODEL:?}"
-code_effort="${CODEX_REASONING_EFFORT:?}"
-code_timeout="${CODEX_EXEC_TIMEOUT_SECONDS:?}"
-slack_types="${SLACK_TYPES:?}"
-standup_date="${STANDUP_DATE:?}"
-standup_since_iso="${STANDUP_SINCE_ISO:?}"
-standup_until_iso="${STANDUP_UNTIL_ISO:?}"
-notion_parent_page_id="${NOTION_STANDUP_PARENT_PAGE_ID:?}"
-
-remote_run_root="${STANDUP_REMOTE_RUN_ROOT:-$HOME/standup-summary-runs}"
+remote_run_root="${remote_run_root_arg:-$HOME/standup-summary-runs}"
 run_dir="$remote_run_root/$run_id"
 mount_root="$run_dir/mounts"
 evidence_dir="$run_dir/evidence"
@@ -121,11 +134,11 @@ trace_file="$run_dir/trace.md"
 context_inventory="$evidence_dir/context-inventory.txt"
 codex_events_file="$evidence_dir/codex-events.jsonl"
 notion_parent_dir="$mount_root/notion"
-locality_repo_dir="${LOCALITY_REPO_DIR:-$HOME/workspace/locality}"
-locality_internal_repo_dir="${LOCALITY_INTERNAL_REPO_DIR:-$HOME/workspace/locality-internal}"
+locality_repo_dir="${locality_repo_dir_arg:-$HOME/workspace/locality}"
+locality_internal_repo_dir="${locality_internal_repo_dir_arg:-$HOME/workspace/locality-internal}"
 
 mkdir -p "$mount_root" "$evidence_dir" "$run_dir"
-printf '%s' "${PROMPT_B64:?}" | base64 -d > "$prompt_file"
+printf '%s' "$prompt_b64_arg" | base64 -d > "$prompt_file"
 
 "$loc_bin" connections --json > "$evidence_dir/connections.json"
 
@@ -188,9 +201,9 @@ print(connection_id)
 PY
 }
 
-linear_connection_id="$(resolve_connection linear "${LINEAR_CONNECTION_ID:-}")"
-slack_connection_id="$(resolve_connection slack "${SLACK_CONNECTION_ID:-}")"
-notion_connection_id="$(resolve_connection notion "${NOTION_CONNECTION_ID:-}")"
+linear_connection_id="$(resolve_connection linear "$linear_connection_id_explicit")"
+slack_connection_id="$(resolve_connection slack "$slack_connection_id_explicit")"
+notion_connection_id="$(resolve_connection notion "$notion_connection_id_explicit")"
 
 "$loc_bin" mount linear "$mount_root/linear" --connection "$linear_connection_id" --mount-id "$run_id-linear" --projection plain-files --json > "$evidence_dir/mount-linear.json"
 "$loc_bin" mount slack "$mount_root/slack" --connection "$slack_connection_id" --mount-id "$run_id-slack" --projection plain-files --history-limit 15 --types "$slack_types" --json > "$evidence_dir/mount-slack.json"
@@ -209,9 +222,39 @@ hydrate_root() {
     -name pull-requests.md -o \
     -name attachments.md \
   \) -print0 | while IFS= read -r -d '' file; do
-    if "$loc_bin" pull "$file" --json > "$evidence_dir/hydrate-$(basename "$file").json" 2>> "$evidence_dir/hydration-failures.log"; then
+    rel_path="${file#"$root"/}"
+    if output="$("$loc_bin" pull "$file" --json 2>> "$evidence_dir/hydration-failures.log")"; then
+      python3 - "$name" "$rel_path" "$file" ok "$output" >> "$evidence_dir/hydration.jsonl" <<'PY'
+import json
+import sys
+
+connector, rel_path, path, status, output = sys.argv[1:6]
+try:
+    payload = json.loads(output)
+except json.JSONDecodeError:
+    payload = output
+print(json.dumps({
+    "connector": connector,
+    "path": path,
+    "relative_path": rel_path,
+    "status": status,
+    "output": payload,
+}, sort_keys=True))
+PY
       printf 'ok\t%s\n' "$file" >> "$evidence_dir/hydration.log"
     else
+      python3 - "$name" "$rel_path" "$file" failed >> "$evidence_dir/hydration.jsonl" <<'PY'
+import json
+import sys
+
+connector, rel_path, path, status = sys.argv[1:5]
+print(json.dumps({
+    "connector": connector,
+    "path": path,
+    "relative_path": rel_path,
+    "status": status,
+}, sort_keys=True))
+PY
       printf 'failed\t%s\n' "$file" >> "$evidence_dir/hydration.log"
     fi
   done
@@ -231,16 +274,24 @@ find "$mount_root" -type f \( \
 ensure_repo() {
   local slug="$1"
   local dir="$2"
-  mkdir -p "$(dirname "$dir")"
-  if ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    rm -rf "$dir"
+  if [[ -d "$dir" ]] && git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    :
+  else
+    if [[ -e "$dir" ]]; then
+      if [[ ! -d "$dir" ]]; then
+        fail "repo path exists and is not a directory: $dir"
+      fi
+      if find "$dir" -mindepth 1 -print -quit | grep -q .; then
+        fail "repo path exists but is not a git worktree and is not empty: $dir"
+      fi
+    fi
+    mkdir -p "$(dirname "$dir")"
     if command -v gh >/dev/null 2>&1; then
       gh repo clone "$slug" "$dir"
     else
       git clone "https://github.com/$slug.git" "$dir"
     fi
   fi
-  git -C "$dir" remote get-url origin > "$evidence_dir/$(basename "$dir")-origin.txt"
   git -C "$dir" fetch --prune origin
   git -C "$dir" log --since="$standup_since_iso" --date=iso-strict --pretty=format:'%H%x09%ad%x09%an%x09%ae%x09%s' > "$evidence_dir/$(basename "$dir")-commits.tsv"
   git -C "$dir" log --since="$standup_since_iso" --stat --date=iso-strict > "$evidence_dir/$(basename "$dir")-stat.log"
@@ -279,9 +330,9 @@ codex_cmd=(
 )
 
 if [[ "$code_timeout" != "0" ]] && command -v timeout >/dev/null 2>&1; then
-  timeout "$code_timeout" "${codex_cmd[@]}" | tee "$codex_events_file"
+  timeout "$code_timeout" "${codex_cmd[@]}" > "$codex_events_file"
 else
-  "${codex_cmd[@]}" | tee "$codex_events_file"
+  "${codex_cmd[@]}" > "$codex_events_file"
 fi
 
 [[ -s "$artifact_file" ]] || fail "Codex did not write $artifact_file"
@@ -299,31 +350,30 @@ REMOTE_WORKER
 
 prompt_b64="$(b64 < "$PROMPT_FILE")"
 
-remote_command=""
-add_export() {
-  local name="$1"
-  local value="$2"
-  remote_command+="export ${name}=$(shell_quote "$value")"$'\n'
-}
+remote_args=(
+  "$RUN_ID"
+  "$LOC_BIN"
+  "$CODEX_MODEL"
+  "$CODEX_REASONING_EFFORT"
+  "$CODEX_EXEC_TIMEOUT_SECONDS"
+  "$SLACK_TYPES"
+  "$STANDUP_DATE"
+  "$STANDUP_SINCE_ISO"
+  "$STANDUP_UNTIL_ISO"
+  "$notion_parent_page_id"
+  "${LINEAR_CONNECTION_ID:-}"
+  "${SLACK_CONNECTION_ID:-}"
+  "${NOTION_CONNECTION_ID:-}"
+  "${LOCALITY_REPO_DIR:-}"
+  "${LOCALITY_INTERNAL_REPO_DIR:-}"
+  "${STANDUP_REMOTE_RUN_ROOT:-}"
+  "$prompt_b64"
+)
 
-add_export RUN_ID "$RUN_ID"
-add_export LOC_BIN "$LOC_BIN"
-add_export CODEX_MODEL "$CODEX_MODEL"
-add_export CODEX_REASONING_EFFORT "$CODEX_REASONING_EFFORT"
-add_export CODEX_EXEC_TIMEOUT_SECONDS "$CODEX_EXEC_TIMEOUT_SECONDS"
-add_export SLACK_TYPES "$SLACK_TYPES"
-add_export STANDUP_DATE "$STANDUP_DATE"
-add_export STANDUP_SINCE_ISO "$STANDUP_SINCE_ISO"
-add_export STANDUP_UNTIL_ISO "$STANDUP_UNTIL_ISO"
-add_export NOTION_STANDUP_PARENT_PAGE_ID "$notion_parent_page_id"
-add_export LINEAR_CONNECTION_ID "${LINEAR_CONNECTION_ID:-}"
-add_export SLACK_CONNECTION_ID "${SLACK_CONNECTION_ID:-}"
-add_export NOTION_CONNECTION_ID "${NOTION_CONNECTION_ID:-}"
-add_export LOCALITY_REPO_DIR "${LOCALITY_REPO_DIR:-}"
-add_export LOCALITY_INTERNAL_REPO_DIR "${LOCALITY_INTERNAL_REPO_DIR:-}"
-add_export STANDUP_REMOTE_RUN_ROOT "${STANDUP_REMOTE_RUN_ROOT:-}"
-add_export PROMPT_B64 "$prompt_b64"
-add_export WORKER_B64 "$worker_b64"
-remote_command+='printf %s "$WORKER_B64" | base64 -d | bash'
+remote_command="printf %s $(shell_quote "$remote_script_b64") | base64 -d | bash -s --"
+for arg in "${remote_args[@]}"; do
+  remote_command+=" $(shell_quote "$arg")"
+done
+remote_shell_command="bash -lc $(shell_quote "$remote_command")"
 
-exec amika sandbox ssh "${amika_flags[@]}" "$sandbox" "$remote_command"
+amika_sandbox_ssh "$sandbox" -- "$remote_shell_command"
