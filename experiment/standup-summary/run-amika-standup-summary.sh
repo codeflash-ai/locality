@@ -195,11 +195,11 @@ if explicit_id:
     raise SystemExit(2)
 
 if not active:
-    print(f"{connector}: no active connection", file=sys.stderr)
+    print(f"missing active connection for connector: {connector}", file=sys.stderr)
     raise SystemExit(2)
 if len(active) > 1:
     ids = ", ".join(str(field(row, "id", "connection_id", "connectionId")) for row in active)
-    print(f"{connector}: multiple active connections ({ids}); set {connector.upper()}_CONNECTION_ID", file=sys.stderr)
+    print(f"multiple active connections for connector {connector} ({ids}); set {connector.upper()}_CONNECTION_ID", file=sys.stderr)
     raise SystemExit(2)
 
 connection_id = field(active[0], "id", "connection_id", "connectionId")

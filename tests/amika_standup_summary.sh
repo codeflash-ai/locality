@@ -114,6 +114,10 @@ printf 'loc ' >> "$FAKE_LOG"
 log_args "$@"
 
 if [[ "${1:-}" = "connections" && "${2:-}" = "--json" ]]; then
+  if [[ -n "${FAKE_LOC_CONNECTIONS_JSON:-}" ]]; then
+    printf '%s\n' "$FAKE_LOC_CONNECTIONS_JSON"
+    exit 0
+  fi
   cat <<'JSON'
 [
   {"id":"linear-work","connector":"linear","status":"active"},
@@ -308,6 +312,22 @@ FAKE_CODEX
 
 chmod +x "${fake_bin}/amika" "${fake_bin}/loc" "${fake_bin}/git" "${fake_bin}/codex"
 
+missing_bin="${TMPDIR}/missing_bin"
+multiple_bin="${TMPDIR}/multiple_bin"
+mkdir -p "$missing_bin" "$multiple_bin"
+cp "${fake_bin}/amika" "${fake_bin}/git" "${fake_bin}/codex" "${fake_bin}/loc" "$missing_bin/"
+cp "${fake_bin}/amika" "${fake_bin}/git" "${fake_bin}/codex" "${fake_bin}/loc" "$multiple_bin/"
+missing_slack_connections_json='[
+  {"id":"linear-work","connector":"linear","status":"active"},
+  {"id":"notion-work","connector":"notion","status":"active"}
+]'
+multiple_notion_connections_json='[
+  {"id":"linear-work","connector":"linear","status":"active"},
+  {"id":"slack-work","connector":"slack","status":"active"},
+  {"id":"notion-a","connector":"notion","status":"active"},
+  {"id":"notion-b","connector":"notion","status":"active"}
+]'
+
 invalid_run_id_stderr="${TMPDIR}/invalid-run-id.err"
 if PATH="$fake_bin:$PATH" \
   NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
@@ -374,6 +394,59 @@ if PATH="$fake_bin:$PATH" \
 fi
 assert_file_contains "$existing_run_id_stderr" "run directory already exists"
 assert_file_not_contains "$fake_log" "loc "
+
+: > "$fake_log"
+missing_slack_stderr="${TMPDIR}/missing-slack-connection.err"
+if PATH="$missing_bin:$PATH" \
+  FAKE_BIN="$missing_bin" \
+  FAKE_LOG="$fake_log" \
+  FAKE_LOC_CONNECTIONS_JSON="$missing_slack_connections_json" \
+  FAKE_REMOTE_HOME="$fake_remote_home" \
+  NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
+  RUN_ID="standup-missing-slack-connection" \
+  STANDUP_DATE="2026-08-06" \
+  STANDUP_SINCE_ISO="2026-08-05T00:00:00Z" \
+  STANDUP_UNTIL_ISO="2026-08-06T00:00:00Z" \
+  "$RUNNER" --sandbox fake-machine 2>"$missing_slack_stderr"; then
+  fail "missing Slack connection unexpectedly succeeded"
+fi
+assert_file_contains "$missing_slack_stderr" "missing active connection for connector: slack"
+assert_file_not_contains "$fake_log" "loc mount"
+
+: > "$fake_log"
+multiple_notion_stderr="${TMPDIR}/multiple-notion-connection.err"
+if PATH="$multiple_bin:$PATH" \
+  FAKE_BIN="$multiple_bin" \
+  FAKE_LOG="$fake_log" \
+  FAKE_LOC_CONNECTIONS_JSON="$multiple_notion_connections_json" \
+  FAKE_REMOTE_HOME="$fake_remote_home" \
+  NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
+  RUN_ID="standup-multiple-notion-connection" \
+  STANDUP_DATE="2026-08-06" \
+  STANDUP_SINCE_ISO="2026-08-05T00:00:00Z" \
+  STANDUP_UNTIL_ISO="2026-08-06T00:00:00Z" \
+  "$RUNNER" --sandbox fake-machine 2>"$multiple_notion_stderr"; then
+  fail "multiple Notion connections unexpectedly succeeded"
+fi
+assert_file_contains "$multiple_notion_stderr" "multiple active connections for connector notion"
+assert_file_not_contains "$fake_log" "loc mount"
+
+: > "$fake_log"
+PATH="$multiple_bin:$PATH" \
+  FAKE_BIN="$multiple_bin" \
+  FAKE_LOG="$fake_log" \
+  FAKE_LOC_CONNECTIONS_JSON="$multiple_notion_connections_json" \
+  FAKE_REMOTE_HOME="$fake_remote_home" \
+  LOCALITY_REPO_DIR="$same_name_locality_repo" \
+  LOCALITY_INTERNAL_REPO_DIR="$same_name_internal_repo" \
+  NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
+  NOTION_CONNECTION_ID="notion-a" \
+  RUN_ID="standup-explicit-notion-connection" \
+  STANDUP_DATE="2026-08-06" \
+  STANDUP_SINCE_ISO="2026-08-05T00:00:00Z" \
+  STANDUP_UNTIL_ISO="2026-08-06T00:00:00Z" \
+  "$RUNNER" --sandbox fake-machine >/dev/null
+assert_file_contains "$fake_log" "--connection notion-a"
 
 : > "$fake_log"
 token_origin_stderr="${TMPDIR}/token-origin.err"
