@@ -54,6 +54,7 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://api.notion.com/v1/oauth/authorize?...",
   "redirect_uri": "http://localhost:8757/oauth/notion/callback",
+  "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/notion/callback",
   "session": "signed-session",
   "state": "opaque-state",
   "expires_in": 600
@@ -104,6 +105,7 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
   "redirect_uri": "http://localhost:8757/oauth/google-docs/callback",
+  "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/google-docs/callback",
   "session": "signed-session",
   "state": "opaque-state",
   "expires_in": 600
@@ -160,6 +162,7 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
   "redirect_uri": "http://localhost:8757/oauth/google-calendar/callback",
+  "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/google-calendar/callback",
   "session": "signed-session",
   "state": "opaque-state",
   "expires_in": 600
@@ -212,6 +215,7 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
   "redirect_uri": "http://localhost:8757/oauth/gmail/callback",
+  "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/gmail/callback",
   "session": "signed-session",
   "state": "opaque-state",
   "expires_in": 600
@@ -263,6 +267,7 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://slack.com/oauth/v2/authorize?...",
   "redirect_uri": "http://localhost:8757/oauth/slack/callback",
+  "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/slack/callback",
   "session": "signed-session",
   "state": "opaque-state",
   "expires_in": 600
@@ -309,6 +314,14 @@ Run checks:
 ```sh
 npm run check
 ```
+
+## Required Configuration
+
+- `LOCALITY_BROKER_PUBLIC_BASE_URL`: HTTPS public origin for the broker, for
+  example `https://oauth.locality.example`. The broker uses this value to build
+  provider callback URLs returned as `provider_redirect_uri`. `/start` endpoints
+  fail with `broker_config_error` until it is configured. See
+  [`docs/deployment.md`](docs/deployment.md) for Cloudflare Workers setup.
 
 ## Required Secrets
 

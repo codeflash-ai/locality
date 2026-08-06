@@ -32,13 +32,14 @@ crate cannot ship by itself.
 6. Add CLI connect and mount routing without changing existing commands. Keep
    provider-specific mount settings in the provider crate and serialize the
    default represented by the manifest.
-7. Add or update the connector's OAuth profile in `crates/locality-auth-core`
-   before adding per-runtime OAuth code. Public broker, CLI, and hosted adapters
-   must consume the shared ID/scope/callback profile instead of duplicating
-   connector auth constants.
+7. For OAuth connectors, add or update the connector's OAuth profile in
+   `crates/locality-auth-core` before adding per-runtime OAuth code. Public
+   broker, CLI, and hosted adapters that implement that connector's OAuth must
+   consume the shared ID/scope/callback profile instead of duplicating connector
+   auth constants.
 8. Add the desktop source ID, setup/auth classification, display metadata, and
    `apps/desktop/src/assets/connectors/<id>.svg` icon. Add OAuth-service routing
-   only when the connector actually uses the hosted OAuth broker.
+   only when the connector actually uses the public OAuth broker.
 9. Add `docs/<id>-connector.md`, public
    `docs-site/connectors/<docs_slug>.mdx`, docs navigation, README support, and
    any provider-specific security or live-test instructions.

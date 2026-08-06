@@ -32,6 +32,17 @@ URL:
   - `/v1/oauth/gmail/callback`
   - `/v1/oauth/slack/callback`
 
+Configure it as a non-secret Worker variable, either in the Cloudflare dashboard
+or in `wrangler.toml`:
+
+```toml
+[vars]
+LOCALITY_BROKER_PUBLIC_BASE_URL = "https://oauth.locality.example"
+```
+
+Broker `/start` endpoints fail with `broker_config_error` until
+`LOCALITY_BROKER_PUBLIC_BASE_URL` is configured.
+
 Configure the Notion OAuth integration with the broker HTTPS callback:
 
 ```text

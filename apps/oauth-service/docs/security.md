@@ -34,8 +34,8 @@ The broker supports two refresh modes:
 - OAuth sessions are short-lived HMAC-signed payloads.
 - Session verification checks state, connector, redirect URI, expiry, and payload
   shape before exchanging a code.
-- Notion, Google Docs, and Gmail redirect URIs are restricted to configured
-  loopback callback URLs.
+- Brokered OAuth connector redirect URIs are restricted to configured loopback
+  callback URLs.
 - Production handle mode keeps provider refresh tokens inside encrypted opaque
   handles before returning them to local clients.
 - Upstream OAuth error bodies are not returned to callers.
@@ -56,9 +56,10 @@ Deployment controls to add before public launch:
 
 ## Redirects
 
-The broker accepts only configured loopback redirect URIs for Notion, Google
-Docs, and Gmail. The Locality CLI should use stable localhost callbacks so each
-provider integration can keep a small static redirect allowlist.
+The broker accepts only configured loopback redirect URIs for brokered OAuth
+connectors, including Notion, Google Docs, Google Calendar, Gmail, and Slack.
+The Locality CLI should use stable localhost callbacks so each provider
+integration can keep a small static redirect allowlist.
 
 ## Provider Callback Boundary
 

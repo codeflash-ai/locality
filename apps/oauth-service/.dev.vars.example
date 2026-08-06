@@ -1,4 +1,5 @@
 # Local development only. Never commit .dev.vars.
+LOCALITY_BROKER_PUBLIC_BASE_URL="https://oauth.locality.example"
 LOCALITY_BROKER_SESSION_SECRET=replace-with-at-least-32-random-bytes
 LOCALITY_REFRESH_HANDLE_KEY=replace-with-at-least-32-random-bytes
 LOCALITY_NOTION_CLIENT_ID=notion-oauth-client-id
