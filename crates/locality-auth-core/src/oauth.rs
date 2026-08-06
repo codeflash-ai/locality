@@ -186,11 +186,32 @@ pub fn broker_callback_uri(
     if trimmed.contains('?') || trimmed.contains('#') {
         return Err(OAuthProfileError::BrokerBaseUrlMustNotContainQueryOrFragment);
     }
+    if https_base_url_host(trimmed).is_none() {
+        return Err(OAuthProfileError::BrokerBaseUrlMustNotBeEmpty);
+    }
     Ok(format!(
         "{}{}",
         trimmed.trim_end_matches('/'),
         connector.broker_callback_path()
     ))
+}
+
+fn https_base_url_host(public_base_url: &str) -> Option<&str> {
+    let after_scheme = public_base_url.strip_prefix("https://")?;
+    let authority = after_scheme.split('/').next().unwrap_or_default();
+    if authority.is_empty() || authority.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(bracketed_host) = authority.strip_prefix('[') {
+        let closing_bracket = bracketed_host.find(']')?;
+        &bracketed_host[..closing_bracket]
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+
+    if host.is_empty() { None } else { Some(host) }
 }
 
 pub fn scope_csv(scopes: &[&str]) -> String {
@@ -201,9 +222,26 @@ pub fn granted_scopes_match_exact(granted: &[String], expected: &[&str]) -> bool
     if granted.len() != expected.len() {
         return false;
     }
+    if string_slice_has_duplicates(granted) || str_slice_has_duplicates(expected) {
+        return false;
+    }
     expected
         .iter()
         .all(|expected_scope| granted.iter().any(|scope| scope == expected_scope))
+}
+
+fn string_slice_has_duplicates(values: &[String]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .any(|(index, value)| values[index + 1..].iter().any(|other| other == value))
+}
+
+fn str_slice_has_duplicates(values: &[&str]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .any(|(index, value)| values[index + 1..].iter().any(|other| other == value))
 }
 
 #[cfg(test)]
@@ -277,6 +315,30 @@ mod tests {
             ),
             Err(OAuthProfileError::BrokerBaseUrlMustNotContainQueryOrFragment)
         );
+        assert_eq!(
+            broker_callback_uri(
+                "https://oauth.locality.test/path#fragment",
+                OAuthConnector::Gmail
+            ),
+            Err(OAuthProfileError::BrokerBaseUrlMustNotContainQueryOrFragment)
+        );
+    }
+
+    #[test]
+    fn broker_callback_uri_rejects_empty_or_whitespace_hosts() {
+        for base_url in [
+            "https://",
+            "https:///foo",
+            "https://:443",
+            "https://   /foo",
+            "https://\t/foo",
+        ] {
+            assert_eq!(
+                broker_callback_uri(base_url, OAuthConnector::Gmail),
+                Err(OAuthProfileError::BrokerBaseUrlMustNotBeEmpty),
+                "{base_url} must be rejected as missing a usable host"
+            );
+        }
     }
 
     #[test]
@@ -287,5 +349,45 @@ mod tests {
             scope_csv(profile.scopes),
             "channels:history,channels:read,files:read,groups:history,groups:read,users:read"
         );
+    }
+
+    #[test]
+    fn granted_scopes_match_exact_accepts_different_order() {
+        let granted = scope_strings(&["email", "profile", "openid"]);
+        assert!(granted_scopes_match_exact(
+            &granted,
+            &["openid", "email", "profile"]
+        ));
+    }
+
+    #[test]
+    fn granted_scopes_match_exact_rejects_missing_scope() {
+        let granted = scope_strings(&["openid", "email"]);
+        assert!(!granted_scopes_match_exact(
+            &granted,
+            &["openid", "email", "profile"]
+        ));
+    }
+
+    #[test]
+    fn granted_scopes_match_exact_rejects_extra_scope() {
+        let granted = scope_strings(&["openid", "email", "profile", "calendar"]);
+        assert!(!granted_scopes_match_exact(
+            &granted,
+            &["openid", "email", "profile"]
+        ));
+    }
+
+    #[test]
+    fn granted_scopes_match_exact_rejects_duplicate_scope() {
+        let granted = scope_strings(&["openid", "email", "email"]);
+        assert!(!granted_scopes_match_exact(
+            &granted,
+            &["openid", "email", "email"]
+        ));
+    }
+
+    fn scope_strings(scopes: &[&str]) -> Vec<String> {
+        scopes.iter().map(|scope| (*scope).to_string()).collect()
     }
 }
