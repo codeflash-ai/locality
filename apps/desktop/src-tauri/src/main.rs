@@ -176,6 +176,7 @@ use tauri::{
 use tauri_plugin_dialog::DialogExt;
 
 mod agent_guidance;
+mod single_instance;
 
 use agent_guidance::{
     AgentGuidanceInstallReport, install_agent_guidance as install_guidance_files,
@@ -5875,14 +5876,6 @@ where
         .any(|arg| arg.as_ref() == DESKTOP_BACKGROUND_LAUNCH_ARG)
 }
 
-fn desktop_second_launch_should_show_main_window<I, S>(args: I) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    !desktop_launch_requested_background_from_args(args)
-}
-
 fn refresh_launch_at_login_cache_async() {
     tauri::async_runtime::spawn_blocking(|| {
         set_launch_at_login_cache(launch_at_login_enabled());
@@ -8588,6 +8581,10 @@ fn app_store_distribution() -> bool {
 
 fn desktop_smoke_test_requested() -> bool {
     std::env::var_os("LOCALITY_DESKTOP_SMOKE_TEST").is_some()
+}
+
+fn desktop_single_instance_required(smoke_test_requested: bool) -> bool {
+    !smoke_test_requested
 }
 
 fn install_terminal_cli_link() -> Result<PathBuf, String> {
@@ -20287,14 +20284,9 @@ mod tests {
     }
 
     #[test]
-    fn second_desktop_launch_only_activates_for_foreground_requests() {
-        assert!(super::desktop_second_launch_should_show_main_window([
-            "Locality"
-        ]));
-        assert!(!super::desktop_second_launch_should_show_main_window([
-            "Locality",
-            "--background"
-        ]));
+    fn release_smoke_launches_bypass_single_instance_forwarding() {
+        assert!(super::desktop_single_instance_required(false));
+        assert!(!super::desktop_single_instance_required(true));
     }
 
     #[cfg(not(windows))]
@@ -21696,14 +21688,43 @@ fn main() {
     }
 
     let background_launch = desktop_launch_requested_background();
+    let smoke_test_requested = desktop_smoke_test_requested();
+    let single_instance_guard = if desktop_single_instance_required(smoke_test_requested) {
+        match single_instance::acquire_desktop_single_instance(background_launch) {
+            Ok(Some(guard)) => Some(guard),
+            Ok(None) => return,
+            Err(error) => {
+                desktop_log(
+                    "error",
+                    "app.single_instance_failed",
+                    format!("could not claim desktop process ownership: {error}"),
+                );
+                eprintln!("loc desktop could not claim single-instance ownership: {error}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let desktop_activation_receiver = match single_instance_guard
+        .as_ref()
+        .map(|guard| guard.activation_receiver())
+        .transpose()
+    {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            desktop_log(
+                "error",
+                "app.single_instance_receiver_failed",
+                format!("could not prepare desktop activation receiver: {error}"),
+            );
+            eprintln!("loc desktop could not prepare its activation receiver: {error}");
+            std::process::exit(1);
+        }
+    };
 
     desktop_log("info", "app.start", "Locality desktop starting");
     let builder = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            if desktop_second_launch_should_show_main_window(args.iter()) {
-                show_main_window_with_view(app, None);
-            }
-        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init());
     let builder = if app_store_distribution() {
@@ -21726,7 +21747,7 @@ fn main() {
             }
         })
         .setup(move |app| {
-            if desktop_smoke_test_requested() {
+            if smoke_test_requested {
                 configure_main_window_chrome(app);
                 // Keep release smoke tests isolated from the user's daemon state.
                 std::process::exit(0);
@@ -21749,6 +21770,10 @@ fn main() {
             refresh_launch_at_login_cache_async();
             configure_main_window_chrome(app);
             build_tray(app)?;
+            if let Some(receiver) = desktop_activation_receiver {
+                let app_handle = app.app_handle().clone();
+                receiver.start(move || show_main_window_with_view(&app_handle, None));
+            }
             sync_tray_visibility(app.app_handle(), &desktop_settings());
             start_state_change_watcher(app.app_handle().clone());
             ensure_runtime_ready_in_background(app.app_handle().clone());
