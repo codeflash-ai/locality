@@ -540,6 +540,30 @@ mod tests {
     }
 
     #[test]
+    fn notion_start_response_without_provider_redirect_uses_local_redirect_fallback() {
+        let payload = serde_json::json!({
+            "connector": "notion",
+            "client_id": "client-id",
+            "authorization_url": "https://api.notion.com/v1/oauth/authorize?client_id=wrong&redirect_uri=https%3A%2F%2Foauth.locality.test%2Fwrong",
+            "redirect_uri": "http://localhost:8757/oauth/notion/callback",
+            "session": "signed-session",
+            "state": "signed-session",
+            "expires_in": 600
+        });
+
+        let start: NotionOAuthBrokerStartResponse =
+            serde_json::from_value(payload).expect("decode legacy start response");
+
+        assert_eq!(start.provider_redirect_uri, None);
+
+        let url = Url::parse(&start.normalized_authorization_url()).expect("normalized URL");
+        assert_eq!(
+            query_value(&url, "redirect_uri").as_deref(),
+            Some("http://localhost:8757/oauth/notion/callback")
+        );
+    }
+
+    #[test]
     fn normalize_notion_authorization_url_replaces_managed_parameters() {
         let normalized = normalize_notion_authorization_url(
             "https://api.notion.com/v1/oauth/authorize?client_id=wrong&response_type=token&response_type=none&owner=workspace&redirect_uri=http%3A%2F%2Fwrong&state=wrong",

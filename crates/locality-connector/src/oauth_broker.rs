@@ -111,6 +111,24 @@ mod tests {
     }
 
     #[test]
+    fn start_response_defaults_missing_provider_redirect_uri() {
+        let payload = serde_json::json!({
+            "connector": "gmail",
+            "client_id": "client-id",
+            "authorization_url": "https://accounts.example.test/o/oauth2/v2/auth",
+            "redirect_uri": "http://localhost:8757/oauth/gmail/callback",
+            "session": "signed-session",
+            "state": "signed-session",
+            "expires_in": 600
+        });
+
+        let start: OAuthBrokerStartResponse =
+            serde_json::from_value(payload).expect("decode legacy start response");
+
+        assert_eq!(start.provider_redirect_uri, None);
+    }
+
+    #[test]
     fn token_payload_can_carry_refresh_handle_and_scopes_without_refresh_token() {
         let payload = serde_json::json!({
             "access_token": "access",
