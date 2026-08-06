@@ -258,6 +258,23 @@ fi
 assert_file_contains "$missing_amika_stderr" "missing required tool: amika"
 grep -F -q "command not found" "$missing_amika_stderr" && fail "missing amika used shell command-not-found"
 
+root_page_only_stderr="${TMPDIR}/root-page-only.err"
+: > "$fake_log"
+if PATH="$fake_bin:$PATH" \
+  FAKE_BIN="$fake_bin" \
+  FAKE_LOG="$fake_log" \
+  FAKE_REMOTE_HOME="$fake_remote_home" \
+  NOTION_ROOT_PAGE_ID="legacy-root" \
+  RUN_ID="standup-root-page-only" \
+  STANDUP_DATE="2026-08-06" \
+  STANDUP_SINCE_ISO="2026-08-05T00:00:00Z" \
+  STANDUP_UNTIL_ISO="2026-08-06T00:00:00Z" \
+  "$RUNNER" --sandbox fake-machine 2>"$root_page_only_stderr"; then
+  fail "NOTION_ROOT_PAGE_ID-only run unexpectedly succeeded"
+fi
+assert_file_contains "$root_page_only_stderr" "NOTION_STANDUP_PARENT_PAGE_ID"
+grep -F -q "amika " "$fake_log" && fail "NOTION_ROOT_PAGE_ID-only run invoked amika"
+
 runner_output="$(
   PATH="$fake_bin:$PATH" \
   FAKE_BIN="$fake_bin" \

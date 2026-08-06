@@ -45,8 +45,8 @@ done
 [[ -n "$sandbox" ]] || fail "missing sandbox machine id"
 [[ -s "$PROMPT_FILE" ]] || fail "missing prompt file: $PROMPT_FILE"
 
-notion_parent_page_id="${NOTION_STANDUP_PARENT_PAGE_ID:-${NOTION_ROOT_PAGE_ID:-}}"
-[[ -n "$notion_parent_page_id" ]] || fail "set NOTION_STANDUP_PARENT_PAGE_ID or NOTION_ROOT_PAGE_ID"
+notion_parent_page_id="${NOTION_STANDUP_PARENT_PAGE_ID:-}"
+[[ -n "$notion_parent_page_id" ]] || fail "set NOTION_STANDUP_PARENT_PAGE_ID"
 
 : "${RUN_ID:=standup-$(date -u +%Y%m%dT%H%M%SZ)}"
 : "${LOC_BIN:=loc}"
