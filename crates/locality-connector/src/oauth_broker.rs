@@ -12,6 +12,8 @@ pub struct OAuthBrokerStartResponse {
     pub client_id: String,
     pub authorization_url: String,
     pub redirect_uri: String,
+    #[serde(default)]
+    pub provider_redirect_uri: Option<String>,
     pub session: String,
     pub state: String,
     pub expires_in: u64,
@@ -69,7 +71,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{OAuthBrokerStart, OAuthBrokerToken};
+    use super::{OAuthBrokerStart, OAuthBrokerStartResponse, OAuthBrokerToken};
 
     #[test]
     fn start_request_carries_connector_and_redirect_uri() {
@@ -84,6 +86,27 @@ mod tests {
         assert_eq!(
             json["redirect_uri"],
             "http://localhost:8757/oauth/google-docs/callback"
+        );
+    }
+
+    #[test]
+    fn start_response_accepts_provider_redirect_uri() {
+        let payload = serde_json::json!({
+            "connector": "gmail",
+            "client_id": "client-id",
+            "authorization_url": "https://accounts.example.test/o/oauth2/v2/auth",
+            "redirect_uri": "http://localhost:8757/oauth/gmail/callback",
+            "provider_redirect_uri": "https://oauth.locality.test/v1/oauth/gmail/callback",
+            "session": "signed-session",
+            "state": "signed-session",
+            "expires_in": 600
+        });
+
+        let start: OAuthBrokerStartResponse =
+            serde_json::from_value(payload).expect("decode start response");
+        assert_eq!(
+            start.provider_redirect_uri.as_deref(),
+            Some("https://oauth.locality.test/v1/oauth/gmail/callback")
         );
     }
 
