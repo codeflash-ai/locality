@@ -59,3 +59,15 @@ Deployment controls to add before public launch:
 The broker accepts only configured loopback redirect URIs for Notion, Google
 Docs, and Gmail. The Locality CLI should use stable localhost callbacks so each
 provider integration can keep a small static redirect allowlist.
+
+## Provider Callback Boundary
+
+Production brokered OAuth uses a double redirect. Provider applications redirect
+to the broker over HTTPS. The broker verifies the signed OAuth state, checks that
+the session is for the callback connector, and then redirects back to the
+validated loopback client completion URI. The provider never sees
+`http://localhost` as its registered redirect URI.
+
+The localhost completion URI remains restricted to `localhost` and `127.0.0.1`
+allowlists. The broker callback response sets `Cache-Control: no-store` and
+`Referrer-Policy: no-referrer`.

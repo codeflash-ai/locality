@@ -11,22 +11,25 @@ only performs the confidential token exchange and refresh calls.
 ## Flow
 
 ```text
-loc CLI -> broker /start
-loc CLI <- authorization_url, state, signed session
-loc CLI -> browser -> provider OAuth consent
-provider -> localhost callback on the user's machine
-loc CLI -> broker /exchange with code, state, session, redirect_uri
-broker -> provider token endpoint with client_secret
+loc CLI -> broker /start with localhost client redirect_uri
+broker -> loc CLI with authorization_url, session, state, provider_redirect_uri
+browser -> provider consent using provider_redirect_uri=https://<broker>/v1/oauth/<connector>/callback
+provider -> broker HTTPS callback with code/state
+broker -> localhost client redirect_uri with code/state
+loc CLI -> broker /exchange with code, state, session, and localhost client redirect_uri
+broker -> provider token endpoint with provider_redirect_uri and client_secret
 broker -> loc CLI with access token and refresh handle
-```
 
-Refresh is similarly narrow:
-
-```text
+later:
 loc CLI -> broker /refresh with refresh_token_handle
 broker -> provider token endpoint with client_secret
 broker -> loc CLI with new access token and new refresh handle
 ```
+
+Provider OAuth apps should register only the broker HTTPS callback URLs, such as
+`https://oauth.locality.example/v1/oauth/notion/callback`. The localhost URL is
+only the desktop completion URL used after the broker receives and verifies the
+provider callback.
 
 The broker does not persist page content or tokens. In `handle` mode, it returns
 an encrypted opaque refresh handle instead of the raw provider refresh token.
