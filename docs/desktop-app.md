@@ -68,6 +68,10 @@ User-initiated launches and Dock/Finder reopens should present the main window.
 Launch-at-login and automatic updater relaunches should pass the desktop
 background launch argument so Locality resumes tray and Live Mode work without
 stealing focus.
+Only one Locality desktop process should run per logged-in session. A later
+foreground launch activates the existing process and presents its main window;
+a later background launch exits quietly without creating another Dock, taskbar,
+or menu-bar icon.
 
 Every app launch, including the launch after an updater relaunch, must validate
 the local runtime before normal desktop work. The backend should probe the bundled
