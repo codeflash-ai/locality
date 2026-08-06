@@ -147,6 +147,9 @@ that as app-data access. Upgrade repair may copy missing legacy virtual content
 from the old app-group cache into `~/.loc/content`, but that path is bounded to
 preserving existing cache bytes and does not make the group container a watched
 or active content root.
+Desktop single-instance coordination also stays outside the app group in the
+private UID-scoped `/tmp/locality-desktop-si-<uid>` directory. Its fixed, short
+prefix keeps the activation endpoint within Darwin's Unix-socket path limit.
 
 Find the local signing identity:
 

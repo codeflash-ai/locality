@@ -19,8 +19,6 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::HANDLE;
 
-#[cfg(target_os = "macos")]
-const MACOS_APP_GROUP_IDENTIFIER: &str = "C484HB7Q6S.group.ai.codeflash.locality";
 #[cfg(windows)]
 const WINDOWS_DESKTOP_SINGLE_INSTANCE_MUTEX: &str =
     r"Local\CodeFlash.Locality.Desktop.SingleInstance";
@@ -169,17 +167,15 @@ pub fn acquire_desktop_single_instance(
 
 #[cfg(target_os = "macos")]
 fn desktop_single_instance_coordination_dir() -> io::Result<PathBuf> {
-    let home = locality_platform::user_home().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "cannot resolve the user home for desktop coordination",
-        )
-    })?;
-    Ok(home
-        .join("Library")
-        .join("Group Containers")
-        .join(MACOS_APP_GROUP_IDENTIFIER)
-        .join("si"))
+    let effective_user_id = unsafe { libc::geteuid() };
+    Ok(macos_desktop_single_instance_coordination_dir(
+        effective_user_id,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_desktop_single_instance_coordination_dir(effective_user_id: libc::uid_t) -> PathBuf {
+    Path::new("/tmp").join(format!("locality-desktop-si-{effective_user_id}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -455,16 +451,26 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_coordination_endpoint_uses_the_per_user_app_group() {
-        let home = locality_platform::user_home().expect("user home");
+    fn macos_coordination_endpoint_is_outside_the_app_group_and_bounded() {
+        use std::os::unix::ffi::OsStrExt;
+
         let path = super::desktop_single_instance_coordination_dir()
             .expect("macOS coordination directory");
+        let effective_user_id = unsafe { libc::geteuid() };
 
-        assert!(path.starts_with(&home));
-        assert!(
-            path.ends_with("Library/Group Containers/C484HB7Q6S.group.ai.codeflash.locality/si")
+        assert_eq!(
+            path,
+            std::path::PathBuf::from(format!("/tmp/locality-desktop-si-{effective_user_id}"))
         );
-        assert!(!path.starts_with("/tmp"));
+
+        let longest_socket_path =
+            super::macos_desktop_single_instance_coordination_dir(libc::uid_t::MAX)
+                .join("activate.sock");
+        assert_eq!(
+            longest_socket_path,
+            std::path::PathBuf::from("/tmp/locality-desktop-si-4294967295/activate.sock")
+        );
+        assert!(longest_socket_path.as_os_str().as_bytes().len() <= 103);
     }
 
     #[cfg(windows)]
