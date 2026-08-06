@@ -1051,6 +1051,11 @@ SQL
 }
 
 build_live_binaries() {
+  local default_loc_bin="$live_connector_repo_root/target/debug/loc"
+  local default_localityd_bin="$live_connector_repo_root/target/debug/localityd"
+  local default_fuse_bin="$live_connector_repo_root/target/debug/locality-fuse"
+  local should_build=0
+
   if [[ $# -eq 0 ]]; then
     loc_bin="$(_live_loc_bin)"
     localityd_bin="$(_live_localityd_bin)"
@@ -1063,9 +1068,19 @@ build_live_binaries() {
     live_fail "build_live_binaries requires no arguments or loc, localityd, and FUSE binary paths"
     return 1
   fi
+
+  if [[ "$loc_bin" == "$default_loc_bin" \
+      && "$localityd_bin" == "$default_localityd_bin" \
+      && "$fuse_bin" == "$default_fuse_bin" ]]; then
+    should_build=1
+  fi
   if [[ ! -x "$loc_bin" || ! -x "$localityd_bin" || ! -x "$fuse_bin" ]]; then
+    should_build=1
+  fi
+  if [[ "$should_build" == "1" ]]; then
     (cd "$live_connector_repo_root" && cargo build -p loc-cli -p localityd -p locality-fuse)
   fi
+
   loc_bin="$(_live_loc_bin)"
   localityd_bin="$(_live_localityd_bin)"
   fuse_bin="$(_live_fuse_bin)"

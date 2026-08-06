@@ -851,13 +851,23 @@ where
                 .iter()
                 .map(|entry| entry.remote_id.clone())
                 .collect::<BTreeSet<_>>();
-            crate::virtual_fs::prune_stale_virtual_children(
-                store,
-                &mount.mount_id,
-                &target.parent_path,
-                &returned_remote_ids,
-            )
-            .map_err(PullError::Store)?;
+            if plain_files_directory_pull {
+                prune_stale_plain_directory_children(
+                    store,
+                    mount,
+                    &target.parent_path,
+                    &returned_remote_ids,
+                    state_root,
+                )?;
+            } else {
+                crate::virtual_fs::prune_stale_virtual_children(
+                    store,
+                    &mount.mount_id,
+                    &target.parent_path,
+                    &returned_remote_ids,
+                )
+                .map_err(PullError::Store)?;
+            }
         }
         enumerated = result.entries.len();
         let remote_move_plan = if plain_files_directory_pull {
@@ -1038,6 +1048,155 @@ where
     }))
 }
 
+fn prune_stale_plain_directory_children<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    parent_path: &Path,
+    returned_remote_ids: &BTreeSet<RemoteId>,
+    state_root: Option<&Path>,
+) -> Result<usize, PullError>
+where
+    S: EntityRepository + ShadowRepository,
+{
+    let entities = store
+        .list_entities(&mount.mount_id)
+        .map_err(PullError::Store)?;
+    let mut delete_ids = BTreeSet::new();
+    let mut projection_removals = Vec::new();
+    for entity in entities.iter().filter(|entity| {
+        plain_entity_listing_parent_path(entity) == parent_path
+            && !returned_remote_ids.contains(&entity.remote_id)
+    }) {
+        let subtree = stale_plain_child_subtree(&entities, entity);
+        if subtree.iter().any(|entity| {
+            matches!(
+                entity.hydration,
+                HydrationState::Dirty | HydrationState::Conflicted
+            )
+        }) {
+            continue;
+        }
+        if !stale_plain_child_subtree_can_be_removed(store, mount, &subtree, state_root)? {
+            continue;
+        }
+        for entity in subtree {
+            projection_removals.push((
+                projection_content_path(state_root, mount, &entity.path)?,
+                entity.kind.clone(),
+            ));
+            delete_ids.insert(entity.remote_id.clone());
+        }
+    }
+
+    projection_removals.sort_by(|(left_path, _), (right_path, _)| {
+        right_path
+            .components()
+            .count()
+            .cmp(&left_path.components().count())
+            .then_with(|| right_path.cmp(left_path))
+    });
+    projection_removals.dedup();
+    for (path, kind) in projection_removals {
+        remove_clean_entity_projection(&path, &kind)?;
+    }
+
+    let pruned = delete_ids.len();
+    for remote_id in delete_ids {
+        store
+            .delete_entity(&mount.mount_id, &remote_id)
+            .map_err(PullError::Store)?;
+    }
+    Ok(pruned)
+}
+
+fn stale_plain_child_subtree_can_be_removed<S>(
+    store: &S,
+    mount: &MountConfig,
+    subtree: &[&EntityRecord],
+    state_root: Option<&Path>,
+) -> Result<bool, PullError>
+where
+    S: ShadowRepository,
+{
+    for entity in subtree
+        .iter()
+        .filter(|entity| entity.kind == EntityKind::Page)
+    {
+        let path = projection_content_path(state_root, mount, &entity.path)?;
+        if !can_replace_file(store, mount, entity, &path)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn stale_plain_child_subtree<'a>(
+    entities: &'a [EntityRecord],
+    child: &EntityRecord,
+) -> Vec<&'a EntityRecord> {
+    let subtree_root = plain_entity_subtree_root_path(child);
+    entities
+        .iter()
+        .filter(|entity| {
+            entity.remote_id == child.remote_id || entity.path.starts_with(&subtree_root)
+        })
+        .collect()
+}
+
+fn plain_entity_listing_parent_path(entity: &EntityRecord) -> PathBuf {
+    match entity.kind {
+        EntityKind::Page if is_page_document_path(&entity.path) => {
+            page_listing_parent_path(&entity.path)
+        }
+        EntityKind::Database
+        | EntityKind::Directory
+        | EntityKind::Asset
+        | EntityKind::Unknown(_)
+        | EntityKind::Page => entity
+            .path
+            .parent()
+            .filter(|parent| *parent != Path::new(""))
+            .map(Path::to_path_buf)
+            .unwrap_or_default(),
+    }
+}
+
+fn plain_entity_subtree_root_path(entity: &EntityRecord) -> PathBuf {
+    match entity.kind {
+        EntityKind::Page if is_page_document_path(&entity.path) => {
+            page_container_path(&entity.path)
+        }
+        EntityKind::Database
+        | EntityKind::Directory
+        | EntityKind::Asset
+        | EntityKind::Unknown(_)
+        | EntityKind::Page => entity.path.clone(),
+    }
+}
+
+fn remove_clean_entity_projection(path: &Path, kind: &EntityKind) -> Result<(), PullError> {
+    match kind {
+        EntityKind::Directory | EntityKind::Database => match std::fs::remove_dir(path) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(PullError::WriteFile {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            }),
+        },
+        EntityKind::Page | EntityKind::Asset | EntityKind::Unknown(_) => {
+            remove_clean_projection(path)
+        }
+    }
+}
+
 fn should_hydrate_database_directory_rows(row_count: usize, limit: isize) -> bool {
     limit >= 0 && row_count <= limit as usize
 }
@@ -1120,13 +1279,13 @@ where
                 .iter()
                 .map(|entry| entry.remote_id.clone())
                 .collect::<BTreeSet<_>>();
-            crate::virtual_fs::prune_stale_virtual_children(
+            prune_stale_plain_directory_children(
                 store,
-                &mount.mount_id,
+                mount,
                 &directory.path,
                 &returned_remote_ids,
-            )
-            .map_err(PullError::Store)?;
+                state_root,
+            )?;
         }
         report.enumerated += result.entries.len();
         let remote_move_plan = remote_move_plan(store, mount, &result.entries, state_root)?;
@@ -3317,6 +3476,131 @@ mod tests {
                 .get_entity(&fixture.mount_id, &new_thread_id)
                 .expect("new thread lookup")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn pull_plain_gmail_draft_directory_removes_clean_stale_draft_projection() {
+        let fixture = PullFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(fixture.mount_id.clone(), "gmail", fixture.root.clone());
+        store.save_mount(mount.clone()).expect("save mount");
+        let draft_folder_id = RemoteId::new("gmail-folder:draft");
+        let stale_draft_id = RemoteId::new("gmail-draft:draft-stale");
+        let current_draft_id = RemoteId::new("gmail-draft:draft-current");
+        let stale_path = PathBuf::from("draft/stale.md");
+        let current_path = PathBuf::from("draft/current.md");
+        let stale_frontmatter = gmail_draft_frontmatter(&stale_draft_id);
+        let current_frontmatter = gmail_draft_frontmatter(&current_draft_id);
+        let stale_body = "stale remote draft\n";
+        let current_body = "current remote draft\n";
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                draft_folder_id.clone(),
+                EntityKind::Directory,
+                "draft",
+                "draft",
+            ))
+            .expect("save draft folder");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    fixture.mount_id.clone(),
+                    stale_draft_id.clone(),
+                    EntityKind::Page,
+                    "Stale Draft",
+                    &stale_path,
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save stale draft");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    fixture.mount_id.clone(),
+                    current_draft_id.clone(),
+                    EntityKind::Page,
+                    "Current Draft",
+                    &current_path,
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save current draft");
+        store
+            .save_shadow(
+                &fixture.mount_id,
+                shadow_document(&stale_draft_id, &stale_frontmatter, stale_body),
+            )
+            .expect("save stale shadow");
+        store
+            .save_shadow(
+                &fixture.mount_id,
+                shadow_document(&current_draft_id, &current_frontmatter, current_body),
+            )
+            .expect("save current shadow");
+        let stale_absolute = fixture.root.join(&stale_path);
+        let current_absolute = fixture.root.join(&current_path);
+        std::fs::create_dir_all(fixture.root.join("draft")).expect("create draft directory");
+        write_atomic(
+            &stale_absolute,
+            render_canonical_markdown(&CanonicalDocument::new(
+                stale_frontmatter,
+                stale_body.to_string(),
+            )),
+        )
+        .expect("write stale draft projection");
+        write_atomic(
+            &current_absolute,
+            render_canonical_markdown(&CanonicalDocument::new(
+                current_frontmatter,
+                current_body.to_string(),
+            )),
+        )
+        .expect("write current draft projection");
+        let source = FakePullSource::new(Vec::new(), Vec::new()).with_children(
+            &draft_folder_id,
+            vec![tree_entry(
+                &fixture.mount_id,
+                &current_draft_id,
+                "Current Draft",
+                "draft/current.md",
+                HydrationState::Stub,
+            )],
+        );
+
+        let report = super::pull_virtual_directory_path(
+            &mut store,
+            &source,
+            &mount,
+            Path::new("draft"),
+            fixture.root.join("draft"),
+            None,
+        )
+        .expect("pull draft directory")
+        .expect("draft directory report");
+
+        assert!(report.ok);
+        assert_eq!(report.enumerated, 1);
+        assert!(
+            store
+                .get_entity(&fixture.mount_id, &stale_draft_id)
+                .expect("stale draft lookup")
+                .is_none()
+        );
+        assert!(
+            !stale_absolute.exists(),
+            "stale draft projection should be removed"
+        );
+        assert!(
+            store
+                .get_entity(&fixture.mount_id, &current_draft_id)
+                .expect("current draft lookup")
+                .is_some()
+        );
+        assert!(
+            current_absolute.exists(),
+            "current draft projection should remain"
         );
     }
 

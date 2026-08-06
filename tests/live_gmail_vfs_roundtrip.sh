@@ -59,6 +59,10 @@ remote_draft_send_diff_report="$tmp_root/remote-draft-send-diff.json"
 remote_draft_send_push_report="$tmp_root/remote-draft-send-push.json"
 remote_sent_list_report="$tmp_root/remote-sent-list.json"
 remote_sent_get_report="$tmp_root/remote-sent-message.json"
+stale_draft_push_report="$tmp_root/stale-draft-push.json"
+stale_draft_pull_report="$tmp_root/stale-draft-pull.json"
+stale_draft_send_report="$tmp_root/stale-draft-send.json"
+stale_draft_prune_pull_report="$tmp_root/stale-draft-prune-pull.json"
 drafts_list_report="$tmp_root/gmail-drafts.json"
 draft_get_report="$tmp_root/gmail-draft.json"
 credential_path=""
@@ -227,6 +231,21 @@ find_marker_under_draft() {
 
 wait_for_marker_under_draft() {
   find_marker_under_draft "$@" >/dev/null
+}
+
+wait_for_path_absent() {
+  local path="$1"
+  local label="$2"
+  local attempts="${LOCALITY_GMAIL_LIVE_MARKER_WAIT_ATTEMPTS:-120}"
+  local attempt
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if [[ ! -e "$path" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  live_fail "$label remained visible at $path"
 }
 
 wait_for_marker_under_sent() {
@@ -491,6 +510,45 @@ wait_for_gmail_draft_content() {
     sleep 0.25
   done
   live_fail "updated Gmail draft content was not visible through the drafts API"
+}
+
+wait_for_gmail_draft_absent() {
+  local searched_draft_id="$1"
+  local attempts="${LOCALITY_GMAIL_LIVE_API_WAIT_ATTEMPTS:-120}"
+  local attempt
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if ! get_gmail_draft_full "$searched_draft_id" "$draft_get_report"; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  live_fail "sent Gmail draft was still visible through the drafts API"
+}
+
+send_gmail_draft() {
+  local searched_draft_id="$1"
+  local output_path="$2"
+  local request_body="$tmp_root/gmail-draft-send-body.json"
+  local access_token
+
+  access_token="$(gmail_access_token required)"
+  python3 - "$searched_draft_id" >"$request_body" <<'PY'
+import json
+import sys
+
+print(json.dumps({"id": sys.argv[1]}))
+PY
+  if curl -fsS -X POST "https://gmail.googleapis.com/gmail/v1/users/me/drafts/send" \
+    -H "Authorization: Bearer $access_token" \
+    -H "Content-Type: application/json" \
+    --data-binary "@$request_body" \
+    >"$output_path" 2>>"$command_log"; then
+    unset access_token
+    return 0
+  fi
+  unset access_token
+  return 1
 }
 
 find_gmail_sent_message_id_for_subject_body() {
@@ -954,6 +1012,76 @@ if [[ "${LOCALITY_LIVE_GMAIL_SEND:-0}" == "1" ]]; then
   step="verifying Gmail direct send marker under sent"
   wait_for_marker_under_sent "$send_marker"
 
+  stale_subject="Locality live Gmail stale remote draft $unique"
+  stale_marker="Locality live Gmail stale remote draft marker $unique"
+  stale_draft_path="$mount_root/draft/locality-live-gmail-stale-draft-$unique.md"
+
+  step="creating Gmail stale remote draft prune fixture through Linux FUSE"
+  draft_deleted=0
+  draft_cleanup_needed=1
+  subject="$stale_subject"
+  marker="$stale_marker"
+  printf -- '---\nto:\n  - "%s"\nsubject: "%s"\n---\n%s\n' \
+    "$LOCALITY_GMAIL_LIVE_TO_EMAIL" \
+    "$stale_subject" \
+    "$stale_marker" >"$stale_draft_path"
+
+  step="pushing Gmail stale remote draft prune fixture"
+  LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$stale_draft_path" \
+    >"$stale_draft_push_report" 2>>"$command_log"
+  assert_json_ok "$stale_draft_push_report" "Gmail stale remote draft create push report"
+  stale_created_id="$(json_field "$stale_draft_push_report" "changed_remote_ids.0" 2>/dev/null || true)"
+  if ! classify_created_gmail_remote_id "$stale_created_id"; then
+    live_fail "Gmail stale remote draft create push report produced an empty message id"
+  fi
+  if [[ -z "$draft_id" ]]; then
+    resolve_created_gmail_draft_id required
+  fi
+  stale_draft_id="$draft_id"
+
+  step="pulling Gmail draft directory after stale remote draft create"
+  LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root/draft" \
+    >"$stale_draft_pull_report" 2>>"$command_log"
+  assert_json_ok "$stale_draft_pull_report" "Gmail stale remote draft pull report"
+
+  step="finding projected Gmail stale remote draft"
+  stale_projected_draft_path="$(find_marker_under_draft "$stale_marker" "$raw_message_id" "$stale_draft_id")"
+  if [[ -z "$stale_projected_draft_path" ]]; then
+    live_fail "created Gmail stale remote draft file was not visible under draft/"
+  fi
+
+  step="sending Gmail stale remote draft outside the local draft folder"
+  if ! send_gmail_draft "$stale_draft_id" "$stale_draft_send_report"; then
+    live_fail "failed to send Gmail stale remote draft through drafts API"
+  fi
+  stale_sent_message_id="$(json_field "$stale_draft_send_report" "id" 2>/dev/null || true)"
+  if [[ -n "$stale_sent_message_id" ]]; then
+    remote_sent_message_id="$stale_sent_message_id"
+  fi
+  draft_deleted=1
+  draft_cleanup_needed=0
+  draft_id=""
+  raw_message_id=""
+
+  step="waiting for Gmail stale remote draft to leave drafts API"
+  wait_for_gmail_draft_absent "$stale_draft_id"
+
+  step="pulling Gmail draft directory after stale remote draft was sent"
+  LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root/draft" \
+    >"$stale_draft_prune_pull_report" 2>>"$command_log"
+  assert_json_ok "$stale_draft_prune_pull_report" "Gmail stale remote draft prune pull report"
+
+  step="verifying sent Gmail stale remote draft was pruned from draft"
+  wait_for_path_absent "$stale_projected_draft_path" "sent Gmail stale remote draft"
+  if grep -R -F -q -- "$stale_marker" "$mount_root/draft" 2>/dev/null; then
+    live_fail "sent Gmail stale remote draft marker remained visible under draft/"
+  fi
+
+  step="trashing sent Gmail stale remote draft scratch message"
+  trash_gmail_message "$remote_sent_message_id" best_effort >/dev/null 2>&1 || \
+    echo "warning: Gmail OAuth scope did not allow trashing sent stale-draft scratch message" >&2
+  remote_sent_message_id=""
+
   remote_subject="Locality live Gmail remote draft $unique"
   remote_marker="Locality live Gmail remote draft marker $unique"
   remote_updated_subject="Locality live Gmail remote draft updated $unique"
@@ -1042,7 +1170,7 @@ if [[ "${LOCALITY_LIVE_GMAIL_SEND:-0}" == "1" ]]; then
     echo "warning: Gmail OAuth scope did not allow trashing sent scratch message" >&2
   remote_sent_message_id=""
 
-  echo "live Gmail API, CLI, daemon, and Linux FUSE draft, direct-send, and remote draft edit/send checks passed"
+  echo "live Gmail API, CLI, daemon, and Linux FUSE draft, direct-send, stale draft prune, and remote draft edit/send checks passed"
 else
   echo "skip: set LOCALITY_LIVE_GMAIL_SEND=1 to run the live Gmail direct-send and remote draft edit/send checks; this sends real email"
   echo "live Gmail API, CLI, daemon, and Linux FUSE draft checks passed"
