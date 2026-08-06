@@ -72,9 +72,13 @@ test "${1:-}" = "sandbox" || { echo "expected amika sandbox" >&2; exit 1; }
 test "${2:-}" = "ssh" || { echo "expected amika sandbox ssh" >&2; exit 1; }
 test "${3:-}" = "fake-machine" || { echo "expected fake-machine sandbox" >&2; exit 1; }
 shift 3
-test "${1:-}" = "--" || { echo "expected -- before remote command" >&2; exit 1; }
-shift
-test "$#" -eq 1 || { echo "expected single remote shell command" >&2; exit 1; }
+if [[ "${1:-}" = "--" ]]; then
+  shift
+fi
+test "${1:-}" = "bash" || { echo "expected bash remote argv" >&2; exit 1; }
+test "${2:-}" = "-lc" || { echo "expected -lc remote argv" >&2; exit 1; }
+test "$#" -eq 3 || { echo "expected bash -lc and one remote command argument" >&2; exit 1; }
+shift 2
 HOME="$FAKE_REMOTE_HOME" PATH="$FAKE_BIN:$PATH" bash -lc "$1"
 FAKE_AMIKA
 

@@ -390,6 +390,5 @@ remote_command="printf %s $(shell_quote "$remote_script_b64") | base64 -d | bash
 for arg in "${remote_args[@]}"; do
   remote_command+=" $(shell_quote "$arg")"
 done
-remote_shell_command="bash -lc $(shell_quote "$remote_command")"
 
-amika_sandbox_ssh "$sandbox" -- "$remote_shell_command"
+amika_sandbox_ssh "$sandbox" -- bash -lc "$remote_command"
