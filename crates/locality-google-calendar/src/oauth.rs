@@ -2,6 +2,9 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::OnceLock;
 
+use locality_auth_core::oauth::{
+    GOOGLE_CALENDAR_LOCAL_BROKER_SCOPES, GOOGLE_CALENDAR_REQUIRED_API_SCOPES, OAuthConnector,
+};
 use locality_connector::ConnectorCapabilities;
 use locality_connector::oauth_broker::{
     OAuthBrokerCodeExchange, OAuthBrokerRefresh, OAuthBrokerStart, OAuthBrokerStartResponse,
@@ -12,19 +15,13 @@ use reqwest::blocking::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const GOOGLE_CALENDAR_CONNECTOR_ID: &str = "google-calendar";
+pub const GOOGLE_CALENDAR_CONNECTOR_ID: &str = OAuthConnector::GoogleCalendar.as_str();
 pub const DEFAULT_GOOGLE_CALENDAR_OAUTH_BROKER_URL: &str =
     "https://afs-oauth-broker.saurabh-b07.workers.dev";
 pub const DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI: &str =
-    "http://localhost:8757/oauth/google-calendar/callback";
-pub const GOOGLE_CALENDAR_OAUTH_SCOPES: &[&str] = &[
-    "openid",
-    "email",
-    "profile",
-    "https://www.googleapis.com/auth/calendar.events",
-];
-const REQUIRED_GOOGLE_CALENDAR_API_SCOPES: &[&str] =
-    &["https://www.googleapis.com/auth/calendar.events"];
+    OAuthConnector::GoogleCalendar.default_local_callback_uri();
+pub const GOOGLE_CALENDAR_OAUTH_SCOPES: &[&str] = GOOGLE_CALENDAR_LOCAL_BROKER_SCOPES;
+const REQUIRED_GOOGLE_CALENDAR_API_SCOPES: &[&str] = GOOGLE_CALENDAR_REQUIRED_API_SCOPES;
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 

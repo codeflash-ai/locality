@@ -2398,6 +2398,7 @@ name = "locality-gmail"
 version = "0.3.7"
 dependencies = [
  "base64 0.22.1",
+ "locality-auth-core",
  "locality-connector",
  "locality-core",
  "reqwest",
@@ -2412,6 +2413,7 @@ name = "locality-google-calendar"
 version = "0.3.7"
 dependencies = [
  "chrono",
+ "locality-auth-core",
  "locality-connector",
  "locality-core",
  "reqwest",
@@ -2425,6 +2427,7 @@ dependencies = [
 name = "locality-google-docs"
 version = "0.3.7"
 dependencies = [
+ "locality-auth-core",
  "locality-connector",
  "locality-core",
  "reqwest",
@@ -2465,6 +2468,7 @@ name = "locality-notion"
 version = "0.3.7"
 dependencies = [
  "base64 0.22.1",
+ "locality-auth-core",
  "locality-connector",
  "locality-core",
  "mime_guess",
@@ -2504,6 +2508,7 @@ name = "locality-slack"
 version = "0.3.7"
 dependencies = [
  "chrono",
+ "locality-auth-core",
  "locality-connector",
  "locality-core",
  "locality-protocol",

@@ -1,6 +1,7 @@
 use std::fmt;
 use std::sync::OnceLock;
 
+use locality_auth_core::oauth::{GOOGLE_DOCS_LOCAL_BROKER_SCOPES, OAuthConnector};
 use locality_connector::ConnectorCapabilities;
 use locality_connector::oauth_broker::{
     OAuthBrokerCodeExchange, OAuthBrokerRefresh, OAuthBrokerStart, OAuthBrokerStartResponse,
@@ -11,21 +12,14 @@ use reqwest::blocking::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const GOOGLE_DOCS_CONNECTOR_ID: &str = "google-docs";
+pub const GOOGLE_DOCS_CONNECTOR_ID: &str = OAuthConnector::GoogleDocs.as_str();
 // Cloudflare worker name is still `afs-oauth-broker`; the workers.dev hostname
 // predates the Locality product rename until auth.locality.dev is deployed.
 pub const DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL: &str =
     "https://afs-oauth-broker.saurabh-b07.workers.dev";
 pub const DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI: &str =
-    "http://localhost:8757/oauth/google-docs/callback";
-pub const GOOGLE_DOCS_OAUTH_SCOPES: &[&str] = &[
-    "openid",
-    "email",
-    "profile",
-    "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/drive.metadata",
-];
+    OAuthConnector::GoogleDocs.default_local_callback_uri();
+pub const GOOGLE_DOCS_OAUTH_SCOPES: &[&str] = GOOGLE_DOCS_LOCAL_BROKER_SCOPES;
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 

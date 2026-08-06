@@ -2,6 +2,10 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::OnceLock;
 
+use locality_auth_core::oauth::{
+    GMAIL_FULL_MAILBOX_SCOPE as AUTH_CORE_GMAIL_FULL_MAILBOX_SCOPE, GMAIL_LOCAL_BROKER_SCOPES,
+    GMAIL_REQUIRED_API_SCOPES, OAuthConnector,
+};
 use locality_connector::ConnectorCapabilities;
 use locality_connector::oauth_broker::{
     OAuthBrokerCodeExchange, OAuthBrokerRefresh, OAuthBrokerStart, OAuthBrokerStartResponse,
@@ -12,21 +16,13 @@ use reqwest::blocking::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const GMAIL_CONNECTOR_ID: &str = "gmail";
+pub const GMAIL_CONNECTOR_ID: &str = OAuthConnector::Gmail.as_str();
 pub const DEFAULT_GMAIL_OAUTH_BROKER_URL: &str = "https://afs-oauth-broker.saurabh-b07.workers.dev";
-pub const DEFAULT_GMAIL_OAUTH_REDIRECT_URI: &str = "http://localhost:8757/oauth/gmail/callback";
-pub const GMAIL_OAUTH_SCOPES: &[&str] = &[
-    "openid",
-    "email",
-    "profile",
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.compose",
-];
-const REQUIRED_GMAIL_API_SCOPES: &[&str] = &[
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.compose",
-];
-pub const GMAIL_FULL_MAILBOX_SCOPE: &str = "https://mail.google.com/";
+pub const DEFAULT_GMAIL_OAUTH_REDIRECT_URI: &str =
+    OAuthConnector::Gmail.default_local_callback_uri();
+pub const GMAIL_OAUTH_SCOPES: &[&str] = GMAIL_LOCAL_BROKER_SCOPES;
+const REQUIRED_GMAIL_API_SCOPES: &[&str] = GMAIL_REQUIRED_API_SCOPES;
+pub const GMAIL_FULL_MAILBOX_SCOPE: &str = AUTH_CORE_GMAIL_FULL_MAILBOX_SCOPE;
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 

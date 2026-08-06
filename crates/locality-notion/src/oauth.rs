@@ -7,6 +7,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use locality_auth_core::oauth::OAuthConnector;
 use locality_core::{LocalityError, LocalityResult};
 use reqwest::{Url, blocking::Client};
 use serde::de::DeserializeOwned;
@@ -20,6 +21,9 @@ pub const DEFAULT_NOTION_OAUTH_AUTHORIZE_URL: &str = "https://api.notion.com/v1/
 // predates the Locality product rename until auth.locality.dev is deployed.
 pub const DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL: &str =
     "https://afs-oauth-broker.saurabh-b07.workers.dev";
+pub const NOTION_CONNECTOR_ID: &str = OAuthConnector::Notion.as_str();
+pub const DEFAULT_NOTION_OAUTH_REDIRECT_URI: &str =
+    OAuthConnector::Notion.default_local_callback_uri();
 
 const REDACTED: &str = "<redacted>";
 const NOTION_OAUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
