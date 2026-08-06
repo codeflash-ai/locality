@@ -303,7 +303,7 @@ if [[ "$expected_cwd" = */standup-codex-fail ]]; then
 fi
 printf '# Standup\n' > "$STANDUP_ARTIFACT_FILE"
 printf '# Trace\n' > "$STANDUP_TRACE_FILE"
-printf '{"type":"turn.completed","payload":"codex-secret-payload","message":"mounted evidence should not persist"}\n'
+printf '{"type":"turn.completed","event":"secret mounted evidence","payload":"codex-secret-payload","message":"mounted evidence should not persist"}\n'
 FAKE_CODEX
 
 chmod +x "${fake_bin}/amika" "${fake_bin}/loc" "${fake_bin}/git" "${fake_bin}/codex"
@@ -480,6 +480,7 @@ assert_file_contains "$evidence_dir/fake-codex.log" "codex exec"
 assert_file_contains "$evidence_dir/fake-codex.log" "-C ${run_dir_q}"
 test -s "$codex_events_file" || fail "missing redacted codex events"
 assert_file_contains "$codex_events_file" "turn.completed"
+assert_file_not_contains "$codex_events_file" "secret mounted evidence"
 assert_file_not_contains "$codex_events_file" "codex-secret-payload"
 assert_file_not_contains "$codex_events_file" "mounted evidence should not persist"
 

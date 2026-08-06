@@ -444,7 +444,7 @@ redact_codex_events() {
 import json
 import sys
 
-safe_keys = ("type", "timestamp", "event", "status", "exit_code")
+safe_keys = ("type", "timestamp", "status", "exit_code")
 safe_value_types = (str, int, float, bool, type(None))
 
 with open(sys.argv[1], "w", encoding="utf-8") as output:
