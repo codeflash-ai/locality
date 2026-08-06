@@ -268,8 +268,9 @@ mod tests {
     use locality_connector::oauth_broker::OAuthBrokerToken;
 
     use super::{
-        GMAIL_CONNECTOR_ID, GMAIL_FULL_MAILBOX_SCOPE, GMAIL_OAUTH_SCOPES, GmailOAuthScopeError,
-        StoredGmailCredential, gmail_capabilities_json, validate_gmail_oauth_scopes,
+        DEFAULT_GMAIL_OAUTH_REDIRECT_URI, GMAIL_CONNECTOR_ID, GMAIL_FULL_MAILBOX_SCOPE,
+        GMAIL_OAUTH_SCOPES, GmailOAuthScopeError, StoredGmailCredential, gmail_capabilities_json,
+        validate_gmail_oauth_scopes,
     };
 
     fn gmail_scopes() -> Vec<String> {
@@ -280,13 +281,23 @@ mod tests {
     }
 
     #[test]
-    fn oauth_scopes_cover_read_and_compose_without_full_mailbox_scope() {
-        assert!(GMAIL_OAUTH_SCOPES.contains(&"openid"));
-        assert!(GMAIL_OAUTH_SCOPES.contains(&"email"));
-        assert!(GMAIL_OAUTH_SCOPES.contains(&"profile"));
-        assert!(GMAIL_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/gmail.readonly"));
-        assert!(GMAIL_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/gmail.compose"));
-        assert!(!GMAIL_OAUTH_SCOPES.contains(&"https://mail.google.com/"));
+    fn oauth_constants_match_gmail_broker_contract() {
+        assert_eq!(GMAIL_CONNECTOR_ID, "gmail");
+        assert_eq!(
+            DEFAULT_GMAIL_OAUTH_REDIRECT_URI,
+            "http://localhost:8757/oauth/gmail/callback"
+        );
+        assert_eq!(
+            GMAIL_OAUTH_SCOPES,
+            &[
+                "openid",
+                "email",
+                "profile",
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/gmail.compose",
+            ]
+        );
+        assert_eq!(GMAIL_FULL_MAILBOX_SCOPE, "https://mail.google.com/");
     }
 
     #[test]

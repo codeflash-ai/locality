@@ -461,11 +461,21 @@ mod tests {
     use reqwest::Url;
 
     use super::{
-        DEFAULT_NOTION_OAUTH_AUTHORIZE_URL, HttpNotionOAuthBrokerClient, HttpNotionOAuthClient,
+        DEFAULT_NOTION_OAUTH_AUTHORIZE_URL, DEFAULT_NOTION_OAUTH_REDIRECT_URI,
+        HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NOTION_CONNECTOR_ID,
         NotionOAuthBrokerCodeExchange, NotionOAuthBrokerRefresh, NotionOAuthBrokerStartResponse,
         NotionOAuthCodeExchange, NotionOAuthRefresh, NotionOAuthToken, StoredNotionCredential,
         normalize_notion_authorization_url,
     };
+
+    #[test]
+    fn oauth_constants_match_notion_broker_contract() {
+        assert_eq!(NOTION_CONNECTOR_ID, "notion");
+        assert_eq!(
+            DEFAULT_NOTION_OAUTH_REDIRECT_URI,
+            "http://localhost:8757/oauth/notion/callback"
+        );
+    }
 
     #[test]
     fn broker_start_response_normalizes_missing_response_type() {

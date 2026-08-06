@@ -219,18 +219,28 @@ mod tests {
     use locality_connector::oauth_broker::OAuthBrokerToken;
 
     use super::{
-        GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, StoredGoogleDocsCredential,
-        google_docs_capabilities_json,
+        DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI, GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES,
+        StoredGoogleDocsCredential, google_docs_capabilities_json,
     };
 
     #[test]
-    fn oauth_scopes_include_google_docs_and_workspace_metadata_access() {
-        assert!(GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/documents"));
-        assert!(!GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive"));
-        assert!(
-            GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive.metadata")
+    fn oauth_constants_match_google_docs_broker_contract() {
+        assert_eq!(GOOGLE_DOCS_CONNECTOR_ID, "google-docs");
+        assert_eq!(
+            DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI,
+            "http://localhost:8757/oauth/google-docs/callback"
         );
-        assert!(GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive.file"));
+        assert_eq!(
+            GOOGLE_DOCS_OAUTH_SCOPES,
+            &[
+                "openid",
+                "email",
+                "profile",
+                "https://www.googleapis.com/auth/documents",
+                "https://www.googleapis.com/auth/drive.file",
+                "https://www.googleapis.com/auth/drive.metadata",
+            ]
+        );
     }
 
     #[test]
