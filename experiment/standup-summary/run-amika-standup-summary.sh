@@ -143,6 +143,9 @@ notion_parent_dir="$mount_root/notion"
 locality_repo_dir="${locality_repo_dir_arg:-$HOME/workspace/locality}"
 locality_internal_repo_dir="${locality_internal_repo_dir_arg:-$HOME/workspace/locality-internal}"
 
+if [[ -e "$run_dir" ]]; then
+  fail "run directory already exists for RUN_ID: $run_id"
+fi
 mkdir -p "$mount_root" "$evidence_dir" "$run_dir"
 printf '%s' "$prompt_b64_arg" | base64 -d > "$prompt_file"
 
@@ -278,11 +281,10 @@ find "$mount_root" -type f \( \
 \) -print | sort > "$context_inventory"
 
 ensure_repo() {
-  local slug="$1"
-  local dir="$2"
-  local label
+  local label="$1"
+  local slug="$2"
+  local dir="$3"
   local log_ref
-  label="$(basename "$dir")"
   if [[ -d "$dir" ]] && git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     :
   else
@@ -301,6 +303,9 @@ ensure_repo() {
       git clone "https://github.com/$slug.git" "$dir"
     fi
   fi
+
+  validate_repo_origin "$label" "$slug" "$dir"
+  require_clean_repo "$label" "$slug" "$dir"
   git -C "$dir" fetch --prune origin
   if log_ref="$(git -C "$dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"; then
     printf 'ref\t%s\n' "$log_ref" > "$evidence_dir/git-log-$label-ref.txt"
@@ -313,22 +318,110 @@ ensure_repo() {
   fi
 }
 
-ensure_repo codeflash-ai/locality "$locality_repo_dir"
-ensure_repo codeflash-ai/locality-internal "$locality_internal_repo_dir"
+origin_has_embedded_credentials() {
+  local origin="$1"
+  local authority
+  case "$origin" in
+    http://*@*|https://*@*)
+      return 0
+      ;;
+    ssh://*@*)
+      authority="${origin#ssh://}"
+      authority="${authority%%/*}"
+      [[ "$authority" == "git@github.com" ]] && return 1
+      [[ "$authority" == *@* ]] && return 0
+      ;;
+  esac
+  return 1
+}
 
-export STANDUP_MOUNT_ROOT="$mount_root"
-export STANDUP_CONTEXT_INVENTORY="$context_inventory"
-export STANDUP_EVIDENCE_DIR="$evidence_dir"
-export LOCALITY_REPO_DIR="$locality_repo_dir"
-export LOCALITY_INTERNAL_REPO_DIR="$locality_internal_repo_dir"
-export STANDUP_NOTION_PARENT_DIR="$notion_parent_dir"
-export STANDUP_ARTIFACT_FILE="$artifact_file"
-export STANDUP_TRACE_FILE="$trace_file"
-export STANDUP_DATE="$standup_date"
-export STANDUP_SINCE_ISO="$standup_since_iso"
-export STANDUP_UNTIL_ISO="$standup_until_iso"
-export STANDUP_PAGE_TITLE="standup-$standup_date"
-export LOC_BIN="$loc_bin"
+origin_matches_slug() {
+  local origin="$1"
+  local slug="$2"
+  case "$origin" in
+    "https://github.com/$slug"|"https://github.com/$slug/"|"https://github.com/$slug.git"|"https://github.com/$slug.git/"|\
+    "git@github.com:$slug"|"git@github.com:$slug.git"|\
+    "ssh://git@github.com/$slug"|"ssh://git@github.com/$slug/"|"ssh://git@github.com/$slug.git"|"ssh://git@github.com/$slug.git/")
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+validate_repo_origin() {
+  local label="$1"
+  local slug="$2"
+  local dir="$3"
+  local origin
+
+  if ! origin="$(git -C "$dir" config --get remote.origin.url 2>/dev/null)" || [[ -z "$origin" ]]; then
+    fail "repo origin is missing for $label ($slug)"
+  fi
+  if origin_has_embedded_credentials "$origin"; then
+    fail "repo origin contains embedded credentials for $label ($slug)"
+  fi
+  if ! origin_matches_slug "$origin" "$slug"; then
+    fail "repo origin does not match expected slug for $label ($slug)"
+  fi
+}
+
+require_clean_repo() {
+  local label="$1"
+  local slug="$2"
+  local dir="$3"
+  local status
+
+  if ! status="$(git -C "$dir" status --porcelain 2>/dev/null)"; then
+    fail "could not inspect checkout status for $label ($slug)"
+  fi
+  if [[ -n "$status" ]]; then
+    fail "checkout is not clean for $label ($slug)"
+  fi
+}
+
+ensure_repo locality codeflash-ai/locality "$locality_repo_dir"
+ensure_repo locality-internal codeflash-ai/locality-internal "$locality_internal_repo_dir"
+
+STANDUP_MOUNT_ROOT="$mount_root"
+STANDUP_CONTEXT_INVENTORY="$context_inventory"
+STANDUP_EVIDENCE_DIR="$evidence_dir"
+LOCALITY_REPO_DIR="$locality_repo_dir"
+LOCALITY_INTERNAL_REPO_DIR="$locality_internal_repo_dir"
+STANDUP_NOTION_PARENT_DIR="$notion_parent_dir"
+STANDUP_ARTIFACT_FILE="$artifact_file"
+STANDUP_TRACE_FILE="$trace_file"
+STANDUP_DATE="$standup_date"
+STANDUP_SINCE_ISO="$standup_since_iso"
+STANDUP_UNTIL_ISO="$standup_until_iso"
+STANDUP_PAGE_TITLE="standup-$standup_date"
+LOC_BIN="$loc_bin"
+
+codex_env=(
+  env -i
+  "PATH=${PATH:-/usr/bin:/bin}"
+  "HOME=$HOME"
+)
+[[ -n "${USER+x}" ]] && codex_env+=("USER=$USER")
+[[ -n "${LOGNAME+x}" ]] && codex_env+=("LOGNAME=$LOGNAME")
+[[ -n "${SHELL+x}" ]] && codex_env+=("SHELL=$SHELL")
+[[ -n "${LANG+x}" ]] && codex_env+=("LANG=$LANG")
+[[ -n "${LC_ALL+x}" ]] && codex_env+=("LC_ALL=$LC_ALL")
+[[ -n "${TERM+x}" ]] && codex_env+=("TERM=$TERM")
+codex_env+=(
+  "STANDUP_MOUNT_ROOT=$STANDUP_MOUNT_ROOT"
+  "STANDUP_CONTEXT_INVENTORY=$STANDUP_CONTEXT_INVENTORY"
+  "STANDUP_EVIDENCE_DIR=$STANDUP_EVIDENCE_DIR"
+  "LOCALITY_REPO_DIR=$LOCALITY_REPO_DIR"
+  "LOCALITY_INTERNAL_REPO_DIR=$LOCALITY_INTERNAL_REPO_DIR"
+  "STANDUP_NOTION_PARENT_DIR=$STANDUP_NOTION_PARENT_DIR"
+  "STANDUP_ARTIFACT_FILE=$STANDUP_ARTIFACT_FILE"
+  "STANDUP_TRACE_FILE=$STANDUP_TRACE_FILE"
+  "STANDUP_DATE=$STANDUP_DATE"
+  "STANDUP_SINCE_ISO=$STANDUP_SINCE_ISO"
+  "STANDUP_UNTIL_ISO=$STANDUP_UNTIL_ISO"
+  "STANDUP_PAGE_TITLE=$STANDUP_PAGE_TITLE"
+  "LOC_BIN=$LOC_BIN"
+)
 
 codex_cmd=(
   codex exec
@@ -336,7 +429,7 @@ codex_cmd=(
   --model "$code_model"
   -c "model_reasoning_effort=\"$code_effort\""
   --dangerously-bypass-approvals-and-sandbox
-  -C "$locality_repo_dir"
+  -C "$run_dir"
   --add-dir "$mount_root"
   --add-dir "$evidence_dir"
   --add-dir "$locality_repo_dir"
@@ -346,9 +439,9 @@ codex_cmd=(
 )
 
 if [[ "$code_timeout" != "0" ]] && command -v timeout >/dev/null 2>&1; then
-  timeout "$code_timeout" "${codex_cmd[@]}" > "$codex_events_file"
+  timeout "$code_timeout" "${codex_env[@]}" "${codex_cmd[@]}" > "$codex_events_file"
 else
-  "${codex_cmd[@]}" > "$codex_events_file"
+  "${codex_env[@]}" "${codex_cmd[@]}" > "$codex_events_file"
 fi
 
 [[ -s "$artifact_file" ]] || fail "Codex did not write $artifact_file"

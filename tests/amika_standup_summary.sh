@@ -16,6 +16,12 @@ assert_file_contains() {
   grep -F -q -- "$needle" "$path" || fail "missing ${needle} in ${path}"
 }
 
+assert_file_not_contains() {
+  local path="$1"
+  local needle="$2"
+  ! grep -F -q -- "$needle" "$path" || fail "unexpected ${needle} in ${path}"
+}
+
 test -s "$PROMPT" || fail "missing scenario prompt at $PROMPT"
 assert_file_contains "$PROMPT" "standup-\${STANDUP_DATE}"
 assert_file_contains "$PROMPT" "saurabh"
@@ -39,7 +45,14 @@ trap 'rm -rf "$TMPDIR"' EXIT
 fake_bin="${TMPDIR}/fake_bin"
 fake_remote_home="${TMPDIR}/remote home"
 fake_log="${TMPDIR}/fake.log"
-mkdir -p "$fake_bin" "$fake_remote_home/workspace/locality/.git" "$fake_remote_home/workspace/locality-internal/.git"
+same_name_locality_repo="${fake_remote_home}/public/repo"
+same_name_internal_repo="${fake_remote_home}/private/repo"
+mkdir -p \
+  "$fake_bin" \
+  "$fake_remote_home/workspace/locality/.git" \
+  "$fake_remote_home/workspace/locality-internal/.git" \
+  "$same_name_locality_repo/.git" \
+  "$same_name_internal_repo/.git"
 : > "$fake_log"
 
 no_amika_bin="${TMPDIR}/no_amika_bin"
@@ -48,8 +61,8 @@ ln -s "$(command -v bash)" "$no_amika_bin/bash"
 ln -s "$(command -v dirname)" "$no_amika_bin/dirname"
 ln -s "$(command -v pwd)" "$no_amika_bin/pwd"
 
-fake_locality_repo_q="$(printf '%q' "${fake_remote_home}/workspace/locality")"
-fake_internal_repo_q="$(printf '%q' "${fake_remote_home}/workspace/locality-internal")"
+fake_locality_repo_q="$(printf '%q' "$same_name_locality_repo")"
+fake_internal_repo_q="$(printf '%q' "$same_name_internal_repo")"
 
 cat > "${fake_bin}/amika" <<'FAKE_AMIKA'
 #!/usr/bin/env bash
@@ -164,18 +177,46 @@ log_args() {
 printf 'git ' >> "$FAKE_LOG"
 log_args "$@"
 
+repo_dir=""
 if [[ "${1:-}" = "-C" ]]; then
+  repo_dir="$2"
   shift 2
 fi
+
+repo_kind() {
+  case "$repo_dir" in
+    *locality-internal*|*private*) printf 'internal\n' ;;
+    *) printf 'locality\n' ;;
+  esac
+}
+
+origin_for_repo() {
+  case "$(repo_kind)" in
+    internal) printf '%s\n' "${FAKE_GIT_INTERNAL_ORIGIN:-https://github.com/codeflash-ai/locality-internal.git}" ;;
+    locality) printf '%s\n' "${FAKE_GIT_LOCALITY_ORIGIN:-https://github.com/codeflash-ai/locality.git}" ;;
+  esac
+}
+
+status_for_repo() {
+  case "$(repo_kind)" in
+    internal) printf '%s' "${FAKE_GIT_INTERNAL_STATUS:-}" ;;
+    locality) printf '%s' "${FAKE_GIT_LOCALITY_STATUS:-}" ;;
+  esac
+}
 
 case "${1:-}" in
   rev-parse)
     test "${2:-}" = "--is-inside-work-tree"
     printf 'true\n'
     ;;
-  remote)
-    echo "origin URL must not be captured" >&2
-    exit 1
+  config)
+    test "${2:-}" = "--get"
+    test "${3:-}" = "remote.origin.url"
+    origin_for_repo
+    ;;
+  status)
+    test "${2:-}" = "--porcelain"
+    status_for_repo
     ;;
   fetch)
     test "${2:-}" = "--prune"
@@ -203,26 +244,59 @@ FAKE_GIT
 cat > "${fake_bin}/codex" <<'FAKE_CODEX'
 #!/usr/bin/env bash
 set -euo pipefail
+codex_log="${STANDUP_EVIDENCE_DIR:?}/fake-codex.log"
 log_args() {
   local first=1
   for arg in "$@"; do
     if [[ "$first" -eq 1 ]]; then
       first=0
     else
-      printf ' ' >> "$FAKE_LOG"
+      printf ' ' >> "$codex_log"
     fi
-    printf '%q' "$arg" >> "$FAKE_LOG"
+    printf '%q' "$arg" >> "$codex_log"
   done
-  printf '\n' >> "$FAKE_LOG"
+  printf '\n' >> "$codex_log"
 }
-printf 'codex ' >> "$FAKE_LOG"
+printf 'codex ' >> "$codex_log"
 log_args "$@"
 test "${1:-}" = "exec"
+test -z "${FAKE_LOG:-}"
+test -z "${FAKE_REMOTE_HOME:-}"
+test -z "${SECRET_SHOULD_NOT_LEAK:-}"
 test -n "${STANDUP_ARTIFACT_FILE:-}"
 test -n "${STANDUP_TRACE_FILE:-}"
 test -s "${STANDUP_EVIDENCE_DIR:-}/hydration.jsonl"
 grep -F -q '/notion/page.md' "$STANDUP_EVIDENCE_DIR/hydration.jsonl"
 grep -F -q '/notion/child/page.md' "$STANDUP_EVIDENCE_DIR/hydration.jsonl"
+expected_cwd="${STANDUP_EVIDENCE_DIR%/evidence}"
+codex_cwd=""
+has_mount_root=0
+has_evidence_dir=0
+has_locality_repo=0
+has_internal_repo=0
+while (($#)); do
+  case "$1" in
+    -C)
+      shift
+      codex_cwd="${1:-}"
+      ;;
+    --add-dir)
+      shift
+      case "${1:-}" in
+        "$STANDUP_MOUNT_ROOT") has_mount_root=1 ;;
+        "$STANDUP_EVIDENCE_DIR") has_evidence_dir=1 ;;
+        "$LOCALITY_REPO_DIR") has_locality_repo=1 ;;
+        "$LOCALITY_INTERNAL_REPO_DIR") has_internal_repo=1 ;;
+      esac
+      ;;
+  esac
+  shift
+done
+test "$codex_cwd" = "$expected_cwd"
+test "$has_mount_root" -eq 1
+test "$has_evidence_dir" -eq 1
+test "$has_locality_repo" -eq 1
+test "$has_internal_repo" -eq 1
 printf '# Standup\n' > "$STANDUP_ARTIFACT_FILE"
 printf '# Trace\n' > "$STANDUP_TRACE_FILE"
 printf '{"type":"turn.completed"}\n'
@@ -279,16 +353,82 @@ fi
 assert_file_contains "$root_page_only_stderr" "NOTION_STANDUP_PARENT_PAGE_ID"
 grep -F -q "amika " "$fake_log" && fail "NOTION_ROOT_PAGE_ID-only run invoked amika"
 
+: > "$fake_log"
+existing_run_id_stderr="${TMPDIR}/existing-run-id.err"
+mkdir -p "$fake_remote_home/standup-summary-runs/standup-existing-run"
+if PATH="$fake_bin:$PATH" \
+  FAKE_BIN="$fake_bin" \
+  FAKE_LOG="$fake_log" \
+  FAKE_REMOTE_HOME="$fake_remote_home" \
+  NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
+  RUN_ID="standup-existing-run" \
+  STANDUP_DATE="2026-08-06" \
+  STANDUP_SINCE_ISO="2026-08-05T00:00:00Z" \
+  STANDUP_UNTIL_ISO="2026-08-06T00:00:00Z" \
+  "$RUNNER" --sandbox fake-machine 2>"$existing_run_id_stderr"; then
+  fail "existing RUN_ID unexpectedly succeeded"
+fi
+assert_file_contains "$existing_run_id_stderr" "run directory already exists"
+assert_file_not_contains "$fake_log" "loc "
+
+: > "$fake_log"
+token_origin_stderr="${TMPDIR}/token-origin.err"
+if PATH="$fake_bin:$PATH" \
+  FAKE_BIN="$fake_bin" \
+  FAKE_LOG="$fake_log" \
+  FAKE_REMOTE_HOME="$fake_remote_home" \
+  FAKE_GIT_LOCALITY_ORIGIN="https://token@github.com/codeflash-ai/locality.git" \
+  NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
+  RUN_ID="standup-token-origin" \
+  STANDUP_DATE="2026-08-06" \
+  STANDUP_SINCE_ISO="2026-08-05T00:00:00Z" \
+  STANDUP_UNTIL_ISO="2026-08-06T00:00:00Z" \
+  "$RUNNER" --sandbox fake-machine 2>"$token_origin_stderr"; then
+  fail "token-bearing origin unexpectedly succeeded"
+fi
+assert_file_contains "$token_origin_stderr" "origin contains embedded credentials"
+assert_file_contains "$token_origin_stderr" "codeflash-ai/locality"
+assert_file_not_contains "$token_origin_stderr" "https://token@github.com"
+assert_file_not_contains "$fake_log" "https://token@github.com"
+assert_file_not_contains "$fake_log" "fetch --prune origin"
+
+: > "$fake_log"
+dirty_repo_stderr="${TMPDIR}/dirty-repo.err"
+if PATH="$fake_bin:$PATH" \
+  FAKE_BIN="$fake_bin" \
+  FAKE_LOG="$fake_log" \
+  FAKE_REMOTE_HOME="$fake_remote_home" \
+  FAKE_GIT_LOCALITY_STATUS=" M secret.txt" \
+  NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
+  RUN_ID="standup-dirty-repo" \
+  STANDUP_DATE="2026-08-06" \
+  STANDUP_SINCE_ISO="2026-08-05T00:00:00Z" \
+  STANDUP_UNTIL_ISO="2026-08-06T00:00:00Z" \
+  "$RUNNER" --sandbox fake-machine 2>"$dirty_repo_stderr"; then
+  fail "dirty repo unexpectedly succeeded"
+fi
+assert_file_contains "$dirty_repo_stderr" "checkout is not clean"
+assert_file_contains "$dirty_repo_stderr" "locality"
+assert_file_not_contains "$dirty_repo_stderr" "https://github.com"
+assert_file_not_contains "$fake_log" "fetch --prune origin"
+
+: > "$fake_log"
 runner_output="$(
   PATH="$fake_bin:$PATH" \
   FAKE_BIN="$fake_bin" \
   FAKE_LOG="$fake_log" \
   FAKE_REMOTE_HOME="$fake_remote_home" \
+  LOCALITY_REPO_DIR="$same_name_locality_repo" \
+  LOCALITY_INTERNAL_REPO_DIR="$same_name_internal_repo" \
   NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
+  SECRET_SHOULD_NOT_LEAK="top-secret" \
   "$RUNNER" --sandbox fake-machine
 )"
 
 printf '%s\n' "$runner_output" | grep -F -q '{"type":"turn.completed"}' && fail "runner leaked raw codex event JSON"
+evidence_dir="$(
+  printf '%s\n' "$runner_output" | python3 -c 'import json, sys; print(json.load(sys.stdin)["evidence_dir"])'
+)"
 
 assert_file_contains "$fake_log" "loc connections --json"
 assert_file_contains "$fake_log" "loc mount linear"
@@ -303,6 +443,10 @@ assert_file_contains "$fake_log" "git -C ${fake_locality_repo_q} log origin/main
 assert_file_contains "$fake_log" "git -C ${fake_internal_repo_q} log"
 assert_file_contains "$fake_log" "git -C ${fake_internal_repo_q} symbolic-ref --quiet --short refs/remotes/origin/HEAD"
 assert_file_contains "$fake_log" "git -C ${fake_internal_repo_q} log origin/main --since="
-assert_file_contains "$fake_log" "codex exec"
+test -s "$evidence_dir/locality-commits.tsv" || fail "missing locality evidence commits"
+test -s "$evidence_dir/locality-internal-commits.tsv" || fail "missing locality-internal evidence commits"
+run_dir_q="$(printf '%q' "${evidence_dir%/evidence}")"
+assert_file_contains "$evidence_dir/fake-codex.log" "codex exec"
+assert_file_contains "$evidence_dir/fake-codex.log" "-C ${run_dir_q}"
 
 printf 'successful runner contract passed\n'
