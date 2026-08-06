@@ -15,6 +15,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
+#[cfg(target_os = "macos")]
+use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::HANDLE;
@@ -28,6 +30,8 @@ const WINDOWS_DESKTOP_ACTIVATION_EVENT: &str = r"Local\CodeFlash.Locality.Deskto
 const UNIX_ACTIVATION_RETRY_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(unix)]
 const UNIX_ACTIVATION_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(target_os = "macos")]
+const DARWIN_UNIX_SOCKET_PATH_MAX: usize = 103;
 
 pub struct DesktopSingleInstanceGuard {
     #[cfg(unix)]
@@ -167,15 +171,60 @@ pub fn acquire_desktop_single_instance(
 
 #[cfg(target_os = "macos")]
 fn desktop_single_instance_coordination_dir() -> io::Result<PathBuf> {
-    let effective_user_id = unsafe { libc::geteuid() };
-    Ok(macos_desktop_single_instance_coordination_dir(
-        effective_user_id,
-    ))
+    macos_desktop_single_instance_coordination_dir(&macos_user_temp_dir()?)
 }
 
 #[cfg(target_os = "macos")]
-fn macos_desktop_single_instance_coordination_dir(effective_user_id: libc::uid_t) -> PathBuf {
-    Path::new("/tmp").join(format!("locality-desktop-si-{effective_user_id}"))
+fn macos_user_temp_dir() -> io::Result<PathBuf> {
+    let required =
+        unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
+    if required == 0 {
+        return Err(io::Error::other(
+            "macOS did not provide a private user temporary directory",
+        ));
+    }
+
+    let mut bytes = vec![0_u8; required];
+    let written = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+        )
+    };
+    if written == 0 || written > bytes.len() || bytes.get(written - 1) != Some(&0) {
+        return Err(io::Error::other(
+            "macOS returned an invalid private user temporary directory",
+        ));
+    }
+    bytes.truncate(written - 1);
+
+    let path = PathBuf::from(OsString::from_vec(bytes));
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "macOS returned a relative private user temporary directory",
+        ));
+    }
+    Ok(path)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_desktop_single_instance_coordination_dir(user_temp_dir: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let coordination_dir = user_temp_dir.join("locality-si");
+    let activation_socket_path = coordination_dir.join("activate.sock");
+    if activation_socket_path.as_os_str().as_bytes().len() > DARWIN_UNIX_SOCKET_PATH_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "desktop activation socket path exceeds the Darwin limit: {}",
+                activation_socket_path.display()
+            ),
+        ));
+    }
+    Ok(coordination_dir)
 }
 
 #[cfg(target_os = "linux")]
@@ -451,26 +500,28 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_coordination_endpoint_is_outside_the_app_group_and_bounded() {
+    fn macos_coordination_endpoint_uses_the_private_user_temp_directory() {
         use std::os::unix::ffi::OsStrExt;
 
+        let user_temp_dir = super::macos_user_temp_dir().expect("private user temp directory");
         let path = super::desktop_single_instance_coordination_dir()
             .expect("macOS coordination directory");
-        let effective_user_id = unsafe { libc::geteuid() };
 
-        assert_eq!(
-            path,
-            std::path::PathBuf::from(format!("/tmp/locality-desktop-si-{effective_user_id}"))
+        assert_eq!(path, user_temp_dir.join("locality-si"));
+        assert!(
+            path.join("activate.sock").as_os_str().as_bytes().len()
+                <= super::DARWIN_UNIX_SOCKET_PATH_MAX
         );
+    }
 
-        let longest_socket_path =
-            super::macos_desktop_single_instance_coordination_dir(libc::uid_t::MAX)
-                .join("activate.sock");
-        assert_eq!(
-            longest_socket_path,
-            std::path::PathBuf::from("/tmp/locality-desktop-si-4294967295/activate.sock")
-        );
-        assert!(longest_socket_path.as_os_str().as_bytes().len() <= 103);
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_coordination_endpoint_rejects_an_unbounded_socket_path() {
+        let oversized_base = std::path::Path::new("/").join("x".repeat(103));
+        let error = super::macos_desktop_single_instance_coordination_dir(&oversized_base)
+            .expect_err("oversized activation socket path must fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[cfg(windows)]

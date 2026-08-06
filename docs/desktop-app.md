@@ -73,10 +73,12 @@ foreground launch activates the existing process and presents its main window;
 a later background launch exits quietly without creating another Dock, taskbar,
 or menu-bar icon. The exclusion guard must be claimed before Tauri setup and
 must fail closed if its activation receiver cannot start. Windows uses
-session-scoped kernel objects; macOS uses a private UID-scoped directory under
-the fixed, short `/tmp` prefix; Linux uses the user's runtime directory. Release
-smoke launches bypass this forwarding so the mounted bundle always executes its
-own setup validation even when Locality is already running.
+session-scoped kernel objects; macOS uses a namespaced directory under Darwin's
+private per-user temporary directory; Linux uses the user's runtime directory.
+The macOS activation socket is length-checked before binding so it stays within
+Darwin's Unix-socket path limit. Release smoke launches bypass this forwarding
+so the mounted bundle always executes its own setup validation even when
+Locality is already running.
 
 Every app launch, including the launch after an updater relaunch, must validate
 the local runtime before normal desktop work. The backend should probe the bundled
