@@ -74,6 +74,15 @@ available. The fixture-backed smoke starts `localityd` with
 materialization, and local mutations exercise only the seeded daemon state
 instead of queueing connector-backed refresh work with the dummy token.
 
+GitHub Actions invokes the same smoke script through
+`tests/run_linux_fuse_ci.sh`. Current hosted agents expose `/dev/fuse` but deny
+host-user mounts, so the wrapper passes that device into a privileged container
+mount namespace and then runs the script as the numeric host runner user. The
+container keeps `/usr/bin/fusermount3` setuid and does not alter the smoke
+assertions, required-mode behavior, or filesystem operations being tested. Its
+Cargo target directory is isolated from the mounted workspace so cached
+host-built binaries cannot bypass the container build.
+
 ## Live Notion FUSE E2E
 
 The opt-in live FUSE script uses the real `loc`, `localityd`, and
@@ -95,11 +104,12 @@ then runs the FUSE mount, pull, edit, push, child create, child parent move out
 and back with Unix `mv`, child rename, and child delete/archive path with token
 environment variables removed from `loc` and `localityd`.
 
-The `notion-live-e2e` GitHub Actions workflow runs this script on
-`ubuntu-latest` when the live Notion environment is configured. That job seeds
-`~/.loc/credentials` from the `NOTION_TOKEN` secret before invoking the script
-with `NOTION_TOKEN` removed, so the CI path exercises the stored-credential
-product path rather than relying on direct token environment variables.
+The `notion-live-e2e` GitHub Actions workflow runs this script through the same
+privileged FUSE container on `ubuntu-latest` when the live Notion environment
+is configured. That job seeds `~/.loc/credentials` from the `NOTION_TOKEN`
+secret before invoking the script with `NOTION_TOKEN` removed, so the CI path
+exercises the stored-credential product path rather than relying on direct
+token environment variables.
 
 ### Existing Mount
 

@@ -110,6 +110,15 @@ script creates an isolated Locality state directory, runs through the real
 `loc`, `localityd`, and `locality-fuse` binaries, and keeps command/provider
 payloads out of test output.
 
+GitHub-hosted jobs run these unchanged scripts through
+`tests/run_linux_fuse_ci.sh`. New Ubuntu 22.04 and 24.04 hosted agents expose
+`/dev/fuse` but reject valid host-user mounts with `Operation not permitted`.
+The wrapper builds a pinned Rust/Linux image, passes the real host FUSE device
+into a privileged mount namespace, then drops back to the host runner UID before
+executing the script. This preserves the real unprivileged `fusermount3`,
+kernel directory, read, write, rename, and unmount paths instead of replacing
+them with mocks or allowing the tests to skip.
+
 For Google OAuth and Slack credentials, a local run can reuse a stored
 connection credential by reading its hex-encoded secret reference from
 `~/.loc/credentials`:
@@ -178,14 +187,22 @@ LOCALITY_LIVE_LINEAR_VFS=1 tests/live_linear_vfs_roundtrip.sh
 
 GitHub Actions runs `.github/workflows/connector-live-e2e.yml` for relevant
 changes on `main` and on manual dispatch. The workflow uses the
-`connector-live-e2e` environment and uploads no artifacts. Normal push and
-push runs validate refresh-capable OAuth credential JSON but never write back
-to GitHub Secrets. Manual dispatch can set `force_oauth_refresh=true` to
-exercise the broker refresh path. Manual dispatch can also set
+`connector-live-e2e` environment and uploads no artifacts. Google OAuth jobs
+validate refresh-capable credential JSON but do not write back to GitHub
+Secrets during normal push runs. Manual dispatch can set
+`force_oauth_refresh=true` to exercise their broker refresh paths, and can set
 `persist_rotated_oauth_secrets=true`; in that mode each OAuth job requires
 `LOCALITY_SECRET_ROTATOR_TOKEN`, exports its refreshed credential JSON after the
 first successful pull, and uses `gh secret set --env connector-live-e2e` to
 replace the corresponding environment secret.
+
+Slack is different because each successful Slack refresh invalidates the
+previous refresh token. Every Slack live job therefore requires
+`LOCALITY_SECRET_ROTATOR_TOKEN`, preflights its access to the environment
+Secrets public key, forces the existing live refresh assertion, and writes the
+rotated credential back even when a later live assertion fails. Workflow
+concurrency serializes runs so the next job cannot start from the superseded
+handle.
 
 ## Live Connector E2E Secrets
 
@@ -210,7 +227,7 @@ The non-Notion connector workflow uses the `connector-live-e2e` environment:
 | `LOCALITY_SLACK_LIVE_TYPES` | no | Optional Slack mount type list for non-public conversations, for example `private_channel,im,mpim`. |
 | `LINEAR_API_KEY` | yes | Linear API key with access to the scratch issue. |
 | `LOCALITY_LINEAR_LIVE_ISSUE_ID` | yes | Stable scratch Linear issue id whose body can be edited and restored. |
-| `LOCALITY_SECRET_ROTATOR_TOKEN` | only for manual rotation | GitHub token used only when `workflow_dispatch` sets both `force_oauth_refresh=true` and `persist_rotated_oauth_secrets=true`; it must be able to update `connector-live-e2e` environment secrets. |
+| `LOCALITY_SECRET_ROTATOR_TOKEN` | yes for Slack; otherwise only for manual rotation | GitHub token able to update `connector-live-e2e` environment secrets. Slack uses it on every live run because Slack refresh tokens are single-use; Google jobs use it only when manual dispatch sets both `force_oauth_refresh=true` and `persist_rotated_oauth_secrets=true`. |
 
 ## Expected Behavior Coverage
 

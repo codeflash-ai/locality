@@ -58,24 +58,16 @@ jobs:
             expect \
             patchelf \
             sqlite3
-      - name: Report Linux FUSE coverage
-        run: |
-          if [ -e /dev/fuse ]; then
-            echo "::notice::/dev/fuse is present. This workflow will run the real Linux FUSE mount smoke test."
-          else
-            echo "::error::/dev/fuse is not present. Real online-only FUSE mount smoke is not covered by this hosted runner."
-            exit 1
-          fi
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
+      - name: Validate CI workflow contracts
+        run: tests/ci_workflow_contract.sh
       - name: Validate connector extension contracts
         run: |
           cargo test -p locality-connector --test manifest_contract --test conformance_testkit
           cargo test -p localityd --test connector_manifest
       - name: Run Rust tests
         run: cargo test --workspace --all-targets
-      - name: Run real Linux FUSE smoke test
-        run: LOCALITY_FUSE_SMOKE=1 LOCALITY_FUSE_SMOKE_REQUIRED=1 tests/linux_fuse_smoke.sh
       - name: Run Amika snapshot shell test
         run: make test-init-amika-locality-snapshot
       - name: Install desktop dependencies
@@ -84,6 +76,26 @@ jobs:
       - name: Build desktop web UI
         run: npm run build
         working-directory: apps/desktop
+
+  linux-fuse:
+    name: Linux FUSE smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FUSE dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev pkg-config sqlite3
+      - name: Verify hosted runner exposes FUSE
+        run: |
+          if [ ! -e /dev/fuse ]; then
+            echo "::error::/dev/fuse is not present. Real online-only FUSE mount smoke is not covered by this hosted runner."
+            exit 1
+          fi
+      - name: Run real Linux FUSE smoke test
+        run: LOCALITY_FUSE_SMOKE=1 LOCALITY_FUSE_SMOKE_REQUIRED=1 tests/run_linux_fuse_ci.sh tests/linux_fuse_smoke.sh
 
   windows:
     name: Windows tests
