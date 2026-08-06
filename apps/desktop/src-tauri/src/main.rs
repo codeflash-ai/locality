@@ -111,13 +111,13 @@ use locality_slack::{
 };
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
-    ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository, FreshnessStateRecord,
-    FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, JournalRepository,
-    MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState,
-    MountLiveModeStateChangeError, MountRepository, ProjectionMode, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, SqliteStateStore, StoreError,
-    VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
-    WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
+    ConnectionRecord, ConnectionRepository, CredentialError, CredentialStore, EntityRecord,
+    EntityRepository, FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord,
+    HydrationJobRepository, JournalRepository, MountConfig, MountLiveModeRecord,
+    MountLiveModeRepository, MountLiveModeState, MountLiveModeStateChangeError, MountRepository,
+    ProjectionMode, RemoteObservationRecord, RemoteObservationRepository, ShadowRepository,
+    SqliteStateStore, StoreError, VirtualMutationKind, VirtualMutationRecord,
+    VirtualMutationRepository, WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
     is_live_mode_state_change_signal_path, open_credential_store,
     save_mount_live_mode_and_publish_signal,
 };
@@ -3281,6 +3281,7 @@ fn live_mode_failure_should_pause(message: &str) -> bool {
         || message.contains("Review required before pushing")
         || lower.contains("needs review")
         || lower.contains("could not identify the remote page")
+        || (lower.contains("credential for connection") && lower.contains("was not found"))
 }
 
 fn live_mode_timestamp() -> String {
@@ -4159,7 +4160,12 @@ fn load_desktop_snapshot_at_state_root(state_root: &Path) -> Result<DesktopSnaps
     ensure_dev_sidecars_match_desktop_before_state_open(state_root)?;
     let store =
         SqliteStateStore::open(state_root.to_path_buf()).map_err(|error| error.to_string())?;
-    load_desktop_snapshot_from_store(&store, &state_root)
+    let credentials = open_credential_store(state_root);
+    load_desktop_snapshot_from_store_with_credentials(
+        &store,
+        state_root,
+        Some(credentials.as_ref()),
+    )
 }
 
 fn ensure_dev_sidecars_match_desktop_before_state_open(state_root: &Path) -> Result<(), String> {
@@ -4224,14 +4230,26 @@ fn load_desktop_snapshot_from_store(
     store: &SqliteStateStore,
     state_root: &Path,
 ) -> Result<DesktopSnapshot, String> {
+    load_desktop_snapshot_from_store_with_credentials(store, state_root, None)
+}
+
+fn load_desktop_snapshot_from_store_with_credentials(
+    store: &SqliteStateStore,
+    state_root: &Path,
+    credentials: Option<&dyn CredentialStore>,
+) -> Result<DesktopSnapshot, String> {
     let mounts = store.load_mounts().map_err(|error| error.to_string())?;
-    let connections = store
+    let mut connections = store
         .list_connections()
         .map_err(|error| error.to_string())?;
-    let journals = store.list_journal().unwrap_or_default();
     let mount = choose_mount(&mounts, &connections);
+    let persisted_connection = choose_connection(&connections, mount.as_ref());
+    let needs_onboarding = desktop_needs_onboarding(persisted_connection.as_ref(), mount.as_ref());
+    if let Some(credentials) = credentials {
+        mark_connections_with_missing_credentials(&mut connections, credentials);
+    }
+    let journals = store.list_journal().unwrap_or_default();
     let connection = choose_connection(&connections, mount.as_ref());
-    let needs_onboarding = desktop_needs_onboarding(connection.as_ref(), mount.as_ref());
     let settings = desktop_settings();
     let pending_changes = match mount.as_ref() {
         Some(mount) => pending_changes_for_mount(store, state_root, &mount.mount_id)?,
@@ -4309,6 +4327,23 @@ fn load_desktop_snapshot_from_store(
             state: "available".to_string(),
         }],
     })
+}
+
+fn mark_connections_with_missing_credentials(
+    connections: &mut [ConnectionRecord],
+    credentials: &dyn CredentialStore,
+) {
+    for connection in connections
+        .iter_mut()
+        .filter(|connection| connection.status == "active")
+    {
+        if matches!(
+            credentials.get(&connection.secret_ref),
+            Err(CredentialError::NotFound(_))
+        ) {
+            connection.status = "missing".to_string();
+        }
+    }
 }
 
 fn degraded_snapshot(message: String) -> DesktopSnapshot {
@@ -14071,12 +14106,12 @@ mod tests {
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
         ConnectionRecord, ConnectionRepository, ConnectorProfileId, EntityRecord, EntityRepository,
-        FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, JournalRepository,
-        LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig, MountLiveModeRecord,
-        MountLiveModeRepository, MountLiveModeState, MountRepository, ProjectionMode,
-        RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
-        StoreResult, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
-        WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
+        FreshnessStateRecord, FreshnessStateRepository, InMemoryCredentialStore,
+        InMemoryStateStore, JournalRepository, LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig,
+        MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState, MountRepository,
+        ProjectionMode, RemoteObservationRecord, RemoteObservationRepository, ShadowRepository,
+        SqliteStateStore, StoreResult, VirtualMutationKind, VirtualMutationRecord,
+        VirtualMutationRepository, WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
     };
     use localityd::ipc::DaemonBuildInfo;
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
@@ -14731,6 +14766,36 @@ mod tests {
                 .status,
             "reconnect_needed"
         );
+    }
+
+    #[test]
+    fn desktop_snapshot_marks_missing_credential_as_reconnect_needed_without_losing_mount() {
+        let temp = TestTempDir::new("desktop-missing-credential");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let connection = test_connection("workspace-1", "CodeFlash");
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("codeflash-wiki"),
+        )
+        .with_connection_id(connection.connection_id.clone())
+        .projection(ProjectionMode::LinuxFuse);
+        store.save_connection(connection).expect("save connection");
+        store.save_mount(mount).expect("save mount");
+        let credentials = InMemoryCredentialStore::new();
+
+        let snapshot = super::load_desktop_snapshot_from_store_with_credentials(
+            &store,
+            temp.path(),
+            Some(&credentials),
+        )
+        .expect("load snapshot with credentials");
+
+        assert!(!snapshot.needs_onboarding);
+        assert_eq!(snapshot.health.state, "reconnect_needed");
+        assert_eq!(snapshot.connection.status, "missing");
+        assert_eq!(snapshot.mount.mount_id, "notion-main");
+        assert_eq!(snapshot.mount.status, "reconnect_needed");
     }
 
     #[test]
@@ -15874,6 +15939,47 @@ mod tests {
         assert_eq!(summary.state, "error");
         assert_eq!(summary.label, "Live Mode paused");
         assert_eq!(summary.reason, record.last_reason);
+    }
+
+    #[test]
+    fn live_mode_missing_credentials_pause_until_reconnect() {
+        let temp = TestTempDir::new("live-mode-missing-credential");
+        let mount_id = MountId::new("notion-main");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        store
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "notion",
+                temp.path().join("notion"),
+            ))
+            .expect("save mount");
+        store
+            .save_mount_live_mode(MountLiveModeRecord::new(mount_id.clone(), true, "1"))
+            .expect("save live mode");
+        drop(store);
+
+        record_mount_live_mode_tick_result(
+            temp.path(),
+            &mount_id,
+            &ActionReport {
+                ok: false,
+                message: "credential for connection `notion-default` was not found".to_string(),
+            },
+            false,
+        )
+        .expect("record credential failure");
+
+        let store = SqliteStateStore::open(temp.path().to_path_buf()).expect("reopen store");
+        let record = store
+            .get_mount_live_mode(&mount_id)
+            .expect("load live mode")
+            .expect("live mode record");
+        assert!(!record.enabled);
+        assert_eq!(record.state, MountLiveModeState::Error);
+        assert_eq!(
+            record.last_reason.as_deref(),
+            Some("credential for connection `notion-default` was not found")
+        );
     }
 
     #[test]

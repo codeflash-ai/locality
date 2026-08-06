@@ -199,9 +199,13 @@ Failures that do not originate from a push report still use
 - messages containing `Review required before pushing`
 - current push copy containing `needs review`
 - messages that cannot identify the remote page
+- missing saved connection credentials, which require the user to reconnect
 
 The durable pause retains the user-facing push message as `last_reason`, which
 lets desktop status and Review Center explain why automatic sync stopped.
+Desktop snapshots also treat an active connection whose credential is absent as
+`Reconnect Needed`; transient credential-store errors do not rewrite connection
+metadata or force a reconnect.
 
 `loc status` and desktop summaries also hide stale disabled error records when
 there are no current pending changes requiring attention.
