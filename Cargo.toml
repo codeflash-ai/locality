@@ -9,6 +9,7 @@ members = [
   "crates/locality-protocol",
   "crates/locality-platform",
   "crates/locality-store",
+  "crates/locality-auth-core",
   "crates/locality-notion",
   "crates/locality-google-docs",
   "crates/locality-google-calendar",
@@ -34,6 +35,7 @@ locality-engine = { path = "crates/locality-engine" }
 locality-protocol = { path = "crates/locality-protocol" }
 locality-platform = { path = "crates/locality-platform" }
 locality-store = { path = "crates/locality-store" }
+locality-auth-core = { path = "crates/locality-auth-core" }
 locality-notion = { path = "crates/locality-notion" }
 locality-google-docs = { path = "crates/locality-google-docs" }
 locality-google-calendar = { path = "crates/locality-google-calendar" }

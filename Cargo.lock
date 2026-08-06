@@ -2299,6 +2299,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "locality-auth-core"
+version = "0.1.0"
+
+[[package]]
 name = "locality-cloud-files"
 version = "0.3.7"
 dependencies = [
