@@ -10,7 +10,9 @@ use locality_gmail::{GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, StoredGmailCredenti
 use locality_google_calendar::{
     GOOGLE_CALENDAR_CONNECTOR_ID, GOOGLE_CALENDAR_OAUTH_SCOPES, StoredGoogleCalendarCredential,
 };
-use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, StoredGoogleDocsCredential};
+use locality_google_docs::{
+    GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, StoredGoogleDocsCredential,
+};
 use locality_granola::GRANOLA_CONNECTOR_ID;
 use locality_linear::LINEAR_CONNECTOR_ID;
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
@@ -2006,6 +2008,84 @@ fn resolving_expired_google_docs_credential_refreshes_with_broker_handle() {
         serde_json::from_str::<StoredGoogleDocsCredential>(&saved).expect("stored credential");
     assert_eq!(saved.access_token, "new-access-token");
     assert_eq!(saved.refresh_token_handle.as_deref(), Some("handle-2"));
+}
+
+#[test]
+fn resolving_expired_google_docs_credential_rejects_refresh_unsupported_scope() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) = save_google_docs_oauth_connection(&mut store);
+    let mut refresh_scopes = GOOGLE_DOCS_OAUTH_SCOPES
+        .iter()
+        .map(|scope| scope.to_string())
+        .collect::<Vec<_>>();
+    refresh_scopes.push("https://www.googleapis.com/auth/calendar.events".to_string());
+    let refresh_response = serde_json::json!({
+        "access_token": "new-access-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token_handle": "handle-2",
+        "account_id": "acct-1",
+        "account_label": "user@example.com",
+        "workspace_id": "google-drive",
+        "workspace_name": "Google Drive",
+        "scopes": refresh_scopes,
+    })
+    .to_string();
+    let (broker_url, broker) = spawn_refresh_broker("HTTP/1.1 200 OK", refresh_response);
+
+    let mut stored = StoredGoogleDocsCredential::from_broker_token(
+        OAuthBrokerToken {
+            access_token: "expired-access-token".to_string(),
+            token_type: Some("Bearer".to_string()),
+            expires_in: Some(1),
+            refresh_token_handle: Some("handle-1".to_string()),
+            account_id: Some("acct-1".to_string()),
+            account_label: Some("user@example.com".to_string()),
+            workspace_id: Some("google-drive".to_string()),
+            workspace_name: Some("Google Drive".to_string()),
+            scopes: GOOGLE_DOCS_OAUTH_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+        },
+        "client-id".to_string(),
+        broker_url,
+        1,
+    );
+    stored.expires_at = Some(1);
+    let original_secret = serde_json::to_string(&stored).expect("credential json");
+    credentials
+        .put(&secret_ref, &original_secret)
+        .expect("save credential");
+    let mount = MountConfig::new(
+        MountId::new("google-docs-main"),
+        GOOGLE_DOCS_CONNECTOR_ID,
+        "/tmp/locality/google-docs",
+    )
+    .with_remote_root_id(RemoteId::new("workspace-folder"))
+    .with_connection_id(connection_id);
+
+    let error = resolve_source_for_mount(&store, &credentials, &mount)
+        .expect_err("unsupported refreshed Google Docs scope must be rejected");
+    broker.join().expect("broker thread");
+
+    assert_eq!(error.code(), "auth_required");
+    assert!(
+        error
+            .message()
+            .contains("unsupported Google Docs OAuth scope")
+    );
+    assert!(
+        error
+            .message()
+            .contains("https://www.googleapis.com/auth/calendar.events")
+    );
+    assert_eq!(error.suggested_command(), Some("loc connect google-docs"));
+    assert_eq!(
+        credentials.get(&secret_ref).expect("saved credential"),
+        original_secret
+    );
 }
 
 #[test]

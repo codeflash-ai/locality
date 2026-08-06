@@ -97,11 +97,21 @@ impl StoredGoogleDocsCredential {
         }
     }
 
-    pub fn refreshed(&self, token: OAuthBrokerToken, acquired_at: u64) -> Self {
+    pub fn refreshed(
+        &self,
+        token: OAuthBrokerToken,
+        acquired_at: u64,
+    ) -> Result<Self, GoogleDocsOAuthScopeError> {
         let expires_at = token
             .expires_in
             .and_then(|expires_in| acquired_at.checked_add(expires_in));
-        Self {
+        let scopes = if token.scopes.is_empty() {
+            self.scopes.clone()
+        } else {
+            validate_google_docs_oauth_scopes(&token.scopes)?;
+            token.scopes
+        };
+        Ok(Self {
             kind: "oauth".to_string(),
             connector: GOOGLE_DOCS_CONNECTOR_ID.to_string(),
             access_token: token.access_token,
@@ -112,17 +122,13 @@ impl StoredGoogleDocsCredential {
             account_label: token.account_label.or_else(|| self.account_label.clone()),
             workspace_id: token.workspace_id.or_else(|| self.workspace_id.clone()),
             workspace_name: token.workspace_name.or_else(|| self.workspace_name.clone()),
-            scopes: if token.scopes.is_empty() {
-                self.scopes.clone()
-            } else {
-                token.scopes
-            },
+            scopes,
             refresh_token_handle: token
                 .refresh_token_handle
                 .or_else(|| self.refresh_token_handle.clone()),
             acquired_at,
             expires_at,
-        }
+        })
     }
 
     pub fn expires_soon(&self, now: u64) -> bool {
@@ -409,25 +415,80 @@ mod tests {
             100,
         );
 
-        let refreshed = stored.refreshed(
-            OAuthBrokerToken {
-                access_token: "new-access-token".to_string(),
-                token_type: Some("Bearer".to_string()),
-                expires_in: Some(7200),
-                refresh_token_handle: Some("handle-2".to_string()),
-                account_id: None,
-                account_label: None,
-                workspace_id: None,
-                workspace_name: None,
-                scopes: vec![],
-            },
-            200,
-        );
+        let refreshed = stored
+            .refreshed(
+                OAuthBrokerToken {
+                    access_token: "new-access-token".to_string(),
+                    token_type: Some("Bearer".to_string()),
+                    expires_in: Some(7200),
+                    refresh_token_handle: Some("handle-2".to_string()),
+                    account_id: None,
+                    account_label: None,
+                    workspace_id: None,
+                    workspace_name: None,
+                    scopes: vec![],
+                },
+                200,
+            )
+            .expect("refresh with omitted scopes");
 
         assert_eq!(refreshed.access_token, "new-access-token");
         assert_eq!(refreshed.refresh_token_handle.as_deref(), Some("handle-2"));
         assert_eq!(refreshed.account_label.as_deref(), Some("user@example.com"));
         assert_eq!(refreshed.scopes, vec!["openid".to_string()]);
         assert_eq!(refreshed.expires_at, Some(7400));
+    }
+
+    #[test]
+    fn refreshed_broker_credential_rejects_invalid_non_empty_scopes() {
+        let stored = StoredGoogleDocsCredential::from_broker_token(
+            OAuthBrokerToken {
+                access_token: "access-token".to_string(),
+                token_type: Some("Bearer".to_string()),
+                expires_in: Some(3600),
+                refresh_token_handle: Some("handle-1".to_string()),
+                account_id: Some("acct-1".to_string()),
+                account_label: Some("user@example.com".to_string()),
+                workspace_id: Some("google-drive".to_string()),
+                workspace_name: Some("Google Drive".to_string()),
+                scopes: GOOGLE_DOCS_OAUTH_SCOPES
+                    .iter()
+                    .map(|scope| scope.to_string())
+                    .collect(),
+            },
+            "client-id".to_string(),
+            "https://auth.example.test".to_string(),
+            100,
+        );
+
+        let mut refreshed_scopes = GOOGLE_DOCS_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>();
+        refreshed_scopes.push("https://www.googleapis.com/auth/calendar.events".to_string());
+
+        let error = stored
+            .refreshed(
+                OAuthBrokerToken {
+                    access_token: "new-access-token".to_string(),
+                    token_type: Some("Bearer".to_string()),
+                    expires_in: Some(7200),
+                    refresh_token_handle: Some("handle-2".to_string()),
+                    account_id: None,
+                    account_label: None,
+                    workspace_id: None,
+                    workspace_name: None,
+                    scopes: refreshed_scopes,
+                },
+                200,
+            )
+            .expect_err("unsupported refreshed scope");
+
+        assert_eq!(
+            error,
+            GoogleDocsOAuthScopeError::UnsupportedScope(
+                "https://www.googleapis.com/auth/calendar.events".to_string()
+            )
+        );
     }
 }
