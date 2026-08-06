@@ -2301,6 +2301,9 @@ dependencies = [
 [[package]]
 name = "locality-auth-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "locality-cloud-files"

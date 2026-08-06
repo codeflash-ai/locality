@@ -1,5 +1,10 @@
 //! Shared OAuth connector profiles.
 
+use std::fmt;
+use std::net::IpAddr;
+
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OAuthConnector {
     Notion,
@@ -134,9 +139,10 @@ pub enum GoogleOAuthScopeError {
     UnsupportedConnector,
     FullMailboxScope,
     MissingRequiredScope(&'static str),
+    UnsupportedScope(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GoogleOAuthTokenResponse {
     pub access_token: String,
     pub token_type: Option<String>,
@@ -146,7 +152,20 @@ pub struct GoogleOAuthTokenResponse {
     pub id_token: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl fmt::Debug for GoogleOAuthTokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GoogleOAuthTokenResponse")
+            .field("access_token", &REDACTED)
+            .field("token_type", &self.token_type)
+            .field("refresh_token", &redacted_if_present(&self.refresh_token))
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .field("id_token", &redacted_if_present(&self.id_token))
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GoogleHostedCredential {
     pub kind: String,
     pub connector: String,
@@ -161,6 +180,32 @@ pub struct GoogleHostedCredential {
     pub scopes: Vec<String>,
     pub acquired_at: u64,
     pub expires_at: Option<u64>,
+}
+
+impl fmt::Debug for GoogleHostedCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GoogleHostedCredential")
+            .field("kind", &self.kind)
+            .field("connector", &self.connector)
+            .field("access_token", &REDACTED)
+            .field("refresh_token", &REDACTED)
+            .field("token_type", &self.token_type)
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field("account_id", &self.account_id)
+            .field("account_label", &self.account_label)
+            .field("workspace_id", &self.workspace_id)
+            .field("workspace_name", &self.workspace_name)
+            .field("scopes", &self.scopes)
+            .field("acquired_at", &self.acquired_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+const REDACTED: &str = "<redacted>";
+
+fn redacted_if_present(value: &Option<String>) -> Option<&'static str> {
+    value.as_ref().map(|_| REDACTED)
 }
 
 pub const SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE: &str = "channels:join";
@@ -280,7 +325,7 @@ pub fn validate_google_oauth_scopes(
     connector: OAuthConnector,
     granted: &[String],
 ) -> Result<(), GoogleOAuthScopeError> {
-    let required_scopes = google_required_api_scopes(connector)?;
+    let allowed_scopes = google_hosted_scope_set(connector)?;
     if connector == OAuthConnector::Gmail
         && granted
             .iter()
@@ -289,9 +334,16 @@ pub fn validate_google_oauth_scopes(
         return Err(GoogleOAuthScopeError::FullMailboxScope);
     }
 
+    let required_scopes = google_required_api_scopes(connector)?;
     for required in required_scopes {
         if !granted.iter().any(|scope| scope == required) {
             return Err(GoogleOAuthScopeError::MissingRequiredScope(required));
+        }
+    }
+
+    for scope in granted {
+        if !allowed_scopes.iter().any(|allowed| scope == allowed) {
+            return Err(GoogleOAuthScopeError::UnsupportedScope(scope.clone()));
         }
     }
 
@@ -307,6 +359,17 @@ fn google_hosted_profile(
                 .ok_or(GoogleOAuthProfileError::UnsupportedConnector)
         }
         _ => Err(GoogleOAuthProfileError::UnsupportedConnector),
+    }
+}
+
+fn google_hosted_scope_set(
+    connector: OAuthConnector,
+) -> Result<&'static [&'static str], GoogleOAuthScopeError> {
+    match connector {
+        OAuthConnector::GoogleDocs => Ok(GOOGLE_DOCS_HOSTED_ADMIN_SCOPES),
+        OAuthConnector::GoogleCalendar => Ok(GOOGLE_CALENDAR_HOSTED_ADMIN_SCOPES),
+        OAuthConnector::Gmail => Ok(GMAIL_HOSTED_ADMIN_SCOPES),
+        _ => Err(GoogleOAuthScopeError::UnsupportedConnector),
     }
 }
 
@@ -329,35 +392,93 @@ fn valid_google_oauth_client_id(client_id: &str) -> bool {
 }
 
 fn valid_google_hosted_redirect_uri(connector: OAuthConnector, redirect_uri: &str) -> bool {
-    if redirect_uri.is_empty() || redirect_uri.chars().any(char::is_whitespace) {
-        return false;
-    }
-    if redirect_uri.contains('?') || redirect_uri.contains('#') {
-        return false;
-    }
-    let Some(after_scheme) = redirect_uri.strip_prefix("https://") else {
+    let Some(parsed) = parse_hosted_https_redirect_uri(redirect_uri) else {
         return false;
     };
-    let Some((authority, path)) = after_scheme.split_once('/') else {
-        return false;
-    };
-    if authority.is_empty()
-        || authority.contains('@')
-        || authority.contains(':')
-        || authority.chars().any(char::is_control)
-    {
-        return false;
-    }
-    if is_loopback_google_redirect_host(authority) {
-        return false;
-    }
 
-    path == connector.broker_callback_path().trim_start_matches('/')
+    !is_loopback_google_redirect_host(parsed.host)
+        && parsed.path == connector.broker_callback_path()
 }
 
 fn is_loopback_google_redirect_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    host == "localhost" || host.ends_with(".localhost") || host == "127.0.0.1" || host == "0.0.0.0"
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Err(_) => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostedHttpsRedirectUri<'a> {
+    host: &'a str,
+    path: &'a str,
+}
+
+fn parse_hosted_https_redirect_uri(uri: &str) -> Option<HostedHttpsRedirectUri<'_>> {
+    if uri.is_empty() || uri.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if uri.contains('?') || uri.contains('#') {
+        return None;
+    }
+    let after_scheme = uri.strip_prefix("https://")?;
+    let (authority, path) = after_scheme.split_once('/')?;
+    if path.is_empty() {
+        return None;
+    }
+    let host = parse_https_authority_host(authority)?;
+    Some(HostedHttpsRedirectUri {
+        host,
+        path: &uri[uri.len() - path.len() - 1..],
+    })
+}
+
+fn parse_https_authority_host(authority: &str) -> Option<&str> {
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority
+            .chars()
+            .any(|char| char.is_control() || char.is_whitespace())
+    {
+        return None;
+    }
+
+    if let Some(bracketed_host) = authority.strip_prefix('[') {
+        let closing_bracket = bracketed_host.find(']')?;
+        let host = &bracketed_host[..closing_bracket];
+        let suffix = &bracketed_host[closing_bracket + 1..];
+        if host.is_empty() || !valid_optional_https_port_suffix(suffix) {
+            return None;
+        }
+        return Some(host);
+    }
+
+    let Some((host, port)) = authority.split_once(':') else {
+        return (!authority.is_empty()).then_some(authority);
+    };
+    if host.is_empty() || port.contains(':') || !valid_https_port(port) {
+        return None;
+    }
+    Some(host)
+}
+
+fn valid_optional_https_port_suffix(suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    let Some(port) = suffix.strip_prefix(':') else {
+        return false;
+    };
+    valid_https_port(port)
+}
+
+fn valid_https_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
 }
 
 fn append_query_param(url: &mut String, key: &str, value: &str) {
@@ -574,6 +695,47 @@ mod tests {
     }
 
     #[test]
+    fn google_hosted_authorization_accepts_supported_connectors_with_https_ports() {
+        for connector in [
+            OAuthConnector::GoogleDocs,
+            OAuthConnector::GoogleCalendar,
+            OAuthConnector::Gmail,
+        ] {
+            let redirect_uri = format!(
+                "https://api.locality.test:8443{}",
+                connector.broker_callback_path()
+            );
+
+            let url = google_authorization_url(
+                connector,
+                "google-client.apps.googleusercontent.com",
+                &redirect_uri,
+                "intent.random",
+            )
+            .expect("authorization URL");
+
+            assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
+            assert!(url.contains(&format!(
+                "redirect_uri={}",
+                percent_encode_query_component(&redirect_uri)
+            )));
+        }
+    }
+
+    #[test]
+    fn google_hosted_authorization_rejects_supported_connector_wrong_callback_path() {
+        assert_eq!(
+            google_authorization_url(
+                OAuthConnector::Gmail,
+                "google-client",
+                "https://api.locality.test/v1/oauth/google-docs/callback",
+                "intent.random",
+            ),
+            Err(GoogleOAuthProfileError::InvalidRedirectUri)
+        );
+    }
+
+    #[test]
     fn google_scope_validation_is_provider_bound() {
         let docs = [
             "openid",
@@ -613,6 +775,72 @@ mod tests {
                 "https://www.googleapis.com/auth/calendar.events"
             ))
         );
+    }
+
+    #[test]
+    fn google_scope_validation_rejects_extra_scopes() {
+        let mut docs = hosted_scope_strings(OAuthConnector::GoogleDocs);
+        docs.push("https://www.googleapis.com/auth/calendar.events".to_string());
+
+        assert_eq!(
+            validate_google_oauth_scopes(OAuthConnector::GoogleDocs, &docs),
+            Err(GoogleOAuthScopeError::UnsupportedScope(
+                "https://www.googleapis.com/auth/calendar.events".to_string()
+            ))
+        );
+
+        let mut gmail = hosted_scope_strings(OAuthConnector::Gmail);
+        gmail.push(GMAIL_FULL_MAILBOX_SCOPE.to_string());
+
+        assert_eq!(
+            validate_google_oauth_scopes(OAuthConnector::Gmail, &gmail),
+            Err(GoogleOAuthScopeError::FullMailboxScope)
+        );
+    }
+
+    #[test]
+    fn google_oauth_json_contracts_require_serde_traits_and_redact_debug() {
+        fn assert_json_contract<T>()
+        where
+            T: serde::Serialize + for<'de> serde::Deserialize<'de>,
+        {
+        }
+        assert_json_contract::<GoogleOAuthTokenResponse>();
+        assert_json_contract::<GoogleHostedCredential>();
+
+        let token = GoogleOAuthTokenResponse {
+            access_token: "access-secret".to_string(),
+            token_type: Some("Bearer".to_string()),
+            refresh_token: Some("refresh-secret".to_string()),
+            expires_in: Some(3600),
+            scope: Some("openid email".to_string()),
+            id_token: Some("id-secret".to_string()),
+        };
+        let token_debug = format!("{token:?}");
+        assert!(token_debug.contains("<redacted>"));
+        assert!(!token_debug.contains("access-secret"));
+        assert!(!token_debug.contains("refresh-secret"));
+        assert!(!token_debug.contains("id-secret"));
+
+        let credential = GoogleHostedCredential {
+            kind: "hosted_oauth".to_string(),
+            connector: "gmail".to_string(),
+            access_token: "credential-access-secret".to_string(),
+            refresh_token: "credential-refresh-secret".to_string(),
+            token_type: Some("Bearer".to_string()),
+            oauth_client_id: "google-client".to_string(),
+            account_id: Some("account-id".to_string()),
+            account_label: Some("account@example.test".to_string()),
+            workspace_id: Some("workspace-id".to_string()),
+            workspace_name: Some("Workspace".to_string()),
+            scopes: hosted_scope_strings(OAuthConnector::Gmail),
+            acquired_at: 100,
+            expires_at: Some(3700),
+        };
+        let credential_debug = format!("{credential:?}");
+        assert!(credential_debug.contains("<redacted>"));
+        assert!(!credential_debug.contains("credential-access-secret"));
+        assert!(!credential_debug.contains("credential-refresh-secret"));
     }
 
     #[test]
@@ -663,5 +891,14 @@ mod tests {
 
     fn scope_strings(scopes: &[&str]) -> Vec<String> {
         scopes.iter().map(|scope| (*scope).to_string()).collect()
+    }
+
+    fn hosted_scope_strings(connector: OAuthConnector) -> Vec<String> {
+        oauth_profile(connector, OAuthHostMode::HostedAdmin)
+            .expect("hosted profile")
+            .scopes
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect()
     }
 }

@@ -11,3 +11,4 @@ name = "locality_auth_core"
 path = "src/lib.rs"
 
 [dependencies]
+serde = { version = "1.0", features = ["derive"] }
