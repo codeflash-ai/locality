@@ -235,6 +235,16 @@ if PATH="$fake_bin:$PATH" \
 fi
 assert_file_contains "$invalid_run_id_stderr" "RUN_ID"
 
+dotdot_run_id_stderr="${TMPDIR}/dotdot-run-id.err"
+if PATH="$fake_bin:$PATH" \
+  NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
+  RUN_ID=".." \
+  "$RUNNER" --sandbox fake-machine 2>"$dotdot_run_id_stderr"; then
+  fail "dotdot RUN_ID unexpectedly succeeded"
+fi
+assert_file_contains "$dotdot_run_id_stderr" "RUN_ID must start with an alphanumeric character"
+grep -F -q "amika sandbox ssh" "$fake_log" && fail "dotdot RUN_ID invoked amika"
+
 missing_amika_stderr="${TMPDIR}/missing-amika.err"
 if PATH="$no_amika_bin" \
   NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \

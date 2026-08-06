@@ -56,8 +56,8 @@ notion_parent_page_id="${NOTION_STANDUP_PARENT_PAGE_ID:-${NOTION_ROOT_PAGE_ID:-}
 : "${SLACK_TYPES:=private_channel,im,mpim}"
 : "${STANDUP_DATE:=$(date -u +%F)}"
 
-if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
-  fail "RUN_ID must match [A-Za-z0-9._-]+: $RUN_ID"
+if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  fail "RUN_ID must start with an alphanumeric character and contain only [A-Za-z0-9._-]: $RUN_ID"
 fi
 
 command -v amika >/dev/null 2>&1 || fail "missing required tool: amika"
