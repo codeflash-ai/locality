@@ -1,9 +1,9 @@
-use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::OnceLock;
 
 use locality_auth_core::oauth::{
-    GOOGLE_CALENDAR_LOCAL_BROKER_SCOPES, GOOGLE_CALENDAR_REQUIRED_API_SCOPES, OAuthConnector,
+    GOOGLE_CALENDAR_LOCAL_BROKER_SCOPES, GoogleOAuthScopeError as SharedGoogleOAuthScopeError,
+    OAuthConnector, validate_google_oauth_scopes,
 };
 use locality_connector::ConnectorCapabilities;
 use locality_connector::oauth_broker::{
@@ -21,7 +21,6 @@ pub const DEFAULT_GOOGLE_CALENDAR_OAUTH_BROKER_URL: &str =
 pub const DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI: &str =
     OAuthConnector::GoogleCalendar.default_local_callback_uri();
 pub const GOOGLE_CALENDAR_OAUTH_SCOPES: &[&str] = GOOGLE_CALENDAR_LOCAL_BROKER_SCOPES;
-const REQUIRED_GOOGLE_CALENDAR_API_SCOPES: &[&str] = GOOGLE_CALENDAR_REQUIRED_API_SCOPES;
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
@@ -138,6 +137,7 @@ impl StoredGoogleCalendarCredential {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GoogleCalendarOAuthScopeError {
     MissingRequiredScope(&'static str),
+    UnsupportedScope(String),
 }
 
 impl fmt::Display for GoogleCalendarOAuthScopeError {
@@ -146,6 +146,10 @@ impl fmt::Display for GoogleCalendarOAuthScopeError {
             Self::MissingRequiredScope(scope) => write!(
                 f,
                 "Google Calendar OAuth broker response missing required Google Calendar OAuth scope `{scope}`; reconnect with the default Google Calendar OAuth broker configuration"
+            ),
+            Self::UnsupportedScope(scope) => write!(
+                f,
+                "Google Calendar OAuth broker returned unsupported Google Calendar OAuth scope `{scope}`; reconnect with the default Google Calendar OAuth broker configuration"
             ),
         }
     }
@@ -156,16 +160,22 @@ impl std::error::Error for GoogleCalendarOAuthScopeError {}
 pub fn validate_google_calendar_oauth_scopes(
     scopes: &[String],
 ) -> Result<(), GoogleCalendarOAuthScopeError> {
-    let granted = scopes.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    for required in REQUIRED_GOOGLE_CALENDAR_API_SCOPES {
-        if !granted.contains(required) {
-            return Err(GoogleCalendarOAuthScopeError::MissingRequiredScope(
-                required,
-            ));
-        }
-    }
-
-    Ok(())
+    validate_google_oauth_scopes(OAuthConnector::GoogleCalendar, scopes).map_err(
+        |error| match error {
+            SharedGoogleOAuthScopeError::MissingRequiredScope(scope) => {
+                GoogleCalendarOAuthScopeError::MissingRequiredScope(scope)
+            }
+            SharedGoogleOAuthScopeError::UnsupportedScope(scope) => {
+                GoogleCalendarOAuthScopeError::UnsupportedScope(scope)
+            }
+            SharedGoogleOAuthScopeError::FullMailboxScope => {
+                unreachable!("full mailbox scope is only special-cased for Gmail")
+            }
+            SharedGoogleOAuthScopeError::UnsupportedConnector => {
+                unreachable!("Google Calendar is a supported Google OAuth connector")
+            }
+        },
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -346,6 +356,27 @@ mod tests {
             error
                 .to_string()
                 .contains("missing required Google Calendar OAuth scope")
+        );
+    }
+
+    #[test]
+    fn google_calendar_scope_validation_rejects_unsupported_extra_scope() {
+        let mut scopes = calendar_scopes();
+        scopes.push("https://www.googleapis.com/auth/documents".to_string());
+
+        let error = validate_google_calendar_oauth_scopes(&scopes)
+            .expect_err("unsupported Google Docs scope");
+
+        assert_eq!(
+            error,
+            GoogleCalendarOAuthScopeError::UnsupportedScope(
+                "https://www.googleapis.com/auth/documents".to_string()
+            )
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Google Calendar OAuth scope")
         );
     }
 

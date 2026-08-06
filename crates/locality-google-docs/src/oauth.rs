@@ -1,7 +1,10 @@
 use std::fmt;
 use std::sync::OnceLock;
 
-use locality_auth_core::oauth::{GOOGLE_DOCS_LOCAL_BROKER_SCOPES, OAuthConnector};
+use locality_auth_core::oauth::{
+    GOOGLE_DOCS_LOCAL_BROKER_SCOPES, GoogleOAuthScopeError as SharedGoogleOAuthScopeError,
+    OAuthConnector, validate_google_oauth_scopes,
+};
 use locality_connector::ConnectorCapabilities;
 use locality_connector::oauth_broker::{
     OAuthBrokerCodeExchange, OAuthBrokerRefresh, OAuthBrokerStart, OAuthBrokerStartResponse,
@@ -128,6 +131,48 @@ impl StoredGoogleDocsCredential {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoogleDocsOAuthScopeError {
+    MissingRequiredScope(&'static str),
+    UnsupportedScope(String),
+}
+
+impl fmt::Display for GoogleDocsOAuthScopeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingRequiredScope(scope) => write!(
+                f,
+                "Google Docs OAuth broker response missing required Google Docs OAuth scope `{scope}`; reconnect with the default Google Docs OAuth broker configuration"
+            ),
+            Self::UnsupportedScope(scope) => write!(
+                f,
+                "Google Docs OAuth broker returned unsupported Google Docs OAuth scope `{scope}`; reconnect with the default Google Docs OAuth broker configuration"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GoogleDocsOAuthScopeError {}
+
+pub fn validate_google_docs_oauth_scopes(
+    scopes: &[String],
+) -> Result<(), GoogleDocsOAuthScopeError> {
+    validate_google_oauth_scopes(OAuthConnector::GoogleDocs, scopes).map_err(|error| match error {
+        SharedGoogleOAuthScopeError::MissingRequiredScope(scope) => {
+            GoogleDocsOAuthScopeError::MissingRequiredScope(scope)
+        }
+        SharedGoogleOAuthScopeError::UnsupportedScope(scope) => {
+            GoogleDocsOAuthScopeError::UnsupportedScope(scope)
+        }
+        SharedGoogleOAuthScopeError::FullMailboxScope => {
+            unreachable!("full mailbox scope is only special-cased for Gmail")
+        }
+        SharedGoogleOAuthScopeError::UnsupportedConnector => {
+            unreachable!("Google Docs is a supported Google OAuth connector")
+        }
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct HttpGoogleDocsOAuthBrokerClient {
     base_url: String,
@@ -220,7 +265,8 @@ mod tests {
 
     use super::{
         DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI, GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES,
-        StoredGoogleDocsCredential, google_docs_capabilities_json,
+        GoogleDocsOAuthScopeError, StoredGoogleDocsCredential, google_docs_capabilities_json,
+        validate_google_docs_oauth_scopes,
     };
 
     #[test]
@@ -240,6 +286,61 @@ mod tests {
                 "https://www.googleapis.com/auth/drive.file",
                 "https://www.googleapis.com/auth/drive.metadata",
             ]
+        );
+    }
+
+    #[test]
+    fn google_docs_scope_validation_requires_docs_and_drive_scopes() {
+        let scopes = GOOGLE_DOCS_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>();
+
+        validate_google_docs_oauth_scopes(&scopes).expect("valid Google Docs scopes");
+
+        let missing_drive_metadata = GOOGLE_DOCS_OAUTH_SCOPES
+            .iter()
+            .filter(|scope| **scope != "https://www.googleapis.com/auth/drive.metadata")
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>();
+
+        let error = validate_google_docs_oauth_scopes(&missing_drive_metadata)
+            .expect_err("missing drive.metadata scope");
+
+        assert_eq!(
+            error,
+            GoogleDocsOAuthScopeError::MissingRequiredScope(
+                "https://www.googleapis.com/auth/drive.metadata"
+            )
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("missing required Google Docs OAuth scope")
+        );
+    }
+
+    #[test]
+    fn google_docs_scope_validation_rejects_unsupported_extra_scope() {
+        let mut scopes = GOOGLE_DOCS_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>();
+        scopes.push("https://www.googleapis.com/auth/calendar.events".to_string());
+
+        let error = validate_google_docs_oauth_scopes(&scopes)
+            .expect_err("unsupported Google Calendar scope");
+
+        assert_eq!(
+            error,
+            GoogleDocsOAuthScopeError::UnsupportedScope(
+                "https://www.googleapis.com/auth/calendar.events".to_string()
+            )
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Google Docs OAuth scope")
         );
     }
 

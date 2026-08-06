@@ -1,10 +1,10 @@
-use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::OnceLock;
 
 use locality_auth_core::oauth::{
     GMAIL_FULL_MAILBOX_SCOPE as AUTH_CORE_GMAIL_FULL_MAILBOX_SCOPE, GMAIL_LOCAL_BROKER_SCOPES,
-    GMAIL_REQUIRED_API_SCOPES, OAuthConnector,
+    GoogleOAuthScopeError as SharedGoogleOAuthScopeError, OAuthConnector,
+    validate_google_oauth_scopes,
 };
 use locality_connector::ConnectorCapabilities;
 use locality_connector::oauth_broker::{
@@ -21,7 +21,6 @@ pub const DEFAULT_GMAIL_OAUTH_BROKER_URL: &str = "https://afs-oauth-broker.saura
 pub const DEFAULT_GMAIL_OAUTH_REDIRECT_URI: &str =
     OAuthConnector::Gmail.default_local_callback_uri();
 pub const GMAIL_OAUTH_SCOPES: &[&str] = GMAIL_LOCAL_BROKER_SCOPES;
-const REQUIRED_GMAIL_API_SCOPES: &[&str] = GMAIL_REQUIRED_API_SCOPES;
 pub const GMAIL_FULL_MAILBOX_SCOPE: &str = AUTH_CORE_GMAIL_FULL_MAILBOX_SCOPE;
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
@@ -140,6 +139,7 @@ impl StoredGmailCredential {
 pub enum GmailOAuthScopeError {
     FullMailboxScope,
     MissingRequiredScope(&'static str),
+    UnsupportedScope(String),
 }
 
 impl fmt::Display for GmailOAuthScopeError {
@@ -153,6 +153,10 @@ impl fmt::Display for GmailOAuthScopeError {
                 f,
                 "Gmail OAuth broker response missing required Gmail OAuth scope `{scope}`; reconnect with the default Gmail OAuth broker configuration"
             ),
+            Self::UnsupportedScope(scope) => write!(
+                f,
+                "Gmail OAuth broker returned unsupported Gmail OAuth scope `{scope}`; reconnect with the default Gmail OAuth broker configuration"
+            ),
         }
     }
 }
@@ -160,21 +164,18 @@ impl fmt::Display for GmailOAuthScopeError {
 impl std::error::Error for GmailOAuthScopeError {}
 
 pub fn validate_gmail_oauth_scopes(scopes: &[String]) -> Result<(), GmailOAuthScopeError> {
-    if scopes
-        .iter()
-        .any(|scope| scope.as_str() == GMAIL_FULL_MAILBOX_SCOPE)
-    {
-        return Err(GmailOAuthScopeError::FullMailboxScope);
-    }
-
-    let granted = scopes.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    for required in REQUIRED_GMAIL_API_SCOPES {
-        if !granted.contains(required) {
-            return Err(GmailOAuthScopeError::MissingRequiredScope(required));
+    validate_google_oauth_scopes(OAuthConnector::Gmail, scopes).map_err(|error| match error {
+        SharedGoogleOAuthScopeError::FullMailboxScope => GmailOAuthScopeError::FullMailboxScope,
+        SharedGoogleOAuthScopeError::MissingRequiredScope(scope) => {
+            GmailOAuthScopeError::MissingRequiredScope(scope)
         }
-    }
-
-    Ok(())
+        SharedGoogleOAuthScopeError::UnsupportedScope(scope) => {
+            GmailOAuthScopeError::UnsupportedScope(scope)
+        }
+        SharedGoogleOAuthScopeError::UnsupportedConnector => {
+            unreachable!("Gmail is a supported Google OAuth connector")
+        }
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -348,6 +349,22 @@ mod tests {
 
         assert_eq!(error, GmailOAuthScopeError::FullMailboxScope);
         assert!(error.to_string().contains(GMAIL_FULL_MAILBOX_SCOPE));
+    }
+
+    #[test]
+    fn gmail_scope_validation_rejects_unsupported_extra_scope() {
+        let mut scopes = gmail_scopes();
+        scopes.push("https://www.googleapis.com/auth/documents".to_string());
+
+        let error = validate_gmail_oauth_scopes(&scopes).expect_err("unsupported Docs scope");
+
+        assert_eq!(
+            error,
+            GmailOAuthScopeError::UnsupportedScope(
+                "https://www.googleapis.com/auth/documents".to_string()
+            )
+        );
+        assert!(error.to_string().contains("unsupported Gmail OAuth scope"));
     }
 
     #[test]
