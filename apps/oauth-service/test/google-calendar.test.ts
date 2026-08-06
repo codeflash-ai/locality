@@ -159,6 +159,26 @@ describe("Google Calendar OAuth broker", () => {
     );
   });
 
+  it("relays the provider callback back to the localhost Google Calendar client redirect", async () => {
+    const start = await startGoogleCalendarSession();
+    const callback = await app.request(
+      `/v1/oauth/google-calendar/callback?code=provider-code&state=${encodeURIComponent(start.state)}`,
+      { method: "GET" },
+      env
+    );
+
+    expect(callback.status).toBe(302);
+    expect(callback.headers.get("cache-control")).toBe("no-store");
+    expect(callback.headers.get("referrer-policy")).toBe("no-referrer");
+    const location = callback.headers.get("location");
+    expect(location).toBeTruthy();
+    const redirected = new URL(location!);
+    expect(redirected.origin).toBe("http://localhost:8757");
+    expect(redirected.pathname).toBe("/oauth/google-calendar/callback");
+    expect(redirected.searchParams.get("code")).toBe("provider-code");
+    expect(redirected.searchParams.get("state")).toBe(start.state);
+  });
+
   it("refreshes Google Calendar credentials through an opaque refresh handle", async () => {
     const start = await startGoogleCalendarSession();
     let calls = 0;
