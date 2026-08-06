@@ -33,10 +33,12 @@ crate cannot ship by itself.
    provider-specific mount settings in the provider crate and serialize the
    default represented by the manifest.
 7. For OAuth connectors, add or update the connector's OAuth profile in
-   `crates/locality-auth-core` before adding per-runtime OAuth code. Public
-   broker, CLI, and hosted adapters that implement that connector's OAuth must
-   consume the shared ID/scope/callback profile instead of duplicating connector
-   auth constants.
+   `crates/locality-auth-core` before adding per-runtime OAuth code. Rust
+   runtimes and adapters that implement that connector's OAuth must consume the
+   shared ID/scope/callback profile instead of duplicating connector auth
+   constants. Public broker routing and configuration must stay aligned with the
+   shared profile through generated metadata, drift tests, or explicit matching
+   updates.
 8. Add the desktop source ID, setup/auth classification, display metadata, and
    `apps/desktop/src/assets/connectors/<id>.svg` icon. Add OAuth-service routing
    only when the connector actually uses the public OAuth broker.

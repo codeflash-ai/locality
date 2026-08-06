@@ -31,6 +31,9 @@ Provider OAuth apps should register only the broker HTTPS callback URLs, such as
 only the desktop completion URL used after the broker receives and verifies the
 provider callback.
 
+The current stateless broker uses the signed session token as the OAuth `state`,
+so `session` and `state` match in `/start` and `/exchange` payloads.
+
 The broker does not persist page content or tokens. In `handle` mode, it returns
 an encrypted opaque refresh handle instead of the raw provider refresh token.
 
@@ -56,7 +59,7 @@ Response:
   "redirect_uri": "http://localhost:8757/oauth/notion/callback",
   "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/notion/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "expires_in": 600
 }
 ```
@@ -68,7 +71,7 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "code": "provider-authorization-code",
   "redirect_uri": "http://localhost:8757/oauth/notion/callback"
 }
@@ -107,7 +110,7 @@ Response:
   "redirect_uri": "http://localhost:8757/oauth/google-docs/callback",
   "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/google-docs/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "expires_in": 600
 }
 ```
@@ -119,7 +122,7 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "code": "provider-authorization-code",
   "redirect_uri": "http://localhost:8757/oauth/google-docs/callback"
 }
@@ -164,7 +167,7 @@ Response:
   "redirect_uri": "http://localhost:8757/oauth/google-calendar/callback",
   "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/google-calendar/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "expires_in": 600
 }
 ```
@@ -176,7 +179,7 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "code": "provider-authorization-code",
   "redirect_uri": "http://localhost:8757/oauth/google-calendar/callback"
 }
@@ -217,7 +220,7 @@ Response:
   "redirect_uri": "http://localhost:8757/oauth/gmail/callback",
   "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/gmail/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "expires_in": 600
 }
 ```
@@ -229,7 +232,7 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "code": "provider-authorization-code",
   "redirect_uri": "http://localhost:8757/oauth/gmail/callback"
 }
@@ -269,7 +272,7 @@ Response:
   "redirect_uri": "http://localhost:8757/oauth/slack/callback",
   "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/slack/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "expires_in": 600
 }
 ```
@@ -281,7 +284,7 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "code": "provider-authorization-code",
   "redirect_uri": "http://localhost:8757/oauth/slack/callback"
 }
