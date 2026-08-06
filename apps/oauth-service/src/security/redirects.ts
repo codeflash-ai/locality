@@ -1,5 +1,5 @@
-import { badRequest } from "../http/errors";
-import type { BrokerEnv } from "../types";
+import { badRequest, configError } from "../http/errors";
+import type { BrokerEnv, ConnectorId } from "../types";
 
 const DEFAULT_NOTION_REDIRECT_URIS = [
   "http://localhost:8757/oauth/notion/callback",
@@ -64,6 +64,36 @@ export function allowedSlackRedirectUris(env: BrokerEnv): string[] {
 
 export function validateSlackRedirectUri(env: BrokerEnv, redirectUri: string): string {
   return validateLoopbackRedirectUri("Slack", allowedSlackRedirectUris(env), redirectUri);
+}
+
+export function providerCallbackUri(env: BrokerEnv, connector: ConnectorId): string {
+  const base = env.LOCALITY_BROKER_PUBLIC_BASE_URL;
+  if (!base || base.trim() === "") {
+    throw configError("LOCALITY_BROKER_PUBLIC_BASE_URL must be configured");
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(base);
+  } catch {
+    throw configError("LOCALITY_BROKER_PUBLIC_BASE_URL must be a valid HTTPS URL");
+  }
+
+  if (parsed.protocol !== "https:") {
+    throw configError("LOCALITY_BROKER_PUBLIC_BASE_URL must use HTTPS");
+  }
+  if (!parsed.hostname) {
+    throw configError("LOCALITY_BROKER_PUBLIC_BASE_URL must include a hostname");
+  }
+  if (parsed.username || parsed.password) {
+    throw configError("LOCALITY_BROKER_PUBLIC_BASE_URL must not include credentials");
+  }
+  if (parsed.search || parsed.hash) {
+    throw configError("LOCALITY_BROKER_PUBLIC_BASE_URL must not include query or fragment");
+  }
+
+  parsed.pathname = `${parsed.pathname.replace(/\/+$/, "")}/v1/oauth/${connector}/callback`;
+  return parsed.toString();
 }
 
 function validateLoopbackRedirectUri(connectorName: string, allowed: string[], redirectUri: string): string {

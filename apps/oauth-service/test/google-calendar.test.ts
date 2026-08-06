@@ -7,6 +7,7 @@ interface StartResponse {
   client_id: string;
   authorization_url: string;
   redirect_uri: string;
+  provider_redirect_uri: string;
   session: string;
   state: string;
 }
@@ -27,6 +28,7 @@ const env: BrokerEnv = {
   LOCALITY_BROKER_SESSION_SECRET: "test-session-secret-with-enough-entropy",
   LOCALITY_REFRESH_HANDLE_KEY: "test-refresh-handle-key-with-enough-entropy",
   LOCALITY_TOKEN_MODE: "handle",
+  LOCALITY_BROKER_PUBLIC_BASE_URL: "https://oauth.locality.test",
   LOCALITY_NOTION_CLIENT_ID: "notion-client-id",
   LOCALITY_NOTION_CLIENT_SECRET: "notion-client-secret",
   LOCALITY_GOOGLE_CLIENT_ID: "google-client-id",
@@ -77,7 +79,7 @@ describe("Google Calendar OAuth broker", () => {
     expect(authorizationUrl.searchParams.get("client_id")).toBe("google-client-id");
     expect(authorizationUrl.searchParams.get("response_type")).toBe("code");
     expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(
-      "http://localhost:8757/oauth/google-calendar/callback"
+      "https://oauth.locality.test/v1/oauth/google-calendar/callback"
     );
     expect(authorizationUrl.searchParams.get("scope")?.split(" ").sort()).toEqual(
       [
@@ -91,6 +93,9 @@ describe("Google Calendar OAuth broker", () => {
     expect(authorizationUrl.searchParams.get("prompt")).toBe("consent");
     expect(authorizationUrl.searchParams.get("include_granted_scopes")).toBeNull();
     expect(body.redirect_uri).toBe("http://localhost:8757/oauth/google-calendar/callback");
+    expect(body.provider_redirect_uri).toBe(
+      "https://oauth.locality.test/v1/oauth/google-calendar/callback"
+    );
     expect(body.session).toBeTruthy();
     expect(body.state).toBeTruthy();
   });
@@ -149,7 +154,9 @@ describe("Google Calendar OAuth broker", () => {
     expect(requestBody.get("client_secret")).toBe("google-client-secret");
     expect(requestBody.get("grant_type")).toBe("authorization_code");
     expect(requestBody.get("code")).toBe("authorization-code");
-    expect(requestBody.get("redirect_uri")).toBe("http://localhost:8757/oauth/google-calendar/callback");
+    expect(requestBody.get("redirect_uri")).toBe(
+      "https://oauth.locality.test/v1/oauth/google-calendar/callback"
+    );
   });
 
   it("refreshes Google Calendar credentials through an opaque refresh handle", async () => {

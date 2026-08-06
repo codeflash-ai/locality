@@ -18,13 +18,14 @@ import { exchangeNotionCode, notionAuthorizeUrl, refreshNotionToken, type Notion
 import { exchangeSlackCode, refreshSlackToken, slackAuthorizeUrl, type SlackTokenResponse } from "./oauth/slack";
 import { randomBase64Url, decryptJsonHandle, encryptJsonHandle } from "./security/crypto";
 import {
+  providerCallbackUri,
   validateGmailRedirectUri,
   validateGoogleCalendarRedirectUri,
   validateGoogleDocsRedirectUri,
   validateNotionRedirectUri,
   validateSlackRedirectUri
 } from "./security/redirects";
-import { nowSeconds, signSession, verifySession } from "./security/session";
+import { nowSeconds, signSession, verifySession, type OAuthSessionPayloadV2 } from "./security/session";
 import type { ApiErrorBody, BrokerEnv, ConnectorId } from "./types";
 
 const SESSION_TTL_SECONDS = 10 * 60;
@@ -91,33 +92,46 @@ app.get("/.well-known/loc-auth-broker", (c) =>
   })
 );
 
+app.get("/v1/oauth/:connector/callback", async (c) => {
+  const connector = connectorFromParam(c.req.param("connector"));
+  const state = requireString(c.req.query("state"), "state");
+  const payload = await verifySession(
+    state,
+    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
+  );
+  if (payload.v !== 2 || payload.connector !== connector) {
+    throw badRequest("oauth_session_mismatch", "OAuth callback did not match the broker session");
+  }
+  if (payload.provider_redirect_uri !== providerCallbackUri(c.env, connector)) {
+    throw badRequest("oauth_session_mismatch", "OAuth callback did not match the broker callback URI");
+  }
+
+  const requestUrl = new URL(c.req.url);
+  if (!requestUrl.searchParams.get("code") && !requestUrl.searchParams.get("error")) {
+    throw badRequest("invalid_oauth_callback", "OAuth callback must include code or error");
+  }
+
+  c.header("Cache-Control", "no-store");
+  c.header("Referrer-Policy", "no-referrer");
+  return c.redirect(callbackRedirectTarget(payload, state, requestUrl), 302);
+});
+
 app.post("/v1/oauth/notion/start", async (c) => {
   const body = await optionalJson<StartRequest>(c.req.raw);
-  const redirectUri = validateNotionRedirectUri(
+  const clientRedirectUri = validateNotionRedirectUri(
     c.env,
     body.redirect_uri ?? "http://localhost:8757/oauth/notion/callback"
   );
-  const now = nowSeconds();
-  const state = randomBase64Url();
-  const session = await signSession(
-    {
-      v: 1,
-      connector: "notion",
-      state,
-      redirect_uri: redirectUri,
-      iat: now,
-      exp: now + SESSION_TTL_SECONDS,
-      nonce: randomBase64Url()
-    },
-    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
-  );
+  const providerRedirectUri = providerCallbackUri(c.env, "notion");
+  const session = await currentSession(c.env, "notion", clientRedirectUri, providerRedirectUri);
   return c.json({
     connector: "notion",
     client_id: c.env.LOCALITY_NOTION_CLIENT_ID,
-    authorization_url: notionAuthorizeUrl(c.env, redirectUri, state),
-    redirect_uri: redirectUri,
+    authorization_url: notionAuthorizeUrl(c.env, providerRedirectUri, session),
+    redirect_uri: clientRedirectUri,
+    provider_redirect_uri: providerRedirectUri,
     session,
-    state,
+    state: session,
     expires_in: SESSION_TTL_SECONDS
   });
 });
@@ -127,15 +141,22 @@ app.post("/v1/oauth/notion/exchange", async (c) => {
   const session = requireString(body.session, "session");
   const state = requireString(body.state, "state");
   const code = requireString(body.code, "code");
-  const redirectUri = validateNotionRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
+  const clientRedirectUri = validateNotionRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
   const payload = await verifySession(
     session,
     requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
   );
-  if (payload.connector !== "notion" || payload.state !== state || payload.redirect_uri !== redirectUri) {
+  const providerRedirectUri = providerCallbackUri(c.env, "notion");
+  if (
+    payload.v !== 2 ||
+    payload.connector !== "notion" ||
+    state !== session ||
+    payload.client_redirect_uri !== clientRedirectUri ||
+    payload.provider_redirect_uri !== providerRedirectUri
+  ) {
     throw badRequest("oauth_session_mismatch", "OAuth callback did not match the broker session");
   }
-  const token = await exchangeNotionCode(c.env, code, redirectUri);
+  const token = await exchangeNotionCode(c.env, code, payload.provider_redirect_uri);
   return c.json(await shapeNotionTokenResponse(c.env, token));
 });
 
@@ -148,31 +169,20 @@ app.post("/v1/oauth/notion/refresh", async (c) => {
 
 app.post("/v1/oauth/google-docs/start", async (c) => {
   const body = await optionalJson<StartRequest>(c.req.raw);
-  const redirectUri = validateGoogleDocsRedirectUri(
+  const clientRedirectUri = validateGoogleDocsRedirectUri(
     c.env,
     body.redirect_uri ?? "http://localhost:8757/oauth/google-docs/callback"
   );
-  const now = nowSeconds();
-  const state = randomBase64Url();
-  const session = await signSession(
-    {
-      v: 1,
-      connector: "google-docs",
-      state,
-      redirect_uri: redirectUri,
-      iat: now,
-      exp: now + SESSION_TTL_SECONDS,
-      nonce: randomBase64Url()
-    },
-    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
-  );
+  const providerRedirectUri = providerCallbackUri(c.env, "google-docs");
+  const session = await currentSession(c.env, "google-docs", clientRedirectUri, providerRedirectUri);
   return c.json({
     connector: "google-docs",
     client_id: googleClientId(c.env),
-    authorization_url: googleDocsAuthorizeUrl(c.env, redirectUri, state),
-    redirect_uri: redirectUri,
+    authorization_url: googleDocsAuthorizeUrl(c.env, providerRedirectUri, session),
+    redirect_uri: clientRedirectUri,
+    provider_redirect_uri: providerRedirectUri,
     session,
-    state,
+    state: session,
     expires_in: SESSION_TTL_SECONDS
   });
 });
@@ -182,15 +192,22 @@ app.post("/v1/oauth/google-docs/exchange", async (c) => {
   const session = requireString(body.session, "session");
   const state = requireString(body.state, "state");
   const code = requireString(body.code, "code");
-  const redirectUri = validateGoogleDocsRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
+  const clientRedirectUri = validateGoogleDocsRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
   const payload = await verifySession(
     session,
     requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
   );
-  if (payload.connector !== "google-docs" || payload.state !== state || payload.redirect_uri !== redirectUri) {
+  const providerRedirectUri = providerCallbackUri(c.env, "google-docs");
+  if (
+    payload.v !== 2 ||
+    payload.connector !== "google-docs" ||
+    state !== session ||
+    payload.client_redirect_uri !== clientRedirectUri ||
+    payload.provider_redirect_uri !== providerRedirectUri
+  ) {
     throw badRequest("oauth_session_mismatch", "OAuth callback did not match the broker session");
   }
-  const token = await exchangeGoogleDocsCode(c.env, code, redirectUri);
+  const token = await exchangeGoogleDocsCode(c.env, code, payload.provider_redirect_uri);
   return c.json(await shapeGoogleDocsTokenResponse(c.env, token));
 });
 
@@ -203,31 +220,20 @@ app.post("/v1/oauth/google-docs/refresh", async (c) => {
 
 app.post("/v1/oauth/google-calendar/start", async (c) => {
   const body = await optionalJson<StartRequest>(c.req.raw);
-  const redirectUri = validateGoogleCalendarRedirectUri(
+  const clientRedirectUri = validateGoogleCalendarRedirectUri(
     c.env,
     body.redirect_uri ?? "http://localhost:8757/oauth/google-calendar/callback"
   );
-  const now = nowSeconds();
-  const state = randomBase64Url();
-  const session = await signSession(
-    {
-      v: 1,
-      connector: "google-calendar",
-      state,
-      redirect_uri: redirectUri,
-      iat: now,
-      exp: now + SESSION_TTL_SECONDS,
-      nonce: randomBase64Url()
-    },
-    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
-  );
+  const providerRedirectUri = providerCallbackUri(c.env, "google-calendar");
+  const session = await currentSession(c.env, "google-calendar", clientRedirectUri, providerRedirectUri);
   return c.json({
     connector: "google-calendar",
     client_id: googleClientId(c.env),
-    authorization_url: googleCalendarAuthorizeUrl(c.env, redirectUri, state),
-    redirect_uri: redirectUri,
+    authorization_url: googleCalendarAuthorizeUrl(c.env, providerRedirectUri, session),
+    redirect_uri: clientRedirectUri,
+    provider_redirect_uri: providerRedirectUri,
     session,
-    state,
+    state: session,
     expires_in: SESSION_TTL_SECONDS
   });
 });
@@ -237,15 +243,22 @@ app.post("/v1/oauth/google-calendar/exchange", async (c) => {
   const session = requireString(body.session, "session");
   const state = requireString(body.state, "state");
   const code = requireString(body.code, "code");
-  const redirectUri = validateGoogleCalendarRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
+  const clientRedirectUri = validateGoogleCalendarRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
   const payload = await verifySession(
     session,
     requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
   );
-  if (payload.connector !== "google-calendar" || payload.state !== state || payload.redirect_uri !== redirectUri) {
+  const providerRedirectUri = providerCallbackUri(c.env, "google-calendar");
+  if (
+    payload.v !== 2 ||
+    payload.connector !== "google-calendar" ||
+    state !== session ||
+    payload.client_redirect_uri !== clientRedirectUri ||
+    payload.provider_redirect_uri !== providerRedirectUri
+  ) {
     throw badRequest("oauth_session_mismatch", "OAuth callback did not match the broker session");
   }
-  const token = await exchangeGoogleCalendarCode(c.env, code, redirectUri);
+  const token = await exchangeGoogleCalendarCode(c.env, code, payload.provider_redirect_uri);
   return c.json(await shapeGoogleCalendarTokenResponse(c.env, token));
 });
 
@@ -258,31 +271,20 @@ app.post("/v1/oauth/google-calendar/refresh", async (c) => {
 
 app.post("/v1/oauth/gmail/start", async (c) => {
   const body = await optionalJson<StartRequest>(c.req.raw);
-  const redirectUri = validateGmailRedirectUri(
+  const clientRedirectUri = validateGmailRedirectUri(
     c.env,
     body.redirect_uri ?? "http://localhost:8757/oauth/gmail/callback"
   );
-  const now = nowSeconds();
-  const state = randomBase64Url();
-  const session = await signSession(
-    {
-      v: 1,
-      connector: "gmail",
-      state,
-      redirect_uri: redirectUri,
-      iat: now,
-      exp: now + SESSION_TTL_SECONDS,
-      nonce: randomBase64Url()
-    },
-    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
-  );
+  const providerRedirectUri = providerCallbackUri(c.env, "gmail");
+  const session = await currentSession(c.env, "gmail", clientRedirectUri, providerRedirectUri);
   return c.json({
     connector: "gmail",
     client_id: googleClientId(c.env),
-    authorization_url: gmailAuthorizeUrl(c.env, redirectUri, state),
-    redirect_uri: redirectUri,
+    authorization_url: gmailAuthorizeUrl(c.env, providerRedirectUri, session),
+    redirect_uri: clientRedirectUri,
+    provider_redirect_uri: providerRedirectUri,
     session,
-    state,
+    state: session,
     expires_in: SESSION_TTL_SECONDS
   });
 });
@@ -292,15 +294,22 @@ app.post("/v1/oauth/gmail/exchange", async (c) => {
   const session = requireString(body.session, "session");
   const state = requireString(body.state, "state");
   const code = requireString(body.code, "code");
-  const redirectUri = validateGmailRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
+  const clientRedirectUri = validateGmailRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
   const payload = await verifySession(
     session,
     requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
   );
-  if (payload.connector !== "gmail" || payload.state !== state || payload.redirect_uri !== redirectUri) {
+  const providerRedirectUri = providerCallbackUri(c.env, "gmail");
+  if (
+    payload.v !== 2 ||
+    payload.connector !== "gmail" ||
+    state !== session ||
+    payload.client_redirect_uri !== clientRedirectUri ||
+    payload.provider_redirect_uri !== providerRedirectUri
+  ) {
     throw badRequest("oauth_session_mismatch", "OAuth callback did not match the broker session");
   }
-  const token = await exchangeGmailCode(c.env, code, redirectUri);
+  const token = await exchangeGmailCode(c.env, code, payload.provider_redirect_uri);
   return c.json(await shapeGmailTokenResponse(c.env, token));
 });
 
@@ -313,31 +322,20 @@ app.post("/v1/oauth/gmail/refresh", async (c) => {
 
 app.post("/v1/oauth/slack/start", async (c) => {
   const body = await optionalJson<StartRequest>(c.req.raw);
-  const redirectUri = validateSlackRedirectUri(
+  const clientRedirectUri = validateSlackRedirectUri(
     c.env,
     body.redirect_uri ?? "http://localhost:8757/oauth/slack/callback"
   );
-  const now = nowSeconds();
-  const state = randomBase64Url();
-  const session = await signSession(
-    {
-      v: 1,
-      connector: "slack",
-      state,
-      redirect_uri: redirectUri,
-      iat: now,
-      exp: now + SESSION_TTL_SECONDS,
-      nonce: randomBase64Url()
-    },
-    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
-  );
+  const providerRedirectUri = providerCallbackUri(c.env, "slack");
+  const session = await currentSession(c.env, "slack", clientRedirectUri, providerRedirectUri);
   return c.json({
     connector: "slack",
     client_id: c.env.LOCALITY_SLACK_CLIENT_ID,
-    authorization_url: slackAuthorizeUrl(c.env, redirectUri, state),
-    redirect_uri: redirectUri,
+    authorization_url: slackAuthorizeUrl(c.env, providerRedirectUri, session),
+    redirect_uri: clientRedirectUri,
+    provider_redirect_uri: providerRedirectUri,
     session,
-    state,
+    state: session,
     expires_in: SESSION_TTL_SECONDS
   });
 });
@@ -347,15 +345,22 @@ app.post("/v1/oauth/slack/exchange", async (c) => {
   const session = requireString(body.session, "session");
   const state = requireString(body.state, "state");
   const code = requireString(body.code, "code");
-  const redirectUri = validateSlackRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
+  const clientRedirectUri = validateSlackRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
   const payload = await verifySession(
     session,
     requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
   );
-  if (payload.connector !== "slack" || payload.state !== state || payload.redirect_uri !== redirectUri) {
+  const providerRedirectUri = providerCallbackUri(c.env, "slack");
+  if (
+    payload.v !== 2 ||
+    payload.connector !== "slack" ||
+    state !== session ||
+    payload.client_redirect_uri !== clientRedirectUri ||
+    payload.provider_redirect_uri !== providerRedirectUri
+  ) {
     throw badRequest("oauth_session_mismatch", "OAuth callback did not match the broker session");
   }
-  const token = await exchangeSlackCode(c.env, code, redirectUri);
+  const token = await exchangeSlackCode(c.env, code, payload.provider_redirect_uri);
   return c.json(await shapeSlackTokenResponse(c.env, token));
 });
 
@@ -452,6 +457,70 @@ async function shapeSlackTokenResponse(env: BrokerEnv, token: SlackTokenResponse
     bot_id: token.bot_user_id,
     ...refresh
   };
+}
+
+function connectorFromParam(value: string): ConnectorId {
+  if (
+    value === "notion" ||
+    value === "google-docs" ||
+    value === "google-calendar" ||
+    value === "gmail" ||
+    value === "slack"
+  ) {
+    return value;
+  }
+  throw badRequest("unknown_connector", "OAuth connector is not supported");
+}
+
+async function currentSession(
+  env: BrokerEnv,
+  connector: ConnectorId,
+  clientRedirectUri: string,
+  providerRedirectUri: string
+): Promise<string> {
+  const now = nowSeconds();
+  return signSession(
+    {
+      v: 2,
+      connector,
+      state_nonce: randomBase64Url(),
+      client_redirect_uri: clientRedirectUri,
+      provider_redirect_uri: providerRedirectUri,
+      iat: now,
+      exp: now + SESSION_TTL_SECONDS,
+      nonce: randomBase64Url()
+    },
+    requireOperationalSecret(env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
+  );
+}
+
+function callbackRedirectTarget(payload: OAuthSessionPayloadV2, state: string, requestUrl: URL): string {
+  const target = new URL(payload.client_redirect_uri);
+  const code = requestUrl.searchParams.get("code");
+  if (code) {
+    target.searchParams.set("code", boundedCallbackValue(code, "code"));
+  }
+  const error = requestUrl.searchParams.get("error");
+  if (error) {
+    target.searchParams.set("error", boundedCallbackValue(error, "error"));
+  }
+  const errorDescription = requestUrl.searchParams.get("error_description");
+  if (errorDescription) {
+    target.searchParams.set("error_description", boundedCallbackValue(errorDescription, "error_description"));
+  }
+  const errorUri = requestUrl.searchParams.get("error_uri");
+  if (errorUri) {
+    target.searchParams.set("error_uri", boundedCallbackValue(errorUri, "error_uri"));
+  }
+  target.searchParams.set("state", state);
+  return target.toString();
+}
+
+function boundedCallbackValue(value: string, field: string): string {
+  if (value.length > 4096) {
+    throw badRequest("invalid_oauth_callback", `${field} is too large`);
+  }
+  return value;
 }
 
 async function shapeRefreshToken(env: BrokerEnv, connector: ConnectorId, refreshToken: string | undefined) {
