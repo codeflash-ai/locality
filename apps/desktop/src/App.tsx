@@ -1705,7 +1705,7 @@ function SetupLoading() {
               Checking setup
             </div>
             <h1>Checking your Locality setup</h1>
-            <p>Locality is checking your Notion connection and local folder.</p>
+            <p>Locality is checking your connections and local folders.</p>
           </div>
         </SetupContent>
       </section>
