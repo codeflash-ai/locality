@@ -61,6 +61,7 @@ import {
 import { connectionMissing, connectionReady } from "./connection-state";
 import { copyLoginLinkDisabled, loginLinkFlowMode } from "./onboarding-connect";
 import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
+import { pushNeedsReview, shouldOpenReviewAfterPush, shouldReviewBeforePush } from "./review-push";
 import { classifyMountSetupError } from "./onboarding-errors";
 import { onboardingProgressSegments, onboardingProgressStep, onboardingStepMeta, type OnboardingStep } from "./onboarding-steps";
 import {
@@ -7138,6 +7139,17 @@ function FileChangeList({
           action,
         },
       }));
+      if (
+        shouldOpenReviewAfterPush({
+          action,
+          reportOk: report.ok,
+          message: report.message,
+          canOpenReview: Boolean(onReview),
+        })
+      ) {
+        onReview?.();
+        return;
+      }
       if (report.ok && (action === "resolve" || action === "reset") && selectedPath === change.localPath) {
         await loadFileDetails(change);
       }
@@ -7215,8 +7227,13 @@ function FileChangeList({
         const isPushingFile = isWorking && action?.action === "push";
         const isSaving = editor?.state === "saving";
         const hasUnsavedEditorChanges = editor !== undefined && editor.contents !== editor.savedContents;
-        const shouldReviewBeforePush = Boolean(!confirmDangerous && change.state === "needs_review" && onReview);
         const actionNeedsReview = Boolean(action?.state === "error" && pushNeedsReview(action.message) && onReview);
+        const routeToReview = shouldReviewBeforePush({
+          confirmDangerous,
+          changeState: change.state,
+          action,
+          canOpenReview: Boolean(onReview),
+        });
         const isSelected = selectedPath === change.localPath;
         const liveMode = liveModeOverrides[change.localPath] ?? change.liveMode;
         const remoteDeleted = isRemoteDeletedChange(change);
@@ -7314,7 +7331,7 @@ function FileChangeList({
                     <FolderOpen />
                   ) : isPushingFile ? (
                     <Loader2 className="spin-icon" />
-                  ) : shouldReviewBeforePush ? (
+                  ) : routeToReview ? (
                     <ListChecks />
                   ) : (
                     <ShieldCheck />
@@ -7326,14 +7343,14 @@ function FileChangeList({
                     void runFileAction(change, "draft");
                     return;
                   }
-                  if (shouldReviewBeforePush) {
+                  if (routeToReview) {
                     onReview?.();
                     return;
                   }
                   void runFileAction(change, "push");
                 }}
               >
-                {remoteDeleted ? "Keep Draft" : isPushingFile ? "Pushing..." : shouldReviewBeforePush ? "Review" : "Push"}
+                {remoteDeleted ? "Keep Draft" : isPushingFile ? "Pushing..." : routeToReview ? "Review" : "Push"}
               </PrimaryButton>
             </div>
             {isSelected && (
@@ -7391,14 +7408,14 @@ function FileChangeList({
                         disabled={isSaving || hasUnsavedEditorChanges || isWorking}
                         icon={isPushingFile ? <Loader2 className="spin-icon" /> : undefined}
                         onClick={() => {
-                          if (shouldReviewBeforePush) {
+                          if (routeToReview) {
                             onReview?.();
                             return;
                           }
                           void runFileAction(change, "push");
                         }}
                       >
-                        {isPushingFile ? "Pushing..." : shouldReviewBeforePush ? "Review Saved" : "Push Saved"}
+                        {isPushingFile ? "Pushing..." : routeToReview ? "Review Saved" : "Push Saved"}
                       </PrimaryButton>
                     </div>
                   </>
@@ -8564,10 +8581,6 @@ function joinMountPath(mountPath: string, relativePath: string) {
 
 function hasConflictMarkers(contents: string) {
   return /^\s*<<<<<<<.*$/m.test(contents) && /^\s*=======\s*$/m.test(contents) && /^\s*>>>>>>>.*$/m.test(contents);
-}
-
-function pushNeedsReview(message: string) {
-  return message.includes("Open Review Push") || message.includes("needs review");
 }
 
 function copyText(value: string) {
