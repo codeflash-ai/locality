@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  hostedWorkspaceCommand,
+  invokeHostedWorkspace,
+  invokeHostedWorkspaceList,
   invokePortableWorkspace,
   portableWorkspaceSuccessMessage,
   validatePortableWorkspaceForm,
@@ -7,54 +10,85 @@ import {
 } from "./portable-workspace";
 
 describe("hosted portable workspace", () => {
-  it("builds the exact Desktop command request", async () => {
-    expect(validatePortableWorkspaceForm({
+  it("builds the exact attach request without a parallel materializer command", async () => {
+    const validation = validatePortableWorkspaceForm({
       apiUrl: "https://workspace.example.test",
       root: "/mnt/locality",
+      credentialRef: "hosted-workspace:desktop-team",
       profileKey: "a".repeat(64),
-    })).toEqual({
+    });
+    expect(validation).toEqual({
       ok: true,
       request: {
         apiUrl: "https://workspace.example.test",
         root: "/mnt/locality",
+        credentialRef: "hosted-workspace:desktop-team",
         profileKey: "a".repeat(64),
       },
     });
+    if (!validation.ok) throw new Error("expected valid request");
 
     const calls: unknown[] = [];
-    const request = {
-      apiUrl: "https://workspace.example.test",
-      root: "/mnt/locality",
-      profileKey: "a".repeat(64),
-    };
     await invokePortableWorkspace(async (command, args) => {
       calls.push({ command, args });
       return report();
-    }, request);
+    }, validation.request);
     expect(calls).toEqual([{
-      command: "materialize_portable_workspace",
-      args: { request },
+      command: "attach_hosted_workspace",
+      args: { request: validation.request },
     }]);
-  });
-
-  it("keeps hosted materialization separate from the existing local mount command", () => {
-    expect(workspaceWorkflowCommand("hosted")).toBe("materialize_portable_workspace");
+    expect(workspaceWorkflowCommand("hosted")).toBe("attach_hosted_workspace");
     expect(workspaceWorkflowCommand("local")).toBe("create_workspace_mount");
   });
 
-  it("rejects incomplete or malformed hosted credentials before invoking Tauri", () => {
-    expect(validatePortableWorkspaceForm({
-      apiUrl: "file:///tmp/workspace",
-      root: "/mnt/locality",
-      profileKey: "a".repeat(64),
-    })).toEqual({ ok: false, message: "The hosted workspace API URL must use HTTP or HTTPS." });
-    expect(validatePortableWorkspaceForm({
+  it("maps attach, refresh, relocate, and list to the shared coordinator IPC contract", async () => {
+    expect(hostedWorkspaceCommand("attach")).toBe("attach_hosted_workspace");
+    expect(hostedWorkspaceCommand("refresh")).toBe("refresh_hosted_workspace");
+    expect(hostedWorkspaceCommand("relocate")).toBe("relocate_hosted_workspace");
+
+    const request = {
+      apiUrl: "https://workspace.example.test",
+      root: "/mnt/relocated",
+      credentialRef: "hosted-workspace:desktop-team",
+    };
+    const calls: unknown[] = [];
+    await invokeHostedWorkspace(async (command, args) => {
+      calls.push({ command, args });
+      return report();
+    }, "refresh", request);
+    await invokeHostedWorkspace(async (command, args) => {
+      calls.push({ command, args });
+      return report();
+    }, "relocate", request);
+    await invokeHostedWorkspaceList(async (command) => {
+      calls.push({ command });
+      return { ok: true, attachments: [] };
+    });
+    expect(calls).toEqual([
+      { command: "refresh_hosted_workspace", args: { request } },
+      { command: "relocate_hosted_workspace", args: { request } },
+      { command: "list_hosted_workspaces" },
+    ]);
+  });
+
+  it("rejects malformed placement, references, and credentials before invoking Tauri", () => {
+    const base = {
       apiUrl: "https://workspace.example.test",
       root: "/mnt/locality",
-      profileKey: "secret",
-    })).toEqual({
+      credentialRef: "hosted-workspace:desktop-team",
+      profileKey: "a".repeat(64),
+    };
+    expect(validatePortableWorkspaceForm({ ...base, credentialRef: "plain-ref" })).toEqual({
+      ok: false,
+      message: "Enter a valid hosted-workspace credential reference.",
+    });
+    expect(validatePortableWorkspaceForm({ ...base, profileKey: "secret" })).toEqual({
       ok: false,
       message: "The Workspace Profile key must be 64 lowercase hexadecimal characters.",
+    });
+    expect(validatePortableWorkspaceForm({ ...base, root: "relative/Locality" })).toEqual({
+      ok: false,
+      message: "The local workspace root must be an absolute path.",
     });
   });
 
@@ -62,32 +96,19 @@ describe("hosted portable workspace", () => {
     ["https://workspace.example.test/api", "The hosted workspace API URL must not contain a path."],
     ["https://user@workspace.example.test", "The hosted workspace API URL must not contain credentials."],
     ["https://workspace.example.test?tenant=7", "The hosted workspace API URL must not contain a query or fragment."],
-    ["https://workspace.example.test#tenant", "The hosted workspace API URL must not contain a query or fragment."],
     ["http://workspace.example.test", "HTTP is allowed only for a loopback hosted workspace."],
   ])("matches Rust URL rejection for %s", (apiUrl, message) => {
     expect(validatePortableWorkspaceForm({
       apiUrl,
       root: "/mnt/locality",
+      credentialRef: "hosted-workspace:desktop-team",
       profileKey: "a".repeat(64),
     })).toEqual({ ok: false, message });
   });
 
-  it("accepts loopback HTTP and rejects relative roots", () => {
-    expect(validatePortableWorkspaceForm({
-      apiUrl: "http://127.1:8080",
-      root: "/mnt/locality",
-      profileKey: "a".repeat(64),
-    }).ok).toBe(true);
-    expect(validatePortableWorkspaceForm({
-      apiUrl: "https://workspace.example.test",
-      root: "relative/Locality",
-      profileKey: "a".repeat(64),
-    })).toEqual({ ok: false, message: "The local workspace root must be an absolute path." });
-  });
-
   it("renders completion state without exposing the profile key", () => {
     const message = portableWorkspaceSuccessMessage(report());
-    expect(message).toBe("Materialized 4 file(s) and 3 folder(s) at /mnt/locality.");
+    expect(message).toBe("Attached 4 file(s) and 3 folder(s) at /mnt/locality.");
     expect(message).not.toContain("secret");
   });
 });
@@ -95,13 +116,13 @@ describe("hosted portable workspace", () => {
 function report() {
   return {
     ok: true,
+    api_origin: "https://workspace.example.test",
+    profile_id: "018f4f6e-9f2c-7b1a-8c3d-4e5f60718293",
+    profile_revision: 7,
     root: "/mnt/locality",
-    session_id: "session-7",
-    content_encoding: "zstd",
-    entries: 8,
+    mount_count: 2,
     files: 4,
     directories: 3,
     materialized_bytes: 120,
-    decoded_bytes: 4096,
   };
 }

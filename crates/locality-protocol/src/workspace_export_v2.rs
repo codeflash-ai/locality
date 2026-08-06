@@ -401,6 +401,18 @@ impl WorkspaceExportControlMetadataV2 {
         &self.layout_digest
     }
 
+    pub fn profile_id(&self) -> &WorkspaceProfileId {
+        &self.profile_id
+    }
+
+    pub fn profile_revision(&self) -> u64 {
+        self.profile_revision
+    }
+
+    pub fn layout_version(&self) -> u16 {
+        self.layout_version
+    }
+
     pub fn inventory_sha256(&self) -> &str {
         &self.inventory_sha256
     }

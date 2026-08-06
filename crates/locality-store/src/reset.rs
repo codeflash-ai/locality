@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::credentials::{CredentialError, open_credential_store};
-use crate::repository::ConnectionRepository;
+use crate::repository::{ConnectionRepository, HostedWorkspaceRepository};
 use crate::sqlite::SqliteStateStore;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -75,14 +75,29 @@ pub fn connection_secret_refs(state_root: &Path) -> Vec<String> {
     ];
     if state_root.join("state.sqlite3").exists()
         && let Ok(store) = SqliteStateStore::open(state_root.to_path_buf())
-        && let Ok(connections) = store.list_connections()
     {
-        refs.extend(
-            connections
-                .into_iter()
-                .filter(|connection| !connection.secret_ref.is_empty())
-                .map(|connection| connection.secret_ref),
-        );
+        if let Ok(connections) = store.list_connections() {
+            refs.extend(
+                connections
+                    .into_iter()
+                    .filter(|connection| !connection.secret_ref.is_empty())
+                    .map(|connection| connection.secret_ref),
+            );
+        }
+        if let Ok(attachments) = store.list_hosted_workspace_attachments() {
+            refs.extend(
+                attachments
+                    .into_iter()
+                    .map(|attachment| attachment.credential_ref().as_str().to_string()),
+            );
+        }
+        if let Ok(transitions) = store.list_pending_hosted_workspace_transitions() {
+            refs.extend(
+                transitions
+                    .into_iter()
+                    .map(|transition| transition.prepared().credential_ref().as_str().to_string()),
+            );
+        }
     }
     refs.sort();
     refs.dedup();

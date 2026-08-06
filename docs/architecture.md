@@ -51,6 +51,45 @@ future GCP/Azure cells. Shared domain, connector, engine, protocol, and client
 crates remain public; private backend/PostgreSQL/AWS crates depend on exact
 public revisions, never the reverse.
 
+### Durable hosted workspace attachments
+
+The public client now has a read-only, plain-files attachment boundary for a
+hosted generation-2 workspace profile. Its durable identity is the canonical
+HTTP(S) API origin plus hosted profile ID. SQLite stores only an opaque
+credential-store reference; the reusable profile key remains in the local
+credential store. Each portable mount ID receives a distinct host-local
+`MountId`, and inactive mappings are retained so a mount that disappears and
+later returns keeps the same local identity.
+
+Hosted attachments are deliberately separate from connector `mounts`. They are
+therefore absent from connector discovery, Live Mode, push, and per-mount pull;
+refresh replaces the complete authorized workspace tree from one immutable
+export. The absolute root is host-local placement and is never sent as profile
+identity or backend authority.
+
+`loc-cli::hosted_workspace` exposes one attach/refresh/relocate coordinator as a
+Rust API, through `loc hosted-workspace attach|refresh|relocate|list`, and
+through Desktop IPC commands that call that same API; it does not change `loc
+sandbox init`. Session negotiation, export download, and archive staging
+happen without the shared workspace-path lock. A transition-specific
+cross-process liveness lease prevents recovery from cancelling an active stage.
+Final overlap validation, exact pending-payload revalidation, receipt binding,
+atomic filesystem publication, and the complete SQLite mapping commit run while
+holding the same cross-process lock as CLI/Desktop connector mount creation and
+remount. The mapping commit rechecks global `MountId` uniqueness in its SQLite
+transaction. A durable pending transition plus the materializer journal closes
+crash windows between the filesystem receipt and SQLite commit. Relocation
+publishes a complete generation only to an absent, non-overlapping destination,
+commits the attachment and full mapping set by compare-and-swap, then consumes
+a durable post-commit cleanup intent. Cleanup validates the old root's exact
+receipt, filesystem identity, ownership marker, secret-derived ownership tag,
+profile revision, and layout before removal. A changed, writable, or non-owned
+old root is preserved for review, and startup recovery resumes cleanup.
+
+Detach remains intentionally unavailable. It needs a shared durable transaction
+that binds ownership-checked filesystem removal, attachment/mapping tombstones,
+credential retention or deletion policy, and crash recovery.
+
 See [`cloud-sandbox-data-plane.md`](cloud-sandbox-data-plane.md) for the target
 architecture, database decision, data model, replica protocol, permissions,
 security model, migration path, and implementation phases. The rest of this

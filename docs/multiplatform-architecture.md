@@ -479,6 +479,22 @@ binding is valid layout 0 state, not corrupt or rebuildable metadata.
 layout 1 begins only when an owning coordinator supplies its trusted workspace
 root, accepts the resolver plan, and explicitly persists the binding.
 
+Read-only hosted workspaces use a sibling durable model rather than connector
+`MountConfig` rows. Their portable mount IDs map to stable, distinct local
+`MountId`s, while the complete hosted workspace root remains one local
+plain-files publication unit. CLI and Desktop connector mount changes and hosted
+publication share the remount/path coordinator lock, so final host-alias overlap
+validation cannot race mount creation. Hosted roots and mappings are excluded
+from connector discovery, Live Mode, push, and per-mount pull.
+
+Hosted attachment, refresh, list, and relocation use the same `loc-cli`
+coordinator from both `loc` and Desktop IPC. Relocation stages outside the
+shared path lock, publishes only to an absent non-overlapping destination, and
+then holds the lock across exact pending/receipt validation and the SQLite CAS.
+The CAS creates a durable old-root cleanup intent; identity-, receipt-, and
+ownership-bound cleanup follows, and recovery resumes it after a crash without
+deleting changed or non-owned paths.
+
 Workspace-binding component v4 remains within schema v27. It adds the separate
 host-binding and remount-recovery tables and preserves released
 component-v2/v3 and v1 mount-binding rows. Those legacy rows continue to resolve
@@ -576,7 +592,7 @@ coordinator-owned compare-and-swap workflow that can prove the move completed.
 
 Desktop mount creation and path matching now route accepted virtual mounts
 through the shared binding resolver. Existing layout-0 and v1 mounts continue
-on their exact legacy roots. Full target rename/removal, workspace relocation,
+on their exact legacy roots. Full connector-target rename/removal, connector workspace relocation,
 change-anchor replay, and projection lifecycle reconciliation remain future
 owning-coordinator work; this increment does not move files or reset domains.
 

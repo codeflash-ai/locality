@@ -1005,6 +1005,44 @@ daemon stopped
   socket: /Users/alice/.loc/localityd.sock
 ```
 
+## Hosted Workspaces
+
+`loc hosted-workspace attach` attaches a generation-2 read-only hosted profile;
+`refresh` updates the matching durable attachment at the same root, `relocate`
+publishes it at a new absent root and safely retires the old owned generation,
+and `list` reads committed attachments and stable portable-to-local mappings.
+Attach and refresh require the reusable profile key through stdin (or
+`LOCALITY_PROFILE_KEY`) and never accept it as an argument:
+
+```bash
+printf '%s\n' "$PROFILE_KEY" | loc hosted-workspace attach \
+  --api-url https://api.example.com \
+  --root "$HOME/Locality/Hosted" \
+  --credential-ref hosted-workspace:team \
+  --profile-key-stdin
+
+loc hosted-workspace refresh \
+  --api-url https://api.example.com \
+  --root "$HOME/Locality/Hosted" \
+  --credential-ref hosted-workspace:team
+
+loc hosted-workspace relocate \
+  --api-url https://api.example.com \
+  --root "$HOME/Locality/Relocated" \
+  --credential-ref hosted-workspace:team
+
+loc hosted-workspace list --json
+```
+
+The credential reference is opaque local metadata; the key itself stays in the
+credential store. Refresh rejects a changed root so relocation is explicit.
+Relocation requires an absent non-overlapping destination, commits the new root
+and complete mount mappings, then removes only the exact owned old generation.
+Changed, writable, or non-owned old paths are preserved for recovery and
+review. Desktop exposes attach, refresh, relocate, and list through this same
+coordinator. `detach` is not yet exposed because it still needs attachment and
+mapping tombstones plus an explicit credential-retention policy.
+
 ## Initial `loc log --json` Shape
 
 `loc log [path] [--push-id <push-id>] [--diff]` reads the durable push journal

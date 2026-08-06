@@ -21,10 +21,12 @@ use locality_core::planner::{PlanSummary, PushOperation, PushPlan};
 use locality_core::readable_diff::ReadableDiffOutput;
 use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::shadow::ShadowDocument;
+use locality_core::workspace_layout::{MountTarget, PortableMountId};
 use locality_protocol::freshness_delivery::{GenerationDelta, MAX_DELIVERY_ID_BYTES};
 use locality_protocol::generation_baseline::{
     GenerationBaselineRefreshModeV1, GenerationBaselineSourceV1,
 };
+use locality_protocol::workspace_layout::{LayoutDigest, WorkspaceProfileId};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -52,6 +54,13 @@ use crate::generation_delivery::{
     NegotiatedGenerationApplyJournalRecord, ObservedGenerationRecord, ObservedGenerationRecordV2,
     PreparedGenerationApply, PreparedGenerationApplyV2, PreparedGenerationApplyV3,
 };
+use crate::hosted_workspace::{
+    CanonicalApiOrigin, HOSTED_WORKSPACE_ATTACHMENT_COMPONENT_VERSION, HostedWorkspaceAttachment,
+    HostedWorkspaceCredentialRef, HostedWorkspaceIdentity, HostedWorkspaceMountMapping,
+    HostedWorkspaceTransitionKind, PendingHostedWorkspaceCleanup, PendingHostedWorkspaceTransition,
+    PreparedHostedWorkspaceTransition, committed_attachment, prepare_pending_transition,
+    relocation_cleanup,
+};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
@@ -62,7 +71,7 @@ use crate::records::{
 use crate::repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, ConnectorStateRepository,
     EntityRepository, EntitySearchCandidate, EntitySearchDocument, EntitySearchRepository,
-    FreshnessStateRepository, HydrationJobRepository, JournalRepository,
+    FreshnessStateRepository, HostedWorkspaceRepository, HydrationJobRepository, JournalRepository,
     MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
     RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
     VirtualMutationRepository, WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
@@ -76,7 +85,7 @@ use crate::workspace_binding::{
 use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 27;
+const SCHEMA_VERSION: i64 = 29;
 const ENTITY_SEARCH_COMPONENT_VERSION: i64 = 2;
 const JOURNALS_COMPONENT_VERSION: i64 = 3;
 const VIRTUAL_MUTATIONS_COMPONENT_VERSION: i64 = 4;
@@ -198,6 +207,15 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
         required: true,
         rebuildable: false,
         data_json: "{\"format\":\"workspace_binding.v2\",\"layout_0_without_binding\":true,\"legacy_v1_readable\":true,\"target_scope\":\"workspace_id\",\"remount_recovery\":\"v1\"}",
+    },
+    StateComponentDefinition {
+        component_id: "durable:hosted_workspaces",
+        component_kind: "durable_transaction",
+        current_version: HOSTED_WORKSPACE_ATTACHMENT_COMPONENT_VERSION as i64,
+        min_reader_version: HOSTED_WORKSPACE_ATTACHMENT_COMPONENT_VERSION as i64,
+        required: true,
+        rebuildable: false,
+        data_json: "{\"identity\":\"canonical_api_origin+profile_id\",\"credential_storage\":\"reference_only\",\"mount_mapping\":\"stable_local_id\",\"publication\":\"whole_workspace\",\"relocation_cleanup\":\"durable_v1\"}",
     },
     StateComponentDefinition {
         component_id: "durable:metadata_discovery",
@@ -2638,10 +2656,860 @@ impl GenerationDeliveryRepository for SqliteStateStore {
     }
 }
 
+impl HostedWorkspaceRepository for SqliteStateStore {
+    fn begin_hosted_workspace_transition(
+        &mut self,
+        prepared: PreparedHostedWorkspaceTransition,
+    ) -> StoreResult<PendingHostedWorkspaceTransition> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity = prepared.identity().clone();
+        let cleanup_pending: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM hosted_workspace_pending_cleanups
+                 WHERE api_origin = ?1 AND profile_id = ?2
+             )",
+            params![
+                identity.api_origin().as_str(),
+                identity.profile_id().as_str()
+            ],
+            |row| row.get(0),
+        )?;
+        if cleanup_pending {
+            return Err(StoreError::InvalidState(
+                "hosted workspace attachment still has pending relocation cleanup".to_string(),
+            ));
+        }
+        let attachment = hosted_workspace_attachment_from_connection(&transaction, &identity)?;
+        let mappings = hosted_workspace_mappings_from_connection(&transaction, &identity)?;
+        let mut reserved = BTreeSet::new();
+        {
+            let mut statement = transaction.prepare("SELECT mount_id FROM mounts")?;
+            reserved.extend(
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(MountId::new),
+            );
+        }
+        {
+            let mut statement = transaction.prepare(
+                "SELECT local_mount_id, api_origin, profile_id
+                 FROM hosted_workspace_mount_mappings",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            reserved.extend(
+                rows.into_iter()
+                    .filter(|(_, origin, profile_id)| {
+                        origin != identity.api_origin().as_str()
+                            || profile_id != identity.profile_id().as_str()
+                    })
+                    .map(|(mount_id, _, _)| MountId::new(mount_id)),
+            );
+        }
+        {
+            let mut statement = transaction.prepare(
+                "SELECT m.local_mount_id, t.api_origin, t.profile_id
+                 FROM hosted_workspace_pending_mounts m
+                 JOIN hosted_workspace_pending_transitions t
+                   ON t.transition_id = m.transition_id",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            reserved.extend(
+                rows.into_iter()
+                    .filter(|(_, origin, profile_id)| {
+                        origin != identity.api_origin().as_str()
+                            || profile_id != identity.profile_id().as_str()
+                    })
+                    .map(|(mount_id, _, _)| MountId::new(mount_id)),
+            );
+        }
+        let pending =
+            prepare_pending_transition(attachment.as_ref(), &mappings, &reserved, prepared)?;
+        if let Some(existing) = pending_hosted_workspace_from_connection(&transaction, &identity)? {
+            if existing == pending {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(StoreError::InvalidState(
+                "hosted workspace attachment already has a different pending transition"
+                    .to_string(),
+            ));
+        }
+        let transition_id_in_use: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM hosted_workspace_pending_transitions WHERE transition_id = ?1
+             )",
+            params![pending.prepared().transition_id()],
+            |row| row.get(0),
+        )?;
+        if transition_id_in_use {
+            return Err(StoreError::InvalidState(
+                "hosted workspace transition ID is already in use".to_string(),
+            ));
+        }
+        let exact_root_in_use: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM hosted_workspace_attachments
+                 WHERE root = ?1 AND (api_origin != ?2 OR profile_id != ?3)
+                UNION ALL
+                SELECT 1 FROM hosted_workspace_pending_transitions
+                 WHERE target_root = ?1 AND (api_origin != ?2 OR profile_id != ?3)
+                UNION ALL
+                SELECT 1 FROM hosted_workspace_pending_cleanups
+                 WHERE root = ?1 AND (api_origin != ?2 OR profile_id != ?3)
+             )",
+            params![
+                path_to_text(pending.prepared().target_root()),
+                identity.api_origin().as_str(),
+                identity.profile_id().as_str(),
+            ],
+            |row| row.get(0),
+        )?;
+        if exact_root_in_use {
+            return Err(StoreError::InvalidState(
+                "hosted workspace root is already reserved by another attachment".to_string(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO hosted_workspace_pending_transitions (
+                transition_id, api_origin, profile_id, credential_ref, target_root,
+                transition_kind, profile_revision, layout_version, layout_digest,
+                base_profile_revision, base_layout_digest, base_root, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                pending.prepared().transition_id(),
+                identity.api_origin().as_str(),
+                identity.profile_id().as_str(),
+                pending.prepared().credential_ref().as_str(),
+                path_to_text(pending.prepared().target_root()),
+                pending.kind().as_str(),
+                pending.prepared().profile_revision() as i64,
+                pending.prepared().layout_version() as i64,
+                pending.prepared().layout_digest().as_str(),
+                pending.base_profile_revision().map(|value| value as i64),
+                pending.base_layout_digest().map(LayoutDigest::as_str),
+                pending.base_root().map(path_to_text),
+                pending.prepared().created_at(),
+            ],
+        )?;
+        for mapping in pending.prepared().mounts() {
+            transaction.execute(
+                "INSERT INTO hosted_workspace_pending_mounts (
+                    transition_id, portable_mount_id, local_mount_id, mount_target,
+                    target_collision_key, first_seen_revision
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    pending.prepared().transition_id(),
+                    mapping.portable_mount_id().as_str(),
+                    mapping.local_mount_id().as_str(),
+                    mapping.mount_target().as_str(),
+                    mapping.mount_target().collision_key(),
+                    mapping.first_seen_revision() as i64,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(pending)
+    }
+
+    fn get_hosted_workspace_attachment(
+        &self,
+        identity: &HostedWorkspaceIdentity,
+    ) -> StoreResult<Option<HostedWorkspaceAttachment>> {
+        let connection = self.connection()?;
+        hosted_workspace_attachment_from_connection(&connection, identity)
+    }
+
+    fn list_hosted_workspace_attachments(&self) -> StoreResult<Vec<HostedWorkspaceAttachment>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT api_origin, profile_id, credential_ref, root, profile_revision,
+                    layout_version, layout_digest, updated_at
+             FROM hosted_workspace_attachments ORDER BY api_origin, profile_id",
+        )?;
+        let rows = statement
+            .query_map([], hosted_workspace_attachment_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(hosted_workspace_attachment_from_row)
+            .collect()
+    }
+
+    fn list_hosted_workspace_mount_mappings(
+        &self,
+        identity: &HostedWorkspaceIdentity,
+    ) -> StoreResult<Vec<HostedWorkspaceMountMapping>> {
+        let connection = self.connection()?;
+        hosted_workspace_mappings_from_connection(&connection, identity)
+    }
+
+    fn get_pending_hosted_workspace_transition(
+        &self,
+        identity: &HostedWorkspaceIdentity,
+    ) -> StoreResult<Option<PendingHostedWorkspaceTransition>> {
+        let connection = self.connection()?;
+        pending_hosted_workspace_from_connection(&connection, identity)
+    }
+
+    fn list_pending_hosted_workspace_transitions(
+        &self,
+    ) -> StoreResult<Vec<PendingHostedWorkspaceTransition>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT api_origin, profile_id
+             FROM hosted_workspace_pending_transitions ORDER BY api_origin, profile_id",
+        )?;
+        let identities = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        identities
+            .into_iter()
+            .map(|(origin, profile_id)| {
+                let identity = hosted_workspace_identity(origin, profile_id)?;
+                pending_hosted_workspace_from_connection(&connection, &identity)?.ok_or_else(|| {
+                    StoreError::InvalidState(
+                        "hosted workspace pending transition disappeared while listing".to_string(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn get_pending_hosted_workspace_cleanup(
+        &self,
+        identity: &HostedWorkspaceIdentity,
+    ) -> StoreResult<Option<PendingHostedWorkspaceCleanup>> {
+        let connection = self.connection()?;
+        pending_hosted_workspace_cleanup_from_connection(&connection, identity)
+    }
+
+    fn list_pending_hosted_workspace_cleanups(
+        &self,
+    ) -> StoreResult<Vec<PendingHostedWorkspaceCleanup>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT api_origin, profile_id
+             FROM hosted_workspace_pending_cleanups ORDER BY api_origin, profile_id",
+        )?;
+        let identities = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        identities
+            .into_iter()
+            .map(|(origin, profile_id)| {
+                let identity = hosted_workspace_identity(origin, profile_id)?;
+                pending_hosted_workspace_cleanup_from_connection(&connection, &identity)?
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(
+                            "hosted workspace cleanup disappeared while listing".to_string(),
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    fn commit_hosted_workspace_transition(
+        &mut self,
+        transition_id: &str,
+        committed_at: &str,
+    ) -> StoreResult<HostedWorkspaceAttachment> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity_row = transaction
+            .query_row(
+                "SELECT api_origin, profile_id
+                 FROM hosted_workspace_pending_transitions WHERE transition_id = ?1",
+                params![transition_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::InvalidState("hosted workspace transition was not found".to_string())
+            })?;
+        let identity = hosted_workspace_identity(identity_row.0, identity_row.1)?;
+        let pending = pending_hosted_workspace_from_connection(&transaction, &identity)?
+            .ok_or_else(|| {
+                StoreError::InvalidState("hosted workspace transition was not found".to_string())
+            })?;
+        if pending.prepared().transition_id() != transition_id {
+            return Err(StoreError::InvalidState(
+                "hosted workspace transition identity mismatch".to_string(),
+            ));
+        }
+        let current = hosted_workspace_attachment_from_connection(&transaction, &identity)?;
+        let attachment = committed_attachment(&pending, current.as_ref(), committed_at)?;
+        let cleanup = relocation_cleanup(&pending, current.as_ref())?;
+        let existing_cleanup: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM hosted_workspace_pending_cleanups
+                 WHERE api_origin = ?1 AND profile_id = ?2
+             )",
+            params![
+                identity.api_origin().as_str(),
+                identity.profile_id().as_str()
+            ],
+            |row| row.get(0),
+        )?;
+        if existing_cleanup {
+            return Err(StoreError::InvalidState(
+                "hosted workspace attachment already has pending relocation cleanup".to_string(),
+            ));
+        }
+        ensure_hosted_transition_mount_ids_available(&transaction, &pending)?;
+        transaction.execute(
+            "INSERT INTO hosted_workspace_attachments (
+                api_origin, profile_id, credential_ref, root, profile_revision,
+                layout_version, layout_digest, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(api_origin, profile_id) DO UPDATE SET
+                credential_ref = excluded.credential_ref,
+                root = excluded.root,
+                profile_revision = excluded.profile_revision,
+                layout_version = excluded.layout_version,
+                layout_digest = excluded.layout_digest,
+                updated_at = excluded.updated_at",
+            params![
+                identity.api_origin().as_str(),
+                identity.profile_id().as_str(),
+                attachment.credential_ref().as_str(),
+                path_to_text(attachment.root()),
+                attachment.profile_revision() as i64,
+                attachment.layout_version() as i64,
+                attachment.layout_digest().as_str(),
+                attachment.updated_at(),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE hosted_workspace_mount_mappings SET active = 0
+             WHERE api_origin = ?1 AND profile_id = ?2",
+            params![
+                identity.api_origin().as_str(),
+                identity.profile_id().as_str()
+            ],
+        )?;
+        for mapping in pending.prepared().mounts() {
+            transaction.execute(
+                "INSERT INTO hosted_workspace_mount_mappings (
+                    api_origin, profile_id, portable_mount_id, local_mount_id,
+                    mount_target, target_collision_key, active,
+                    first_seen_revision, last_seen_revision
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)
+                 ON CONFLICT(api_origin, profile_id, portable_mount_id) DO UPDATE SET
+                    local_mount_id = excluded.local_mount_id,
+                    mount_target = excluded.mount_target,
+                    target_collision_key = excluded.target_collision_key,
+                    active = 1,
+                    first_seen_revision = excluded.first_seen_revision,
+                    last_seen_revision = excluded.last_seen_revision",
+                params![
+                    identity.api_origin().as_str(),
+                    identity.profile_id().as_str(),
+                    mapping.portable_mount_id().as_str(),
+                    mapping.local_mount_id().as_str(),
+                    mapping.mount_target().as_str(),
+                    mapping.mount_target().collision_key(),
+                    mapping.first_seen_revision() as i64,
+                    mapping.last_seen_revision() as i64,
+                ],
+            )?;
+        }
+        if let Some(cleanup) = cleanup {
+            transaction.execute(
+                "INSERT INTO hosted_workspace_pending_cleanups (
+                    cleanup_id, api_origin, profile_id, credential_ref, root,
+                    profile_revision, layout_version, layout_digest, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    cleanup.cleanup_id(),
+                    cleanup.identity().api_origin().as_str(),
+                    cleanup.identity().profile_id().as_str(),
+                    cleanup.credential_ref().as_str(),
+                    path_to_text(cleanup.root()),
+                    cleanup.profile_revision() as i64,
+                    cleanup.layout_version() as i64,
+                    cleanup.layout_digest().as_str(),
+                    cleanup.created_at(),
+                ],
+            )?;
+        }
+        let deleted = transaction.execute(
+            "DELETE FROM hosted_workspace_pending_transitions WHERE transition_id = ?1",
+            params![transition_id],
+        )?;
+        if deleted != 1 {
+            return Err(StoreError::InvalidState(
+                "hosted workspace transition disappeared during commit".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(attachment)
+    }
+
+    fn cancel_hosted_workspace_transition(&mut self, transition_id: &str) -> StoreResult<()> {
+        let connection = self.connection()?;
+        let deleted = connection.execute(
+            "DELETE FROM hosted_workspace_pending_transitions WHERE transition_id = ?1",
+            params![transition_id],
+        )?;
+        if deleted != 1 {
+            return Err(StoreError::InvalidState(
+                "hosted workspace transition was not found".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn complete_hosted_workspace_cleanup(&mut self, cleanup_id: &str) -> StoreResult<()> {
+        let connection = self.connection()?;
+        let deleted = connection.execute(
+            "DELETE FROM hosted_workspace_pending_cleanups WHERE cleanup_id = ?1",
+            params![cleanup_id],
+        )?;
+        if deleted != 1 {
+            return Err(StoreError::InvalidState(
+                "hosted workspace relocation cleanup was not found".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+type PendingHostedWorkspaceCleanupRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+);
+
+fn pending_hosted_workspace_cleanup_from_connection(
+    connection: &Connection,
+    identity: &HostedWorkspaceIdentity,
+) -> StoreResult<Option<PendingHostedWorkspaceCleanup>> {
+    let row = connection
+        .query_row(
+            "SELECT cleanup_id, api_origin, profile_id, credential_ref, root,
+                    profile_revision, layout_version, layout_digest, created_at
+             FROM hosted_workspace_pending_cleanups
+             WHERE api_origin = ?1 AND profile_id = ?2",
+            params![
+                identity.api_origin().as_str(),
+                identity.profile_id().as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row): Option<PendingHostedWorkspaceCleanupRow> = row else {
+        return Ok(None);
+    };
+    let parsed_identity = hosted_workspace_identity(row.1, row.2)?;
+    if &parsed_identity != identity {
+        return Err(StoreError::InvalidState(
+            "hosted workspace cleanup identity is inconsistent".to_string(),
+        ));
+    }
+    PendingHostedWorkspaceCleanup::new(
+        row.0,
+        parsed_identity,
+        HostedWorkspaceCredentialRef::new(row.3)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        PathBuf::from(row.4),
+        u64::try_from(row.5).map_err(|_| {
+            StoreError::InvalidState(
+                "hosted workspace cleanup profile revision is invalid".to_string(),
+            )
+        })?,
+        u16::try_from(row.6).map_err(|_| {
+            StoreError::InvalidState(
+                "hosted workspace cleanup layout version is invalid".to_string(),
+            )
+        })?,
+        LayoutDigest::new(row.7).map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        row.8,
+    )
+    .map(Some)
+}
+
+type HostedWorkspaceAttachmentRow = (String, String, String, String, i64, i64, String, String);
+
+fn hosted_workspace_attachment_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<HostedWorkspaceAttachmentRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+    ))
+}
+
+fn hosted_workspace_identity(
+    origin: String,
+    profile_id: String,
+) -> StoreResult<HostedWorkspaceIdentity> {
+    Ok(HostedWorkspaceIdentity::new(
+        CanonicalApiOrigin::new(origin)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        WorkspaceProfileId::new(profile_id)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+    ))
+}
+
+fn hosted_workspace_attachment_from_row(
+    row: HostedWorkspaceAttachmentRow,
+) -> StoreResult<HostedWorkspaceAttachment> {
+    HostedWorkspaceAttachment::new(
+        hosted_workspace_identity(row.0, row.1)?,
+        HostedWorkspaceCredentialRef::new(row.2)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        PathBuf::from(row.3),
+        u64::try_from(row.4).map_err(|_| {
+            StoreError::InvalidState("hosted workspace profile revision is invalid".to_string())
+        })?,
+        u16::try_from(row.5).map_err(|_| {
+            StoreError::InvalidState("hosted workspace layout version is invalid".to_string())
+        })?,
+        LayoutDigest::new(row.6).map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        row.7,
+    )
+}
+
+fn hosted_workspace_attachment_from_connection(
+    connection: &Connection,
+    identity: &HostedWorkspaceIdentity,
+) -> StoreResult<Option<HostedWorkspaceAttachment>> {
+    connection
+        .query_row(
+            "SELECT api_origin, profile_id, credential_ref, root, profile_revision,
+                    layout_version, layout_digest, updated_at
+             FROM hosted_workspace_attachments
+             WHERE api_origin = ?1 AND profile_id = ?2",
+            params![
+                identity.api_origin().as_str(),
+                identity.profile_id().as_str()
+            ],
+            hosted_workspace_attachment_row,
+        )
+        .optional()?
+        .map(hosted_workspace_attachment_from_row)
+        .transpose()
+}
+
+fn hosted_workspace_mappings_from_connection(
+    connection: &Connection,
+    identity: &HostedWorkspaceIdentity,
+) -> StoreResult<Vec<HostedWorkspaceMountMapping>> {
+    let mut statement = connection.prepare(
+        "SELECT portable_mount_id, local_mount_id, mount_target, active,
+                first_seen_revision, last_seen_revision, target_collision_key
+         FROM hosted_workspace_mount_mappings
+         WHERE api_origin = ?1 AND profile_id = ?2
+         ORDER BY portable_mount_id",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                identity.api_origin().as_str(),
+                identity.profile_id().as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|row| {
+            let portable = PortableMountId::new(row.0)
+                .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+            let target = MountTarget::new(row.2)
+                .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+            if target.collision_key() != row.6 {
+                return Err(StoreError::InvalidState(
+                    "hosted workspace mount target collision key is inconsistent".to_string(),
+                ));
+            }
+            HostedWorkspaceMountMapping::persisted(
+                portable,
+                MountId::new(row.1),
+                target,
+                match row.3 {
+                    0 => false,
+                    1 => true,
+                    _ => {
+                        return Err(StoreError::InvalidState(
+                            "hosted workspace mount active flag is invalid".to_string(),
+                        ));
+                    }
+                },
+                u64::try_from(row.4).map_err(|_| {
+                    StoreError::InvalidState(
+                        "hosted workspace mount first revision is invalid".to_string(),
+                    )
+                })?,
+                u64::try_from(row.5).map_err(|_| {
+                    StoreError::InvalidState(
+                        "hosted workspace mount last revision is invalid".to_string(),
+                    )
+                })?,
+            )
+        })
+        .collect()
+}
+
+type PendingHostedWorkspaceRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn pending_hosted_workspace_from_connection(
+    connection: &Connection,
+    identity: &HostedWorkspaceIdentity,
+) -> StoreResult<Option<PendingHostedWorkspaceTransition>> {
+    let row = connection
+        .query_row(
+            "SELECT transition_id, api_origin, profile_id, credential_ref, target_root,
+                    transition_kind, profile_revision, layout_version, layout_digest,
+                    base_profile_revision, base_layout_digest, base_root, created_at
+             FROM hosted_workspace_pending_transitions
+             WHERE api_origin = ?1 AND profile_id = ?2",
+            params![
+                identity.api_origin().as_str(),
+                identity.profile_id().as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row): Option<PendingHostedWorkspaceRow> = row else {
+        return Ok(None);
+    };
+    let parsed_identity = hosted_workspace_identity(row.1, row.2)?;
+    if &parsed_identity != identity {
+        return Err(StoreError::InvalidState(
+            "hosted workspace pending identity is inconsistent".to_string(),
+        ));
+    }
+    let revision = u64::try_from(row.6).map_err(|_| {
+        StoreError::InvalidState("hosted workspace pending revision is invalid".to_string())
+    })?;
+    let mut statement = connection.prepare(
+        "SELECT portable_mount_id, local_mount_id, mount_target,
+                first_seen_revision, target_collision_key
+         FROM hosted_workspace_pending_mounts
+         WHERE transition_id = ?1 ORDER BY portable_mount_id",
+    )?;
+    let mount_rows = statement
+        .query_map(params![row.0.as_str()], |mount_row| {
+            Ok((
+                mount_row.get::<_, String>(0)?,
+                mount_row.get::<_, String>(1)?,
+                mount_row.get::<_, String>(2)?,
+                mount_row.get::<_, i64>(3)?,
+                mount_row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mounts = mount_rows
+        .into_iter()
+        .map(|mount_row| {
+            let target = MountTarget::new(mount_row.2)
+                .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+            if target.collision_key() != mount_row.4 {
+                return Err(StoreError::InvalidState(
+                    "hosted workspace pending target collision key is inconsistent".to_string(),
+                ));
+            }
+            let first_seen_revision = u64::try_from(mount_row.3).map_err(|_| {
+                StoreError::InvalidState(
+                    "hosted workspace pending first revision is invalid".to_string(),
+                )
+            })?;
+            HostedWorkspaceMountMapping::proposal(
+                PortableMountId::new(mount_row.0)
+                    .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+                MountId::new(mount_row.1),
+                target,
+                revision,
+            )
+            .map(|mapping| mapping.with_history(first_seen_revision))
+        })
+        .collect::<StoreResult<Vec<_>>>()?;
+    let prepared = PreparedHostedWorkspaceTransition::new(
+        row.0,
+        parsed_identity,
+        HostedWorkspaceCredentialRef::new(row.3)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        PathBuf::from(row.4),
+        revision,
+        u16::try_from(row.7).map_err(|_| {
+            StoreError::InvalidState(
+                "hosted workspace pending layout version is invalid".to_string(),
+            )
+        })?,
+        LayoutDigest::new(row.8).map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        mounts,
+        row.12,
+    )?;
+    PendingHostedWorkspaceTransition::new(
+        prepared,
+        HostedWorkspaceTransitionKind::parse(&row.5)?,
+        row.9
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    StoreError::InvalidState(
+                        "hosted workspace base revision is invalid".to_string(),
+                    )
+                })
+            })
+            .transpose()?,
+        row.10
+            .map(LayoutDigest::new)
+            .transpose()
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        row.11.map(PathBuf::from),
+    )
+    .map(Some)
+}
+
+fn ensure_hosted_transition_mount_ids_available(
+    connection: &Connection,
+    pending: &PendingHostedWorkspaceTransition,
+) -> StoreResult<()> {
+    for mapping in pending.prepared().mounts() {
+        let reserved: bool = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM mounts WHERE mount_id = ?1
+                UNION ALL
+                SELECT 1 FROM hosted_workspace_mount_mappings
+                 WHERE local_mount_id = ?1
+                   AND (api_origin != ?2 OR profile_id != ?3)
+                UNION ALL
+                SELECT 1 FROM hosted_workspace_pending_mounts m
+                JOIN hosted_workspace_pending_transitions t
+                  ON t.transition_id = m.transition_id
+                 WHERE m.local_mount_id = ?1 AND t.transition_id != ?4
+             )",
+            params![
+                mapping.local_mount_id().as_str(),
+                pending.prepared().identity().api_origin().as_str(),
+                pending.prepared().identity().profile_id().as_str(),
+                pending.prepared().transition_id(),
+            ],
+            |row| row.get(0),
+        )?;
+        if reserved {
+            return Err(StoreError::InvalidState(format!(
+                "local mount `{}` became reserved outside this hosted profile",
+                mapping.local_mount_id().as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_connector_mount_id_available(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<()> {
+    let reserved: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM hosted_workspace_mount_mappings WHERE local_mount_id = ?1
+            UNION ALL
+            SELECT 1 FROM hosted_workspace_pending_mounts WHERE local_mount_id = ?1
+         )",
+        params![mount_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if reserved {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` is reserved by a hosted workspace",
+            mount_id.as_str()
+        )));
+    }
+    Ok(())
+}
+
 impl MountRepository for SqliteStateStore {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_connector_mount_id_available(&transaction, &mount.mount_id)?;
         let existing = transaction
             .query_row(
                 "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json
@@ -5673,6 +6541,7 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
         migrate_workspace_bindings_component_to_v4(connection)?;
         ensure_state_components_safe_before_mutation(connection, user_version)?;
         validate_workspace_bindings(connection)?;
+        validate_hosted_workspace_storage(connection)?;
         retire_removed_state_components(connection)?;
         repair_missing_state_components(connection)?;
         ensure_state_components_allow_schema_migration(connection, user_version)?;
@@ -5705,6 +6574,97 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
             projection_json TEXT NOT NULL DEFAULT '\"plain_files\"',
             connection_id TEXT,
             settings_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS hosted_workspace_attachments (
+            api_origin TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            credential_ref TEXT NOT NULL,
+            root TEXT NOT NULL,
+            profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+            layout_version INTEGER NOT NULL CHECK (layout_version > 0),
+            layout_digest TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (api_origin, profile_id),
+            UNIQUE (root)
+        );
+
+        CREATE TABLE IF NOT EXISTS hosted_workspace_mount_mappings (
+            api_origin TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            portable_mount_id TEXT NOT NULL,
+            local_mount_id TEXT NOT NULL UNIQUE,
+            mount_target TEXT NOT NULL,
+            target_collision_key TEXT NOT NULL,
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            first_seen_revision INTEGER NOT NULL CHECK (first_seen_revision > 0),
+            last_seen_revision INTEGER NOT NULL CHECK (
+                last_seen_revision >= first_seen_revision
+            ),
+            PRIMARY KEY (api_origin, profile_id, portable_mount_id),
+            FOREIGN KEY (api_origin, profile_id)
+                REFERENCES hosted_workspace_attachments(api_origin, profile_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS hosted_workspace_active_target_unique
+            ON hosted_workspace_mount_mappings(api_origin, profile_id, target_collision_key)
+            WHERE active = 1;
+
+        CREATE TABLE IF NOT EXISTS hosted_workspace_pending_transitions (
+            transition_id TEXT PRIMARY KEY,
+            api_origin TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            credential_ref TEXT NOT NULL,
+            target_root TEXT NOT NULL,
+            transition_kind TEXT NOT NULL CHECK (
+                transition_kind IN ('attach', 'refresh', 'relocate')
+            ),
+            profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+            layout_version INTEGER NOT NULL CHECK (layout_version > 0),
+            layout_digest TEXT NOT NULL,
+            base_profile_revision INTEGER CHECK (base_profile_revision > 0),
+            base_layout_digest TEXT,
+            base_root TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE (api_origin, profile_id),
+            CHECK (
+                (base_profile_revision IS NULL AND base_layout_digest IS NULL AND base_root IS NULL)
+                OR
+                (base_profile_revision IS NOT NULL AND base_layout_digest IS NOT NULL AND base_root IS NOT NULL)
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS hosted_workspace_pending_mounts (
+            transition_id TEXT NOT NULL,
+            portable_mount_id TEXT NOT NULL,
+            local_mount_id TEXT NOT NULL,
+            mount_target TEXT NOT NULL,
+            target_collision_key TEXT NOT NULL,
+            first_seen_revision INTEGER NOT NULL CHECK (first_seen_revision > 0),
+            PRIMARY KEY (transition_id, portable_mount_id),
+            UNIQUE (transition_id, local_mount_id),
+            UNIQUE (transition_id, target_collision_key),
+            FOREIGN KEY (transition_id)
+                REFERENCES hosted_workspace_pending_transitions(transition_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS hosted_workspace_pending_cleanups (
+            cleanup_id TEXT PRIMARY KEY,
+            api_origin TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            credential_ref TEXT NOT NULL,
+            root TEXT NOT NULL,
+            profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+            layout_version INTEGER NOT NULL CHECK (layout_version > 0),
+            layout_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (api_origin, profile_id),
+            UNIQUE (root),
+            FOREIGN KEY (api_origin, profile_id)
+                REFERENCES hosted_workspace_attachments(api_origin, profile_id)
+                ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS discovery_projection_transactions (
@@ -6490,6 +7450,19 @@ fn state_component_issue_allows_schema_migration(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
             if user_version < SCHEMA_VERSION && component_id == "durable:workspace_bindings"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
+            found: 1,
+            current,
+        } if component_id == "durable:hosted_workspaces"
+            && *current == HOSTED_WORKSPACE_ATTACHMENT_COMPONENT_VERSION as i64
+            && user_version < SCHEMA_VERSION
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::MissingComponent { component_id }
+            if user_version < SCHEMA_VERSION && component_id == "durable:hosted_workspaces"
     )
 }
 
@@ -6524,6 +7497,7 @@ fn migrate_workspace_bindings_schema_v21(
     create_workspace_host_bindings_table(&transaction)?;
     migrate_workspace_bindings_table_to_v3(&transaction)?;
     create_workspace_remount_recoveries_table(&transaction)?;
+    create_hosted_workspace_tables(&transaction)?;
     if user_version < 27 {
         discard_untrusted_legacy_workspace_bindings(&transaction)?;
     }
@@ -6531,7 +7505,137 @@ fn migrate_workspace_bindings_schema_v21(
     record_schema_migration(&transaction, user_version, SCHEMA_VERSION)?;
     transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     validate_workspace_bindings(&transaction)?;
+    validate_hosted_workspace_storage(&transaction)?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn create_hosted_workspace_tables(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS hosted_workspace_attachments (
+            api_origin TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            credential_ref TEXT NOT NULL,
+            root TEXT NOT NULL,
+            profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+            layout_version INTEGER NOT NULL CHECK (layout_version > 0),
+            layout_digest TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (api_origin, profile_id),
+            UNIQUE (root)
+        );
+        CREATE TABLE IF NOT EXISTS hosted_workspace_mount_mappings (
+            api_origin TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            portable_mount_id TEXT NOT NULL,
+            local_mount_id TEXT NOT NULL UNIQUE,
+            mount_target TEXT NOT NULL,
+            target_collision_key TEXT NOT NULL,
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            first_seen_revision INTEGER NOT NULL CHECK (first_seen_revision > 0),
+            last_seen_revision INTEGER NOT NULL CHECK (last_seen_revision >= first_seen_revision),
+            PRIMARY KEY (api_origin, profile_id, portable_mount_id),
+            FOREIGN KEY (api_origin, profile_id)
+                REFERENCES hosted_workspace_attachments(api_origin, profile_id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS hosted_workspace_active_target_unique
+            ON hosted_workspace_mount_mappings(api_origin, profile_id, target_collision_key)
+            WHERE active = 1;
+        CREATE TABLE IF NOT EXISTS hosted_workspace_pending_transitions (
+            transition_id TEXT PRIMARY KEY,
+            api_origin TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            credential_ref TEXT NOT NULL,
+            target_root TEXT NOT NULL,
+            transition_kind TEXT NOT NULL CHECK (transition_kind IN ('attach', 'refresh', 'relocate')),
+            profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+            layout_version INTEGER NOT NULL CHECK (layout_version > 0),
+            layout_digest TEXT NOT NULL,
+            base_profile_revision INTEGER CHECK (base_profile_revision > 0),
+            base_layout_digest TEXT,
+            base_root TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE (api_origin, profile_id),
+            CHECK (
+                (base_profile_revision IS NULL AND base_layout_digest IS NULL AND base_root IS NULL)
+                OR
+                (base_profile_revision IS NOT NULL AND base_layout_digest IS NOT NULL AND base_root IS NOT NULL)
+            )
+        );
+        CREATE TABLE IF NOT EXISTS hosted_workspace_pending_mounts (
+            transition_id TEXT NOT NULL,
+            portable_mount_id TEXT NOT NULL,
+            local_mount_id TEXT NOT NULL,
+            mount_target TEXT NOT NULL,
+            target_collision_key TEXT NOT NULL,
+            first_seen_revision INTEGER NOT NULL CHECK (first_seen_revision > 0),
+            PRIMARY KEY (transition_id, portable_mount_id),
+            UNIQUE (transition_id, local_mount_id),
+            UNIQUE (transition_id, target_collision_key),
+            FOREIGN KEY (transition_id)
+                REFERENCES hosted_workspace_pending_transitions(transition_id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS hosted_workspace_pending_cleanups (
+            cleanup_id TEXT PRIMARY KEY,
+            api_origin TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            credential_ref TEXT NOT NULL,
+            root TEXT NOT NULL,
+            profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+            layout_version INTEGER NOT NULL CHECK (layout_version > 0),
+            layout_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (api_origin, profile_id),
+            UNIQUE (root),
+            FOREIGN KEY (api_origin, profile_id)
+                REFERENCES hosted_workspace_attachments(api_origin, profile_id) ON DELETE CASCADE
+        );",
+    )?;
+    Ok(())
+}
+
+fn validate_hosted_workspace_storage(connection: &Connection) -> StoreResult<()> {
+    for table in [
+        "hosted_workspace_attachments",
+        "hosted_workspace_mount_mappings",
+        "hosted_workspace_pending_transitions",
+        "hosted_workspace_pending_mounts",
+        "hosted_workspace_pending_cleanups",
+    ] {
+        if !table_exists(connection, table)? {
+            return Err(StoreError::StateCompatibility(format!(
+                "required hosted workspace table `{table}` is missing"
+            )));
+        }
+    }
+    let mapping_owner_count: i64 = connection.query_row(
+        "SELECT COUNT(*)
+         FROM hosted_workspace_mount_mappings m
+         LEFT JOIN hosted_workspace_attachments a
+           ON a.api_origin = m.api_origin AND a.profile_id = m.profile_id
+         WHERE a.profile_id IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if mapping_owner_count != 0 {
+        return Err(StoreError::InvalidState(
+            "hosted workspace storage contains orphan mappings".to_string(),
+        ));
+    }
+    let cleanup_owner_count: i64 = connection.query_row(
+        "SELECT COUNT(*)
+         FROM hosted_workspace_pending_cleanups c
+         LEFT JOIN hosted_workspace_attachments a
+           ON a.api_origin = c.api_origin AND a.profile_id = c.profile_id
+         WHERE a.profile_id IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if cleanup_owner_count != 0 {
+        return Err(StoreError::InvalidState(
+            "hosted workspace storage contains orphan relocation cleanups".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -6760,6 +7864,7 @@ fn mount_from_connection(
 }
 
 fn save_mount_row(connection: &Connection, mount: &MountConfig) -> StoreResult<()> {
+    ensure_connector_mount_id_available(connection, &mount.mount_id)?;
     connection.execute(
         "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -9059,7 +10164,10 @@ fn seed_missing_state_components(connection: &Connection) -> StoreResult<()> {
 fn repairable_missing_state_component(component_id: &str) -> bool {
     !matches!(
         component_id,
-        "projection:linux_fuse" | "projection:windows_cloud_files" | "durable:workspace_bindings"
+        "projection:linux_fuse"
+            | "projection:windows_cloud_files"
+            | "durable:workspace_bindings"
+            | "durable:hosted_workspaces"
     )
 }
 

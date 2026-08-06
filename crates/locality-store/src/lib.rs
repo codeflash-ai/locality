@@ -10,6 +10,7 @@ pub mod credentials;
 pub mod discovery;
 pub mod error;
 pub mod generation_delivery;
+pub mod hosted_workspace;
 pub mod live_mode;
 pub mod memory;
 pub mod records;
@@ -41,6 +42,13 @@ pub use generation_delivery::{
     NegotiatedGenerationApplyJournalRecord, ObservedGenerationRecord, ObservedGenerationRecordV2,
     PreparedGenerationApply, PreparedGenerationApplyV2, PreparedGenerationApplyV3,
 };
+pub use hosted_workspace::{
+    CanonicalApiOrigin, CanonicalApiOriginError, HOSTED_WORKSPACE_ATTACHMENT_COMPONENT_VERSION,
+    HOSTED_WORKSPACE_LAYOUT_VERSION, HostedWorkspaceAttachment, HostedWorkspaceCredentialRef,
+    HostedWorkspaceCredentialRefError, HostedWorkspaceIdentity, HostedWorkspaceMountMapping,
+    HostedWorkspaceTransitionKind, PendingHostedWorkspaceCleanup, PendingHostedWorkspaceTransition,
+    PreparedHostedWorkspaceTransition,
+};
 pub use live_mode::{
     LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountLiveModeStateChangeError,
     is_live_mode_state_change_signal_path, live_mode_state_change_signal_path,
@@ -58,7 +66,7 @@ pub use records::{
 pub use repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, ConnectorStateRepository,
     EntityRepository, EntitySearchCandidate, EntitySearchDocument, EntitySearchRepository,
-    FreshnessStateRepository, HydrationJobRepository, JournalRepository,
+    FreshnessStateRepository, HostedWorkspaceRepository, HydrationJobRepository, JournalRepository,
     MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
     RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
     VirtualMutationRepository, WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,

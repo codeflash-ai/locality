@@ -11,6 +11,11 @@ use locality_core::model::{MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
 
 use crate::error::{StoreError, StoreResult};
+use crate::hosted_workspace::{
+    HostedWorkspaceAttachment, HostedWorkspaceIdentity, HostedWorkspaceMountMapping,
+    PendingHostedWorkspaceCleanup, PendingHostedWorkspaceTransition,
+    PreparedHostedWorkspaceTransition,
+};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
@@ -25,6 +30,63 @@ pub trait MountRepository {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()>;
     fn get_mount(&self, mount_id: &MountId) -> StoreResult<Option<MountConfig>>;
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>>;
+}
+
+/// Whole-workspace hosted attachments. These mounts intentionally remain
+/// outside [`MountRepository`] so connector operations cannot discover them.
+pub trait HostedWorkspaceRepository {
+    fn begin_hosted_workspace_transition(
+        &mut self,
+        prepared: PreparedHostedWorkspaceTransition,
+    ) -> StoreResult<PendingHostedWorkspaceTransition>;
+
+    fn get_hosted_workspace_attachment(
+        &self,
+        identity: &HostedWorkspaceIdentity,
+    ) -> StoreResult<Option<HostedWorkspaceAttachment>>;
+
+    fn list_hosted_workspace_attachments(&self) -> StoreResult<Vec<HostedWorkspaceAttachment>>;
+
+    /// Includes inactive historical mappings so a portable ID regains the
+    /// same local identity when it reappears in a later profile revision.
+    fn list_hosted_workspace_mount_mappings(
+        &self,
+        identity: &HostedWorkspaceIdentity,
+    ) -> StoreResult<Vec<HostedWorkspaceMountMapping>>;
+
+    fn get_pending_hosted_workspace_transition(
+        &self,
+        identity: &HostedWorkspaceIdentity,
+    ) -> StoreResult<Option<PendingHostedWorkspaceTransition>>;
+
+    fn list_pending_hosted_workspace_transitions(
+        &self,
+    ) -> StoreResult<Vec<PendingHostedWorkspaceTransition>>;
+
+    fn get_pending_hosted_workspace_cleanup(
+        &self,
+        identity: &HostedWorkspaceIdentity,
+    ) -> StoreResult<Option<PendingHostedWorkspaceCleanup>>;
+
+    fn list_pending_hosted_workspace_cleanups(
+        &self,
+    ) -> StoreResult<Vec<PendingHostedWorkspaceCleanup>>;
+
+    /// Compare-and-swap the attachment and the complete active mount set in
+    /// one transaction, then remove the pending transition.
+    fn commit_hosted_workspace_transition(
+        &mut self,
+        transition_id: &str,
+        committed_at: &str,
+    ) -> StoreResult<HostedWorkspaceAttachment>;
+
+    /// Only safe before publication. Filesystem-aware coordinators keep a
+    /// pending transition after publication until recovery can prove outcome.
+    fn cancel_hosted_workspace_transition(&mut self, transition_id: &str) -> StoreResult<()>;
+
+    /// Complete only after the owning coordinator has removed the exact old
+    /// receipt-authenticated generation (or proved it was already removed).
+    fn complete_hosted_workspace_cleanup(&mut self, cleanup_id: &str) -> StoreResult<()>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

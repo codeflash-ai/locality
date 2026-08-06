@@ -192,6 +192,55 @@ pub struct DaemonRemountCoordinatorLock {
     startup_handoff_begun: AtomicBool,
 }
 
+/// Process-scoped liveness lease for one durable hosted-workspace transition.
+///
+/// The attaching process retains this lock while it downloads and stages the
+/// immutable export. Recovery uses the same non-blocking lock before deciding
+/// that an unpublished pending transition was abandoned, so it cannot cancel
+/// work that is still active in another process.
+pub struct HostedWorkspaceTransitionLock {
+    _file: fs::File,
+}
+
+impl HostedWorkspaceTransitionLock {
+    pub fn try_acquire(state_root: &Path, transition_id: &str) -> io::Result<Self> {
+        if transition_id.is_empty()
+            || transition_id.len() > 200
+            || transition_id.bytes().any(|byte| {
+                !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "hosted workspace transition ID is not safe for coordination",
+            ));
+        }
+        let directory = state_root.join("hosted-workspace-transition-locks");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{transition_id}.lock"));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        prevent_coordination_file_inheritance(&file)?;
+        try_lock_coordination_file(&file, CoordinationLockMode::Exclusive).map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "hosted workspace transition `{transition_id}` is active in another process"
+                    ),
+                )
+            } else {
+                error
+            }
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
 impl DaemonRemountCoordinatorLock {
     pub fn try_acquire(state_root: &Path) -> io::Result<Self> {
         fs::create_dir_all(state_root)?;
