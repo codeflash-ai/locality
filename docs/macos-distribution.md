@@ -96,13 +96,17 @@ updated `.app` even if the old process exits during installer handoff. The
 relaunch runs the same `localityd` build validation described above before
 normal desktop work resumes.
 
-During onboarding, the desktop app also verifies the terminal command. For DMG
-installs it creates or refreshes `/usr/local/bin/loc` as a symlink to the
-embedded `Contents/MacOS/loc`, prompting for administrator permission only when
-that standard PATH location is not writable. If the app is launched from the
-mounted DMG volume, onboarding asks the user to move Locality to Applications before
-installing the terminal command so the symlink does not point at a temporary
-volume.
+During onboarding and after each direct-download upgrade, the desktop app also
+verifies the terminal command. DMG installs create or refresh the canonical
+user link `~/.local/bin/loc` so it points at the current app's embedded
+`Contents/MacOS/loc`. The canonical link is preferred over alternate user PATH
+locations such as `~/.cargo/bin`; this ensures an older symlink cannot continue
+to shadow the upgraded CLI. Locality may replace a stale symlink, but it does
+not overwrite an unrelated regular file named `loc`. It adds `~/.local/bin` to
+the user's shell profile when necessary and does not require administrator
+permission. If the app is launched from the mounted DMG volume, onboarding asks
+the user to move Locality to Applications before installing the terminal
+command so the symlink does not point at a temporary volume.
 
 ## Uninstall Cleanup
 

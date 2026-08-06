@@ -195,7 +195,7 @@ fn status_treats_materialized_stub_that_matches_shadow_as_clean() {
 }
 
 #[test]
-fn status_keeps_disabled_live_mode_error_when_entries_need_attention() {
+fn status_keeps_current_push_review_pause_when_entries_need_attention() {
     let fixture = StatusFixture::new();
     let mut store = fixture.store();
     fixture.hydrated_page(
@@ -208,7 +208,7 @@ fn status_keeps_disabled_live_mode_error_when_entries_need_attention() {
     store
         .save_mount_live_mode(
             MountLiveModeRecord::new(fixture.mount_id.clone(), true, "1").error(
-                "Live Mode paused for `Roadmap`: local edits pending review.",
+                "This push needs review because it may move, archive, or touch a large amount of Notion content. Open Review Push to approve it.",
                 "2",
                 "2",
             ),
@@ -229,7 +229,9 @@ fn status_keeps_disabled_live_mode_error_when_entries_need_attention() {
     assert_eq!(report.mounts[0].live_mode.label, "Live Mode paused");
     assert_eq!(
         report.mounts[0].live_mode.reason.as_deref(),
-        Some("Live Mode paused for `Roadmap`: local edits pending review.")
+        Some(
+            "This push needs review because it may move, archive, or touch a large amount of Notion content. Open Review Push to approve it."
+        )
     );
 }
 

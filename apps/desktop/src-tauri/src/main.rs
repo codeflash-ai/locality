@@ -2761,16 +2761,25 @@ fn live_mode_tick_blocking_at_state_root(state_root: &Path) -> ActionReport {
         Err(message) => return ActionReport { ok: false, message },
     }
 
-    let report = live_mode_tick_for_enabled_mount(&state_root, &mount);
-    if let Err(message) = record_mount_live_mode_tick_result(&state_root, &mount.mount_id, &report)
-    {
+    let mut push_requires_review = false;
+    let report = live_mode_tick_for_enabled_mount(&state_root, &mount, &mut push_requires_review);
+    if let Err(message) = record_mount_live_mode_tick_result(
+        &state_root,
+        &mount.mount_id,
+        &report,
+        push_requires_review,
+    ) {
         return ActionReport { ok: false, message };
     }
 
     report
 }
 
-fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> ActionReport {
+fn live_mode_tick_for_enabled_mount(
+    state_root: &Path,
+    mount: &MountConfig,
+    push_requires_review: &mut bool,
+) -> ActionReport {
     if let Err(message) = live_mode_reconcile_recent_local_targets(state_root, mount) {
         return ActionReport { ok: false, message };
     }
@@ -2838,6 +2847,10 @@ fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> A
                             Ok(())
                         }
                         Ok(push_report) => {
+                            *push_requires_review |= live_mode_push_report_requires_pause(
+                                &push_report.pipeline_action,
+                                &push_report.guardrail.decision,
+                            );
                             let message = push_report_message(&push_report);
                             desktop_log(
                                 "warn",
@@ -3224,6 +3237,7 @@ fn record_mount_live_mode_tick_result(
     state_root: &Path,
     mount_id: &MountId,
     report: &ActionReport,
+    push_requires_review: bool,
 ) -> Result<(), String> {
     let mut store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
@@ -3239,7 +3253,7 @@ fn record_mount_live_mode_tick_result(
     }
     let record = if report.ok {
         record.active(non_empty_string(report.message.clone()), now.clone(), now)
-    } else if live_mode_failure_should_pause(&report.message) {
+    } else if push_requires_review || live_mode_failure_should_pause(&report.message) {
         record.error(report.message.clone(), now.clone(), now)
     } else {
         record.active(non_empty_string(report.message.clone()), now.clone(), now)
@@ -3249,10 +3263,23 @@ fn record_mount_live_mode_tick_result(
         .map_err(|error| format!("Live Mode could not update its state: {error}"))
 }
 
+fn live_mode_push_report_requires_pause(pipeline_action: &str, guardrail_decision: &str) -> bool {
+    guardrail_decision == "confirm_required"
+        || matches!(
+            pipeline_action,
+            "fix_validation"
+                | "confirm_plan"
+                | "confirm_dangerous_plan"
+                | "read_only_blocked"
+                | "unsupported_operations"
+        )
+}
+
 fn live_mode_failure_should_pause(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     message.starts_with("Live Mode paused for")
         || message.contains("Review required before pushing")
+        || lower.contains("needs review")
         || lower.contains("could not identify the remote page")
 }
 
@@ -8710,7 +8737,7 @@ fn install_terminal_cli_link_in_path(cli_path: &Path) -> Result<PathBuf, String>
     sort_terminal_cli_path_dirs(&mut dirs);
     let user_fallback = default_user_terminal_cli_dir();
     if let Some(directory) = user_fallback.as_deref() {
-        insert_user_terminal_cli_fallback_dir(&mut dirs, directory);
+        prioritize_user_terminal_cli_dir(&mut dirs, directory);
     }
     let installed = install_terminal_cli_link_in_sorted_path_dirs(cli_path, dirs)?;
     if user_fallback.as_deref().is_some_and(|directory| {
@@ -8840,15 +8867,9 @@ fn default_user_terminal_cli_dir() -> Option<PathBuf> {
         })
 }
 
-fn insert_user_terminal_cli_fallback_dir(dirs: &mut Vec<PathBuf>, directory: &Path) {
-    if dirs.iter().any(|existing| paths_equal(existing, directory)) {
-        return;
-    }
-    let index = dirs
-        .iter()
-        .position(|candidate| is_protected_terminal_cli_path(candidate))
-        .unwrap_or(dirs.len());
-    dirs.insert(index, directory.to_path_buf());
+fn prioritize_user_terminal_cli_dir(dirs: &mut Vec<PathBuf>, directory: &Path) {
+    dirs.retain(|existing| !paths_equal(existing, directory));
+    dirs.insert(0, directory.to_path_buf());
 }
 
 fn ensure_terminal_cli_dir_registered(installed: &Path) -> Result<(), String> {
@@ -15789,6 +15810,7 @@ mod tests {
                 message: "Live Mode could not inspect Notion changes: network unavailable"
                     .to_string(),
             },
+            false,
         )
         .expect("record transient result");
 
@@ -15806,7 +15828,7 @@ mod tests {
     }
 
     #[test]
-    fn live_mode_review_failures_pause_until_user_action() {
+    fn live_mode_structured_push_review_failures_pause_until_user_action() {
         let temp = TestTempDir::new("live-mode-review-failure");
         let mount_id = MountId::new("notion-main");
         let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
@@ -15827,8 +15849,9 @@ mod tests {
             &mount_id,
             &ActionReport {
                 ok: false,
-                message: "Live Mode paused for `Roadmap`: needs review.".to_string(),
+                message: "This push needs review because it may move, archive, or touch a large amount of Notion content. Open Review Push to approve it.".to_string(),
             },
+            true,
         )
         .expect("record review result");
 
@@ -15839,6 +15862,42 @@ mod tests {
             .expect("live mode record");
         assert!(!record.enabled);
         assert_eq!(record.state, MountLiveModeState::Error);
+        assert_eq!(
+            record.last_reason.as_deref(),
+            Some(
+                "This push needs review because it may move, archive, or touch a large amount of Notion content. Open Review Push to approve it."
+            )
+        );
+        let pending_changes = sample_snapshot().pending_changes;
+        let summary = super::MountLiveModeSummary::from_record(Some(&record), &pending_changes);
+        assert!(!summary.enabled);
+        assert_eq!(summary.state, "error");
+        assert_eq!(summary.label, "Live Mode paused");
+        assert_eq!(summary.reason, record.last_reason);
+    }
+
+    #[test]
+    fn live_mode_push_report_pause_policy_uses_pipeline_and_guardrail_state() {
+        assert!(super::live_mode_push_report_requires_pause(
+            "confirm_dangerous_plan",
+            "proceed"
+        ));
+        assert!(super::live_mode_push_report_requires_pause(
+            "proceed_to_apply",
+            "confirm_required"
+        ));
+        assert!(super::live_mode_push_report_requires_pause(
+            "fix_validation",
+            "proceed"
+        ));
+        assert!(super::live_mode_push_report_requires_pause(
+            "unsupported_operations",
+            "proceed"
+        ));
+        assert!(!super::live_mode_push_report_requires_pause(
+            "proceed_to_apply",
+            "proceed"
+        ));
     }
 
     #[test]
@@ -15895,6 +15954,7 @@ mod tests {
                 ok: true,
                 message: "Live Mode checked for changes.".to_string(),
             },
+            false,
         )
         .expect("record disabled result");
 
@@ -20369,6 +20429,43 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn dmg_upgrade_refreshes_canonical_user_cli_before_an_existing_alternate_link() {
+        let temp = TestTempDir::new("terminal-cli-dmg-upgrade");
+        let old_cli = temp.path().join("old/loc");
+        let bundled_cli = temp.path().join("Locality.app/Contents/MacOS/loc");
+        let user_bin = temp.path().join(".local/bin");
+        let alternate_bin = temp.path().join(".cargo/bin");
+        let user_link = user_bin.join("loc");
+        let alternate_link = alternate_bin.join("loc");
+        fs::create_dir_all(old_cli.parent().expect("old cli parent")).expect("create old parent");
+        fs::create_dir_all(bundled_cli.parent().expect("bundled cli parent"))
+            .expect("create bundled parent");
+        fs::create_dir_all(&user_bin).expect("create user bin");
+        fs::create_dir_all(&alternate_bin).expect("create alternate bin");
+        fs::write(&old_cli, b"old loc cli").expect("write old cli");
+        fs::write(&bundled_cli, b"bundled loc cli").expect("write bundled cli");
+        std::os::unix::fs::symlink(&old_cli, &user_link).expect("link old user cli");
+        std::os::unix::fs::symlink(&bundled_cli, &alternate_link)
+            .expect("link bundled alternate cli");
+
+        let mut dirs = vec![alternate_bin, user_bin.clone()];
+        super::prioritize_user_terminal_cli_dir(&mut dirs, &user_bin);
+        let installed = super::install_terminal_cli_link_in_sorted_path_dirs(&bundled_cli, dirs)
+            .expect("upgrade canonical user cli");
+
+        assert_eq!(installed, user_link);
+        assert_eq!(
+            fs::read_link(&installed).expect("read upgraded user link"),
+            bundled_cli
+        );
+        assert_eq!(
+            fs::read_link(&alternate_link).expect("read alternate link"),
+            bundled_cli
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn terminal_cli_installer_does_not_replace_regular_file() {
         let temp = TestTempDir::new("terminal-cli-existing-file");
         let cli = temp.path().join("app/loc");
@@ -20443,7 +20540,7 @@ mod tests {
         fs::write(&cli, b"loc cli").expect("write cli");
 
         let mut dirs = vec![PathBuf::from("/usr/bin"), PathBuf::from("/sbin")];
-        super::insert_user_terminal_cli_fallback_dir(&mut dirs, &user_bin);
+        super::prioritize_user_terminal_cli_dir(&mut dirs, &user_bin);
 
         let installed = super::install_terminal_cli_link_in_sorted_path_dirs(&cli, dirs)
             .expect("install fallback");

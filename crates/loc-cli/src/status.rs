@@ -511,6 +511,7 @@ fn status_live_mode_error_should_pause(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     message.starts_with("Live Mode paused for")
         || message.contains("Review required before pushing")
+        || lower.contains("needs review")
         || lower.contains("conflict")
         || lower.contains("changed since last sync")
         || lower.contains("could not identify the remote page")

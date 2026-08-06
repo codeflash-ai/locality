@@ -189,12 +189,19 @@ instead of starting overlapping work.
 5. Records the result with `record_mount_live_mode_tick_result`.
 
 `record_mount_live_mode_tick_result` keeps Live Mode enabled after transient
-failures unless `live_mode_failure_should_pause` classifies the message as
-review-grade. Review-grade failures currently include:
+failures. Push reports carry their pipeline action and guardrail decision into
+the tick result, so confirmation, validation, read-only, unsupported-operation,
+and guardrail-review outcomes pause Live Mode without parsing user-facing copy.
+Failures that do not originate from a push report still use
+`live_mode_failure_should_pause` for review-grade state messages, including:
 
 - messages starting with `Live Mode paused for`
 - messages containing `Review required before pushing`
+- current push copy containing `needs review`
 - messages that cannot identify the remote page
+
+The durable pause retains the user-facing push message as `last_reason`, which
+lets desktop status and Review Center explain why automatic sync stopped.
 
 `loc status` and desktop summaries also hide stale disabled error records when
 there are no current pending changes requiring attention.
@@ -287,8 +294,9 @@ For a `safe` change:
 - it calls `push_target_direct(target, false)`
 - the direct push uses `assume_yes = true` and `confirm_dangerous = false`
 - if push succeeds, the tick reports one synced pending change
-- if push fails, the failure is recorded and may pause Live Mode depending on
-  the failure message
+- if the structured push action or guardrail requires review, the failure is
+  recorded as a durable Live Mode pause; transient apply failures remain active
+  for retry
 
 For a `needs_review` change with issue code `remote_changed`:
 
