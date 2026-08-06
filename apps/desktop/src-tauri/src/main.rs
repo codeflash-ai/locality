@@ -191,6 +191,9 @@ const WINDOWS_TERMINAL_CLI_SHIM_MARKER: &str = "LOCALITY_TERMINAL_CLI_SHIM";
 #[cfg(windows)]
 const WINDOWS_RUN_KEY_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const DEFAULT_NOTION_MOUNT_POINT_DIRECTORY: &str = "notion";
+// Filter Manager cannot resolve a Cloud Files child name while its provider is
+// disconnected. Rust surfaces the HRESULT as a signed raw OS error.
+const WINDOWS_ERROR_FLT_INVALID_NAME_REQUEST: i32 = -2_145_452_027;
 #[cfg(windows)]
 const WINDOWS_RUN_VALUE_NAME: &str = "Locality";
 #[cfg(windows)]
@@ -6993,6 +6996,10 @@ fn validate_desktop_mount_root(
     state_root: &Path,
     projection: &ProjectionMode,
 ) -> Result<(), String> {
+    if *projection == ProjectionMode::WindowsCloudFiles {
+        return validate_windows_cloud_files_mount_root(root, state_root);
+    }
+
     #[cfg(target_os = "macos")]
     {
         return validate_desktop_mount_root_with_macos_provider_roots(
@@ -7007,6 +7014,47 @@ fn validate_desktop_mount_root(
     {
         let _ = projection;
         validate_mount_root(root, state_root)
+    }
+}
+
+fn validate_windows_cloud_files_mount_root(root: &Path, state_root: &Path) -> Result<(), String> {
+    let inspection = fs::metadata(root).map(|_| ());
+    validate_windows_cloud_files_mount_root_after_inspection(root, state_root, inspection)
+}
+
+fn validate_windows_cloud_files_mount_root_after_inspection(
+    root: &Path,
+    state_root: &Path,
+    inspection: io::Result<()>,
+) -> Result<(), String> {
+    match inspection {
+        Err(error) if error.raw_os_error() == Some(WINDOWS_ERROR_FLT_INVALID_NAME_REQUEST) => {
+            let root = validate_mount_root_location(root, state_root)?;
+            let projection_root = root.parent().ok_or_else(|| {
+                format!(
+                    "Choose a mount point inside a shared Locality folder, for example {}.",
+                    absolute_display_path(&default_notion_mount_root())
+                )
+            })?;
+            // The provider owns the child mount point and may be unable to answer
+            // name queries until it reconnects. The shared sync root remains safe
+            // to inspect. Windows also uses its read-only directory attribute for
+            // folder customization, so it is not a write-permission signal here.
+            validate_mount_root_structure(projection_root, state_root, false).map(|_| ())
+        }
+        Ok(()) => validate_mount_root(root, state_root),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            validate_mount_root(root, state_root)
+        }
+        Err(error) => Err(format!(
+            "Could not inspect mount folder `{}`: {error}",
+            root.display()
+        )),
     }
 }
 
@@ -16132,6 +16180,42 @@ mod tests {
         let root = temp.path().join("Notion");
 
         validate_mount_root(&root, &temp.path().join(".loc")).expect("valid child path");
+    }
+
+    #[test]
+    fn windows_cloud_files_mount_validation_recovers_from_disconnected_name_request() {
+        let temp = TestTempDir::new("windows-cloud-files-disconnected-name-request");
+        let projection_root = temp.path().join("Locality");
+        let mount_root = projection_root.join("notion");
+        fs::create_dir_all(&projection_root).expect("create shared projection root");
+
+        super::validate_windows_cloud_files_mount_root_after_inspection(
+            &mount_root,
+            &temp.path().join(".loc"),
+            Err(std::io::Error::from_raw_os_error(
+                super::WINDOWS_ERROR_FLT_INVALID_NAME_REQUEST,
+            )),
+        )
+        .expect("disconnected provider name request should validate through its shared root");
+    }
+
+    #[test]
+    fn windows_cloud_files_mount_validation_keeps_normal_file_checks() {
+        let temp = TestTempDir::new("windows-cloud-files-existing-file");
+        let root = temp.path().join("notion.md");
+        fs::write(&root, "not a folder").expect("write test file");
+
+        let error = super::validate_desktop_mount_root(
+            &root,
+            &temp.path().join(".loc"),
+            &ProjectionMode::WindowsCloudFiles,
+        )
+        .expect_err("ordinary files remain invalid mount roots");
+
+        assert_eq!(
+            error,
+            format!("Choose a folder path, not a file: {}", root.display())
+        );
     }
 
     #[test]
