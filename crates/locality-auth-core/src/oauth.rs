@@ -406,7 +406,11 @@ fn is_loopback_google_redirect_host(host: &str) -> bool {
         return true;
     }
     match host.parse::<IpAddr>() {
-        Ok(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Ok(IpAddr::V6(ip)) => match ip.to_ipv4_mapped() {
+            Some(mapped) => mapped.is_loopback() || mapped.is_unspecified(),
+            None => ip.is_loopback() || ip.is_unspecified(),
+        },
         Err(_) => false,
     }
 }
@@ -450,10 +454,13 @@ fn parse_https_authority_host(authority: &str) -> Option<&str> {
         let closing_bracket = bracketed_host.find(']')?;
         let host = &bracketed_host[..closing_bracket];
         let suffix = &bracketed_host[closing_bracket + 1..];
-        if host.is_empty() || !valid_optional_https_port_suffix(suffix) {
+        if host.parse::<IpAddr>().is_err() || !valid_optional_https_port_suffix(suffix) {
             return None;
         }
         return Some(host);
+    }
+    if authority.contains('[') || authority.contains(']') {
+        return None;
     }
 
     let Some((host, port)) = authority.split_once(':') else {
@@ -720,6 +727,35 @@ mod tests {
                 percent_encode_query_component(&redirect_uri)
             )));
         }
+    }
+
+    #[test]
+    fn google_hosted_authorization_rejects_local_and_malformed_authorities() {
+        for redirect_uri in [
+            "https://[::ffff:127.0.0.1]/v1/oauth/gmail/callback",
+            "https://[::ffff:0.0.0.0]/v1/oauth/gmail/callback",
+            "https://[api.locality.test]/v1/oauth/gmail/callback",
+            "https://api.locality.test]/v1/oauth/gmail/callback",
+        ] {
+            assert_eq!(
+                google_authorization_url(
+                    OAuthConnector::Gmail,
+                    "google-client",
+                    redirect_uri,
+                    "intent.random",
+                ),
+                Err(GoogleOAuthProfileError::InvalidRedirectUri),
+                "{redirect_uri} must be rejected"
+            );
+        }
+
+        google_authorization_url(
+            OAuthConnector::Gmail,
+            "google-client",
+            "https://api.locality.test:8443/v1/oauth/gmail/callback",
+            "intent.random",
+        )
+        .expect("valid explicit HTTPS port");
     }
 
     #[test]
