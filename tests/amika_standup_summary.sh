@@ -42,6 +42,12 @@ fake_log="${TMPDIR}/fake.log"
 mkdir -p "$fake_bin" "$fake_remote_home/workspace/locality/.git" "$fake_remote_home/workspace/locality-internal/.git"
 : > "$fake_log"
 
+no_amika_bin="${TMPDIR}/no_amika_bin"
+mkdir -p "$no_amika_bin"
+ln -s "$(command -v bash)" "$no_amika_bin/bash"
+ln -s "$(command -v dirname)" "$no_amika_bin/dirname"
+ln -s "$(command -v pwd)" "$no_amika_bin/pwd"
+
 fake_locality_repo_q="$(printf '%q' "${fake_remote_home}/workspace/locality")"
 fake_internal_repo_q="$(printf '%q' "${fake_remote_home}/workspace/locality-internal")"
 
@@ -228,6 +234,19 @@ if PATH="$fake_bin:$PATH" \
   fail "invalid RUN_ID unexpectedly succeeded"
 fi
 assert_file_contains "$invalid_run_id_stderr" "RUN_ID"
+
+missing_amika_stderr="${TMPDIR}/missing-amika.err"
+if PATH="$no_amika_bin" \
+  NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
+  RUN_ID="standup-missing-amika" \
+  STANDUP_DATE="2026-08-06" \
+  STANDUP_SINCE_ISO="2026-08-05T00:00:00Z" \
+  STANDUP_UNTIL_ISO="2026-08-06T00:00:00Z" \
+  "$RUNNER" --sandbox fake-machine 2>"$missing_amika_stderr"; then
+  fail "missing amika unexpectedly succeeded"
+fi
+assert_file_contains "$missing_amika_stderr" "missing required tool: amika"
+grep -F -q "command not found" "$missing_amika_stderr" && fail "missing amika used shell command-not-found"
 
 runner_output="$(
   PATH="$fake_bin:$PATH" \

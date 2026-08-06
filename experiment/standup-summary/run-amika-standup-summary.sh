@@ -60,6 +60,8 @@ if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
   fail "RUN_ID must match [A-Za-z0-9._-]+: $RUN_ID"
 fi
 
+command -v amika >/dev/null 2>&1 || fail "missing required tool: amika"
+
 if [[ -z "${STANDUP_SINCE_ISO:-}" || -z "${STANDUP_UNTIL_ISO:-}" ]]; then
   read -r computed_since computed_until < <(python3 - <<'PY'
 from datetime import datetime, timedelta, timezone
