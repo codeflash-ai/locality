@@ -171,6 +171,12 @@ case "${1:-}" in
     test "${2:-}" = "--prune"
     test "${3:-}" = "origin"
     ;;
+  symbolic-ref)
+    test "${2:-}" = "--quiet"
+    test "${3:-}" = "--short"
+    test "${4:-}" = "refs/remotes/origin/HEAD"
+    printf 'origin/main\n'
+    ;;
   log)
     printf 'abc123\t2026-08-06T00:00:00+00:00\tTest User\ttest@example.com\tstandup change\n'
     ;;
@@ -214,6 +220,15 @@ FAKE_CODEX
 
 chmod +x "${fake_bin}/amika" "${fake_bin}/loc" "${fake_bin}/git" "${fake_bin}/codex"
 
+invalid_run_id_stderr="${TMPDIR}/invalid-run-id.err"
+if PATH="$fake_bin:$PATH" \
+  NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
+  RUN_ID="bad/run" \
+  "$RUNNER" --sandbox fake-machine 2>"$invalid_run_id_stderr"; then
+  fail "invalid RUN_ID unexpectedly succeeded"
+fi
+assert_file_contains "$invalid_run_id_stderr" "RUN_ID"
+
 runner_output="$(
   PATH="$fake_bin:$PATH" \
   FAKE_BIN="$fake_bin" \
@@ -233,7 +248,11 @@ assert_file_contains "$fake_log" "private_channel\\,im\\,mpim"
 assert_file_contains "$fake_log" "loc mount notion"
 assert_file_contains "$fake_log" "loc pull"
 assert_file_contains "$fake_log" "git -C ${fake_locality_repo_q} log"
+assert_file_contains "$fake_log" "git -C ${fake_locality_repo_q} symbolic-ref --quiet --short refs/remotes/origin/HEAD"
+assert_file_contains "$fake_log" "git -C ${fake_locality_repo_q} log origin/main --since="
 assert_file_contains "$fake_log" "git -C ${fake_internal_repo_q} log"
+assert_file_contains "$fake_log" "git -C ${fake_internal_repo_q} symbolic-ref --quiet --short refs/remotes/origin/HEAD"
+assert_file_contains "$fake_log" "git -C ${fake_internal_repo_q} log origin/main --since="
 assert_file_contains "$fake_log" "codex exec"
 
 printf 'successful runner contract passed\n'

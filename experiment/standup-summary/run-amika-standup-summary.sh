@@ -56,6 +56,10 @@ notion_parent_page_id="${NOTION_STANDUP_PARENT_PAGE_ID:-${NOTION_ROOT_PAGE_ID:-}
 : "${SLACK_TYPES:=private_channel,im,mpim}"
 : "${STANDUP_DATE:=$(date -u +%F)}"
 
+if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  fail "RUN_ID must match [A-Za-z0-9._-]+: $RUN_ID"
+fi
+
 if [[ -z "${STANDUP_SINCE_ISO:-}" || -z "${STANDUP_UNTIL_ISO:-}" ]]; then
   read -r computed_since computed_until < <(python3 - <<'PY'
 from datetime import datetime, timedelta, timezone
@@ -274,6 +278,9 @@ find "$mount_root" -type f \( \
 ensure_repo() {
   local slug="$1"
   local dir="$2"
+  local label
+  local log_ref
+  label="$(basename "$dir")"
   if [[ -d "$dir" ]] && git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     :
   else
@@ -293,8 +300,15 @@ ensure_repo() {
     fi
   fi
   git -C "$dir" fetch --prune origin
-  git -C "$dir" log --since="$standup_since_iso" --date=iso-strict --pretty=format:'%H%x09%ad%x09%an%x09%ae%x09%s' > "$evidence_dir/$(basename "$dir")-commits.tsv"
-  git -C "$dir" log --since="$standup_since_iso" --stat --date=iso-strict > "$evidence_dir/$(basename "$dir")-stat.log"
+  if log_ref="$(git -C "$dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"; then
+    printf 'ref\t%s\n' "$log_ref" > "$evidence_dir/git-log-$label-ref.txt"
+    git -C "$dir" log "$log_ref" --since="$standup_since_iso" --date=iso-strict --pretty=format:'%H%x09%ad%x09%an%x09%ae%x09%s' > "$evidence_dir/$label-commits.tsv"
+    git -C "$dir" log "$log_ref" --since="$standup_since_iso" --stat --date=iso-strict > "$evidence_dir/$label-stat.log"
+  else
+    printf 'mode\t--remotes=origin\n' > "$evidence_dir/git-log-$label-ref.txt"
+    git -C "$dir" log --remotes=origin --since="$standup_since_iso" --date=iso-strict --pretty=format:'%H%x09%ad%x09%an%x09%ae%x09%s' > "$evidence_dir/$label-commits.tsv"
+    git -C "$dir" log --remotes=origin --since="$standup_since_iso" --stat --date=iso-strict > "$evidence_dir/$label-stat.log"
+  fi
 }
 
 ensure_repo codeflash-ai/locality "$locality_repo_dir"
