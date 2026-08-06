@@ -74,11 +74,19 @@ pub enum OAuthProfileError {
     BrokerBaseUrlMustNotBeEmpty,
 }
 
+pub const GOOGLE_OAUTH_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+pub const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+
 pub const GOOGLE_IDENTITY_SCOPES: &[&str] = &["openid", "email", "profile"];
 
 pub const NOTION_LOCAL_BROKER_SCOPES: &[&str] = &[];
 pub const NOTION_HOSTED_ADMIN_SCOPES: &[&str] = &[];
 
+pub const GOOGLE_DOCS_REQUIRED_API_SCOPES: &[&str] = &[
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.metadata",
+];
 pub const GOOGLE_DOCS_LOCAL_BROKER_SCOPES: &[&str] = &[
     "openid",
     "email",
@@ -112,6 +120,48 @@ pub const GMAIL_REQUIRED_API_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/gmail.compose",
 ];
 pub const GMAIL_FULL_MAILBOX_SCOPE: &str = "https://mail.google.com/";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoogleOAuthProfileError {
+    UnsupportedConnector,
+    InvalidClientId,
+    InvalidRedirectUri,
+    InvalidState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoogleOAuthScopeError {
+    UnsupportedConnector,
+    FullMailboxScope,
+    MissingRequiredScope(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GoogleOAuthTokenResponse {
+    pub access_token: String,
+    pub token_type: Option<String>,
+    pub refresh_token: Option<String>,
+    pub expires_in: Option<u64>,
+    pub scope: Option<String>,
+    pub id_token: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GoogleHostedCredential {
+    pub kind: String,
+    pub connector: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub token_type: Option<String>,
+    pub oauth_client_id: String,
+    pub account_id: Option<String>,
+    pub account_label: Option<String>,
+    pub workspace_id: Option<String>,
+    pub workspace_name: Option<String>,
+    pub scopes: Vec<String>,
+    pub acquired_at: u64,
+    pub expires_at: Option<u64>,
+}
 
 pub const SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE: &str = "channels:join";
 pub const SLACK_LOCAL_BROKER_SCOPES: &[&str] = &[
@@ -157,6 +207,7 @@ pub const fn oauth_profile(connector: OAuthConnector, host: OAuthHostMode) -> Op
         (OAuthConnector::Slack, OAuthHostMode::HostedAdmin) => SLACK_HOSTED_ADMIN_SCOPES,
     };
     let required_scopes = match (connector, host) {
+        (OAuthConnector::GoogleDocs, _) => GOOGLE_DOCS_REQUIRED_API_SCOPES,
         (OAuthConnector::GoogleCalendar, _) => GOOGLE_CALENDAR_REQUIRED_API_SCOPES,
         (OAuthConnector::Gmail, _) => GMAIL_REQUIRED_API_SCOPES,
         (OAuthConnector::Slack, _) => scopes,
@@ -194,6 +245,143 @@ pub fn broker_callback_uri(
         trimmed.trim_end_matches('/'),
         connector.broker_callback_path()
     ))
+}
+
+pub fn google_authorization_url(
+    connector: OAuthConnector,
+    client_id: &str,
+    redirect_uri: &str,
+    state: &str,
+) -> Result<String, GoogleOAuthProfileError> {
+    let profile = google_hosted_profile(connector)?;
+    if !valid_google_oauth_client_id(client_id) {
+        return Err(GoogleOAuthProfileError::InvalidClientId);
+    }
+    if !valid_google_hosted_redirect_uri(connector, redirect_uri) {
+        return Err(GoogleOAuthProfileError::InvalidRedirectUri);
+    }
+    if state.is_empty() || state.chars().any(char::is_control) {
+        return Err(GoogleOAuthProfileError::InvalidState);
+    }
+
+    let mut url = String::from(GOOGLE_OAUTH_AUTHORIZE_URL);
+    url.push('?');
+    append_query_param(&mut url, "client_id", client_id);
+    append_query_param(&mut url, "response_type", "code");
+    append_query_param(&mut url, "redirect_uri", redirect_uri);
+    append_query_param(&mut url, "scope", &profile.scopes.join(" "));
+    append_query_param(&mut url, "state", state);
+    append_query_param(&mut url, "access_type", "offline");
+    append_query_param(&mut url, "prompt", "consent");
+    Ok(url)
+}
+
+pub fn validate_google_oauth_scopes(
+    connector: OAuthConnector,
+    granted: &[String],
+) -> Result<(), GoogleOAuthScopeError> {
+    let required_scopes = google_required_api_scopes(connector)?;
+    if connector == OAuthConnector::Gmail
+        && granted
+            .iter()
+            .any(|scope| scope.as_str() == GMAIL_FULL_MAILBOX_SCOPE)
+    {
+        return Err(GoogleOAuthScopeError::FullMailboxScope);
+    }
+
+    for required in required_scopes {
+        if !granted.iter().any(|scope| scope == required) {
+            return Err(GoogleOAuthScopeError::MissingRequiredScope(required));
+        }
+    }
+
+    Ok(())
+}
+
+fn google_hosted_profile(
+    connector: OAuthConnector,
+) -> Result<OAuthProfile, GoogleOAuthProfileError> {
+    match connector {
+        OAuthConnector::GoogleDocs | OAuthConnector::GoogleCalendar | OAuthConnector::Gmail => {
+            oauth_profile(connector, OAuthHostMode::HostedAdmin)
+                .ok_or(GoogleOAuthProfileError::UnsupportedConnector)
+        }
+        _ => Err(GoogleOAuthProfileError::UnsupportedConnector),
+    }
+}
+
+fn google_required_api_scopes(
+    connector: OAuthConnector,
+) -> Result<&'static [&'static str], GoogleOAuthScopeError> {
+    match connector {
+        OAuthConnector::GoogleDocs => Ok(GOOGLE_DOCS_REQUIRED_API_SCOPES),
+        OAuthConnector::GoogleCalendar => Ok(GOOGLE_CALENDAR_REQUIRED_API_SCOPES),
+        OAuthConnector::Gmail => Ok(GMAIL_REQUIRED_API_SCOPES),
+        _ => Err(GoogleOAuthScopeError::UnsupportedConnector),
+    }
+}
+
+fn valid_google_oauth_client_id(client_id: &str) -> bool {
+    !client_id.is_empty()
+        && client_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+}
+
+fn valid_google_hosted_redirect_uri(connector: OAuthConnector, redirect_uri: &str) -> bool {
+    if redirect_uri.is_empty() || redirect_uri.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if redirect_uri.contains('?') || redirect_uri.contains('#') {
+        return false;
+    }
+    let Some(after_scheme) = redirect_uri.strip_prefix("https://") else {
+        return false;
+    };
+    let Some((authority, path)) = after_scheme.split_once('/') else {
+        return false;
+    };
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.contains(':')
+        || authority.chars().any(char::is_control)
+    {
+        return false;
+    }
+    if is_loopback_google_redirect_host(authority) {
+        return false;
+    }
+
+    path == connector.broker_callback_path().trim_start_matches('/')
+}
+
+fn is_loopback_google_redirect_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost") || host == "127.0.0.1" || host == "0.0.0.0"
+}
+
+fn append_query_param(url: &mut String, key: &str, value: &str) {
+    if !url.ends_with('?') {
+        url.push('&');
+    }
+    url.push_str(&percent_encode_query_component(key));
+    url.push('=');
+    url.push_str(&percent_encode_query_component(value));
+}
+
+fn percent_encode_query_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
 }
 
 fn https_base_url_host(public_base_url: &str) -> Option<&str> {
@@ -339,6 +527,92 @@ mod tests {
                 "{base_url} must be rejected as missing a usable host"
             );
         }
+    }
+
+    #[test]
+    fn google_hosted_authorization_urls_are_profile_driven_and_https() {
+        let url = google_authorization_url(
+            OAuthConnector::GoogleDocs,
+            "google-client.apps.googleusercontent.com",
+            "https://api.locality.test/v1/oauth/google-docs/callback",
+            "intent.random",
+        )
+        .expect("authorization URL");
+
+        assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
+        assert!(url.contains("client_id=google-client.apps.googleusercontent.com"));
+        assert!(url.contains("response_type=code"));
+        assert!(url.contains(
+            "redirect_uri=https%3A%2F%2Fapi.locality.test%2Fv1%2Foauth%2Fgoogle-docs%2Fcallback"
+        ));
+        assert!(url.contains("scope=openid%20email%20profile%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdocuments%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.metadata"));
+        assert!(url.contains("state=intent.random"));
+        assert!(url.contains("access_type=offline"));
+        assert!(url.contains("prompt=consent"));
+    }
+
+    #[test]
+    fn google_hosted_authorization_rejects_wrong_callback_shape() {
+        assert_eq!(
+            google_authorization_url(
+                OAuthConnector::Gmail,
+                "google-client",
+                "http://localhost:8757/oauth/gmail/callback",
+                "intent.random",
+            ),
+            Err(GoogleOAuthProfileError::InvalidRedirectUri)
+        );
+        assert_eq!(
+            google_authorization_url(
+                OAuthConnector::Slack,
+                "slack-client",
+                "https://api.locality.test/v1/oauth/slack/callback",
+                "intent.random",
+            ),
+            Err(GoogleOAuthProfileError::UnsupportedConnector)
+        );
+    }
+
+    #[test]
+    fn google_scope_validation_is_provider_bound() {
+        let docs = [
+            "openid",
+            "email",
+            "profile",
+            "https://www.googleapis.com/auth/documents",
+            "https://www.googleapis.com/auth/drive.file",
+            "https://www.googleapis.com/auth/drive.metadata",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            validate_google_oauth_scopes(OAuthConnector::GoogleDocs, &docs),
+            Ok(())
+        );
+
+        let gmail_full = [
+            "openid",
+            "email",
+            "profile",
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.compose",
+            "https://mail.google.com/",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            validate_google_oauth_scopes(OAuthConnector::Gmail, &gmail_full),
+            Err(GoogleOAuthScopeError::FullMailboxScope)
+        );
+
+        assert_eq!(
+            validate_google_oauth_scopes(OAuthConnector::GoogleCalendar, &docs),
+            Err(GoogleOAuthScopeError::MissingRequiredScope(
+                "https://www.googleapis.com/auth/calendar.events"
+            ))
+        );
     }
 
     #[test]
