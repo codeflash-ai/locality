@@ -243,7 +243,7 @@ impl HttpGmailOAuthBrokerClient {
 pub fn gmail_capabilities_json() -> Result<String, serde_json::Error> {
     let capabilities = ConnectorCapabilities {
         supports_block_updates: false,
-        supports_entity_body_updates: false,
+        supports_entity_body_updates: true,
         supports_databases: false,
         supports_oauth: true,
         supports_remote_observation: true,
@@ -352,6 +352,7 @@ mod tests {
         assert!(capabilities.supports_oauth);
         assert!(capabilities.supports_remote_observation);
         assert!(capabilities.supports_lazy_child_enumeration);
+        assert!(capabilities.supports_entity_body_updates);
         assert!(!capabilities.supports_databases);
         assert!(!capabilities.supports_media_download);
         assert!(!capabilities.supports_block_updates);

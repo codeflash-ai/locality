@@ -5,8 +5,9 @@ use locality_connector::oauth_broker::OAuthBrokerRefresh;
 use locality_connector::{Connector, EnumerateRequest, FetchRequest};
 use locality_core::diff::property_value_from_frontmatter;
 use locality_core::hydration::HydrationRequest;
-use locality_core::model::{RemoteId, TreeEntry};
+use locality_core::model::{EntityKind, HydrationState, RemoteId, TreeEntry};
 use locality_core::planner::PropertyValue;
+use locality_core::shadow::ShadowDocument;
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
 use locality_gmail::attachments::{GmailAttachmentSpec, decode_attachment_body};
@@ -21,7 +22,9 @@ use locality_gmail::{
 };
 use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
-    CredentialStore, MountConfig,
+    CredentialStore, EntityRecord, EntityRepository, FreshnessStateRepository,
+    HydrationJobRepository, MountConfig, RemoteObservationRepository, ShadowRepository,
+    StoreResult,
 };
 
 use crate::hydration::{HydratedAsset, HydratedEntity, HydrationSource};
@@ -29,6 +32,13 @@ use crate::notion::ConnectorResolveError;
 use crate::source::{SourceAdapter, SourcePushValidator, SourceValidationContext};
 
 const GMAIL_CONNECT_COMMAND: &str = "loc connect gmail";
+const GMAIL_DRAFT_REMOTE_PREFIX: &str = "gmail-draft:";
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GmailDraftIdentityRepair {
+    pub retired_legacy: Option<EntityRecord>,
+    pub retired_shadow: Option<ShadowDocument>,
+}
 
 pub fn resolve_gmail_connector_for_mount<S>(
     store: &S,
@@ -71,6 +81,79 @@ where
         message,
         suggested_command: GMAIL_CONNECT_COMMAND.to_string(),
     })
+}
+
+pub(crate) fn repair_legacy_gmail_draft_message_id_collision<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    record: &EntityRecord,
+    replacement_frontmatter: Option<&str>,
+) -> StoreResult<GmailDraftIdentityRepair>
+where
+    S: EntityRepository
+        + ShadowRepository
+        + HydrationJobRepository
+        + FreshnessStateRepository
+        + RemoteObservationRepository
+        + ?Sized,
+{
+    if !is_gmail_draft_identity_repair_candidate(mount, record) {
+        return Ok(GmailDraftIdentityRepair::default());
+    }
+
+    let Some(occupant) = store.find_entity_by_path(&mount.mount_id, &record.path)? else {
+        return Ok(GmailDraftIdentityRepair::default());
+    };
+    if occupant.remote_id == record.remote_id {
+        return Ok(GmailDraftIdentityRepair::default());
+    }
+    if is_clean_legacy_gmail_draft_message_id(&occupant) {
+        let retired_shadow = store
+            .get_shadow_record(&mount.mount_id, &occupant.remote_id)?
+            .map(|record| record.into_document());
+        if let Some(mut migrated_shadow) = retired_shadow.clone() {
+            migrated_shadow.entity_id = record.remote_id.clone();
+            if let Some(frontmatter) = replacement_frontmatter {
+                migrated_shadow.frontmatter = frontmatter.to_string();
+            }
+            store.save_shadow(&mount.mount_id, migrated_shadow)?;
+        }
+        store.delete_hydration_job(&mount.mount_id, &occupant.remote_id)?;
+        store.delete_freshness_state(&mount.mount_id, &occupant.remote_id)?;
+        store.delete_remote_observation(&mount.mount_id, &occupant.remote_id)?;
+        store.delete_shadow(&mount.mount_id, &occupant.remote_id)?;
+        store.delete_entity(&mount.mount_id, &occupant.remote_id)?;
+        return Ok(GmailDraftIdentityRepair {
+            retired_legacy: Some(occupant),
+            retired_shadow,
+        });
+    }
+    Ok(GmailDraftIdentityRepair::default())
+}
+
+fn is_gmail_draft_identity_repair_candidate(mount: &MountConfig, record: &EntityRecord) -> bool {
+    mount.connector == GMAIL_CONNECTOR_ID
+        && record
+            .remote_id
+            .as_str()
+            .starts_with(GMAIL_DRAFT_REMOTE_PREFIX)
+        && is_direct_gmail_draft_path(&record.path)
+}
+
+fn is_direct_gmail_draft_path(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(components.next(), Some(Component::Normal(component)) if component == "draft")
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
+}
+
+fn is_clean_legacy_gmail_draft_message_id(entity: &EntityRecord) -> bool {
+    entity.kind == EntityKind::Page
+        && !entity.remote_id.as_str().contains(':')
+        && !matches!(
+            entity.hydration,
+            HydrationState::Dirty | HydrationState::Conflicted
+        )
 }
 
 fn connector_from_connection(
@@ -349,6 +432,17 @@ pub(crate) fn validate_gmail_changed_frontmatter(
             ),
         ));
     }
+    if is_nested_outbound_child(context.relative_path) {
+        report.push(ValidationIssue::new(
+            "gmail_outbound_nested_unsupported",
+            context.relative_path,
+            Some(1),
+            "Gmail writes are only supported directly under draft/ or outbox/",
+            Some("move the Gmail Markdown file directly under draft/ or outbox/".to_string()),
+        ));
+    } else if is_direct_outbound_child(context.relative_path) {
+        validate_gmail_outbound_frontmatter(&mut report, context);
+    }
     Ok(report)
 }
 
@@ -367,6 +461,17 @@ pub(crate) fn validate_gmail_create_frontmatter(
         ));
     }
 
+    if is_direct_outbound_child(context.relative_path) {
+        validate_gmail_outbound_frontmatter(&mut report, context);
+    }
+
+    Ok(report)
+}
+
+fn validate_gmail_outbound_frontmatter(
+    report: &mut ValidationReport,
+    context: SourceValidationContext<'_>,
+) {
     let has_subject = frontmatter_string(&context.parsed.frontmatter.properties, "subject")
         .as_deref()
         .is_some_and(|subject| !subject.trim().is_empty())
@@ -405,20 +510,40 @@ pub(crate) fn validate_gmail_create_frontmatter(
             Some("remove attachment frontmatter".to_string()),
         ));
     }
-
-    Ok(report)
 }
 
 fn gmail_draft_frontmatter_has_attachments(
     properties: &locality_core::canonical::FrontmatterProperties,
 ) -> bool {
-    properties.contains_key("attachment")
-        || properties.contains_key("attachments")
+    properties
+        .get("attachment")
+        .map(property_value_from_frontmatter)
+        .as_ref()
+        .is_some_and(|value| property_value_has_attachment_metadata(Some(value)))
+        || properties
+            .get("attachments")
+            .map(property_value_from_frontmatter)
+            .as_ref()
+            .is_some_and(|value| property_value_has_attachment_metadata(Some(value)))
         || matches!(
             properties.get("gmail").map(property_value_from_frontmatter),
             Some(PropertyValue::Object(gmail))
-                if gmail.contains_key("attachment") || gmail.contains_key("attachments")
+                if property_value_has_attachment_metadata(gmail.get("attachment"))
+                    || property_value_has_attachment_metadata(gmail.get("attachments"))
         )
+}
+
+fn property_value_has_attachment_metadata(value: Option<&PropertyValue>) -> bool {
+    match value {
+        None | Some(PropertyValue::Null) => false,
+        Some(PropertyValue::String(value)) => !value.trim().is_empty(),
+        Some(PropertyValue::List(values)) => values.iter().any(|value| !value.trim().is_empty()),
+        Some(PropertyValue::Array(values)) => values
+            .iter()
+            .any(|value| property_value_has_attachment_metadata(Some(value))),
+        Some(PropertyValue::Object(values)) => !values.is_empty(),
+        Some(PropertyValue::Bool(_) | PropertyValue::Number(_)) => true,
+    }
 }
 
 fn frontmatter_string_list(
@@ -468,6 +593,15 @@ fn is_direct_outbound_child(path: &Path) -> bool {
         Some(Component::Normal(component)) if component == "draft" || component == "outbox"
     ) && matches!(components.next(), Some(Component::Normal(_)))
         && components.next().is_none()
+}
+
+fn is_nested_outbound_child(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(
+        components.next(),
+        Some(Component::Normal(component)) if component == "draft" || component == "outbox"
+    ) && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_some()
 }
 
 impl HydrationSource for GmailConnector {
@@ -570,8 +704,9 @@ mod tests {
     use locality_gmail::attachments::attachment_local_path;
     use locality_gmail::client::GmailApi;
     use locality_gmail::dto::{
-        GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
-        GmailMessagePartBody, GmailMessageSendRequest, GmailThread, GmailThreadList,
+        GmailDraft, GmailDraftCreateRequest, GmailDraftList, GmailDraftSendRequest,
+        GmailDraftUpdateRequest, GmailMessage, GmailMessageList, GmailMessagePartBody,
+        GmailMessageSendRequest, GmailThread, GmailThreadList,
     };
 
     use super::*;
@@ -793,7 +928,31 @@ mod tests {
             })
         }
 
+        fn list_drafts(
+            &self,
+            _max_results: u32,
+            _page_token: Option<&str>,
+            _query: Option<&str>,
+        ) -> LocalityResult<GmailDraftList> {
+            Ok(GmailDraftList::default())
+        }
+
+        fn get_draft_full(&self, draft_id: &str) -> LocalityResult<GmailDraft> {
+            Ok(GmailDraft {
+                id: draft_id.to_string(),
+                message: message_fixture("draft-msg-1"),
+            })
+        }
+
         fn create_draft(&self, _request: GmailDraftCreateRequest) -> LocalityResult<GmailDraft> {
+            panic!("not used")
+        }
+
+        fn update_draft(
+            &self,
+            _draft_id: &str,
+            _request: GmailDraftUpdateRequest,
+        ) -> LocalityResult<GmailDraft> {
             panic!("not used")
         }
 

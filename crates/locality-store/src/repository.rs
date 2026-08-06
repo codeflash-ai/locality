@@ -426,6 +426,7 @@ pub trait ShadowRepository {
         mount_id: &MountId,
         entity_id: &RemoteId,
     ) -> StoreResult<Option<ShadowSnapshotRecord>>;
+    fn delete_shadow(&mut self, mount_id: &MountId, entity_id: &RemoteId) -> StoreResult<()>;
 }
 
 pub trait JournalRepository {

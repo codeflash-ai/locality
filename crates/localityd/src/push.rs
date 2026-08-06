@@ -393,6 +393,7 @@ where
             store,
             source,
             state_root: state_root.map(Path::to_path_buf),
+            resume_cleanup_plan: None,
         };
         execute_journaled_push_with_host(&mut host, execution_request)
     };
@@ -475,17 +476,33 @@ where
     let Some(plan) = prepared.pipeline.plan.as_ref() else {
         return Ok(None);
     };
-    if plan.operations.is_empty()
-        || !plan
-            .operations
-            .iter()
-            .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
-    {
+    if !gmail_send_replay_plan_can_be_ambiguous(plan) {
         return Ok(None);
     }
 
     let Some(journal) = latest_ambiguous_gmail_send_journal(store, &prepared.mount.mount_id, plan)?
     else {
+        if let Some(journal) =
+            latest_completed_gmail_send_overlap_journal(store, &prepared.mount.mount_id, plan)?
+        {
+            let error = LocalityError::Guardrail(
+                "a previous Gmail send for this draft was already applied but cannot be safely resumed as part of this broader push; reconcile or remove that pending item before retrying"
+                    .to_string(),
+            );
+
+            return Ok(Some(PushJobReport {
+                target_path: prepared.absolute_path.clone(),
+                mount_id: prepared.mount.mount_id.clone(),
+                entity_id: prepared.entity.remote_id.clone(),
+                pipeline: prepared.pipeline.clone(),
+                readable_diff: prepared.readable_diff.clone(),
+                action: PushJobAction::Failed,
+                execution: None,
+                push_id: Some(journal.push_id),
+                journal_status: Some(journal.status),
+                error: Some(PushJobError::from(error)),
+            }));
+        }
         return Ok(None);
     };
     let error = LocalityError::Guardrail(
@@ -507,7 +524,7 @@ where
     }))
 }
 
-fn latest_ambiguous_gmail_send_journal<S>(
+fn latest_completed_gmail_send_overlap_journal<S>(
     store: &S,
     mount_id: &MountId,
     plan: &PushPlan,
@@ -518,8 +535,67 @@ where
     let mut latest = None;
     for journal in store.list_journal().map_err(LocalityError::from)? {
         if journal.mount_id != *mount_id
-            || !journal_created_entity_source_paths_match(&journal.plan, plan)
+            || !completed_gmail_send_overlap_requires_guard(&journal, plan)
         {
+            continue;
+        }
+        if latest
+            .as_ref()
+            .is_none_or(|current| journal_is_newer(&journal, current))
+        {
+            latest = Some(journal);
+        }
+    }
+
+    Ok(latest)
+}
+
+fn completed_gmail_send_overlap_requires_guard(journal: &JournalEntry, plan: &PushPlan) -> bool {
+    if !matches!(
+        journal.status,
+        JournalStatus::Applying | JournalStatus::Applied | JournalStatus::Failed(_)
+    ) || resumable_plan_matches(journal, plan, "gmail")
+    {
+        return false;
+    }
+
+    if resumable_gmail_draft_send_effect_ids(journal, "gmail").is_some() {
+        return gmail_draft_send_plans_overlap(&journal.plan, plan);
+    }
+
+    resumable_created_entity_effects(journal)
+        && journal.plan.operations.iter().all(is_create_operation)
+        && create_entity_plans_overlap(&journal.plan, plan)
+}
+
+fn gmail_draft_send_plans_overlap(left: &PushPlan, right: &PushPlan) -> bool {
+    let left_ids = gmail_draft_send_move_entity_ids(left);
+    let right_ids = gmail_draft_send_move_entity_ids(right);
+    !left_ids.is_empty()
+        && !right_ids.is_empty()
+        && left_ids
+            .into_iter()
+            .any(|left_id| right_ids.contains(left_id))
+}
+
+fn create_entity_plans_overlap(left: &PushPlan, right: &PushPlan) -> bool {
+    let right_sources = plan_create_entity_sources(right);
+    plan_create_entity_sources(left)
+        .into_iter()
+        .any(|source| right_sources.contains(&source))
+}
+
+fn latest_ambiguous_gmail_send_journal<S>(
+    store: &S,
+    mount_id: &MountId,
+    plan: &PushPlan,
+) -> LocalityResult<Option<JournalEntry>>
+where
+    S: JournalRepository,
+{
+    let mut latest = None;
+    for journal in store.list_journal().map_err(LocalityError::from)? {
+        if journal.mount_id != *mount_id || !ambiguous_gmail_send_plans_match(&journal.plan, plan) {
             continue;
         }
         if latest
@@ -542,6 +618,63 @@ fn ambiguous_gmail_send_status(status: &JournalStatus) -> bool {
             message.contains("gmail send")
                 || message.contains("gmail draft send")
                 || message.contains("gmail message send")
+        }
+        _ => false,
+    }
+}
+
+fn gmail_send_replay_plan_can_be_ambiguous(plan: &PushPlan) -> bool {
+    !plan.operations.is_empty()
+        && (plan
+            .operations
+            .iter()
+            .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+            || !gmail_draft_send_move_entity_ids(plan).is_empty())
+}
+
+fn ambiguous_gmail_send_plans_match(left: &PushPlan, right: &PushPlan) -> bool {
+    let right_create_sources = plan_create_entity_sources(right);
+    if !right_create_sources.is_empty() && journal_created_entity_source_paths_match(left, right) {
+        return true;
+    }
+
+    let left_ids = gmail_draft_send_move_entity_ids(left);
+    let right_ids = gmail_draft_send_move_entity_ids(right);
+    if left_ids.is_empty() || right_ids.is_empty() {
+        return false;
+    }
+    right_ids
+        .into_iter()
+        .any(|right_id| left_ids.contains(&right_id))
+}
+
+fn gmail_draft_send_move_entity_ids(plan: &PushPlan) -> BTreeSet<&RemoteId> {
+    plan.operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PushOperation::MoveEntity {
+                entity_id,
+                new_parent_id,
+                ..
+            } if entity_id.0.starts_with("gmail-draft:")
+                && new_parent_id.0 == "gmail-folder:outbox" =>
+            {
+                Some(entity_id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_gmail_draft_send_move(operation: &PushOperation) -> bool {
+    match operation {
+        PushOperation::MoveEntity {
+            entity_id,
+            new_parent_id,
+            ..
+        } => {
+            entity_id.as_str().starts_with("gmail-draft:")
+                && new_parent_id.as_str() == "gmail-folder:outbox"
         }
         _ => false,
     }
@@ -596,6 +729,7 @@ where
             store,
             source,
             state_root: state_root.map(Path::to_path_buf),
+            resume_cleanup_plan: Some(plan.clone()),
         };
         host.update_status(&journal.push_id, JournalStatus::Applied)?;
         match host.reconcile(PushReconcileRequest {
@@ -666,7 +800,7 @@ where
         if journal.mount_id != *mount_id
             || !matches!(
                 journal.status,
-                JournalStatus::Failed(_) | JournalStatus::Applied
+                JournalStatus::Failed(_) | JournalStatus::Applied | JournalStatus::Applying
             )
             || !resumable_plan_matches(&journal, plan, connector)
         {
@@ -688,7 +822,7 @@ where
     }
     if journal.status == JournalStatus::Applied || !journal.apply_effects.is_empty() {
         return Err(LocalityError::InvalidState(format!(
-            "journal `{}` was applied but its effects do not safely cover the prepared plan; refusing to apply again",
+            "journal `{}` reached apply but its effects do not safely cover the prepared plan; refusing to apply again",
             journal.push_id.0
         )));
     }
@@ -700,11 +834,17 @@ fn resumable_plan_matches(journal: &JournalEntry, plan: &PushPlan, connector: &s
         return true;
     }
 
-    create_only_effects_may_change_parent_for_connector(connector)
+    if create_only_effects_may_change_parent_for_connector(connector)
         && resumable_created_entity_effects(journal)
         && plan.operations.iter().all(is_create_operation)
         && journal.plan.operations.iter().all(is_create_operation)
         && journal_created_entity_sources_match(journal, plan)
+    {
+        return true;
+    }
+
+    resumable_gmail_draft_send_effect_ids(journal, connector).is_some()
+        && gmail_draft_send_plans_match(&journal.plan, plan)
 }
 
 fn resumable_created_entity_effects(journal: &JournalEntry) -> bool {
@@ -716,6 +856,10 @@ fn resumable_created_entity_effects(journal: &JournalEntry) -> bool {
 }
 
 fn resumable_entity_effect_ids(journal: &JournalEntry, connector: &str) -> Option<Vec<RemoteId>> {
+    if let Some(remote_ids) = resumable_gmail_draft_send_effect_ids(journal, connector) {
+        return Some(remote_ids);
+    }
+
     if journal.plan.operations.is_empty()
         || journal.apply_effects.len() != journal.plan.operations.len()
     {
@@ -796,6 +940,107 @@ fn resumable_entity_effect_ids(journal: &JournalEntry, connector: &str) -> Optio
     }
 
     (seen_operations.len() == journal.plan.operations.len()).then_some(changed_remote_ids)
+}
+
+fn resumable_gmail_draft_send_effect_ids(
+    journal: &JournalEntry,
+    connector: &str,
+) -> Option<Vec<RemoteId>> {
+    if connector != "gmail" {
+        return None;
+    }
+
+    let draft_moves = journal
+        .plan
+        .operations
+        .iter()
+        .enumerate()
+        .filter_map(|(operation_index, operation)| match operation {
+            PushOperation::MoveEntity { entity_id, .. } if is_gmail_draft_send_move(operation) => {
+                Some((operation_index, entity_id.clone()))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    if draft_moves.is_empty() {
+        return None;
+    }
+    let draft_ids = draft_moves.values().cloned().collect::<BTreeSet<_>>();
+    for (operation_index, operation) in journal.plan.operations.iter().enumerate() {
+        match operation {
+            PushOperation::MoveEntity { .. } if draft_moves.contains_key(&operation_index) => {}
+            PushOperation::UpdateProperties { entity_id, .. }
+            | PushOperation::UpdateEntityBody { entity_id, .. }
+                if draft_ids.contains(entity_id) => {}
+            _ => return None,
+        }
+    }
+
+    let mut archived = BTreeSet::new();
+    let mut created = BTreeMap::new();
+    for effect in &journal.apply_effects {
+        match effect {
+            JournalApplyEffect::ArchivedEntity {
+                operation_index,
+                entity_id,
+                ..
+            } if draft_moves.get(operation_index) == Some(entity_id) => {
+                if !archived.insert(*operation_index) {
+                    return None;
+                }
+            }
+            JournalApplyEffect::CreatedEntity {
+                operation_index,
+                parent_id,
+                entity_id,
+                ..
+            } if draft_moves.contains_key(operation_index)
+                && parent_id.as_str() == "gmail-folder:sent"
+                && !entity_id.as_str().trim().is_empty() =>
+            {
+                if created
+                    .insert(*operation_index, entity_id.clone())
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    if archived.len() == draft_moves.len() && created.len() == draft_moves.len() {
+        Some(created.into_values().collect())
+    } else {
+        None
+    }
+}
+
+fn gmail_draft_send_plans_match(left: &PushPlan, right: &PushPlan) -> bool {
+    match (
+        resumable_gmail_draft_send_plan_move_ids(left),
+        resumable_gmail_draft_send_plan_move_ids(right),
+    ) {
+        (Some(left_ids), Some(right_ids)) => left_ids == right_ids,
+        _ => false,
+    }
+}
+
+fn resumable_gmail_draft_send_plan_move_ids(plan: &PushPlan) -> Option<BTreeSet<&RemoteId>> {
+    let move_ids = gmail_draft_send_move_entity_ids(plan);
+    if move_ids.is_empty() {
+        return None;
+    }
+    for operation in &plan.operations {
+        match operation {
+            PushOperation::MoveEntity { entity_id, .. } if move_ids.contains(entity_id) => {}
+            PushOperation::UpdateProperties { entity_id, .. }
+            | PushOperation::UpdateEntityBody { entity_id, .. }
+                if move_ids.contains(entity_id) => {}
+            _ => return None,
+        }
+    }
+    Some(move_ids)
 }
 
 fn create_only_effects_may_change_parent(connector: &str, plan: &PushPlan) -> bool {
@@ -3577,6 +3822,7 @@ struct DaemonPushHost<'a, S, Source: ?Sized> {
     store: &'a mut S,
     source: &'a Source,
     state_root: Option<PathBuf>,
+    resume_cleanup_plan: Option<PushPlan>,
 }
 
 impl<S, Source> JournalStore for DaemonPushHost<'_, S, Source>
@@ -3740,6 +3986,7 @@ where
             .map_err(LocalityError::from)?
             .ok_or_else(|| StoreError::MountMissing(request.mount_id.clone()))
             .map_err(LocalityError::from)?;
+        let gmail_connector = mount.connector == "gmail" && self.source.kind().0 == "gmail";
         let planned_moves = request
             .plan
             .operations
@@ -3755,6 +4002,26 @@ where
             })
             .collect::<Vec<_>>();
         for (operation_index, entity_id, new_parent_id) in planned_moves.iter().copied() {
+            let operation = &request.plan.operations[operation_index];
+            if gmail_connector
+                && is_gmail_draft_send_move(operation)
+                && apply_effects_have_gmail_draft_send_created_entity(
+                    request.apply_effects,
+                    operation_index,
+                )
+            {
+                if !apply_effects_have_archived_entity(
+                    request.apply_effects,
+                    operation_index,
+                    entity_id,
+                ) {
+                    return Err(LocalityError::InvalidState(format!(
+                        "gmail draft send move for `{}` did not report an archived-entity effect",
+                        entity_id.0
+                    )));
+                }
+                continue;
+            }
             if !request.changed_remote_ids.contains(entity_id) {
                 return Err(LocalityError::InvalidState(format!(
                     "move operation for `{}` did not report the entity as changed",
@@ -3843,29 +4110,29 @@ where
                         database_reconciled_ids.push(entity_id.clone());
                         continue;
                     }
-                    let Some(PushOperation::CreateEntity {
-                        title,
-                        properties: _,
-                        body: _,
-                        source_path,
-                        parent_kind,
-                        ..
-                    }) = request.plan.operations.get(*operation_index)
-                    else {
+                    let Some(created_operation) = created_entity_reconcile_operation(
+                        request.plan.operations.get(*operation_index),
+                        gmail_connector,
+                    ) else {
                         continue;
                     };
+                    let CreatedEntityReconcileOperation {
+                        title,
+                        source_path,
+                        parent_kind,
+                    } = created_operation;
                     let entity_path = created_entity_reconcile_path(
                         self.store,
                         request.mount_id,
-                        source_path,
-                        parent_kind,
+                        &source_path,
+                        &parent_kind,
                         parent_id,
                     )?;
                     let mut entity = EntityRecord::new(
                         request.mount_id.clone(),
                         entity_id.clone(),
                         EntityKind::Page,
-                        title.clone(),
+                        title,
                         entity_path,
                     )
                     .with_hydration(HydrationState::Stub);
@@ -3883,7 +4150,7 @@ where
                         self.store,
                         request.mount_id,
                         &entity.path,
-                        parent_kind,
+                        &parent_kind,
                         parent_id,
                         entity_id,
                         &rendered,
@@ -3997,35 +4264,81 @@ where
             reconciled_remote_ids.push(remote_id);
         }
 
+        let gmail_draft_send_cleanup_plan = self
+            .resume_cleanup_plan
+            .as_ref()
+            .filter(|plan| gmail_draft_send_plans_match(request.plan, plan))
+            .unwrap_or(request.plan);
         for (operation_index, _, entity, _) in &created_readbacks {
-            let Some(PushOperation::CreateEntity {
+            if let Some(PushOperation::CreateEntity {
                 title,
                 properties,
                 body,
                 source_path,
                 ..
             }) = request.plan.operations.get(*operation_index)
-            else {
-                continue;
-            };
-            let clear_source_mutation = remove_stale_created_entity_source_path(
-                self.state_root.as_deref(),
-                &mount,
-                title,
-                properties,
-                body,
-                source_path,
-                &entity.path,
-            )?;
-            if clear_source_mutation
-                && let Some(mutation) = self
-                    .store
-                    .find_virtual_mutation_by_path(request.mount_id, source_path)
-                    .map_err(LocalityError::from)?
             {
-                self.store
-                    .delete_virtual_mutation(request.mount_id, &mutation.local_id)
-                    .map_err(LocalityError::from)?;
+                let clear_source_mutation = remove_stale_created_entity_source_path(
+                    self.state_root.as_deref(),
+                    &mount,
+                    title,
+                    properties,
+                    body,
+                    source_path,
+                    &entity.path,
+                )?;
+                if clear_source_mutation
+                    && let Some(mutation) = self
+                        .store
+                        .find_virtual_mutation_by_path(request.mount_id, source_path)
+                        .map_err(LocalityError::from)?
+                {
+                    self.store
+                        .delete_virtual_mutation(request.mount_id, &mutation.local_id)
+                        .map_err(LocalityError::from)?;
+                }
+                continue;
+            }
+            if let Some(PushOperation::MoveEntity {
+                entity_id,
+                new_parent_id,
+                projected_path,
+                ..
+            }) = request.plan.operations.get(*operation_index)
+                && gmail_connector
+                && is_gmail_draft_send_move(&request.plan.operations[*operation_index])
+            {
+                let (cleanup_parent_id, cleanup_projected_path) =
+                    gmail_draft_send_cleanup_move(gmail_draft_send_cleanup_plan, entity_id)
+                        .unwrap_or((new_parent_id, projected_path));
+                let source_removed = remove_stale_gmail_draft_send_move_source_path(
+                    self.store,
+                    self.state_root.as_deref(),
+                    &mount,
+                    request.mount_id,
+                    entity_id,
+                    projected_path,
+                    cleanup_projected_path,
+                    &request.plan.operations,
+                )?;
+                if source_removed {
+                    clear_gmail_draft_send_move_mutation(
+                        self.store,
+                        request.mount_id,
+                        entity_id,
+                        cleanup_projected_path,
+                    )?;
+                } else {
+                    convert_gmail_draft_send_move_mutation_to_create(
+                        self.store,
+                        self.state_root.as_deref(),
+                        &mount,
+                        request.mount_id,
+                        entity_id,
+                        cleanup_parent_id,
+                        cleanup_projected_path,
+                    )?;
+                }
             }
         }
         for effect in request.apply_effects {
@@ -4063,6 +4376,319 @@ where
             reconciled_remote_ids,
         })
     }
+}
+
+struct CreatedEntityReconcileOperation {
+    title: String,
+    source_path: PathBuf,
+    parent_kind: Option<EntityKind>,
+}
+
+fn created_entity_reconcile_operation(
+    operation: Option<&PushOperation>,
+    allow_gmail_draft_send_move: bool,
+) -> Option<CreatedEntityReconcileOperation> {
+    match operation? {
+        PushOperation::CreateEntity {
+            title,
+            source_path,
+            parent_kind,
+            ..
+        } => Some(CreatedEntityReconcileOperation {
+            title: title.clone(),
+            source_path: source_path.clone(),
+            parent_kind: parent_kind.clone(),
+        }),
+        operation @ PushOperation::MoveEntity {
+            new_title,
+            projected_path,
+            new_parent_kind,
+            ..
+        } if allow_gmail_draft_send_move && is_gmail_draft_send_move(operation) => {
+            Some(CreatedEntityReconcileOperation {
+                title: new_title.clone(),
+                source_path: projected_path.clone(),
+                parent_kind: Some(new_parent_kind.clone()),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn apply_effects_have_gmail_draft_send_created_entity(
+    effects: &[JournalApplyEffect],
+    operation_index: usize,
+) -> bool {
+    effects.iter().any(|effect| {
+        matches!(
+            effect,
+            JournalApplyEffect::CreatedEntity {
+                operation_index: effect_index,
+                parent_id,
+                ..
+            } if *effect_index == operation_index && parent_id.as_str() == "gmail-folder:sent"
+        )
+    })
+}
+
+fn apply_effects_have_archived_entity(
+    effects: &[JournalApplyEffect],
+    operation_index: usize,
+    entity_id: &RemoteId,
+) -> bool {
+    effects.iter().any(|effect| {
+        matches!(
+            effect,
+            JournalApplyEffect::ArchivedEntity {
+                operation_index: effect_index,
+                entity_id: effect_entity_id,
+                ..
+            } if *effect_index == operation_index && effect_entity_id == entity_id
+        )
+    })
+}
+
+fn gmail_draft_send_cleanup_move<'a>(
+    plan: &'a PushPlan,
+    entity_id: &RemoteId,
+) -> Option<(&'a RemoteId, &'a Path)> {
+    plan.operations
+        .iter()
+        .find_map(|operation| match operation {
+            operation @ PushOperation::MoveEntity {
+                entity_id: operation_entity_id,
+                new_parent_id,
+                projected_path,
+                ..
+            } if operation_entity_id == entity_id && is_gmail_draft_send_move(operation) => {
+                Some((new_parent_id, projected_path.as_path()))
+            }
+            _ => None,
+        })
+}
+
+fn remove_stale_gmail_draft_send_move_source_path<S>(
+    store: &S,
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+    mount_id: &MountId,
+    entity_id: &RemoteId,
+    planned_source_path: &Path,
+    current_source_path: &Path,
+    operations: &[PushOperation],
+) -> LocalityResult<bool>
+where
+    S: ShadowRepository,
+{
+    let stale_path = projection_write_path(state_root, mount, current_source_path);
+    if !gmail_draft_send_source_matches_plan(
+        store,
+        mount,
+        mount_id,
+        entity_id,
+        planned_source_path,
+        current_source_path,
+        &stale_path,
+        operations,
+    ) {
+        return Ok(false);
+    }
+
+    match std::fs::remove_file(&stale_path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn gmail_draft_send_source_matches_plan<S>(
+    store: &S,
+    mount: &MountConfig,
+    mount_id: &MountId,
+    entity_id: &RemoteId,
+    planned_source_path: &Path,
+    current_source_path: &Path,
+    stale_path: &Path,
+    operations: &[PushOperation],
+) -> bool
+where
+    S: ShadowRepository,
+{
+    let Ok(contents) = std::fs::read_to_string(stale_path) else {
+        return true;
+    };
+    let Ok(parsed) = parse_canonical_markdown(&contents) else {
+        return false;
+    };
+    let Ok(shadow) = store.load_shadow(mount_id, entity_id) else {
+        return false;
+    };
+    let shadow_markdown = render_canonical_markdown(&CanonicalDocument::new(
+        shadow.frontmatter.clone(),
+        shadow.rendered_body.clone(),
+    ));
+    let Ok(shadow_parsed) = parse_canonical_markdown(&shadow_markdown) else {
+        return false;
+    };
+
+    let mut expected_title = create_entity_title(planned_source_path, &shadow_parsed, mount);
+    let mut expected_properties =
+        frontmatter_properties_as_property_values(&shadow_parsed.frontmatter.properties);
+    let mut expected_null_deleted_properties = BTreeSet::new();
+    let mut expected_body = shadow_parsed.document.body;
+    for operation in operations {
+        match operation {
+            PushOperation::MoveEntity {
+                entity_id: operation_entity_id,
+                new_title,
+                ..
+            } if operation_entity_id == entity_id => {
+                expected_title.clone_from(new_title);
+            }
+            PushOperation::UpdateProperties {
+                entity_id: operation_entity_id,
+                properties,
+            } if operation_entity_id == entity_id => {
+                apply_property_updates(
+                    &mut expected_properties,
+                    &mut expected_null_deleted_properties,
+                    properties,
+                );
+            }
+            PushOperation::UpdateEntityBody {
+                entity_id: operation_entity_id,
+                body,
+            } if operation_entity_id == entity_id => {
+                expected_body.clone_from(body);
+            }
+            _ => {}
+        }
+    }
+    let mut actual_properties =
+        frontmatter_properties_as_property_values(&parsed.frontmatter.properties);
+    actual_properties.retain(|key, value| {
+        !(expected_null_deleted_properties.contains(key) && matches!(value, PropertyValue::Null))
+    });
+
+    create_entity_title(current_source_path, &parsed, mount) == expected_title
+        && actual_properties == expected_properties
+        && parsed.document.body == expected_body
+}
+
+fn apply_property_updates(
+    target: &mut BTreeMap<String, PropertyValue>,
+    null_deleted_keys: &mut BTreeSet<String>,
+    updates: &BTreeMap<String, PropertyValue>,
+) {
+    for (key, value) in updates {
+        if matches!(value, PropertyValue::Null) {
+            target.remove(key);
+            null_deleted_keys.insert(key.clone());
+        } else {
+            target.insert(key.clone(), value.clone());
+            null_deleted_keys.remove(key);
+        }
+    }
+}
+
+fn frontmatter_properties_as_property_values(
+    properties: &locality_core::canonical::FrontmatterProperties,
+) -> BTreeMap<String, PropertyValue> {
+    properties
+        .iter()
+        .map(|(key, value)| (key.clone(), property_value_from_frontmatter(value)))
+        .collect()
+}
+
+fn convert_gmail_draft_send_move_mutation_to_create<S>(
+    store: &mut S,
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+    mount_id: &MountId,
+    entity_id: &RemoteId,
+    parent_id: &RemoteId,
+    current_source_path: &Path,
+) -> LocalityResult<()>
+where
+    S: VirtualMutationRepository,
+{
+    let Some(mutation) = store
+        .find_virtual_mutation_by_path(mount_id, current_source_path)
+        .map_err(LocalityError::from)?
+    else {
+        return Ok(());
+    };
+    if !matches!(mutation.mutation_kind, VirtualMutationKind::Move)
+        || mutation.target_remote_id.as_ref() != Some(entity_id)
+    {
+        return Ok(());
+    }
+
+    let stale_path = projection_write_path(state_root, mount, current_source_path);
+    let title = std::fs::read_to_string(&stale_path)
+        .ok()
+        .and_then(|contents| parse_canonical_markdown(&contents).ok())
+        .map(|parsed| create_entity_title(current_source_path, &parsed, mount))
+        .unwrap_or_else(|| mutation.title.clone());
+    let create_local_id = format!("local:gmail-outbox-resend:{}", entity_id.0);
+    let create_mutation = VirtualMutationRecord {
+        mount_id: mutation.mount_id.clone(),
+        local_id: create_local_id.clone(),
+        mutation_kind: VirtualMutationKind::Create,
+        target_remote_id: None,
+        parent_remote_id: Some(parent_id.clone()),
+        original_path: None,
+        projected_path: mutation.projected_path.clone(),
+        title,
+        content_path: Some(stale_path),
+        created_at: push_timestamp(),
+        updated_at: push_timestamp(),
+    };
+    let mut superseded_local_ids = BTreeSet::from([
+        mutation.local_id,
+        format!("move:{}", entity_id.0),
+        format!("rename:{}", entity_id.0),
+    ]);
+    superseded_local_ids.remove(&create_local_id);
+    for local_id in superseded_local_ids {
+        store
+            .delete_virtual_mutation(mount_id, &local_id)
+            .map_err(LocalityError::from)?;
+    }
+    store
+        .save_virtual_mutation(create_mutation)
+        .map_err(LocalityError::from)?;
+    Ok(())
+}
+
+fn clear_gmail_draft_send_move_mutation<S>(
+    store: &mut S,
+    mount_id: &MountId,
+    entity_id: &RemoteId,
+    source_path: &Path,
+) -> LocalityResult<()>
+where
+    S: VirtualMutationRepository,
+{
+    if let Some(mutation) = store
+        .find_virtual_mutation_by_path(mount_id, source_path)
+        .map_err(LocalityError::from)?
+        && matches!(mutation.mutation_kind, VirtualMutationKind::Move)
+        && mutation.target_remote_id.as_ref() == Some(entity_id)
+    {
+        store
+            .delete_virtual_mutation(mount_id, &mutation.local_id)
+            .map_err(LocalityError::from)?;
+    }
+    for local_id in [
+        format!("move:{}", entity_id.0),
+        format!("rename:{}", entity_id.0),
+    ] {
+        store
+            .delete_virtual_mutation(mount_id, &local_id)
+            .map_err(LocalityError::from)?;
+    }
+    Ok(())
 }
 
 fn created_entity_reconcile_path<S>(
@@ -4880,6 +5506,299 @@ fn generate_push_id() -> PushId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use locality_store::InMemoryStateStore;
+
+    #[test]
+    fn gmail_draft_send_plan_match_requires_same_move_ids() {
+        let first = gmail_draft_send_plan(&["gmail-draft:draft-1"]);
+        let first_with_body_edit = PushPlan::new(
+            vec![RemoteId::new("gmail-draft:draft-1")],
+            vec![
+                PushOperation::MoveEntity {
+                    entity_id: RemoteId::new("gmail-draft:draft-1"),
+                    new_parent_id: RemoteId::new("gmail-folder:outbox"),
+                    new_parent_kind: EntityKind::Directory,
+                    new_title: "Send One".to_string(),
+                    projected_path: PathBuf::from("outbox/Send One.md"),
+                },
+                PushOperation::UpdateEntityBody {
+                    entity_id: RemoteId::new("gmail-draft:draft-1"),
+                    body: "Edited after apply.\n".to_string(),
+                },
+            ],
+        );
+        let first_and_second =
+            gmail_draft_send_plan(&["gmail-draft:draft-1", "gmail-draft:draft-2"]);
+        let first_plus_create = PushPlan::new(
+            vec![
+                RemoteId::new("gmail-draft:draft-1"),
+                RemoteId::new("gmail-folder:outbox"),
+            ],
+            vec![
+                PushOperation::MoveEntity {
+                    entity_id: RemoteId::new("gmail-draft:draft-1"),
+                    new_parent_id: RemoteId::new("gmail-folder:outbox"),
+                    new_parent_kind: EntityKind::Directory,
+                    new_title: "Send One".to_string(),
+                    projected_path: PathBuf::from("outbox/Send One.md"),
+                },
+                PushOperation::CreateEntity {
+                    parent_id: RemoteId::new("gmail-folder:outbox"),
+                    parent_kind: Some(EntityKind::Directory),
+                    parent_workspace: false,
+                    title: "Extra".to_string(),
+                    properties: BTreeMap::new(),
+                    body: "Extra body.\n".to_string(),
+                    source_path: PathBuf::from("outbox/Extra.md"),
+                },
+            ],
+        );
+
+        assert!(gmail_draft_send_plans_match(&first, &first_with_body_edit));
+        assert!(!gmail_draft_send_plans_match(&first, &first_and_second));
+        assert!(!gmail_draft_send_plans_match(&first_and_second, &first));
+        assert!(!gmail_draft_send_plans_match(&first, &first_plus_create));
+    }
+
+    #[test]
+    fn gmail_draft_send_source_match_treats_null_property_update_as_deletion() {
+        let mount_id = MountId::new("gmail-main");
+        let entity_id = RemoteId::new("gmail-draft:draft-1");
+        let root = std::env::temp_dir().join(format!(
+            "loc-gmail-draft-null-property-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("outbox")).expect("fixture root");
+        let mount = MountConfig::new(mount_id.clone(), "gmail", &root);
+        let stale_path = root.join("outbox/Send Remote Draft.md");
+        let source_path = Path::new("outbox/Send Remote Draft.md");
+        std::fs::write(
+            &stale_path,
+            "---\ntitle: \"Send Remote Draft\"\nsubject: \"Send Remote Draft\"\nto: [\"bob@example.com\"]\n---\nEdited body before sending.\n",
+        )
+        .expect("write stale source");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_shadow(
+                &mount_id,
+                ShadowDocument::from_synced_body(
+                    entity_id.clone(),
+                    "Original body.\n",
+                    1,
+                    [RemoteId::new("body-1")],
+                )
+                .expect("shadow")
+                .with_frontmatter(
+                    "title: \"Remote Draft\"\nsubject: \"Remote Draft\"\nto: [\"ann@example.com\"]\ncc: [\"old@example.com\"]\n",
+                ),
+            )
+            .expect("save shadow");
+
+        let matches = gmail_draft_send_source_matches_plan(
+            &store,
+            &mount,
+            &mount_id,
+            &entity_id,
+            source_path,
+            source_path,
+            &stale_path,
+            &[
+                PushOperation::MoveEntity {
+                    entity_id: entity_id.clone(),
+                    new_parent_id: RemoteId::new("gmail-folder:outbox"),
+                    new_parent_kind: EntityKind::Directory,
+                    new_title: "Send Remote Draft".to_string(),
+                    projected_path: source_path.to_path_buf(),
+                },
+                PushOperation::UpdateProperties {
+                    entity_id: entity_id.clone(),
+                    properties: BTreeMap::from([
+                        (
+                            "subject".to_string(),
+                            PropertyValue::String("Send Remote Draft".to_string()),
+                        ),
+                        (
+                            "to".to_string(),
+                            PropertyValue::List(vec!["bob@example.com".to_string()]),
+                        ),
+                        ("cc".to_string(), PropertyValue::Null),
+                    ]),
+                },
+                PushOperation::UpdateEntityBody {
+                    entity_id: entity_id.clone(),
+                    body: "Edited body before sending.\n".to_string(),
+                },
+            ],
+        );
+
+        assert!(matches);
+    }
+
+    #[test]
+    fn gmail_draft_send_source_match_treats_stale_null_property_as_deleted() {
+        let mount_id = MountId::new("gmail-main");
+        let entity_id = RemoteId::new("gmail-draft:draft-1");
+        let root = std::env::temp_dir().join(format!(
+            "loc-gmail-draft-stale-null-property-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("outbox")).expect("fixture root");
+        let mount = MountConfig::new(mount_id.clone(), "gmail", &root);
+        let stale_path = root.join("outbox/Send Remote Draft.md");
+        let source_path = Path::new("outbox/Send Remote Draft.md");
+        std::fs::write(
+            &stale_path,
+            "---\ntitle: \"Send Remote Draft\"\nsubject: \"Send Remote Draft\"\nto: [\"bob@example.com\"]\ncc:\n---\nEdited body before sending.\n",
+        )
+        .expect("write stale source");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_shadow(
+                &mount_id,
+                ShadowDocument::from_synced_body(
+                    entity_id.clone(),
+                    "Original body.\n",
+                    1,
+                    [RemoteId::new("body-1")],
+                )
+                .expect("shadow")
+                .with_frontmatter(
+                    "title: \"Remote Draft\"\nsubject: \"Remote Draft\"\nto: [\"ann@example.com\"]\ncc: [\"old@example.com\"]\n",
+                ),
+            )
+            .expect("save shadow");
+
+        let matches = gmail_draft_send_source_matches_plan(
+            &store,
+            &mount,
+            &mount_id,
+            &entity_id,
+            source_path,
+            source_path,
+            &stale_path,
+            &[
+                PushOperation::MoveEntity {
+                    entity_id: entity_id.clone(),
+                    new_parent_id: RemoteId::new("gmail-folder:outbox"),
+                    new_parent_kind: EntityKind::Directory,
+                    new_title: "Send Remote Draft".to_string(),
+                    projected_path: source_path.to_path_buf(),
+                },
+                PushOperation::UpdateProperties {
+                    entity_id: entity_id.clone(),
+                    properties: BTreeMap::from([
+                        (
+                            "subject".to_string(),
+                            PropertyValue::String("Send Remote Draft".to_string()),
+                        ),
+                        (
+                            "to".to_string(),
+                            PropertyValue::List(vec!["bob@example.com".to_string()]),
+                        ),
+                        ("cc".to_string(), PropertyValue::Null),
+                    ]),
+                },
+                PushOperation::UpdateEntityBody {
+                    entity_id: entity_id.clone(),
+                    body: "Edited body before sending.\n".to_string(),
+                },
+            ],
+        );
+
+        assert!(matches);
+    }
+
+    #[test]
+    fn gmail_draft_send_source_match_keeps_unrelated_stale_null_property() {
+        let mount_id = MountId::new("gmail-main");
+        let entity_id = RemoteId::new("gmail-draft:draft-1");
+        let root = std::env::temp_dir().join(format!(
+            "loc-gmail-draft-unrelated-null-property-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("outbox")).expect("fixture root");
+        let mount = MountConfig::new(mount_id.clone(), "gmail", &root);
+        let stale_path = root.join("outbox/Send Remote Draft.md");
+        let source_path = Path::new("outbox/Send Remote Draft.md");
+        std::fs::write(
+            &stale_path,
+            "---\ntitle: \"Send Remote Draft\"\nsubject: \"Send Remote Draft\"\nto: [\"bob@example.com\"]\ncc:\n---\nEdited body before sending.\n",
+        )
+        .expect("write stale source");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_shadow(
+                &mount_id,
+                ShadowDocument::from_synced_body(
+                    entity_id.clone(),
+                    "Original body.\n",
+                    1,
+                    [RemoteId::new("body-1")],
+                )
+                .expect("shadow")
+                .with_frontmatter(
+                    "title: \"Remote Draft\"\nsubject: \"Remote Draft\"\nto: [\"ann@example.com\"]\n",
+                ),
+            )
+            .expect("save shadow");
+
+        let matches = gmail_draft_send_source_matches_plan(
+            &store,
+            &mount,
+            &mount_id,
+            &entity_id,
+            source_path,
+            source_path,
+            &stale_path,
+            &[
+                PushOperation::MoveEntity {
+                    entity_id: entity_id.clone(),
+                    new_parent_id: RemoteId::new("gmail-folder:outbox"),
+                    new_parent_kind: EntityKind::Directory,
+                    new_title: "Send Remote Draft".to_string(),
+                    projected_path: source_path.to_path_buf(),
+                },
+                PushOperation::UpdateProperties {
+                    entity_id: entity_id.clone(),
+                    properties: BTreeMap::from([
+                        (
+                            "subject".to_string(),
+                            PropertyValue::String("Send Remote Draft".to_string()),
+                        ),
+                        (
+                            "to".to_string(),
+                            PropertyValue::List(vec!["bob@example.com".to_string()]),
+                        ),
+                    ]),
+                },
+                PushOperation::UpdateEntityBody {
+                    entity_id: entity_id.clone(),
+                    body: "Edited body before sending.\n".to_string(),
+                },
+            ],
+        );
+
+        assert!(!matches);
+    }
+
+    fn gmail_draft_send_plan(ids: &[&str]) -> PushPlan {
+        PushPlan::new(
+            ids.iter().map(|id| RemoteId::new(*id)).collect(),
+            ids.iter()
+                .enumerate()
+                .map(|(index, id)| PushOperation::MoveEntity {
+                    entity_id: RemoteId::new(*id),
+                    new_parent_id: RemoteId::new("gmail-folder:outbox"),
+                    new_parent_kind: EntityKind::Directory,
+                    new_title: format!("Send {}", index + 1),
+                    projected_path: PathBuf::from(format!("outbox/Send {}.md", index + 1)),
+                })
+                .collect(),
+        )
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

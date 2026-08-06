@@ -1209,6 +1209,11 @@ impl ShadowRepository for InMemoryStateStore {
             .get(&Self::shadow_key(mount_id, entity_id))
             .cloned())
     }
+
+    fn delete_shadow(&mut self, mount_id: &MountId, entity_id: &RemoteId) -> StoreResult<()> {
+        self.shadows.remove(&Self::shadow_key(mount_id, entity_id));
+        Ok(())
+    }
 }
 
 impl VirtualMutationRepository for InMemoryStateStore {

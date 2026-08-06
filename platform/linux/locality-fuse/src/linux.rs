@@ -812,7 +812,17 @@ where
                 }
                 self.remove_cached_path(&path);
             } else {
-                return Ok(item);
+                match self.client.item(&item.identifier) {
+                    Ok(report) => {
+                        self.cache_item_at(path.clone(), report.item.clone());
+                        return Ok(report.item);
+                    }
+                    Err(error) if error.is_remote_missing() => {
+                        self.remove_cached_path(&path);
+                        return Err(FuseError::NotFound);
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
         let parent = path.parent().unwrap_or_else(|| Path::new(ROOT_PATH));
@@ -1810,7 +1820,7 @@ mod tests {
                 state_root: std::env::temp_dir(),
                 mount_id: "slack-main".to_string(),
                 root: root.clone(),
-                children: BTreeMap::new(),
+                children: fake_children(&root, vec![item.clone()]),
                 created_files: Mutex::new(Vec::new()),
                 created_item: None,
                 renamed: Mutex::new(Vec::new()),
@@ -1845,6 +1855,43 @@ mod tests {
 
         let _ = std::fs::remove_file(path);
         assert_eq!(&read.data[..], b"recent");
+    }
+
+    #[test]
+    fn resolve_path_evicts_cached_child_missing_from_daemon_state() {
+        let root = test_root_item();
+        let stale = test_named_item("gmail-draft:stale", "stale.md", VirtualFsItemKind::File);
+        let current = test_named_item("gmail-draft:current", "current.md", VirtualFsItemKind::File);
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "gmail-main".to_string(),
+                root: root.clone(),
+                children: BTreeMap::from([(root.identifier.clone(), vec![current])]),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/stale.md"), stale),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let error = fs
+            .resolve_path(Path::new("/stale.md"))
+            .expect_err("stale cached child should miss");
+
+        assert!(matches!(error, FuseError::NotFound));
+        assert!(
+            !fs.cache
+                .lock()
+                .expect("fuse item cache")
+                .contains_key(Path::new("/stale.md"))
+        );
     }
 
     #[test]
@@ -1927,7 +1974,7 @@ mod tests {
                 state_root: std::env::temp_dir(),
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
-                children: BTreeMap::new(),
+                children: fake_children(&root, vec![source.clone(), read_only_parent.clone()]),
                 created_files: Mutex::new(Vec::new()),
                 created_item: None,
                 renamed: Mutex::new(Vec::new()),
@@ -1967,7 +2014,7 @@ mod tests {
                 state_root: std::env::temp_dir(),
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
-                children: BTreeMap::new(),
+                children: fake_children(&root, vec![item.clone()]),
                 created_files: Mutex::new(Vec::new()),
                 created_item: None,
                 renamed: Mutex::new(Vec::new()),
@@ -2022,7 +2069,7 @@ mod tests {
                 state_root: std::env::temp_dir(),
                 mount_id: "notion-main".to_string(),
                 root: shared_test_root_item(),
-                children: BTreeMap::new(),
+                children: fake_children(&shared_test_root_item(), vec![mount_item.clone()]),
                 created_files: Mutex::new(Vec::new()),
                 created_item: None,
                 renamed: Mutex::new(Vec::new()),
@@ -2320,28 +2367,17 @@ mod tests {
         let parent = test_named_item("children:page-root", "Page", VirtualFsItemKind::Folder);
         let stale_dir = test_named_item("children:local:draft", "Draft", VirtualFsItemKind::Folder);
         let stale_page = test_named_item("local:draft", "page.md", VirtualFsItemKind::File);
+        let remote_dir = test_named_item("children:page-draft", "Draft", VirtualFsItemKind::Folder);
+        let remote_page = test_named_item("page-draft", "page.md", VirtualFsItemKind::File);
         let fs = AgentFuse {
             client: FakeClient {
                 state_root: std::env::temp_dir(),
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::from([
-                    (
-                        "children:page-root".to_string(),
-                        vec![test_named_item(
-                            "children:page-draft",
-                            "Draft",
-                            VirtualFsItemKind::Folder,
-                        )],
-                    ),
-                    (
-                        "children:page-draft".to_string(),
-                        vec![test_named_item(
-                            "page-draft",
-                            "page.md",
-                            VirtualFsItemKind::File,
-                        )],
-                    ),
+                    (root.identifier.clone(), vec![parent.clone()]),
+                    ("children:page-root".to_string(), vec![remote_dir.clone()]),
+                    ("children:page-draft".to_string(), vec![remote_page]),
                 ]),
                 created_files: Mutex::new(Vec::new()),
                 created_item: None,
@@ -2421,7 +2457,7 @@ mod tests {
                 state_root: std::env::temp_dir(),
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
-                children: BTreeMap::new(),
+                children: fake_children(&root, vec![page_dir.clone()]),
                 created_files: Mutex::new(Vec::new()),
                 created_item: None,
                 renamed: Mutex::new(Vec::new()),
@@ -2502,7 +2538,7 @@ mod tests {
                 state_root: std::env::temp_dir(),
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
-                children: BTreeMap::new(),
+                children: fake_children(&root, vec![page_dir.clone()]),
                 created_files: Mutex::new(Vec::new()),
                 created_item: None,
                 renamed: Mutex::new(Vec::new()),
@@ -2588,6 +2624,13 @@ mod tests {
         }
     }
 
+    fn fake_children(
+        parent: &VirtualFsItem,
+        children: Vec<VirtualFsItem>,
+    ) -> BTreeMap<String, Vec<VirtualFsItem>> {
+        BTreeMap::from([(parent.identifier.clone(), children)])
+    }
+
     fn test_root_item() -> VirtualFsItem {
         VirtualFsItem {
             identifier: "mount:notion-main".to_string(),
@@ -2649,13 +2692,30 @@ mod tests {
         }
 
         fn item(&self, identifier: &str) -> Result<VirtualFsItemReport, FuseError> {
-            if identifier != projection_root_identifier(&self.mount_id) {
-                return Err(FuseError::Daemon(format!("missing item {identifier}")));
+            if let Some(item) = self
+                .children
+                .values()
+                .flat_map(|children| children.iter())
+                .find(|item| item.identifier == identifier)
+            {
+                return Ok(VirtualFsItemReport {
+                    mount_id: self.mount_id.clone(),
+                    item: item.clone(),
+                });
             }
-            Ok(VirtualFsItemReport {
-                mount_id: self.mount_id.clone(),
-                item: self.root.clone(),
-            })
+            if identifier == projection_root_identifier(&self.mount_id) {
+                return Ok(VirtualFsItemReport {
+                    mount_id: self.mount_id.clone(),
+                    item: self.root.clone(),
+                });
+            }
+            if identifier == DIRECTORY_METADATA_IDENTIFIER {
+                return Ok(VirtualFsItemReport {
+                    mount_id: self.mount_id.clone(),
+                    item: directory_metadata_item(),
+                });
+            }
+            Err(FuseError::NotFound)
         }
 
         fn children(

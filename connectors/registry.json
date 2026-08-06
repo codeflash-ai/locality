@@ -272,7 +272,7 @@
       },
       "capabilities": {
         "supports_block_updates": false,
-        "supports_entity_body_updates": false,
+        "supports_entity_body_updates": true,
         "supports_databases": false,
         "supports_oauth": true,
         "supports_remote_observation": true,
@@ -281,14 +281,19 @@
         "supports_undo": false,
         "supports_batch_observation": false
       },
-      "push_operations": ["create_entity"],
+      "push_operations": [
+        "create_entity",
+        "update_properties",
+        "update_entity_body",
+        "move_entity"
+      ],
       "membership_operations": [],
       "projection": {
         "source_root_create_parent_kind": null,
         "create_entity_parent_kinds": ["directory"],
         "move_entity_parent_kinds": ["directory"],
-        "body_diff_mode": "block",
-        "virtual_rename_policy": "filename_derived",
+        "body_diff_mode": "whole_entity",
+        "virtual_rename_policy": "preserve_canonical",
         "periodic_discovery_seconds": null,
         "max_background_discovery_workers": 4
       },

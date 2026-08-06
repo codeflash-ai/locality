@@ -2,6 +2,7 @@ use locality_connector::Connector;
 use locality_connector::oauth_broker::OAuthBrokerToken;
 use locality_core::canonical::parse_canonical_markdown;
 use locality_core::model::{EntityKind, MountId, RemoteId};
+use locality_core::planner::PushOperationKind;
 use locality_core::push::BodyDiffMode;
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationIssue;
@@ -125,14 +126,16 @@ fn gmail_descriptor_comes_from_registry() {
 Gmail facts:
 - This mount projects Gmail inbox/, sent/, draft/, and outbox/ folders.
 - inbox/ and sent/ are read-only mailbox history.
+- draft/ contains remote Gmail drafts and local draft creates. Edit a remote draft there and push to update the Gmail draft.
 - Create a Markdown file directly under draft/ to create an unsent Gmail draft.
-- Create a Markdown file directly under outbox/ to send immediately after explicit review and push.
+- outbox/ is local-only send staging. Create a Markdown file directly under outbox/ to send immediately after explicit review and push.
+- Move an existing remote draft from draft/ to outbox/ and push to send the updated draft.
 - Both outbound folders require `to` frontmatter and either `subject` or `title` frontmatter.
-- Use outbox/ only when the user explicitly asks to send mail now; otherwise use draft/ for review in Gmail.
+- Use outbox/ only when the user explicitly asks to send mail now; otherwise leave messages in draft/ for drafting and revision.
 - To inspect inbound attachments, first hydrate the message or thread Markdown by opening it or running `loc pull <message-or-thread-path>`.
 - Hydrated messages list attachments in YAML frontmatter under `gmail.attachments`; read `filename`, `mime_type`, `size`, `attachment_id`, and `path` from that list.
 - Open the attachment file at the listed `path`, relative to the mount root. Gmail attachment caches normally live under `.loc/gmail/attachments/...`; use the frontmatter path exactly.
-- Gmail draft creation does not support outbound attachments yet. Outbox direct-send creation does not support outbound attachments yet either. Do not add `attachment` or `attachments` frontmatter to draft or outbox files.
+- Gmail outbound attachments are not supported yet. Do not add `attachment` or `attachments` frontmatter to draft or outbox files.
 ";
     assert!(
         descriptor
@@ -145,6 +148,7 @@ Gmail facts:
         descriptor.create_entity_parent_kinds(),
         &[EntityKind::Directory]
     );
+    assert_eq!(descriptor.body_diff_mode(), BodyDiffMode::WholeEntity);
 }
 
 #[test]
@@ -310,15 +314,38 @@ fn gmail_write_policy_allows_only_direct_draft_and_send_children() {
         !source_create_decision_for_parent_path(&mount, std::path::Path::new("outbox/nested"))
             .is_writable()
     );
-    assert!(
-        !source_move_decision_for_parent_path(&mount, std::path::Path::new("draft")).is_writable()
+}
+
+#[test]
+fn gmail_move_policy_allows_draft_to_direct_outbox_parent() {
+    let mut mount = MountConfig::new(
+        MountId::new("gmail-main"),
+        GMAIL_CONNECTOR_ID,
+        "/tmp/locality/gmail",
     );
-    let send_move_decision =
-        source_move_decision_for_parent_path(&mount, std::path::Path::new("outbox"));
-    assert!(!send_move_decision.is_writable());
+    mount.read_only = false;
+
+    assert!(
+        source_move_decision_for_parent_path(&mount, std::path::Path::new("outbox")).is_writable()
+    );
+}
+
+#[test]
+fn gmail_move_policy_rejects_nested_outbox_parent() {
+    let mut mount = MountConfig::new(
+        MountId::new("gmail-main"),
+        GMAIL_CONNECTOR_ID,
+        "/tmp/locality/gmail",
+    );
+    mount.read_only = false;
+
+    let decision =
+        source_move_decision_for_parent_path(&mount, std::path::Path::new("outbox/nested"));
+
+    assert!(!decision.is_writable());
     assert_eq!(
-        send_move_decision.reason(),
-        Some("Gmail moves are not supported; create a new file directly under draft/ or outbox/")
+        decision.reason(),
+        Some("Gmail only supports moving an existing draft directly into outbox/ to send it")
     );
 }
 
@@ -529,7 +556,6 @@ fn source_descriptors_declare_canonical_title_rename_policy() {
         "notion",
         "google-docs",
         "google-calendar",
-        "gmail",
         "granola",
         "slack",
         "custom",
@@ -545,7 +571,15 @@ fn source_descriptors_declare_canonical_title_rename_policy() {
         VirtualRenamePolicy::PreserveCanonical
     );
     assert_eq!(
+        source_descriptor("gmail").virtual_rename_policy(),
+        VirtualRenamePolicy::PreserveCanonical
+    );
+    assert_eq!(
         source_descriptor("linear").body_diff_mode(),
+        BodyDiffMode::WholeEntity
+    );
+    assert_eq!(
+        source_descriptor("gmail").body_diff_mode(),
         BodyDiffMode::WholeEntity
     );
 }
@@ -914,7 +948,7 @@ fn validate_gmail_create(path: &str, markdown: &str) -> Vec<String> {
         .collect()
 }
 
-fn validate_gmail_changed(path: &str, markdown: &str) -> Vec<String> {
+fn validate_gmail_changed_issues(path: &str, markdown: &str) -> Vec<ValidationIssue> {
     let mount = gmail_mount();
     let parsed = parse_canonical_markdown(markdown).expect("parse gmail markdown");
 
@@ -929,6 +963,10 @@ fn validate_gmail_changed(path: &str, markdown: &str) -> Vec<String> {
         })
         .expect("validate gmail changed")
         .issues
+}
+
+fn validate_gmail_changed(path: &str, markdown: &str) -> Vec<String> {
+    validate_gmail_changed_issues(path, markdown)
         .into_iter()
         .map(|issue| issue.code)
         .collect()
@@ -1391,6 +1429,18 @@ fn resolving_gmail_mount_uses_active_oauth_connection_credentials() {
         panic!("expected gmail source");
     };
     assert_eq!(connector.config().access_token, "gmail-access-token");
+    assert!(connector.capabilities().supports_entity_body_updates);
+    assert_eq!(
+        connector.supported_push_operations(),
+        [
+            PushOperationKind::CreateEntity,
+            PushOperationKind::UpdateProperties,
+            PushOperationKind::UpdateEntityBody,
+            PushOperationKind::MoveEntity,
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+    );
 }
 
 #[test]
@@ -2107,6 +2157,142 @@ fn local_gmail_validator_blocks_nested_send_create() {
     );
 
     assert_eq!(issues, vec!["gmail_create_outside_outbound_folder"]);
+}
+
+#[test]
+fn local_gmail_validator_allows_valid_changed_draft() {
+    let issues = validate_gmail_changed(
+        "draft/foo.md",
+        "---\nto: [\"user@example.com\"]\nsubject: Hello\n---\nBody\n",
+    );
+
+    assert!(issues.is_empty());
+}
+
+#[test]
+fn local_gmail_validator_rejects_changed_nested_draft_and_outbox() {
+    for path in ["draft/nested/foo.md", "outbox/nested/foo.md"] {
+        let issues = validate_gmail_changed(
+            path,
+            "---\nto: [\"user@example.com\"]\nsubject: Hello\n---\nBody\n",
+        );
+
+        assert_eq!(issues, vec!["gmail_outbound_nested_unsupported"], "{path}");
+    }
+}
+
+#[test]
+fn local_gmail_validator_rejects_changed_draft_without_to() {
+    let issues = validate_gmail_changed("draft/foo.md", "---\nsubject: Hello\n---\nBody\n");
+
+    assert_eq!(issues, vec!["gmail_draft_missing_to"]);
+}
+
+#[test]
+fn local_gmail_validator_rejects_changed_draft_without_subject() {
+    let issues = validate_gmail_changed(
+        "draft/foo.md",
+        "---\nto: [\"user@example.com\"]\nsubject: \"\"\n---\nBody\n",
+    );
+
+    assert_eq!(issues, vec!["gmail_draft_missing_subject"]);
+
+    let issues = validate_gmail_changed(
+        "draft/foo.md",
+        "---\ntitle: Fallback title\nto: [\"user@example.com\"]\nsubject: \"\"\n---\nBody\n",
+    );
+
+    assert!(issues.is_empty());
+}
+
+#[test]
+fn local_gmail_validator_rejects_changed_draft_with_attachments() {
+    for (field, markdown) in [
+        (
+            "attachment",
+            "---\nto: [\"user@example.com\"]\nsubject: Hello\nattachment: invoice.pdf\n---\nBody\n",
+        ),
+        (
+            "attachments",
+            "---\nto: [\"user@example.com\"]\nsubject: Hello\nattachments: [\"invoice.pdf\"]\n---\nBody\n",
+        ),
+        (
+            "gmail.attachment",
+            "---\nto: [\"user@example.com\"]\nsubject: Hello\ngmail:\n  attachment: invoice.pdf\n---\nBody\n",
+        ),
+        (
+            "gmail.attachments",
+            "---\nto: [\"user@example.com\"]\nsubject: Hello\ngmail:\n  attachments:\n    - filename: invoice.pdf\n---\nBody\n",
+        ),
+    ] {
+        let issues = validate_gmail_changed_issues("draft/foo.md", markdown);
+
+        assert_eq!(issues.len(), 1, "{field}");
+        assert_eq!(issues[0].code, "gmail_attachments_unsupported", "{field}");
+        assert_eq!(
+            issues[0].suggested_fix.as_deref(),
+            Some("remove attachment frontmatter"),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn local_gmail_validator_allows_valid_changed_outbox() {
+    let issues = validate_gmail_changed(
+        "outbox/foo.md",
+        "---\nto: [\"user@example.com\"]\nsubject: Hello\n---\nBody\n",
+    );
+
+    assert!(issues.is_empty());
+}
+
+#[test]
+fn local_gmail_validator_rejects_changed_outbox_without_to() {
+    let issues = validate_gmail_changed("outbox/foo.md", "---\nsubject: Hello\n---\nBody\n");
+
+    assert_eq!(issues, vec!["gmail_draft_missing_to"]);
+}
+
+#[test]
+fn local_gmail_validator_rejects_changed_outbox_without_subject() {
+    let issues = validate_gmail_changed(
+        "outbox/foo.md",
+        "---\nto: [\"user@example.com\"]\nsubject: \"\"\n---\nBody\n",
+    );
+
+    assert_eq!(issues, vec!["gmail_draft_missing_subject"]);
+
+    let issues = validate_gmail_changed(
+        "outbox/foo.md",
+        "---\ntitle: Fallback title\nto: [\"user@example.com\"]\nsubject: \"\"\n---\nBody\n",
+    );
+
+    assert!(issues.is_empty());
+}
+
+#[test]
+fn local_gmail_validator_rejects_changed_outbox_with_attachments() {
+    for (field, markdown) in [
+        (
+            "attachments",
+            "---\nto: [\"user@example.com\"]\nsubject: Hello\nattachments: [\"invoice.pdf\"]\n---\nBody\n",
+        ),
+        (
+            "gmail.attachments",
+            "---\nto: [\"user@example.com\"]\nsubject: Hello\ngmail:\n  attachments:\n    - filename: invoice.pdf\n---\nBody\n",
+        ),
+    ] {
+        let issues = validate_gmail_changed_issues("outbox/foo.md", markdown);
+
+        assert_eq!(issues.len(), 1, "{field}");
+        assert_eq!(issues[0].code, "gmail_attachments_unsupported", "{field}");
+        assert_eq!(
+            issues[0].suggested_fix.as_deref(),
+            Some("remove attachment frontmatter"),
+            "{field}"
+        );
+    }
 }
 
 #[test]

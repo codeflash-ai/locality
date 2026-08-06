@@ -13,6 +13,8 @@ use crate::oauth::GMAIL_CONNECTOR_ID;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GmailNativeBundle {
     pub mailbox: String,
+    #[serde(default)]
+    pub draft_id: Option<String>,
     pub message: GmailMessage,
 }
 
@@ -46,7 +48,7 @@ pub struct GmailDraftDocument {
 }
 
 pub fn render_gmail_message(bundle: &GmailNativeBundle) -> LocalityResult<GmailRenderedEntity> {
-    render_gmail_message_with_entity_id(bundle, RemoteId::new(bundle.message.id.clone()))
+    render_gmail_message_with_entity_id(bundle, gmail_bundle_entity_id(bundle))
 }
 
 fn render_gmail_message_with_entity_id(
@@ -87,6 +89,16 @@ pub fn parse_thread_remote_id(remote_id: &RemoteId) -> Option<(&str, &str)> {
     rest.split_once(':')
 }
 
+const DRAFT_REMOTE_PREFIX: &str = "gmail-draft:";
+
+pub(crate) fn draft_remote_id(draft_id: &str) -> RemoteId {
+    RemoteId::new(format!("{DRAFT_REMOTE_PREFIX}{draft_id}"))
+}
+
+pub(crate) fn parse_draft_remote_id(remote_id: &RemoteId) -> Option<&str> {
+    remote_id.as_str().strip_prefix(DRAFT_REMOTE_PREFIX)
+}
+
 pub fn thread_message_remote_id(mailbox: &str, thread_id: &str, message_id: &str) -> RemoteId {
     RemoteId::new(format!(
         "gmail-thread-message:{mailbox}:{thread_id}:{message_id}"
@@ -106,6 +118,7 @@ pub fn render_gmail_thread_message(
     render_gmail_message_with_entity_id(
         &GmailNativeBundle {
             mailbox: bundle.mailbox.clone(),
+            draft_id: None,
             message: bundle.message.clone(),
         },
         thread_message_remote_id(&bundle.mailbox, &bundle.thread_id, &bundle.message.id),
@@ -183,11 +196,21 @@ fn thread_frontmatter(
 }
 
 pub fn message_frontmatter(bundle: &GmailNativeBundle) -> String {
-    message_frontmatter_with_attachment_state(
-        bundle,
-        None,
-        &RemoteId::new(bundle.message.id.clone()),
-    )
+    message_frontmatter_with_attachment_state(bundle, None, &gmail_bundle_entity_id(bundle))
+}
+
+pub(crate) fn message_frontmatter_with_entity_id(
+    bundle: &GmailNativeBundle,
+    entity_id: &RemoteId,
+) -> String {
+    message_frontmatter_with_attachment_state(bundle, None, entity_id)
+}
+
+fn gmail_bundle_entity_id(bundle: &GmailNativeBundle) -> RemoteId {
+    match &bundle.draft_id {
+        Some(draft_id) => draft_remote_id(draft_id),
+        None => RemoteId::new(bundle.message.id.clone()),
+    }
 }
 
 fn message_frontmatter_with_attachment_state(
@@ -205,15 +228,21 @@ fn message_frontmatter_with_attachment_state(
     let attachments = attachment_specs
         .map(attachment_frontmatter)
         .unwrap_or_default();
+    let draft_id = bundle
+        .draft_id
+        .as_ref()
+        .map(|draft_id| format!("  draft_id: {}\n", yaml_scalar(draft_id)))
+        .unwrap_or_default();
 
     format!(
-        "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\ngmail:\n  mailbox: {}\n  message_id: {}\n  thread_id: {}\n  labels: [{}]\n{}from: {}\nto: [{}]\ncc: [{}]\nbcc: []\nsubject: {}\ndate: {}\n",
+        "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\ngmail:\n  mailbox: {}\n{}  message_id: {}\n  thread_id: {}\n  labels: [{}]\n{}from: {}\nto: [{}]\ncc: [{}]\nbcc: [{}]\nsubject: {}\ndate: {}\n",
         yaml_scalar(entity_id.as_str()),
         GMAIL_CONNECTOR_ID,
         yaml_scalar(&version),
         yaml_scalar(&version),
         yaml_scalar(&subject),
         yaml_scalar(&bundle.mailbox),
+        draft_id,
         yaml_scalar(&message.id),
         yaml_scalar(message.thread_id.as_deref().unwrap_or("")),
         message
@@ -226,6 +255,7 @@ fn message_frontmatter_with_attachment_state(
         yaml_scalar(headers.get("from").map(String::as_str).unwrap_or("")),
         yaml_list_items(headers.get("to").map(String::as_str).unwrap_or("")),
         yaml_list_items(headers.get("cc").map(String::as_str).unwrap_or("")),
+        yaml_list_items(headers.get("bcc").map(String::as_str).unwrap_or("")),
         yaml_scalar(&subject),
         yaml_scalar(headers.get("date").map(String::as_str).unwrap_or("")),
     )
@@ -629,6 +659,7 @@ mod tests {
         .expect("message");
         let rendered = render_gmail_message(&GmailNativeBundle {
             mailbox: "inbox".to_string(),
+            draft_id: None,
             message,
         })
         .expect("render");
@@ -636,6 +667,7 @@ mod tests {
         assert!(rendered.document.frontmatter.contains("connector: gmail"));
         assert!(rendered.document.frontmatter.contains("mailbox: \"inbox\""));
         assert!(rendered.document.frontmatter.contains("attachments: []"));
+        assert!(rendered.document.frontmatter.contains("bcc: []"));
         assert!(rendered.document.frontmatter.contains("subject: \"Hello\""));
         assert_eq!(rendered.document.body, "Hello from Gmail.\n");
         assert_eq!(rendered.shadow.entity_id.as_str(), "msg-1");
@@ -724,6 +756,7 @@ mod tests {
 
         let rendered = render_gmail_message(&GmailNativeBundle {
             mailbox: "inbox".to_string(),
+            draft_id: None,
             message,
         })
         .expect("render");
@@ -749,6 +782,7 @@ mod tests {
 
         let frontmatter = message_frontmatter(&GmailNativeBundle {
             mailbox: "inbox".to_string(),
+            draft_id: None,
             message,
         });
 
@@ -785,6 +819,7 @@ mod tests {
 
         let rendered = render_gmail_message(&GmailNativeBundle {
             mailbox: "inbox".to_string(),
+            draft_id: None,
             message,
         })
         .expect("render");
@@ -832,6 +867,7 @@ mod tests {
 
         let rendered = render_gmail_message(&GmailNativeBundle {
             mailbox: "inbox".to_string(),
+            draft_id: None,
             message,
         })
         .expect("render");
@@ -862,6 +898,7 @@ mod tests {
 
         let rendered = render_gmail_message(&GmailNativeBundle {
             mailbox: "inbox".to_string(),
+            draft_id: None,
             message,
         })
         .expect("render");
@@ -900,6 +937,7 @@ mod tests {
 
         let rendered = render_gmail_message(&GmailNativeBundle {
             mailbox: "inbox".to_string(),
+            draft_id: None,
             message,
         })
         .expect("render");
@@ -991,6 +1029,7 @@ mod tests {
 
         let rendered = render_gmail_message(&GmailNativeBundle {
             mailbox: "inbox".to_string(),
+            draft_id: None,
             message,
         })
         .expect("render");

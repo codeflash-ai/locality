@@ -19,10 +19,11 @@ The connector projects a fixed mailbox shape:
     outbox/
 ```
 
-`inbox/` and `sent/` are read-only message folders. `draft/` contains unsent
-Gmail drafts and is the local write surface for creating another unsent Gmail UI
-draft. `outbox/` is the reviewed direct-send surface: a Markdown file created
-directly under `outbox/` is sent through Gmail when pushed.
+`inbox/` and `sent/` are read-only message folders. `draft/` contains remote
+Gmail drafts and local draft creates. Editing a remote draft and pushing updates
+the Gmail draft. `outbox/` is local-only send staging for reviewed direct sends.
+A Markdown file created directly under `outbox/` is sent through Gmail when
+pushed.
 
 ## OAuth
 
@@ -70,11 +71,13 @@ CLI overrides:
 ## Projection And Pull
 
 By default, Pull enumerates the recent 100 inbox messages, recent 100 sent
-messages, and recent 100 Gmail drafts. The `draft/` folder contains unsent
-Gmail drafts: drafts created in Gmail are pulled there, and a local Markdown
-file pushed from `draft/` becomes another unsent Gmail draft. The `outbox/` folder
-is local-only outbound staging for reviewed direct sends; pushing a direct child
-under `outbox/` sends the message and reconciles the result under `sent/`.
+messages, and recent 100 Gmail drafts. The `draft/` folder contains remote
+Gmail drafts and local draft creates: drafts created in Gmail are pulled there,
+editing a remote draft and pushing updates the Gmail draft, and a local Markdown
+file pushed from `draft/` becomes another unsent Gmail draft. The `outbox/`
+folder is local-only outbound staging for reviewed direct sends; pushing a
+direct child under `outbox/` sends the message and reconciles the result under
+`sent/`.
 
 Gmail mounts can be registered with a date window:
 
@@ -122,8 +125,9 @@ gmail-main/
 ```
 
 Inbox, sent, and thread content is read-only. Creating a Markdown file directly
-under `draft/` creates an unsent Gmail draft when pushed. Creating a Markdown
-file directly under `outbox/` sends the message when pushed.
+under `draft/` creates an unsent Gmail draft when pushed. Editing a remote draft
+under `draft/` and pushing updates that Gmail draft. Creating a Markdown file
+directly under `outbox/` sends the message when pushed.
 
 ## Attachments
 
@@ -137,9 +141,9 @@ thread and writes them under:
 ```
 
 Rendered message frontmatter includes attachment filename, MIME type, size,
-Gmail attachment ID, and the local path. Draft creation and direct send still
-reject `attachment` or `attachments` frontmatter; outbound attachments require a
-separate design.
+Gmail attachment ID, and the local path. Gmail outbound attachments remain
+unsupported; draft updates, draft creation, and direct send reject `attachment`
+or `attachments` frontmatter.
 
 ## Write Policy
 
@@ -161,6 +165,13 @@ Creating a Markdown file directly under `outbox/` is a reviewed direct send:
 
 ```text
 outbox/reply.md
+```
+
+Moving an existing remote draft directly from `draft/` to `outbox/` sends that
+draft after applying local edits:
+
+```text
+draft/follow-up.md -> outbox/follow-up.md
 ```
 
 Nested outbound paths are rejected for both draft creation and direct send:
@@ -185,19 +196,21 @@ subject: Follow up
 Thanks for the notes. I will follow up here.
 ```
 
-`loc push` for a Gmail file under `draft/` creates an unsent Gmail draft. Send
-that draft later from the Gmail UI after review. `loc push` for a Gmail file
-under `outbox/` directly sends the message after Locality review and push
-approval. Attachments are not supported for Gmail outbound mail in v1;
-`attachment` or `attachments` frontmatter is rejected for both paths.
+`loc push` for a new Gmail file under `draft/` creates an unsent Gmail draft.
+`loc push` for an existing remote draft under `draft/` updates the Gmail draft.
+Move an existing remote draft from `draft/` to `outbox/` and push to send the
+updated draft. `loc push` for a new Gmail file under `outbox/` directly sends
+the message after Locality review and push approval. Gmail outbound attachments
+are not supported in v1; `attachment` or `attachments` frontmatter is rejected
+for both paths.
 
 On macOS File Provider mounts, the push journal remembers the temporary local
 `outbox/` item identifier before sending. Once Gmail apply and read-back both
 succeed, Locality removes that exact File Provider item and signals both the
 `outbox/` and `sent/` containers. Remote or unconfirmed item deletion remains
-blocked. Pushing from `draft/` remains unsent Gmail draft creation and signals
-the `draft/` container. This does not require the user to run `loc pull` or
-refresh Finder.
+blocked. Pushing from `draft/` creates or updates an unsent Gmail draft and
+signals the `draft/` container. This does not require the user to run `loc pull`
+or refresh Finder.
 
 ## Live E2E
 
@@ -205,8 +218,9 @@ refresh Finder.
 mount/pull/diff/push, daemon, and Linux FUSE projection. It creates an unsent
 Gmail draft through the mounted `draft/` folder, verifies the draft projection,
 and deletes the Gmail draft through Gmail API cleanup. Direct-send behavior uses
-the same outbound document shape under `outbox/` and is covered by the outbox-folder
-push and File Provider reconciliation tests.
+the same outbound document shape under `outbox/`; remote draft move-to-send
+behavior is covered by the outbox-folder push and File Provider reconciliation
+tests.
 
 Use a stored `connection:gmail-live` credential and a recipient address:
 

@@ -20,11 +20,27 @@ pub struct GmailThreadList {
     pub result_size_estimate: Option<u64>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GmailDraftList {
+    #[serde(default)]
+    pub drafts: Vec<GmailDraftRef>,
+    pub next_page_token: Option<String>,
+    pub result_size_estimate: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailMessageRef {
     pub id: String,
     pub thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GmailDraftRef {
+    pub id: String,
+    pub message: GmailMessage,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +102,11 @@ pub struct GmailMessagePartBody {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GmailDraftCreateRequest {
+    pub message: GmailRawMessage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GmailDraftUpdateRequest {
     pub message: GmailRawMessage,
 }
 

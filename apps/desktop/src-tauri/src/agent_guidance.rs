@@ -434,6 +434,7 @@ Connected sources can include Notion, Google Docs, Google Calendar, Gmail, Linea
 - Unless the user asked you to apply edits remotely, leave edits pending for Locality review and tell the user what changed.
 - If desktop Live Mode is on, safe local edits may sync automatically. Use `loc live-mode status <file>` to inspect state. Do not run routine `loc pull` or `loc push` after every edit.
 - If the user asks you to sync, publish, send, update the source, or apply the edit remotely, run `loc diff <path>` first, then `loc push <path> -y` for safe plans.
+- If Live Mode is paused, conflicted, or review-needed, inspect with `loc status <path>` and `loc diff <path>` before pushing.
 - If push says the remote changed since last sync, run `loc pull <path>`, resolve any inline conflict markers in the Markdown, rerun `loc diff <path>`, then push again.
 
 ## Creating Notion Content
@@ -452,7 +453,9 @@ Connected sources can include Notion, Google Docs, Google Calendar, Gmail, Linea
 - Notion pages are directories with `page.md`; child pages live as child directories. Preserve Locality identity frontmatter, block IDs, directives starting with `::loc{{`, `_schema.yaml`, `AGENTS.md`, and `CLAUDE.md` unless explicitly asked.
 - Google Docs files are writable Markdown documents. Preserve Locality frontmatter and follow the mount-local `AGENTS.md` for supported formatting.
 - Calendar mounts expose drafts for new events. Create and edit Calendar drafts only through the filesystem shape described in the mount-local `AGENTS.md`, then use `loc diff <path>` and explicit push when the user asks to publish.
-- Gmail mounts expose `draft/` for unsent drafts and `outbox/` for direct sends. Use `outbox/` only when the user explicitly asks to send now; otherwise use `draft/`. Create and edit Gmail outbound files only through the filesystem shape described in the mount-local `AGENTS.md`, then use `loc diff <path>` and explicit push when the user asks to send.
+- Gmail mounts expose `draft/` for remote Gmail drafts and local draft creates. Leave messages in `draft/` when the user asks to draft or revise.
+- Use `outbox/` only when the user explicitly asks to send now. Moving an existing draft into `outbox/` sends that draft after applying local edits.
+- Create and edit Gmail outbound files only through the filesystem shape described in the mount-local `AGENTS.md`, then use `loc diff <path>` and explicit push when the user asks to send.
 - Linear issue edits and Linear status moves are supported through the mounted issue files when the mount-local `AGENTS.md` says so. Inspect with `loc diff <path>` before pushing.
 - Slack and Granola mounts are read-only. Do not edit, create, delete, rename, or push files there.
 
@@ -1094,6 +1097,7 @@ mod tests {
             "loc pull <path>",
             "loc live-mode status <file>",
             "loc connect <provider> --no-browser",
+            "If Live Mode is paused, conflicted, or review-needed",
         ] {
             assert!(skill.contains(command), "missing command {command}");
         }
@@ -1109,11 +1113,14 @@ mod tests {
         assert!(skill.contains("If path/title triage gives no hits, narrow the scope or ask the user for a better starting point instead of relying on broad Locality search"));
         assert!(skill.contains("If useful results are outside a user-provided path or source scope, do not read them until the user permits it"));
         assert!(skill.contains("Calendar mounts expose drafts for new events"));
-        assert!(skill.contains("Gmail mounts expose `draft/` for unsent drafts"));
-        assert!(skill.contains("`outbox/` for direct sends"));
-        assert!(skill.contains(
-            "Use `outbox/` only when the user explicitly asks to send now; otherwise use `draft/`."
-        ));
+        let expected_gmail_guidance = "\
+- Gmail mounts expose `draft/` for remote Gmail drafts and local draft creates. Leave messages in `draft/` when the user asks to draft or revise.
+- Use `outbox/` only when the user explicitly asks to send now. Moving an existing draft into `outbox/` sends that draft after applying local edits.
+- Create and edit Gmail outbound files only through the filesystem shape described in the mount-local `AGENTS.md`, then use `loc diff <path>` and explicit push when the user asks to send.";
+        assert!(
+            skill.contains(expected_gmail_guidance),
+            "missing exact Gmail guidance:\n{skill}"
+        );
         assert!(skill.contains("Linear issue edits"));
         assert!(skill.contains("Linear status moves"));
         assert!(skill.contains("Slack and Granola mounts are read-only"));

@@ -4640,6 +4640,16 @@ impl ShadowRepository for SqliteStateStore {
             .map(shadow_from_row)
             .transpose()
     }
+
+    fn delete_shadow(&mut self, mount_id: &MountId, entity_id: &RemoteId) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM shadows WHERE mount_id = ?1 AND entity_id = ?2",
+            params![mount_id.0, entity_id.0],
+        )?;
+        upsert_entity_search_index(&connection, mount_id, entity_id)?;
+        Ok(())
+    }
 }
 
 impl VirtualMutationRepository for SqliteStateStore {
