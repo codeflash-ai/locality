@@ -438,11 +438,59 @@ codex_cmd=(
   "$(cat "$prompt_file")"
 )
 
-if [[ "$code_timeout" != "0" ]] && command -v timeout >/dev/null 2>&1; then
-  timeout "$code_timeout" "${codex_env[@]}" "${codex_cmd[@]}" > "$codex_events_file"
-else
-  "${codex_env[@]}" "${codex_cmd[@]}" > "$codex_events_file"
-fi
+redact_codex_events() {
+  local output_file="$1"
+  python3 -c '
+import json
+import sys
+
+safe_keys = ("type", "timestamp", "event", "status", "exit_code")
+safe_value_types = (str, int, float, bool, type(None))
+
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    for line in sys.stdin:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            print(json.dumps({"redacted": True, "type": "unparsed"}, sort_keys=True), file=output)
+            continue
+
+        if not isinstance(event, dict):
+            print(json.dumps({"redacted": True, "type": "non_object"}, sort_keys=True), file=output)
+            continue
+
+        redacted = {}
+        for key in safe_keys:
+            if key not in event:
+                continue
+            value = event[key]
+            if isinstance(value, safe_value_types):
+                redacted[key] = value
+        print(json.dumps(redacted, sort_keys=True), file=output)
+' "$output_file"
+}
+
+run_codex_with_redacted_events() {
+  local codex_status filter_status
+  local -a statuses
+  set +e
+  if [[ "$code_timeout" != "0" ]] && command -v timeout >/dev/null 2>&1; then
+    timeout "$code_timeout" "${codex_env[@]}" "${codex_cmd[@]}" | redact_codex_events "$codex_events_file"
+  else
+    "${codex_env[@]}" "${codex_cmd[@]}" | redact_codex_events "$codex_events_file"
+  fi
+  statuses=("${PIPESTATUS[@]}")
+  codex_status="${statuses[0]}"
+  filter_status="${statuses[1]}"
+  set -e
+
+  if [[ "$codex_status" -ne 0 ]]; then
+    return "$codex_status"
+  fi
+  return "$filter_status"
+}
+
+run_codex_with_redacted_events
 
 [[ -s "$artifact_file" ]] || fail "Codex did not write $artifact_file"
 [[ -s "$trace_file" ]] || fail "Codex did not write $trace_file"

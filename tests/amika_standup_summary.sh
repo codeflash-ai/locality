@@ -297,9 +297,13 @@ test "$has_mount_root" -eq 1
 test "$has_evidence_dir" -eq 1
 test "$has_locality_repo" -eq 1
 test "$has_internal_repo" -eq 1
+if [[ "$expected_cwd" = */standup-codex-fail ]]; then
+  printf '{"type":"turn.failed","exit_code":42,"payload":"codex-failure-secret"}\n'
+  exit 42
+fi
 printf '# Standup\n' > "$STANDUP_ARTIFACT_FILE"
 printf '# Trace\n' > "$STANDUP_TRACE_FILE"
-printf '{"type":"turn.completed"}\n'
+printf '{"type":"turn.completed","payload":"codex-secret-payload","message":"mounted evidence should not persist"}\n'
 FAKE_CODEX
 
 chmod +x "${fake_bin}/amika" "${fake_bin}/loc" "${fake_bin}/git" "${fake_bin}/codex"
@@ -413,6 +417,31 @@ assert_file_not_contains "$dirty_repo_stderr" "https://github.com"
 assert_file_not_contains "$fake_log" "fetch --prune origin"
 
 : > "$fake_log"
+codex_fail_stderr="${TMPDIR}/codex-fail.err"
+if PATH="$fake_bin:$PATH" \
+  FAKE_BIN="$fake_bin" \
+  FAKE_LOG="$fake_log" \
+  FAKE_REMOTE_HOME="$fake_remote_home" \
+  LOCALITY_REPO_DIR="$same_name_locality_repo" \
+  LOCALITY_INTERNAL_REPO_DIR="$same_name_internal_repo" \
+  NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
+  RUN_ID="standup-codex-fail" \
+  STANDUP_DATE="2026-08-06" \
+  STANDUP_SINCE_ISO="2026-08-05T00:00:00Z" \
+  STANDUP_UNTIL_ISO="2026-08-06T00:00:00Z" \
+  "$RUNNER" --sandbox fake-machine 2>"$codex_fail_stderr"; then
+  fail "failing codex unexpectedly succeeded"
+else
+  codex_fail_status="$?"
+fi
+test "$codex_fail_status" -eq 42 || fail "failing codex exit status was $codex_fail_status, expected 42"
+codex_fail_events="$fake_remote_home/standup-summary-runs/standup-codex-fail/evidence/codex-events.jsonl"
+test -s "$codex_fail_events" || fail "missing failing codex redacted events"
+assert_file_contains "$codex_fail_events" "turn.failed"
+assert_file_contains "$codex_fail_events" '"exit_code": 42'
+assert_file_not_contains "$codex_fail_events" "codex-failure-secret"
+
+: > "$fake_log"
 runner_output="$(
   PATH="$fake_bin:$PATH" \
   FAKE_BIN="$fake_bin" \
@@ -429,6 +458,7 @@ printf '%s\n' "$runner_output" | grep -F -q '{"type":"turn.completed"}' && fail 
 evidence_dir="$(
   printf '%s\n' "$runner_output" | python3 -c 'import json, sys; print(json.load(sys.stdin)["evidence_dir"])'
 )"
+codex_events_file="$evidence_dir/codex-events.jsonl"
 
 assert_file_contains "$fake_log" "loc connections --json"
 assert_file_contains "$fake_log" "loc mount linear"
@@ -448,5 +478,9 @@ test -s "$evidence_dir/locality-internal-commits.tsv" || fail "missing locality-
 run_dir_q="$(printf '%q' "${evidence_dir%/evidence}")"
 assert_file_contains "$evidence_dir/fake-codex.log" "codex exec"
 assert_file_contains "$evidence_dir/fake-codex.log" "-C ${run_dir_q}"
+test -s "$codex_events_file" || fail "missing redacted codex events"
+assert_file_contains "$codex_events_file" "turn.completed"
+assert_file_not_contains "$codex_events_file" "codex-secret-payload"
+assert_file_not_contains "$codex_events_file" "mounted evidence should not persist"
 
 printf 'successful runner contract passed\n'
