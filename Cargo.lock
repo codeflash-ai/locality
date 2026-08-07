@@ -2348,6 +2348,7 @@ dependencies = [
 name = "locality-desktop"
 version = "0.3.7"
 dependencies = [
+ "libc",
  "loc-cli",
  "locality-connector",
  "locality-core",

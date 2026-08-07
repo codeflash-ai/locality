@@ -176,6 +176,7 @@ use tauri::{
 use tauri_plugin_dialog::DialogExt;
 
 mod agent_guidance;
+mod single_instance;
 
 use agent_guidance::{
     AgentGuidanceInstallReport, install_agent_guidance as install_guidance_files,
@@ -196,11 +197,6 @@ const DEFAULT_NOTION_MOUNT_POINT_DIRECTORY: &str = "notion";
 const WINDOWS_ERROR_FLT_INVALID_NAME_REQUEST: i32 = -2_145_452_027;
 #[cfg(windows)]
 const WINDOWS_RUN_VALUE_NAME: &str = "Locality";
-#[cfg(windows)]
-const WINDOWS_DESKTOP_SINGLE_INSTANCE_MUTEX: &str =
-    r"Local\CodeFlash.Locality.Desktop.SingleInstance";
-#[cfg(windows)]
-const WINDOWS_DESKTOP_ACTIVATION_EVENT: &str = r"Local\CodeFlash.Locality.Desktop.Activate";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -651,47 +647,6 @@ struct TrayRenderState {
 }
 
 static LAST_TRAY_RENDER: OnceLock<Mutex<Option<TrayRenderState>>> = OnceLock::new();
-
-struct DesktopSingleInstanceGuard {
-    #[cfg(windows)]
-    mutex_handle: windows_sys::Win32::Foundation::HANDLE,
-    #[cfg(windows)]
-    activation_event_handle: windows_sys::Win32::Foundation::HANDLE,
-}
-
-impl DesktopSingleInstanceGuard {
-    fn activation_event_handle(&self) -> Option<usize> {
-        #[cfg(windows)]
-        {
-            if self.activation_event_handle.is_null() {
-                None
-            } else {
-                Some(self.activation_event_handle as usize)
-            }
-        }
-
-        #[cfg(not(windows))]
-        {
-            None
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for DesktopSingleInstanceGuard {
-    fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-
-        unsafe {
-            if !self.activation_event_handle.is_null() {
-                let _ = CloseHandle(self.activation_event_handle);
-            }
-            if !self.mutex_handle.is_null() {
-                let _ = CloseHandle(self.mutex_handle);
-            }
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ScreenBounds {
@@ -4143,6 +4098,25 @@ async fn schedule_update_relaunch() -> ActionReport {
             ok: false,
             message: format!("Could not schedule relaunch: {error}"),
         },
+    }
+}
+
+#[tauri::command]
+fn release_update_relaunch_guard(
+    state: tauri::State<'_, single_instance::DesktopSingleInstanceState>,
+) -> ActionReport {
+    match state.release_for_relaunch() {
+        Ok(true) => ActionReport {
+            ok: true,
+            message: "Locality is ready to relaunch.".to_string(),
+        },
+        Ok(false) => ActionReport {
+            ok: true,
+            message: "Locality relaunch ownership was already released.".to_string(),
+        },
+        Err(error) => action_error(format!(
+            "Could not release desktop ownership for relaunch: {error}"
+        )),
     }
 }
 
@@ -8736,6 +8710,10 @@ fn app_store_distribution() -> bool {
 
 fn desktop_smoke_test_requested() -> bool {
     std::env::var_os("LOCALITY_DESKTOP_SMOKE_TEST").is_some()
+}
+
+fn desktop_single_instance_required(smoke_test_requested: bool) -> bool {
+    !smoke_test_requested
 }
 
 fn install_terminal_cli_link() -> Result<PathBuf, String> {
@@ -17366,20 +17344,6 @@ mod tests {
         ]
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn windows_single_instance_objects_are_session_scoped_and_null_terminated() {
-        assert!(super::WINDOWS_DESKTOP_SINGLE_INSTANCE_MUTEX.starts_with(r"Local\"));
-        assert!(super::WINDOWS_DESKTOP_ACTIVATION_EVENT.starts_with(r"Local\"));
-
-        let wide = super::windows_wide_null("Locality");
-        let expected = "Locality"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        assert_eq!(wide, expected);
-    }
-
     #[test]
     fn connection_metadata_change_detects_workspace_switches() {
         let previous = test_connection("workspace-1", "Teamspace A");
@@ -20588,6 +20552,12 @@ mod tests {
         ]));
     }
 
+    #[test]
+    fn release_smoke_launches_bypass_single_instance_forwarding() {
+        assert!(super::desktop_single_instance_required(false));
+        assert!(!super::desktop_single_instance_required(true));
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn launch_agent_starts_desktop_in_background() {
@@ -22013,98 +21983,6 @@ fn sample_live_mode_status(enabled: bool) -> LiveModeFileStatus {
     }
 }
 
-#[cfg(windows)]
-fn acquire_desktop_single_instance() -> Option<DesktopSingleInstanceGuard> {
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
-    use windows_sys::Win32::System::Threading::{CreateEventW, CreateMutexW};
-
-    let mutex_name = windows_wide_null(WINDOWS_DESKTOP_SINGLE_INSTANCE_MUTEX);
-    let mutex_handle = unsafe { CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr()) };
-    if mutex_handle.is_null() {
-        eprintln!("loc desktop could not create single-instance mutex");
-        return Some(DesktopSingleInstanceGuard {
-            mutex_handle,
-            activation_event_handle: std::ptr::null_mut(),
-        });
-    }
-
-    let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-    if already_running {
-        signal_existing_desktop_instance();
-        unsafe {
-            let _ = CloseHandle(mutex_handle);
-        }
-        return None;
-    }
-
-    let event_name = windows_wide_null(WINDOWS_DESKTOP_ACTIVATION_EVENT);
-    let activation_event_handle =
-        unsafe { CreateEventW(std::ptr::null(), 0, 0, event_name.as_ptr()) };
-    if activation_event_handle.is_null() {
-        eprintln!("loc desktop could not create single-instance activation event");
-    }
-
-    Some(DesktopSingleInstanceGuard {
-        mutex_handle,
-        activation_event_handle,
-    })
-}
-
-#[cfg(not(windows))]
-fn acquire_desktop_single_instance() -> Option<DesktopSingleInstanceGuard> {
-    Some(DesktopSingleInstanceGuard {})
-}
-
-#[cfg(windows)]
-fn signal_existing_desktop_instance() {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
-
-    let event_name = windows_wide_null(WINDOWS_DESKTOP_ACTIVATION_EVENT);
-    let event_handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, event_name.as_ptr()) };
-    if event_handle.is_null() {
-        return;
-    }
-
-    unsafe {
-        let _ = SetEvent(event_handle);
-        let _ = CloseHandle(event_handle);
-    }
-}
-
-fn start_desktop_activation_listener(app: AppHandle, activation_event_handle: Option<usize>) {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-        use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
-
-        let Some(activation_event_handle) = activation_event_handle else {
-            return;
-        };
-        std::thread::spawn(move || {
-            let activation_event_handle = activation_event_handle as HANDLE;
-            loop {
-                let result = unsafe { WaitForSingleObject(activation_event_handle, INFINITE) };
-                if result != WAIT_OBJECT_0 {
-                    break;
-                }
-                show_main_window_with_view(&app, None);
-            }
-        });
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = app;
-        let _ = activation_event_handle;
-    }
-}
-
-#[cfg(windows)]
-fn windows_wide_null(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
 fn main() {
     if std::env::args().any(|arg| arg == "--prepare-uninstall") {
         let state_root = default_state_root();
@@ -22116,13 +21994,46 @@ fn main() {
     }
 
     let background_launch = desktop_launch_requested_background();
+    let smoke_test_requested = desktop_smoke_test_requested();
+    let single_instance_guard = if desktop_single_instance_required(smoke_test_requested) {
+        match single_instance::acquire_desktop_single_instance(background_launch) {
+            Ok(Some(guard)) => Some(guard),
+            Ok(None) => return,
+            Err(error) => {
+                desktop_log(
+                    "error",
+                    "app.single_instance_failed",
+                    format!("could not claim desktop process ownership: {error}"),
+                );
+                eprintln!("loc desktop could not claim single-instance ownership: {error}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let desktop_activation_receiver = match single_instance_guard
+        .as_ref()
+        .map(|guard| guard.activation_receiver())
+        .transpose()
+    {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            desktop_log(
+                "error",
+                "app.single_instance_receiver_failed",
+                format!("could not prepare desktop activation receiver: {error}"),
+            );
+            eprintln!("loc desktop could not prepare its activation receiver: {error}");
+            std::process::exit(1);
+        }
+    };
 
     desktop_log("info", "app.start", "Locality desktop starting");
-    let Some(single_instance_guard) = acquire_desktop_single_instance() else {
-        return;
-    };
-    let activation_event_handle = single_instance_guard.activation_event_handle();
     let builder = tauri::Builder::default()
+        .manage(single_instance::DesktopSingleInstanceState::new(
+            single_instance_guard,
+        ))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init());
     let builder = if app_store_distribution() {
@@ -22145,7 +22056,7 @@ fn main() {
             }
         })
         .setup(move |app| {
-            if desktop_smoke_test_requested() {
+            if smoke_test_requested {
                 configure_main_window_chrome(app);
                 // Keep release smoke tests isolated from the user's daemon state.
                 std::process::exit(0);
@@ -22168,7 +22079,23 @@ fn main() {
             refresh_launch_at_login_cache_async();
             configure_main_window_chrome(app);
             build_tray(app)?;
-            start_desktop_activation_listener(app.app_handle().clone(), activation_event_handle);
+            if let Some(receiver) = desktop_activation_receiver {
+                let app_handle = app.app_handle().clone();
+                let receiver_control = receiver
+                    .start(move || show_main_window_with_view(&app_handle, None))
+                    .map_err(|error| {
+                        io::Error::other(format!(
+                            "Locality could not start its desktop activation receiver: {error}"
+                        ))
+                    })?;
+                app.state::<single_instance::DesktopSingleInstanceState>()
+                    .register_activation_receiver(receiver_control)
+                    .map_err(|error| {
+                        io::Error::other(format!(
+                            "Locality could not register its desktop activation receiver: {error}"
+                        ))
+                    })?;
+            }
             sync_tray_visibility(app.app_handle(), &desktop_settings());
             start_state_change_watcher(app.app_handle().clone());
             ensure_runtime_ready_in_background(app.app_handle().clone());
@@ -22238,6 +22165,7 @@ fn main() {
             hide_menubar,
             quit_completely,
             schedule_update_relaunch,
+            release_update_relaunch_guard,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Locality desktop app")
