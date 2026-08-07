@@ -1319,7 +1319,15 @@ impl ChildRefreshQueue {
         &mut self,
         active: &BTreeMap<ChildRefreshKey, ActiveChildRefresh>,
     ) -> Option<ChildRefreshRequest> {
-        let index = self.next_ready_index(active)?;
+        self.pop_ready_at_least(active, ChildRefreshPriority::Background)
+    }
+
+    fn pop_ready_at_least(
+        &mut self,
+        active: &BTreeMap<ChildRefreshKey, ActiveChildRefresh>,
+        minimum_priority: ChildRefreshPriority,
+    ) -> Option<ChildRefreshRequest> {
+        let index = self.next_ready_index_at_least(active, minimum_priority)?;
         let key = self.order.remove(index)?;
         self.not_before.remove(&key);
         self.pending.remove(&key)
@@ -1351,9 +1359,10 @@ impl ChildRefreshQueue {
             .collect()
     }
 
-    fn next_ready_index(
+    fn next_ready_index_at_least(
         &self,
         active: &BTreeMap<ChildRefreshKey, ActiveChildRefresh>,
+        minimum_priority: ChildRefreshPriority,
     ) -> Option<usize> {
         let now = Instant::now();
         let mut best: Option<(usize, ChildRefreshPriority, u32)> = None;
@@ -1361,6 +1370,9 @@ impl ChildRefreshQueue {
             let Some(request) = self.pending.get(key) else {
                 continue;
             };
+            if request.priority < minimum_priority {
+                continue;
+            }
             if self
                 .not_before
                 .get(key)
@@ -2286,6 +2298,9 @@ impl RuntimeState {
                 Some(MutatingJob::Request(request))
             } else if let Some(request) = self.hydration.pop_ready() {
                 Some(MutatingJob::Hydration { request })
+            } else if self.maybe_start_interactive_child_refresh_jobs() {
+                self.maybe_start_scheduled_pull_fetch();
+                return;
             } else if let Some(job) = self
                 .freshness
                 .pop_ready_at(Some(&freshness_timestamp()), FRESHNESS_JOB_BUDGET_UNITS)
@@ -2381,6 +2396,27 @@ impl RuntimeState {
 
             self.start_child_refresh_job(request);
         }
+    }
+
+    fn maybe_start_interactive_child_refresh_jobs(&mut self) -> bool {
+        if !self.config.background_connector_sync || self.active_job.is_some() {
+            return false;
+        }
+
+        let mut started = false;
+        while self.active_job.is_none()
+            && self.active_child_refreshes.len() < DEFAULT_MAX_CHILD_REFRESH_WORKERS
+        {
+            let Some(request) = self.child_refreshes.pop_ready_at_least(
+                &self.active_child_refreshes,
+                ChildRefreshPriority::Interactive,
+            ) else {
+                break;
+            };
+            self.start_child_refresh_job(request);
+            started = true;
+        }
+        started
     }
 
     fn active_background_child_refreshes(&self) -> usize {
@@ -6485,6 +6521,45 @@ mod tests {
     }
 
     #[test]
+    fn interactive_child_refresh_runs_before_ready_freshness_work() {
+        let state_root = temp_runtime_root("runtime-interactive-child-refresh-priority");
+        seed_virtual_mount(&state_root);
+        let mut runtime =
+            runtime_state_for_root_with_runner(state_root.clone(), Arc::new(IdleRuntimeJobRunner));
+
+        runtime.active_job = Some(test_active_job());
+        runtime.queue_freshness(
+            observe_job(&MountId::new("gmail-main"), &RemoteId::new("message-1"))
+                .with_tier(FreshnessTier::Immediate),
+        );
+        runtime.queue_child_refresh(
+            "notion-main".to_string(),
+            "mount:notion-main".to_string(),
+            ChildRefreshPriority::Interactive,
+            0,
+        );
+
+        runtime.active_job = None;
+        runtime.maybe_start_next_job();
+
+        assert!(
+            runtime.active_job.is_none(),
+            "freshness work should not start before an interactive directory discovery"
+        );
+        assert_eq!(
+            runtime.active_child_refreshes.len(),
+            1,
+            "interactive directory discovery should start while the runtime is otherwise idle"
+        );
+        assert!(
+            runtime.child_refreshes.debug_requests(10).is_empty(),
+            "started discovery should leave the pending queue"
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
     fn metadata_discovery_jobs_do_not_reload_when_background_sync_disabled() {
         let state_root = temp_runtime_root("runtime-metadata-discovery-background-disabled");
         seed_virtual_mount(&state_root);
@@ -7731,15 +7806,68 @@ mod tests {
     }
 
     fn runtime_state_for_root(state_root: PathBuf) -> RuntimeState {
+        runtime_state_for_root_with_runner(state_root, Arc::new(DefaultRuntimeJobRunner))
+    }
+
+    fn runtime_state_for_root_with_runner(
+        state_root: PathBuf,
+        runner: Arc<dyn RuntimeJobRunner>,
+    ) -> RuntimeState {
         let (sender, _receiver) = std::sync::mpsc::channel();
         RuntimeState::new(
             crate::DaemonConfig {
                 state_root,
                 ..crate::DaemonConfig::default()
             },
-            Arc::new(DefaultRuntimeJobRunner),
+            runner,
             sender,
         )
+    }
+
+    struct IdleRuntimeJobRunner;
+
+    impl RuntimeJobRunner for IdleRuntimeJobRunner {
+        fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+            panic!("pull should not run in scheduler priority test")
+        }
+
+        fn run_push(&self, _state_root: PathBuf, _job: super::PushJob) -> DaemonResponse {
+            panic!("push should not run in scheduler priority test")
+        }
+
+        fn run_scheduled_pull(
+            &self,
+            _state_root: PathBuf,
+            _tick: super::PullSchedulerTick,
+            _policy: super::HydrationPolicy,
+        ) -> locality_core::LocalityResult<super::ScheduledPullRuntimeReport> {
+            panic!("scheduled pull should not run in scheduler priority test")
+        }
+
+        fn run_hydration(
+            &self,
+            _state_root: PathBuf,
+            _request: HydrationRequest,
+        ) -> locality_core::LocalityResult<super::HydrationOutcome> {
+            panic!("hydration should not run in scheduler priority test")
+        }
+
+        fn run_freshness_job(
+            &self,
+            _state_root: PathBuf,
+            _job: SyncJob,
+        ) -> locality_core::LocalityResult<super::FreshnessRuntimeReport> {
+            panic!("freshness should not run before interactive child refresh")
+        }
+
+        fn run_virtual_fs_refresh_children(
+            &self,
+            _state_root: PathBuf,
+            _mount_id: String,
+            _container_identifier: String,
+        ) -> locality_core::LocalityResult<VirtualFsRefreshChildrenReport> {
+            Ok(VirtualFsRefreshChildrenReport::default())
+        }
     }
 
     fn test_active_job() -> ActiveRuntimeJob {
