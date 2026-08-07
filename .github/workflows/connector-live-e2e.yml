@@ -11,6 +11,9 @@ on:
       - "rust-toolchain.toml"
       - "crates/**"
       - "platform/linux/locality-fuse/**"
+      - "tests/linux-fuse-ci.Dockerfile"
+      - "tests/linux-fuse-ci-entrypoint.sh"
+      - "tests/run_linux_fuse_ci.sh"
       - "tests/live_connector_common.sh"
       - "tests/live_connector_common_selftest.sh"
       - "tests/live_google_docs_vfs_roundtrip.sh"
@@ -18,6 +21,8 @@ on:
       - "tests/live_gmail_vfs_roundtrip.sh"
       - "tests/live_slack_vfs_read.sh"
       - "tests/live_linear_vfs_roundtrip.sh"
+      - "tests/resolve_linear_live_issue.py"
+      - "tests/resolve_linear_live_issue_selftest.sh"
   workflow_dispatch:
     inputs:
       force_oauth_refresh:
@@ -113,7 +118,7 @@ jobs:
           LOCALITY_LIVE_GOOGLE_DOCS_VFS: "1"
           LOCALITY_LIVE_FORCE_OAUTH_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
           LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && format('{0}/locality-google-docs-live-credential.json', runner.temp) || '' }}
-        run: tests/live_google_docs_vfs_roundtrip.sh
+        run: tests/run_linux_fuse_ci.sh tests/live_google_docs_vfs_roundtrip.sh
       - name: Persist refreshed Google Docs credential
         if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true }}
         shell: bash
@@ -189,7 +194,7 @@ jobs:
           LOCALITY_LIVE_GOOGLE_CALENDAR_VFS: "1"
           LOCALITY_LIVE_FORCE_OAUTH_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
           LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && format('{0}/locality-google-calendar-live-credential.json', runner.temp) || '' }}
-        run: tests/live_google_calendar_vfs_roundtrip.sh
+        run: tests/run_linux_fuse_ci.sh tests/live_google_calendar_vfs_roundtrip.sh
       - name: Persist refreshed Google Calendar credential
         if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true }}
         shell: bash
@@ -269,7 +274,7 @@ jobs:
           LOCALITY_LIVE_GMAIL_SEND: "1"
           LOCALITY_LIVE_FORCE_OAUTH_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
           LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && format('{0}/locality-gmail-live-credential.json', runner.temp) || '' }}
-        run: tests/live_gmail_vfs_roundtrip.sh
+        run: tests/run_linux_fuse_ci.sh tests/live_gmail_vfs_roundtrip.sh
       - name: Persist refreshed Gmail credential
         if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true }}
         shell: bash
@@ -319,20 +324,12 @@ jobs:
         env:
           LOCALITY_SLACK_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_SLACK_LIVE_CREDENTIAL_JSON }}
           LOCALITY_SLACK_LIVE_CONVERSATION_ID: ${{ secrets.LOCALITY_SLACK_LIVE_CONVERSATION_ID }}
-          LOCALITY_LIVE_FORCE_OAUTH_REFRESH_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
-          LOCALITY_LIVE_PERSIST_ROTATED_OAUTH_SECRETS: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && '1' || '0' }}
           LOCALITY_SECRET_ROTATOR_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
         run: |
           missing=()
           [ -n "$LOCALITY_SLACK_LIVE_CREDENTIAL_JSON" ] || missing+=("LOCALITY_SLACK_LIVE_CREDENTIAL_JSON")
           [ -n "$LOCALITY_SLACK_LIVE_CONVERSATION_ID" ] || missing+=("LOCALITY_SLACK_LIVE_CONVERSATION_ID")
-          if [ "$LOCALITY_LIVE_PERSIST_ROTATED_OAUTH_SECRETS" = "1" ]; then
-            if [ "$LOCALITY_LIVE_FORCE_OAUTH_REFRESH_INPUT" != "1" ]; then
-              echo "::error::persist_rotated_oauth_secrets requires force_oauth_refresh"
-              exit 1
-            fi
-            [ -n "$LOCALITY_SECRET_ROTATOR_TOKEN" ] || missing+=("LOCALITY_SECRET_ROTATOR_TOKEN")
-          fi
+          [ -n "$LOCALITY_SECRET_ROTATOR_TOKEN" ] || missing+=("LOCALITY_SECRET_ROTATOR_TOKEN")
           if [ "${#missing[@]}" -gt 0 ]; then
             echo "::error::Slack live e2e missing required environment secrets: ${missing[*]}"
             exit 1
@@ -341,17 +338,22 @@ jobs:
             echo "::error::/dev/fuse is unavailable; the live connector Linux FUSE e2e cannot run"
             exit 1
           fi
+          GH_TOKEN="$LOCALITY_SECRET_ROTATOR_TOKEN" \
+            gh api "repos/$GITHUB_REPOSITORY/environments/connector-live-e2e/secrets/public-key" \
+            >/dev/null
       - name: Run live Slack Linux FUSE e2e
         env:
           LOCALITY_SLACK_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_SLACK_LIVE_CREDENTIAL_JSON }}
           LOCALITY_SLACK_LIVE_CONVERSATION_ID: ${{ secrets.LOCALITY_SLACK_LIVE_CONVERSATION_ID }}
           LOCALITY_SLACK_LIVE_TYPES: ${{ secrets.LOCALITY_SLACK_LIVE_TYPES }}
           LOCALITY_LIVE_SLACK_VFS: "1"
-          LOCALITY_LIVE_FORCE_OAUTH_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
-          LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && format('{0}/locality-slack-live-credential.json', runner.temp) || '' }}
-        run: tests/live_slack_vfs_read.sh
+          # Slack refresh tokens rotate on every use, so every live run must
+          # publish the replacement credential before another run starts.
+          LOCALITY_LIVE_FORCE_OAUTH_REFRESH: "1"
+          LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ runner.temp }}/locality-slack-live-credential.json
+        run: tests/run_linux_fuse_ci.sh tests/live_slack_vfs_read.sh
       - name: Persist refreshed Slack credential
-        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true }}
+        if: ${{ always() }}
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
@@ -366,10 +368,19 @@ jobs:
             echo "::error::refreshed Slack credential was not exported; check the live e2e failure above"
             exit 1
           fi
-          gh secret set LOCALITY_SLACK_LIVE_CREDENTIAL_JSON \
-            --repo "$GITHUB_REPOSITORY" \
-            --env connector-live-e2e \
-            < "$ROTATED_CREDENTIAL_PATH"
+          for attempt in 1 2 3; do
+            if gh secret set LOCALITY_SLACK_LIVE_CREDENTIAL_JSON \
+              --repo "$GITHUB_REPOSITORY" \
+              --env connector-live-e2e \
+              < "$ROTATED_CREDENTIAL_PATH"; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$attempt"
+            fi
+          done
+          echo "::error::failed to persist the rotated Slack credential after 3 attempts"
+          exit 1
 
   linear-live:
     name: Linear Linux FUSE live e2e
@@ -416,4 +427,4 @@ jobs:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           LOCALITY_LINEAR_LIVE_ISSUE_ID: ${{ secrets.LOCALITY_LINEAR_LIVE_ISSUE_ID }}
           LOCALITY_LIVE_LINEAR_VFS: "1"
-        run: tests/live_linear_vfs_roundtrip.sh
+        run: tests/run_linux_fuse_ci.sh tests/live_linear_vfs_roundtrip.sh

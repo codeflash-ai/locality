@@ -133,7 +133,7 @@ jobs:
           cargo build -p localityd
           cargo test -p locality-desktop live_mode_bidirectional_cloudstorage_markdown_e2e -- --ignored --exact --test-threads=1 --nocapture
       - name: Run Linux FUSE live Notion e2e from stored credential
-        run: env -u NOTION_TOKEN -u NOTION_AT tests/live_notion_vfs_push_pull.sh
+        run: tests/run_linux_fuse_ci.sh env -u NOTION_TOKEN -u NOTION_AT tests/live_notion_vfs_push_pull.sh
 
   windows-cloud-files-live:
     name: Windows Cloud Files live e2e

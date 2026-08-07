@@ -15,6 +15,9 @@ on:
       - "crates/localityd/**"
       - "crates/loc-cli/**"
       - "platform/linux/locality-fuse/**"
+      - "tests/linux-fuse-ci.Dockerfile"
+      - "tests/linux-fuse-ci-entrypoint.sh"
+      - "tests/run_linux_fuse_ci.sh"
       - "tests/live_granola_vfs_read.sh"
   schedule:
     - cron: "23 15 * * 2"
@@ -95,4 +98,4 @@ jobs:
             exit 1
           fi
       - name: Run live mounted-filesystem test
-        run: tests/live_granola_vfs_read.sh
+        run: tests/run_linux_fuse_ci.sh tests/live_granola_vfs_read.sh

@@ -55,4 +55,4 @@ jobs:
             exit 1
           fi
       - name: Run real Linux FUSE smoke test
-        run: LOCALITY_FUSE_SMOKE=1 LOCALITY_FUSE_SMOKE_REQUIRED=1 tests/linux_fuse_smoke.sh
+        run: LOCALITY_FUSE_SMOKE=1 LOCALITY_FUSE_SMOKE_REQUIRED=1 tests/run_linux_fuse_ci.sh tests/linux_fuse_smoke.sh

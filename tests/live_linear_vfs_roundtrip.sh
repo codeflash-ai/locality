@@ -48,6 +48,7 @@ fuse_log="$tmp_root/locality-fuse.log"
 command_log="$tmp_root/commands.err.log"
 mount_report="$tmp_root/mount.json"
 initial_pull_report="$tmp_root/initial-pull.json"
+issue_search_report="$tmp_root/issue-search.json"
 diff_report="$tmp_root/diff.json"
 push_report="$tmp_root/push.json"
 pull_after_push_report="$tmp_root/pull-after-push.json"
@@ -88,7 +89,23 @@ assert_changed_remote_id_matches_issue() {
   if [[ -z "$remote_id" ]]; then
     live_fail "$label did not include changed_remote_ids.0"
   fi
-  if [[ "$remote_id" != "$LOCALITY_LINEAR_LIVE_ISSUE_ID" ]]; then
+  if ! python3 - "$remote_id" "$LOCALITY_LINEAR_LIVE_ISSUE_ID" <<'PY'
+import sys
+
+def canonical_issue_id(value):
+    value = value.strip()
+    compact = "".join(
+        character.lower()
+        for character in value
+        if character in "0123456789abcdefABCDEF"
+    )
+    return compact if len(compact) == 32 else value
+
+raise SystemExit(
+    0 if canonical_issue_id(sys.argv[1]) == canonical_issue_id(sys.argv[2]) else 1
+)
+PY
+  then
     live_fail "$label changed_remote_ids.0 did not match the target Linear issue id"
   fi
 }
@@ -164,90 +181,18 @@ find_issue_by_frontmatter() {
   local issue_id="$1"
   local match
 
-  if match="$(python3 - "$mount_root" "$issue_id" <<'PY' 2>>"$command_log"
-import os
-import pathlib
-import re
-import sys
+  if ! LOCALITY_STATE_DIR="$state_root" "$loc_bin" search "$issue_id" \
+    --connector linear \
+    --limit 2 \
+    --json >"$issue_search_report" 2>>"$command_log"; then
+    return 1
+  fi
 
-root = pathlib.Path(sys.argv[1])
-issue_id = sys.argv[2]
-
-def frontmatter_lines(path):
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return None
-    frontmatter = []
-    for line in lines[1:]:
-        if line.strip() == "---":
-            return frontmatter
-        frontmatter.append(line)
-    return None
-
-def scalar_value(line, key):
-    match = re.match(rf"^\s*{re.escape(key)}:\s*(.*?)\s*$", line)
-    if not match:
-        return None
-    value = match.group(1).strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-        value = value[1:-1]
-    return value
-
-def block_key(line):
-    match = re.match(r"^(\s*)([A-Za-z0-9_.-]+):\s*$", line)
-    if not match:
-        return None
-    return (len(match.group(1)), match.group(2))
-
-matches = []
-for current_root, dirs, files in os.walk(root):
-    dirs.sort()
-    files.sort()
-    if "page.md" not in files:
-        continue
-    path = pathlib.Path(current_root) / "page.md"
-    frontmatter = frontmatter_lines(path)
-    if frontmatter is None:
-        continue
-
-    has_linear_connector = False
-    has_issue_id = False
-    active_block = None
-    active_indent = -1
-    for line in frontmatter:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        indent = len(line) - len(line.lstrip(" "))
-        if active_block is not None and indent <= active_indent:
-            active_block = None
-            active_indent = -1
-
-        block = block_key(line)
-        if block is not None:
-            active_indent, active_block = block
-            continue
-
-        if active_block == "loc":
-            if scalar_value(line, "connector") == "linear":
-                has_linear_connector = True
-            if scalar_value(line, "id") == issue_id:
-                has_issue_id = True
-
-    if has_linear_connector and has_issue_id:
-        matches.append(path)
-
-if len(matches) == 1:
-    print(matches[0])
-    raise SystemExit(0)
-
-raise SystemExit(1)
-PY
-  )"; then
+  if match="$(python3 "$script_dir/resolve_linear_live_issue.py" \
+    "$issue_search_report" \
+    "$mount_root" \
+    "$mount_id" \
+    "$issue_id" 2>>"$command_log")"; then
     [[ -n "$match" ]] || return 1
     printf '%s\n' "$match"
     return 0
