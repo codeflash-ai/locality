@@ -9,6 +9,7 @@ use locality_core::{LocalityError, LocalityResult};
 use locality_google_docs::{
     GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsConfig, GoogleDocsConnector,
     HttpGoogleDocsOAuthBrokerClient, StoredGoogleDocsCredential,
+    oauth::GoogleDocsOAuthScopeError,
     render::{GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND, GOOGLE_DOCS_TABLE_NATIVE_KIND},
 };
 use locality_store::{
@@ -98,7 +99,9 @@ fn connection_access_token(
         .map_err(|error| ConnectorResolveError::CredentialStoreUnavailable(error.to_string()))?;
     if stored.expires_soon(timestamp_secs()) {
         let refreshed = refresh_oauth_credential(connection, &stored)?;
-        stored = stored.refreshed(refreshed, timestamp_secs());
+        stored = stored
+            .refreshed(refreshed, timestamp_secs())
+            .map_err(|error| google_docs_refresh_scope_error(connection, error))?;
         let secret = serde_json::to_string(&stored).map_err(|error| {
             ConnectorResolveError::CredentialStoreUnavailable(error.to_string())
         })?;
@@ -134,6 +137,20 @@ fn refresh_oauth_credential(
             refresh_token_handle: Some(refresh_token_handle),
         })
         .map_err(|error| google_docs_refresh_error(connection, &broker_url, error))
+}
+
+fn google_docs_refresh_scope_error(
+    connection: &ConnectionRecord,
+    error: GoogleDocsOAuthScopeError,
+) -> ConnectorResolveError {
+    ConnectorResolveError::AuthRequired {
+        connection_id: connection.connection_id.0.clone(),
+        message: Some(format!(
+            "Google Docs credential for connection `{}` could not be refreshed through OAuth broker: {error}",
+            connection.connection_id.0
+        )),
+        suggested_command: "loc connect google-docs".to_string(),
+    }
 }
 
 fn is_loopback_broker_url(url: &str) -> bool {

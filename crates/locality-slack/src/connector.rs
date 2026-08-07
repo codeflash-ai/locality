@@ -3,6 +3,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
+use locality_auth_core::oauth::OAuthConnector;
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, ChildContainer,
     Connector, ConnectorCapabilities, ConnectorExecutionPolicy, ConnectorKind, EnumerateRequest,
@@ -25,7 +26,7 @@ use crate::render::{
 };
 use crate::settings::{SlackConversationType, SlackMountSettings};
 
-pub const SLACK_CONNECTOR_ID: &str = "slack";
+pub const SLACK_CONNECTOR_ID: &str = OAuthConnector::Slack.as_str();
 const CONVERSATIONS_PAGE_SIZE: u32 = 200;
 const USERS_PAGE_SIZE: u32 = 200;
 

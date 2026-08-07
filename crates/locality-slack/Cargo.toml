@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+locality-auth-core.workspace = true
 locality-core.workspace = true
 locality-connector.workspace = true
 locality-protocol.workspace = true

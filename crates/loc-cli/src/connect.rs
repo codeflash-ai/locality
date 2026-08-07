@@ -13,6 +13,7 @@ use locality_google_calendar::{
     GOOGLE_CALENDAR_CONNECTOR_ID, GOOGLE_CALENDAR_OAUTH_SCOPES,
     HttpGoogleCalendarOAuthBrokerClient, StoredGoogleCalendarCredential,
 };
+use locality_google_docs::oauth::validate_google_docs_oauth_scopes;
 use locality_google_docs::{
     GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, HttpGoogleDocsOAuthBrokerClient,
     StoredGoogleDocsCredential, google_docs_capabilities_json,
@@ -754,6 +755,9 @@ where
         redirect_uri: options.redirect_uri,
     };
     let token = exchange.exchange_code(&exchange_request)?;
+    validate_google_docs_oauth_scopes(&token.scopes).map_err(|error| {
+        ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::google_docs(error.to_string()))
+    })?;
     let acquired_at = timestamp_secs();
     let secret_ref = format!("connection:{}", connection_id.0);
     let stored = StoredGoogleDocsCredential::from_broker_token(

@@ -42,6 +42,7 @@ use crate::media::{
     MediaDownloadReport, MediaFetchReport, PortableMediaCaptureFetcher, PortableMediaCapturePolicy,
     default_portable_media_fetcher, download_media_assets, fetch_media_asset_report_with_fetcher,
 };
+use crate::oauth::NOTION_CONNECTOR_ID;
 use crate::projection::{
     enumerate_explicit_root_trees, enumerate_shared_pages, list_container_children, observe_entity,
     resolve_notion_object_path_entries, resolve_page_path_entries,
@@ -314,7 +315,7 @@ impl Connector for NotionConnector {
     }
 
     fn kind(&self) -> ConnectorKind {
-        ConnectorKind("notion")
+        ConnectorKind(NOTION_CONNECTOR_ID)
     }
 
     fn capabilities(&self) -> ConnectorCapabilities {
@@ -450,5 +451,20 @@ impl Connector for NotionConnector {
 
     fn apply_undo(&self, request: ApplyUndoRequest<'_>) -> LocalityResult<ApplyUndoResult> {
         apply_undo(self.api.as_ref(), request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use locality_connector::Connector;
+
+    use super::{NotionConfig, NotionConnector};
+    use crate::oauth::NOTION_CONNECTOR_ID;
+
+    #[test]
+    fn notion_connector_kind_matches_oauth_connector_id() {
+        let connector = NotionConnector::new(NotionConfig::default());
+
+        assert_eq!(connector.kind().0, NOTION_CONNECTOR_ID);
     }
 }

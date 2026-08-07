@@ -1,6 +1,10 @@
 use std::fmt;
 use std::sync::OnceLock;
 
+use locality_auth_core::oauth::{
+    GOOGLE_DOCS_LOCAL_BROKER_SCOPES, GoogleOAuthScopeError as SharedGoogleOAuthScopeError,
+    OAuthConnector, validate_google_oauth_scopes,
+};
 use locality_connector::ConnectorCapabilities;
 use locality_connector::oauth_broker::{
     OAuthBrokerCodeExchange, OAuthBrokerRefresh, OAuthBrokerStart, OAuthBrokerStartResponse,
@@ -11,21 +15,14 @@ use reqwest::blocking::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const GOOGLE_DOCS_CONNECTOR_ID: &str = "google-docs";
+pub const GOOGLE_DOCS_CONNECTOR_ID: &str = OAuthConnector::GoogleDocs.as_str();
 // Cloudflare worker name is still `afs-oauth-broker`; the workers.dev hostname
 // predates the Locality product rename until auth.locality.dev is deployed.
 pub const DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL: &str =
     "https://afs-oauth-broker.saurabh-b07.workers.dev";
 pub const DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI: &str =
-    "http://localhost:8757/oauth/google-docs/callback";
-pub const GOOGLE_DOCS_OAUTH_SCOPES: &[&str] = &[
-    "openid",
-    "email",
-    "profile",
-    "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/drive.metadata",
-];
+    OAuthConnector::GoogleDocs.default_local_callback_uri();
+pub const GOOGLE_DOCS_OAUTH_SCOPES: &[&str] = GOOGLE_DOCS_LOCAL_BROKER_SCOPES;
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
@@ -100,11 +97,21 @@ impl StoredGoogleDocsCredential {
         }
     }
 
-    pub fn refreshed(&self, token: OAuthBrokerToken, acquired_at: u64) -> Self {
+    pub fn refreshed(
+        &self,
+        token: OAuthBrokerToken,
+        acquired_at: u64,
+    ) -> Result<Self, GoogleDocsOAuthScopeError> {
         let expires_at = token
             .expires_in
             .and_then(|expires_in| acquired_at.checked_add(expires_in));
-        Self {
+        let scopes = if token.scopes.is_empty() {
+            self.scopes.clone()
+        } else {
+            validate_google_docs_oauth_scopes(&token.scopes)?;
+            token.scopes
+        };
+        Ok(Self {
             kind: "oauth".to_string(),
             connector: GOOGLE_DOCS_CONNECTOR_ID.to_string(),
             access_token: token.access_token,
@@ -115,23 +122,61 @@ impl StoredGoogleDocsCredential {
             account_label: token.account_label.or_else(|| self.account_label.clone()),
             workspace_id: token.workspace_id.or_else(|| self.workspace_id.clone()),
             workspace_name: token.workspace_name.or_else(|| self.workspace_name.clone()),
-            scopes: if token.scopes.is_empty() {
-                self.scopes.clone()
-            } else {
-                token.scopes
-            },
+            scopes,
             refresh_token_handle: token
                 .refresh_token_handle
                 .or_else(|| self.refresh_token_handle.clone()),
             acquired_at,
             expires_at,
-        }
+        })
     }
 
     pub fn expires_soon(&self, now: u64) -> bool {
         self.expires_at
             .is_some_and(|expires_at| expires_at <= now.saturating_add(60))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoogleDocsOAuthScopeError {
+    MissingRequiredScope(&'static str),
+    UnsupportedScope(String),
+}
+
+impl fmt::Display for GoogleDocsOAuthScopeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingRequiredScope(scope) => write!(
+                f,
+                "Google Docs OAuth broker response missing required Google Docs OAuth scope `{scope}`; reconnect with the default Google Docs OAuth broker configuration"
+            ),
+            Self::UnsupportedScope(scope) => write!(
+                f,
+                "Google Docs OAuth broker returned unsupported Google Docs OAuth scope `{scope}`; reconnect with the default Google Docs OAuth broker configuration"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GoogleDocsOAuthScopeError {}
+
+pub fn validate_google_docs_oauth_scopes(
+    scopes: &[String],
+) -> Result<(), GoogleDocsOAuthScopeError> {
+    validate_google_oauth_scopes(OAuthConnector::GoogleDocs, scopes).map_err(|error| match error {
+        SharedGoogleOAuthScopeError::MissingRequiredScope(scope) => {
+            GoogleDocsOAuthScopeError::MissingRequiredScope(scope)
+        }
+        SharedGoogleOAuthScopeError::UnsupportedScope(scope) => {
+            GoogleDocsOAuthScopeError::UnsupportedScope(scope)
+        }
+        SharedGoogleOAuthScopeError::FullMailboxScope => {
+            unreachable!("full mailbox scope is only special-cased for Gmail")
+        }
+        SharedGoogleOAuthScopeError::UnsupportedConnector => {
+            unreachable!("Google Docs is a supported Google OAuth connector")
+        }
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -225,18 +270,84 @@ mod tests {
     use locality_connector::oauth_broker::OAuthBrokerToken;
 
     use super::{
-        GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, StoredGoogleDocsCredential,
-        google_docs_capabilities_json,
+        DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI, GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES,
+        GoogleDocsOAuthScopeError, StoredGoogleDocsCredential, google_docs_capabilities_json,
+        validate_google_docs_oauth_scopes,
     };
 
     #[test]
-    fn oauth_scopes_include_google_docs_and_workspace_metadata_access() {
-        assert!(GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/documents"));
-        assert!(!GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive"));
-        assert!(
-            GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive.metadata")
+    fn oauth_constants_match_google_docs_broker_contract() {
+        assert_eq!(GOOGLE_DOCS_CONNECTOR_ID, "google-docs");
+        assert_eq!(
+            DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI,
+            "http://localhost:8757/oauth/google-docs/callback"
         );
-        assert!(GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive.file"));
+        assert_eq!(
+            GOOGLE_DOCS_OAUTH_SCOPES,
+            &[
+                "openid",
+                "email",
+                "profile",
+                "https://www.googleapis.com/auth/documents",
+                "https://www.googleapis.com/auth/drive.file",
+                "https://www.googleapis.com/auth/drive.metadata",
+            ]
+        );
+    }
+
+    #[test]
+    fn google_docs_scope_validation_requires_docs_and_drive_scopes() {
+        let scopes = GOOGLE_DOCS_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>();
+
+        validate_google_docs_oauth_scopes(&scopes).expect("valid Google Docs scopes");
+
+        let missing_drive_metadata = GOOGLE_DOCS_OAUTH_SCOPES
+            .iter()
+            .filter(|scope| **scope != "https://www.googleapis.com/auth/drive.metadata")
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>();
+
+        let error = validate_google_docs_oauth_scopes(&missing_drive_metadata)
+            .expect_err("missing drive.metadata scope");
+
+        assert_eq!(
+            error,
+            GoogleDocsOAuthScopeError::MissingRequiredScope(
+                "https://www.googleapis.com/auth/drive.metadata"
+            )
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("missing required Google Docs OAuth scope")
+        );
+    }
+
+    #[test]
+    fn google_docs_scope_validation_rejects_unsupported_extra_scope() {
+        let mut scopes = GOOGLE_DOCS_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>();
+        scopes.push("https://www.googleapis.com/auth/calendar.events".to_string());
+
+        let error = validate_google_docs_oauth_scopes(&scopes)
+            .expect_err("unsupported Google Calendar scope");
+
+        assert_eq!(
+            error,
+            GoogleDocsOAuthScopeError::UnsupportedScope(
+                "https://www.googleapis.com/auth/calendar.events".to_string()
+            )
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Google Docs OAuth scope")
+        );
     }
 
     #[test]
@@ -304,25 +415,80 @@ mod tests {
             100,
         );
 
-        let refreshed = stored.refreshed(
-            OAuthBrokerToken {
-                access_token: "new-access-token".to_string(),
-                token_type: Some("Bearer".to_string()),
-                expires_in: Some(7200),
-                refresh_token_handle: Some("handle-2".to_string()),
-                account_id: None,
-                account_label: None,
-                workspace_id: None,
-                workspace_name: None,
-                scopes: vec![],
-            },
-            200,
-        );
+        let refreshed = stored
+            .refreshed(
+                OAuthBrokerToken {
+                    access_token: "new-access-token".to_string(),
+                    token_type: Some("Bearer".to_string()),
+                    expires_in: Some(7200),
+                    refresh_token_handle: Some("handle-2".to_string()),
+                    account_id: None,
+                    account_label: None,
+                    workspace_id: None,
+                    workspace_name: None,
+                    scopes: vec![],
+                },
+                200,
+            )
+            .expect("refresh with omitted scopes");
 
         assert_eq!(refreshed.access_token, "new-access-token");
         assert_eq!(refreshed.refresh_token_handle.as_deref(), Some("handle-2"));
         assert_eq!(refreshed.account_label.as_deref(), Some("user@example.com"));
         assert_eq!(refreshed.scopes, vec!["openid".to_string()]);
         assert_eq!(refreshed.expires_at, Some(7400));
+    }
+
+    #[test]
+    fn refreshed_broker_credential_rejects_invalid_non_empty_scopes() {
+        let stored = StoredGoogleDocsCredential::from_broker_token(
+            OAuthBrokerToken {
+                access_token: "access-token".to_string(),
+                token_type: Some("Bearer".to_string()),
+                expires_in: Some(3600),
+                refresh_token_handle: Some("handle-1".to_string()),
+                account_id: Some("acct-1".to_string()),
+                account_label: Some("user@example.com".to_string()),
+                workspace_id: Some("google-drive".to_string()),
+                workspace_name: Some("Google Drive".to_string()),
+                scopes: GOOGLE_DOCS_OAUTH_SCOPES
+                    .iter()
+                    .map(|scope| scope.to_string())
+                    .collect(),
+            },
+            "client-id".to_string(),
+            "https://auth.example.test".to_string(),
+            100,
+        );
+
+        let mut refreshed_scopes = GOOGLE_DOCS_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>();
+        refreshed_scopes.push("https://www.googleapis.com/auth/calendar.events".to_string());
+
+        let error = stored
+            .refreshed(
+                OAuthBrokerToken {
+                    access_token: "new-access-token".to_string(),
+                    token_type: Some("Bearer".to_string()),
+                    expires_in: Some(7200),
+                    refresh_token_handle: Some("handle-2".to_string()),
+                    account_id: None,
+                    account_label: None,
+                    workspace_id: None,
+                    workspace_name: None,
+                    scopes: refreshed_scopes,
+                },
+                200,
+            )
+            .expect_err("unsupported refreshed scope");
+
+        assert_eq!(
+            error,
+            GoogleDocsOAuthScopeError::UnsupportedScope(
+                "https://www.googleapis.com/auth/calendar.events".to_string()
+            )
+        );
     }
 }

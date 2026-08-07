@@ -11,22 +11,28 @@ only performs the confidential token exchange and refresh calls.
 ## Flow
 
 ```text
-loc CLI -> broker /start
-loc CLI <- authorization_url, state, signed session
-loc CLI -> browser -> provider OAuth consent
-provider -> localhost callback on the user's machine
-loc CLI -> broker /exchange with code, state, session, redirect_uri
-broker -> provider token endpoint with client_secret
+loc CLI -> broker /start with localhost client redirect_uri
+broker -> loc CLI with authorization_url, session, state, provider_redirect_uri
+browser -> provider consent using provider_redirect_uri=https://<broker>/v1/oauth/<connector>/callback
+provider -> broker HTTPS callback with code/state
+broker -> localhost client redirect_uri with code/state
+loc CLI -> broker /exchange with code, state, session, and localhost client redirect_uri
+broker -> provider token endpoint with provider_redirect_uri and client_secret
 broker -> loc CLI with access token and refresh handle
-```
 
-Refresh is similarly narrow:
-
-```text
+later:
 loc CLI -> broker /refresh with refresh_token_handle
 broker -> provider token endpoint with client_secret
 broker -> loc CLI with new access token and new refresh handle
 ```
+
+Provider OAuth apps should register only the broker HTTPS callback URLs, such as
+`https://oauth.locality.example/v1/oauth/notion/callback`. The localhost URL is
+only the desktop completion URL used after the broker receives and verifies the
+provider callback.
+
+The current stateless broker uses the signed session token as the OAuth `state`,
+so `session` and `state` match in `/start` and `/exchange` payloads.
 
 The broker does not persist page content or tokens. In `handle` mode, it returns
 an encrypted opaque refresh handle instead of the raw provider refresh token.
@@ -51,8 +57,9 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://api.notion.com/v1/oauth/authorize?...",
   "redirect_uri": "http://localhost:8757/oauth/notion/callback",
+  "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/notion/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "expires_in": 600
 }
 ```
@@ -64,7 +71,7 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "code": "provider-authorization-code",
   "redirect_uri": "http://localhost:8757/oauth/notion/callback"
 }
@@ -101,8 +108,9 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
   "redirect_uri": "http://localhost:8757/oauth/google-docs/callback",
+  "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/google-docs/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "expires_in": 600
 }
 ```
@@ -114,7 +122,7 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "code": "provider-authorization-code",
   "redirect_uri": "http://localhost:8757/oauth/google-docs/callback"
 }
@@ -157,8 +165,9 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
   "redirect_uri": "http://localhost:8757/oauth/google-calendar/callback",
+  "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/google-calendar/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "expires_in": 600
 }
 ```
@@ -170,7 +179,7 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "code": "provider-authorization-code",
   "redirect_uri": "http://localhost:8757/oauth/google-calendar/callback"
 }
@@ -209,8 +218,9 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
   "redirect_uri": "http://localhost:8757/oauth/gmail/callback",
+  "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/gmail/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "expires_in": 600
 }
 ```
@@ -222,7 +232,7 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "code": "provider-authorization-code",
   "redirect_uri": "http://localhost:8757/oauth/gmail/callback"
 }
@@ -260,8 +270,9 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://slack.com/oauth/v2/authorize?...",
   "redirect_uri": "http://localhost:8757/oauth/slack/callback",
+  "provider_redirect_uri": "https://oauth.locality.example/v1/oauth/slack/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "expires_in": 600
 }
 ```
@@ -273,7 +284,7 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-session",
   "code": "provider-authorization-code",
   "redirect_uri": "http://localhost:8757/oauth/slack/callback"
 }
@@ -306,6 +317,14 @@ Run checks:
 ```sh
 npm run check
 ```
+
+## Required Configuration
+
+- `LOCALITY_BROKER_PUBLIC_BASE_URL`: HTTPS public origin for the broker, for
+  example `https://oauth.locality.example`. The broker uses this value to build
+  provider callback URLs returned as `provider_redirect_uri`. `/start` endpoints
+  fail with `broker_config_error` until it is configured. See
+  [`docs/deployment.md`](docs/deployment.md) for Cloudflare Workers setup.
 
 ## Required Secrets
 
