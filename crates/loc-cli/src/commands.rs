@@ -234,7 +234,10 @@ enum LocalityCommand {
         #[command(subcommand)]
         command: SandboxCommand,
     },
-    #[command(about = "Search local mount metadata without contacting remote sources")]
+    #[command(
+        about = "Search local mount metadata without contacting remote sources",
+        hide = true
+    )]
     Search(SearchArgs),
     #[command(about = "Locate a mounted Notion page or database and print its local path")]
     Locate(LocateArgs),
@@ -11963,6 +11966,18 @@ mod tests {
         assert!(help.contains("Usage: loc push"));
         assert!(help.contains("Push local changes"));
         assert!(!help.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn top_level_help_hides_search_command() {
+        let help = clap_help(vec!["--help"]);
+
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with("search ")),
+            "top-level help should not list the search command:\n{help}"
+        );
     }
 
     #[test]
