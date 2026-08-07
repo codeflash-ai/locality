@@ -38,7 +38,11 @@ crate cannot ship by itself.
    shared ID/scope/callback profile instead of duplicating connector auth
    constants. Public broker routing and configuration must stay aligned with the
    shared profile through generated metadata, drift tests, or explicit matching
-   updates.
+   updates. Every OAuth profile must also preserve its connector authority mode:
+   `LocalBrokered` means local direct authority after credential handoff, while
+   `HostedAdmin` means backend-owned hosted hydration. A backend-brokered OAuth
+   callback alone must not imply hosted credential retention or hosted source
+   replication for desktop users.
 8. Add the desktop source ID, setup/auth classification, display metadata, and
    `apps/desktop/src/assets/connectors/<id>.svg` icon. Add OAuth-service routing
    only when the connector actually uses the public OAuth broker.
@@ -117,6 +121,12 @@ OpenTofu stay in the private repository. A hosted adapter may consume an exact
 public connector revision, but the public crates must not depend on private
 hosted code. Do not use this manifest branch to enable currently unreachable
 portable/batch paths or introduce a dynamic ABI/plugin loader.
+
+OAuth brokering and data authority are separate decisions. Locality may use a
+backend callback to complete provider OAuth for a desktop connector, but the
+credential is handed back to the local host and provider data stays outside the
+hosted backend unless an administrator explicitly creates a hosted-managed
+connection.
 
 ## Minimal read-only example
 

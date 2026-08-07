@@ -2303,6 +2303,7 @@ name = "locality-auth-core"
 version = "0.3.8"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -108,6 +108,28 @@ fn strict_parser_rejects_unknown_fields_and_enums() {
 }
 
 #[test]
+fn registry_v1_rejects_connector_authority_fields() {
+    let mut authority_field = registry_value();
+    authority_field["connectors"][0]["authority_mode"] = json!("hosted_managed");
+    assert!(
+        ConnectorRegistry::parse(&authority_field.to_string())
+            .expect_err("registry v1 must not accept connector authority")
+            .to_string()
+            .contains("unknown field")
+    );
+
+    let mut profile_authority_field = registry_value();
+    profile_authority_field["connectors"][0]["profiles"][0]["authority_mode"] =
+        json!("local_direct");
+    assert!(
+        ConnectorRegistry::parse(&profile_authority_field.to_string())
+            .expect_err("registry v1 profiles must not accept connector authority")
+            .to_string()
+            .contains("unknown field")
+    );
+}
+
+#[test]
 fn validation_rejects_duplicate_defaults_and_missing_default_profile() {
     let mut duplicate = registry_value();
     duplicate["connectors"][1]["default_connection_id"] = json!("notion-default");

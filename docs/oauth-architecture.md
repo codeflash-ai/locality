@@ -8,8 +8,20 @@ Locality has two OAuth hosts:
   callbacks, Postgres finalization, and managed secret storage.
 
 The shared layer is `locality-auth-core`. It owns connector IDs, callback paths,
-and scope profiles. It does not own token storage, tenant authorization, hosted
-source finalization, or background job scheduling.
+authority modes, and scope profiles. It does not own token storage, tenant
+authorization, hosted source finalization, or background job scheduling.
+
+## Public Authority Contract
+
+`locality-auth-core` exposes the public connector authority vocabulary:
+`local_direct` and `hosted_managed`. `local_direct` means the local Locality
+host resolves credentials and calls the provider directly. `hosted_managed`
+means a hosted/admin runtime owns managed credential and provider access.
+
+Desktop-originated OAuth uses the `LocalBrokered` host mode and maps to
+`local_direct`, even when the public OAuth broker helps complete the provider
+authorization. Hosted/admin OAuth uses the `HostedAdmin` host mode and maps to
+`hosted_managed`; it must not be silently treated as local direct authority.
 
 ## Public Brokered Desktop Flow
 
