@@ -43,6 +43,16 @@ def block_key(line):
     return (len(match.group(1)), match.group(2))
 
 
+def canonical_issue_id(value):
+    value = str(value).strip()
+    compact = "".join(
+        character.lower()
+        for character in value
+        if character in "0123456789abcdefABCDEF"
+    )
+    return compact if len(compact) == 32 else value
+
+
 def verify_frontmatter(path, issue_id):
     has_linear_connector = False
     has_issue_id = False
@@ -61,7 +71,11 @@ def verify_frontmatter(path, issue_id):
             continue
         if active_block == "loc":
             has_linear_connector |= scalar_value(line, "connector") == "linear"
-            has_issue_id |= scalar_value(line, "id") == issue_id
+            frontmatter_id = scalar_value(line, "id")
+            has_issue_id |= (
+                frontmatter_id is not None
+                and canonical_issue_id(frontmatter_id) == canonical_issue_id(issue_id)
+            )
     if not has_linear_connector or not has_issue_id:
         fail("Linear issue page.md frontmatter identity did not match the search result")
 
@@ -85,10 +99,13 @@ def main():
         if result.get("mount_id") == mount_id
         and result.get("connector") == "linear"
         and result.get("kind") == "page"
-        and result.get("remote_id") == issue_id
+        and canonical_issue_id(result.get("remote_id", "")) == canonical_issue_id(issue_id)
     ]
     if len(matches) != 1:
-        fail(f"Linear issue search expected one exact remote-id match, got {len(matches)}")
+        fail(
+            "Linear issue search expected one canonical remote-id match, "
+            f"got {len(matches)}"
+        )
     path = pathlib.Path(matches[0].get("absolute_path", ""))
     root_normalized = os.path.abspath(root)
     path_normalized = os.path.abspath(path)

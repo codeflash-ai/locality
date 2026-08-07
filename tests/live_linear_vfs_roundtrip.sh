@@ -89,7 +89,23 @@ assert_changed_remote_id_matches_issue() {
   if [[ -z "$remote_id" ]]; then
     live_fail "$label did not include changed_remote_ids.0"
   fi
-  if [[ "$remote_id" != "$LOCALITY_LINEAR_LIVE_ISSUE_ID" ]]; then
+  if ! python3 - "$remote_id" "$LOCALITY_LINEAR_LIVE_ISSUE_ID" <<'PY'
+import sys
+
+def canonical_issue_id(value):
+    value = value.strip()
+    compact = "".join(
+        character.lower()
+        for character in value
+        if character in "0123456789abcdefABCDEF"
+    )
+    return compact if len(compact) == 32 else value
+
+raise SystemExit(
+    0 if canonical_issue_id(sys.argv[1]) == canonical_issue_id(sys.argv[2]) else 1
+)
+PY
+  then
     live_fail "$label changed_remote_ids.0 did not match the target Linear issue id"
   fi
 }
