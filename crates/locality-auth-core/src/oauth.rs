@@ -83,6 +83,10 @@ pub const GOOGLE_OAUTH_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oaut
 pub const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
 pub const GOOGLE_IDENTITY_SCOPES: &[&str] = &["openid", "email", "profile"];
+pub const GOOGLE_CANONICAL_IDENTITY_SCOPES: &[&str] = &[
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+];
 
 pub const NOTION_LOCAL_BROKER_SCOPES: &[&str] = &[];
 pub const NOTION_HOSTED_ADMIN_SCOPES: &[&str] = &[];
@@ -342,7 +346,11 @@ pub fn validate_google_oauth_scopes(
     }
 
     for scope in granted {
-        if !allowed_scopes.iter().any(|allowed| scope == allowed) {
+        if !allowed_scopes.iter().any(|allowed| scope == allowed)
+            && !GOOGLE_CANONICAL_IDENTITY_SCOPES
+                .iter()
+                .any(|allowed| scope == allowed)
+        {
             return Err(GoogleOAuthScopeError::UnsupportedScope(scope.clone()));
         }
     }
@@ -810,6 +818,55 @@ mod tests {
             Err(GoogleOAuthScopeError::MissingRequiredScope(
                 "https://www.googleapis.com/auth/calendar.events"
             ))
+        );
+    }
+
+    #[test]
+    fn google_scope_validation_allows_canonical_identity_scope_aliases() {
+        let docs = [
+            "openid",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+            "https://www.googleapis.com/auth/documents",
+            "https://www.googleapis.com/auth/drive.file",
+            "https://www.googleapis.com/auth/drive.metadata",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            validate_google_oauth_scopes(OAuthConnector::GoogleDocs, &docs),
+            Ok(())
+        );
+
+        let calendar = [
+            "openid",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+            "https://www.googleapis.com/auth/calendar.events",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            validate_google_oauth_scopes(OAuthConnector::GoogleCalendar, &calendar),
+            Ok(())
+        );
+
+        let gmail = [
+            "openid",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.compose",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            validate_google_oauth_scopes(OAuthConnector::Gmail, &gmail),
+            Ok(())
         );
     }
 

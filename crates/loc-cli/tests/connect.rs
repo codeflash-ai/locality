@@ -330,6 +330,45 @@ fn connect_google_docs_broker_oauth_stores_refresh_handle_without_secrets() {
 }
 
 #[test]
+fn connect_google_docs_broker_oauth_accepts_google_identity_scope_aliases() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let scopes = vec![
+        "openid".to_string(),
+        "https://www.googleapis.com/auth/userinfo.email".to_string(),
+        "https://www.googleapis.com/auth/userinfo.profile".to_string(),
+        "https://www.googleapis.com/auth/documents".to_string(),
+        "https://www.googleapis.com/auth/drive.file".to_string(),
+        "https://www.googleapis.com/auth/drive.metadata".to_string(),
+    ];
+    let exchange = ScopedFakeGoogleDocsBrokerOAuthExchange {
+        scopes: scopes.clone(),
+    };
+
+    run_connect_google_docs_broker_oauth(
+        &mut store,
+        &credentials,
+        GoogleDocsBrokerOAuthConnectOptions {
+            connection_id: Some(ConnectionId::new("docs-work")),
+            broker_url: "https://auth.example.test".to_string(),
+            client_id: "google-client-id".to_string(),
+            session: "broker-session".to_string(),
+            state: "state-1".to_string(),
+            code: "oauth-code".to_string(),
+            redirect_uri: "http://localhost:8757/oauth/google-docs/callback".to_string(),
+        },
+        &exchange,
+    )
+    .expect("connect google docs oauth");
+
+    let secret = credentials
+        .get("connection:docs-work")
+        .expect("credential saved");
+    let stored = serde_json::from_str::<StoredGoogleDocsCredential>(&secret).expect("stored oauth");
+    assert_eq!(stored.scopes, scopes);
+}
+
+#[test]
 fn connect_google_docs_broker_oauth_rejects_unsupported_scope_before_persistence() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
@@ -477,6 +516,36 @@ fn connect_google_calendar_broker_oauth_stores_refresh_handle_without_secrets() 
 }
 
 #[test]
+fn connect_google_calendar_broker_oauth_accepts_google_identity_scope_aliases() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let scopes = vec![
+        "openid".to_string(),
+        "https://www.googleapis.com/auth/userinfo.email".to_string(),
+        "https://www.googleapis.com/auth/userinfo.profile".to_string(),
+        "https://www.googleapis.com/auth/calendar.events".to_string(),
+    ];
+    let exchange = ScopedFakeGoogleCalendarBrokerOAuthExchange {
+        scopes: scopes.clone(),
+    };
+
+    run_connect_google_calendar_broker_oauth(
+        &mut store,
+        &credentials,
+        google_calendar_connect_options(),
+        &exchange,
+    )
+    .expect("connect google calendar oauth");
+
+    let secret = credentials
+        .get("connection:google-calendar-default")
+        .expect("credential saved");
+    let stored =
+        serde_json::from_str::<StoredGoogleCalendarCredential>(&secret).expect("stored oauth");
+    assert_eq!(stored.scopes, scopes);
+}
+
+#[test]
 fn connect_slack_broker_oauth_stores_refresh_handle_without_secrets() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
@@ -595,6 +664,31 @@ fn connect_gmail_broker_oauth_accepts_google_token_scope_without_identity_scopes
         .filter(|scope| !matches!(**scope, "openid" | "email" | "profile"))
         .map(|scope| scope.to_string())
         .collect::<Vec<_>>();
+    let exchange = ScopedFakeGmailBrokerOAuthExchange {
+        scopes: scopes.clone(),
+    };
+
+    run_connect_gmail_broker_oauth(&mut store, &credentials, gmail_connect_options(), &exchange)
+        .expect("connect gmail oauth");
+
+    let secret = credentials
+        .get("connection:gmail-default")
+        .expect("credential saved");
+    let stored = serde_json::from_str::<StoredGmailCredential>(&secret).expect("stored oauth");
+    assert_eq!(stored.scopes, scopes);
+}
+
+#[test]
+fn connect_gmail_broker_oauth_accepts_google_identity_scope_aliases() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let scopes = vec![
+        "openid".to_string(),
+        "https://www.googleapis.com/auth/userinfo.email".to_string(),
+        "https://www.googleapis.com/auth/userinfo.profile".to_string(),
+        "https://www.googleapis.com/auth/gmail.readonly".to_string(),
+        "https://www.googleapis.com/auth/gmail.compose".to_string(),
+    ];
     let exchange = ScopedFakeGmailBrokerOAuthExchange {
         scopes: scopes.clone(),
     };
