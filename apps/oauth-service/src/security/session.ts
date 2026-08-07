@@ -2,7 +2,7 @@ import { badRequest, unauthorized } from "../http/errors";
 import type { ConnectorId } from "../types";
 import { constantTimeEqual, hmacSha256Base64Url, parseUtf8Base64Url, utf8Base64Url } from "./crypto";
 
-export interface OAuthSessionPayload {
+export interface OAuthSessionPayloadV1 {
   v: 1;
   connector: ConnectorId;
   state: string;
@@ -11,6 +11,19 @@ export interface OAuthSessionPayload {
   exp: number;
   nonce: string;
 }
+
+export interface OAuthSessionPayloadV2 {
+  v: 2;
+  connector: ConnectorId;
+  state_nonce: string;
+  client_redirect_uri: string;
+  provider_redirect_uri: string;
+  iat: number;
+  exp: number;
+  nonce: string;
+}
+
+export type OAuthSessionPayload = OAuthSessionPayloadV1 | OAuthSessionPayloadV2;
 
 export async function signSession(payload: OAuthSessionPayload, secret: string): Promise<string> {
   const body = utf8Base64Url(JSON.stringify(payload));
@@ -51,17 +64,35 @@ function isOAuthSessionPayload(value: unknown): value is OAuthSessionPayload {
     return false;
   }
   const payload = value as Partial<OAuthSessionPayload>;
-  return (
-    payload.v === 1 &&
-    (payload.connector === "notion" ||
-      payload.connector === "google-docs" ||
-      payload.connector === "google-calendar" ||
-      payload.connector === "gmail" ||
-      payload.connector === "slack") &&
-    typeof payload.state === "string" &&
-    typeof payload.redirect_uri === "string" &&
+  const base =
+    isConnector(payload.connector) &&
     typeof payload.iat === "number" &&
     typeof payload.exp === "number" &&
-    typeof payload.nonce === "string"
+    typeof payload.nonce === "string";
+  if (!base) {
+    return false;
+  }
+  if (payload.v === 1) {
+    const legacy = payload as Partial<OAuthSessionPayloadV1>;
+    return typeof legacy.state === "string" && typeof legacy.redirect_uri === "string";
+  }
+  if (payload.v === 2) {
+    const current = payload as Partial<OAuthSessionPayloadV2>;
+    return (
+      typeof current.state_nonce === "string" &&
+      typeof current.client_redirect_uri === "string" &&
+      typeof current.provider_redirect_uri === "string"
+    );
+  }
+  return false;
+}
+
+function isConnector(value: unknown): value is ConnectorId {
+  return (
+    value === "notion" ||
+    value === "google-docs" ||
+    value === "google-calendar" ||
+    value === "gmail" ||
+    value === "slack"
   );
 }

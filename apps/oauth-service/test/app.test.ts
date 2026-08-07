@@ -8,6 +8,7 @@ interface StartResponse {
   client_id: string;
   authorization_url: string;
   redirect_uri: string;
+  provider_redirect_uri: string;
   session: string;
   state: string;
 }
@@ -34,6 +35,7 @@ const env: BrokerEnv = {
   LOCALITY_BROKER_SESSION_SECRET: "test-session-secret-with-enough-entropy",
   LOCALITY_REFRESH_HANDLE_KEY: "test-refresh-handle-key-with-enough-entropy",
   LOCALITY_TOKEN_MODE: "handle",
+  LOCALITY_BROKER_PUBLIC_BASE_URL: "https://oauth.locality.test",
   LOCALITY_NOTION_CLIENT_ID: "notion-client-id",
   LOCALITY_NOTION_CLIENT_SECRET: "notion-client-secret",
   LOCALITY_NOTION_API_BASE_URL: "https://notion.example.test",
@@ -118,6 +120,21 @@ describe("auth broker", () => {
     expect(body.state).toBeTruthy();
   });
 
+  it("uses the HTTPS broker callback as the provider redirect URI", async () => {
+    const response = await app.request("/v1/oauth/notion/start", { method: "POST" }, env);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as StartResponse & { provider_redirect_uri: string };
+    const authorizationUrl = new URL(body.authorization_url);
+
+    expect(body.redirect_uri).toBe("http://localhost:8757/oauth/notion/callback");
+    expect(body.provider_redirect_uri).toBe("https://oauth.locality.test/v1/oauth/notion/callback");
+    expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(
+      "https://oauth.locality.test/v1/oauth/notion/callback"
+    );
+    expect(authorizationUrl.searchParams.get("state")).toBe(body.state);
+    expect(body.state).toBe(body.session);
+  });
+
   it("rejects unconfigured redirect URIs", async () => {
     const response = await app.request(
       "/v1/oauth/notion/start",
@@ -177,6 +194,42 @@ describe("auth broker", () => {
         })
       })
     );
+    const requestBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+    expect(requestBody.redirect_uri).toBe("https://oauth.locality.test/v1/oauth/notion/callback");
+  });
+
+  it("relays the provider callback back to the localhost client redirect", async () => {
+    const start = await startSession();
+    const callback = await app.request(
+      `/v1/oauth/notion/callback?code=provider-code&state=${encodeURIComponent(start.state)}`,
+      { method: "GET" },
+      env
+    );
+
+    expect(callback.status).toBe(302);
+    expect(callback.headers.get("cache-control")).toBe("no-store");
+    expect(callback.headers.get("referrer-policy")).toBe("no-referrer");
+    const location = callback.headers.get("location");
+    expect(location).toBeTruthy();
+    const redirected = new URL(location!);
+    expect(redirected.origin).toBe("http://localhost:8757");
+    expect(redirected.pathname).toBe("/oauth/notion/callback");
+    expect(redirected.searchParams.get("code")).toBe("provider-code");
+    expect(redirected.searchParams.get("state")).toBe(start.state);
+  });
+
+  it("rejects a callback state signed for another connector", async () => {
+    const start = await startGmailSession();
+    const callback = await app.request(
+      `/v1/oauth/notion/callback?code=provider-code&state=${encodeURIComponent(start.state)}`,
+      { method: "GET" },
+      env
+    );
+
+    expect(callback.status).toBe(400);
+    await expect(callback.json()).resolves.toMatchObject({
+      error: { code: "oauth_session_mismatch" }
+    });
   });
 
   it("refreshes through an opaque refresh handle", async () => {
@@ -346,6 +399,7 @@ describe("auth broker", () => {
     expect(requestBody.get("client_id")).toBe("google-client-id");
     expect(requestBody.get("client_secret")).toBe("google-client-secret");
     expect(requestBody.get("grant_type")).toBe("authorization_code");
+    expect(requestBody.get("redirect_uri")).toBe("https://oauth.locality.test/v1/oauth/google-docs/callback");
   });
 
   it("refreshes Google Docs credentials through an opaque refresh handle", async () => {
@@ -416,7 +470,7 @@ describe("auth broker", () => {
     expect(authorizationUrl.searchParams.get("client_id")).toBe("google-client-id");
     expect(authorizationUrl.searchParams.get("response_type")).toBe("code");
     expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(
-      "http://localhost:8757/oauth/google-calendar/callback"
+      "https://oauth.locality.test/v1/oauth/google-calendar/callback"
     );
     expect(authorizationUrl.searchParams.get("scope")?.split(" ").sort()).toEqual(
       [
@@ -430,6 +484,7 @@ describe("auth broker", () => {
     expect(authorizationUrl.searchParams.get("prompt")).toBe("consent");
     expect(authorizationUrl.searchParams.get("include_granted_scopes")).toBeNull();
     expect(body.redirect_uri).toBe("http://localhost:8757/oauth/google-calendar/callback");
+    expect(body.provider_redirect_uri).toBe("https://oauth.locality.test/v1/oauth/google-calendar/callback");
     expect(body.session).toBeTruthy();
     expect(body.state).toBeTruthy();
   });
@@ -488,7 +543,7 @@ describe("auth broker", () => {
     expect(requestBody.get("client_secret")).toBe("google-client-secret");
     expect(requestBody.get("grant_type")).toBe("authorization_code");
     expect(requestBody.get("code")).toBe("authorization-code");
-    expect(requestBody.get("redirect_uri")).toBe("http://localhost:8757/oauth/google-calendar/callback");
+    expect(requestBody.get("redirect_uri")).toBe("https://oauth.locality.test/v1/oauth/google-calendar/callback");
   });
 
   it("creates a Gmail OAuth session and authorization URL", async () => {
@@ -501,7 +556,9 @@ describe("auth broker", () => {
     expect(`${authorizationUrl.origin}${authorizationUrl.pathname}`).toBe("https://accounts.example.test/o/oauth2/v2/auth");
     expect(authorizationUrl.searchParams.get("client_id")).toBe("google-client-id");
     expect(authorizationUrl.searchParams.get("response_type")).toBe("code");
-    expect(authorizationUrl.searchParams.get("redirect_uri")).toBe("http://localhost:8757/oauth/gmail/callback");
+    expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(
+      "https://oauth.locality.test/v1/oauth/gmail/callback"
+    );
     expect(authorizationUrl.searchParams.get("scope")?.split(" ").sort()).toEqual(
       [
         "openid",
@@ -516,6 +573,7 @@ describe("auth broker", () => {
     expect(authorizationUrl.searchParams.get("prompt")).toBe("consent");
     expect(authorizationUrl.searchParams.get("include_granted_scopes")).toBeNull();
     expect(body.redirect_uri).toBe("http://localhost:8757/oauth/gmail/callback");
+    expect(body.provider_redirect_uri).toBe("https://oauth.locality.test/v1/oauth/gmail/callback");
     expect(body.session).toBeTruthy();
     expect(body.state).toBeTruthy();
   });
@@ -573,7 +631,7 @@ describe("auth broker", () => {
     expect(requestBody.get("client_secret")).toBe("google-client-secret");
     expect(requestBody.get("grant_type")).toBe("authorization_code");
     expect(requestBody.get("code")).toBe("authorization-code");
-    expect(requestBody.get("redirect_uri")).toBe("http://localhost:8757/oauth/gmail/callback");
+    expect(requestBody.get("redirect_uri")).toBe("https://oauth.locality.test/v1/oauth/gmail/callback");
   });
 
   it("refreshes Gmail credentials through an opaque refresh handle", async () => {
@@ -685,7 +743,9 @@ describe("auth broker", () => {
       "https://slack-auth.example.test/oauth/v2/authorize"
     );
     expect(authorizationUrl.searchParams.get("client_id")).toBe("slack-client-id");
-    expect(authorizationUrl.searchParams.get("redirect_uri")).toBe("http://localhost:8757/oauth/slack/callback");
+    expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(
+      "https://oauth.locality.test/v1/oauth/slack/callback"
+    );
     expect(authorizationUrl.searchParams.get("state")).toBe(body.state);
     const scopes = authorizationUrl.searchParams.get("scope")?.split(",") ?? [];
     expect(scopes).toContain("channels:history");
@@ -693,6 +753,7 @@ describe("auth broker", () => {
     expect(scopes).toContain("files:read");
     expect(scopes).not.toContain("chat:write");
     expect(body.redirect_uri).toBe("http://localhost:8757/oauth/slack/callback");
+    expect(body.provider_redirect_uri).toBe("https://oauth.locality.test/v1/oauth/slack/callback");
     expect(body.session).toBeTruthy();
     expect(body.state).toBeTruthy();
   });
@@ -773,7 +834,7 @@ describe("auth broker", () => {
     expect(requestBody.get("client_secret")).toBe("slack-client-secret");
     expect(requestBody.get("grant_type")).toBe("authorization_code");
     expect(requestBody.get("code")).toBe("authorization-code");
-    expect(requestBody.get("redirect_uri")).toBe("http://localhost:8757/oauth/slack/callback");
+    expect(requestBody.get("redirect_uri")).toBe("https://oauth.locality.test/v1/oauth/slack/callback");
   });
 
   it("does not expose raw Slack OAuth error text to callers", async () => {

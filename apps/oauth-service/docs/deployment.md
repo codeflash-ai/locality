@@ -18,47 +18,69 @@ wrangler secret put LOCALITY_GOOGLE_CLIENT_ID
 wrangler secret put LOCALITY_GOOGLE_CLIENT_SECRET
 wrangler secret put LOCALITY_SLACK_CLIENT_ID
 wrangler secret put LOCALITY_SLACK_CLIENT_SECRET
-wrangler deploy
 ```
 
-Configure the Notion OAuth integration with the exact localhost callback used by
-Locality:
+Before deploying the double-redirect broker, configure the required public base
+URL:
+
+- `LOCALITY_BROKER_PUBLIC_BASE_URL`: HTTPS public origin for the broker, for
+  example `https://oauth.locality.example`. Provider OAuth apps must register
+  callback URLs under this origin:
+  - `/v1/oauth/notion/callback`
+  - `/v1/oauth/google-docs/callback`
+  - `/v1/oauth/google-calendar/callback`
+  - `/v1/oauth/gmail/callback`
+  - `/v1/oauth/slack/callback`
+
+Configure it as a non-secret Worker variable, either in the Cloudflare dashboard
+or in `wrangler.toml`:
+
+```toml
+[vars]
+LOCALITY_BROKER_PUBLIC_BASE_URL = "https://oauth.locality.example"
+```
+
+Broker `/start` endpoints fail with `broker_config_error` until
+`LOCALITY_BROKER_PUBLIC_BASE_URL` is configured.
+
+Configure the Notion OAuth integration with the broker HTTPS callback:
 
 ```text
-http://localhost:8757/oauth/notion/callback
-http://127.0.0.1:8757/oauth/notion/callback
+https://oauth.locality.example/v1/oauth/notion/callback
 ```
 
-Configure one Google OAuth client with the exact localhost callbacks used by
+Configure one Google OAuth client with the broker HTTPS callbacks used by
 Locality for Google Docs, Google Calendar, and Gmail:
 
 ```text
-http://localhost:8757/oauth/google-docs/callback
-http://127.0.0.1:8757/oauth/google-docs/callback
-http://localhost:8757/oauth/google-calendar/callback
-http://127.0.0.1:8757/oauth/google-calendar/callback
-http://localhost:8757/oauth/gmail/callback
-http://127.0.0.1:8757/oauth/gmail/callback
+https://oauth.locality.example/v1/oauth/google-docs/callback
+https://oauth.locality.example/v1/oauth/google-calendar/callback
+https://oauth.locality.example/v1/oauth/gmail/callback
 ```
 
-Configure the Slack OAuth app with the exact localhost callbacks used by
-Locality:
+Configure the Slack OAuth app with the broker HTTPS callback:
 
 ```text
-http://localhost:8757/oauth/slack/callback
-http://127.0.0.1:8757/oauth/slack/callback
+https://oauth.locality.example/v1/oauth/slack/callback
+```
+
+After the secrets, `LOCALITY_BROKER_PUBLIC_BASE_URL`, and provider callbacks are
+configured, deploy:
+
+```sh
+wrangler deploy
 ```
 
 Use a stable production URL such as:
 
 ```text
-https://auth.locality.dev
+https://oauth.locality.example
 ```
 
 The Locality client should have:
 
 ```text
-LOCALITY_AUTH_BROKER_URL=https://auth.locality.dev
+LOCALITY_AUTH_BROKER_URL=https://oauth.locality.example
 LOCALITY_NOTION_OAUTH_CLIENT_ID=<public client id>
 ```
 
@@ -68,7 +90,8 @@ The client ID may also be fetched from `/v1/oauth/notion/start`,
 binary is fine because it is not confidential. The three Google start endpoints
 return the same shared Google OAuth client ID.
 
-Optional broker environment overrides for connector local testing:
+Optional broker environment overrides for connector local completion URI
+allowlist testing:
 
 ```text
 LOCALITY_GOOGLE_CALENDAR_REDIRECT_URIS=http://localhost:8757/oauth/google-calendar/callback,http://127.0.0.1:8757/oauth/google-calendar/callback

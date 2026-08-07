@@ -2,6 +2,11 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::OnceLock;
 
+use locality_auth_core::oauth::{
+    OAuthConnector,
+    SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE as AUTH_CORE_SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE,
+    SLACK_LOCAL_BROKER_SCOPES,
+};
 use locality_connector::ConnectorCapabilities;
 use locality_connector::oauth_broker::{
     OAuthBrokerCodeExchange, OAuthBrokerRefresh, OAuthBrokerStart, OAuthBrokerStartResponse,
@@ -15,24 +20,13 @@ use serde::{Deserialize, Serialize};
 use crate::connector::SLACK_CONNECTOR_ID;
 
 pub const DEFAULT_SLACK_OAUTH_BROKER_URL: &str = "https://afs-oauth-broker.saurabh-b07.workers.dev";
-pub const DEFAULT_SLACK_OAUTH_REDIRECT_URI: &str = "http://localhost:8757/oauth/slack/callback";
+pub const DEFAULT_SLACK_OAUTH_REDIRECT_URI: &str =
+    OAuthConnector::Slack.default_local_callback_uri();
 
-pub const SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE: &str = "channels:join";
+pub const SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE: &str =
+    AUTH_CORE_SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE;
 
-pub const SLACK_OAUTH_SCOPES: &[&str] = &[
-    "channels:read",
-    "channels:history",
-    "groups:read",
-    "groups:history",
-    "im:read",
-    "im:history",
-    "mpim:read",
-    "mpim:history",
-    "users:read",
-    "team:read",
-    "files:read",
-    SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE,
-];
+pub const SLACK_OAUTH_SCOPES: &[&str] = SLACK_LOCAL_BROKER_SCOPES;
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 

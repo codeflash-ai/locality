@@ -32,16 +32,23 @@ crate cannot ship by itself.
 6. Add CLI connect and mount routing without changing existing commands. Keep
    provider-specific mount settings in the provider crate and serialize the
    default represented by the manifest.
-7. Add the desktop source ID, setup/auth classification, display metadata, and
+7. For OAuth connectors, add or update the connector's OAuth profile in
+   `crates/locality-auth-core` before adding per-runtime OAuth code. Rust
+   runtimes and adapters that implement that connector's OAuth must consume the
+   shared ID/scope/callback profile instead of duplicating connector auth
+   constants. Public broker routing and configuration must stay aligned with the
+   shared profile through generated metadata, drift tests, or explicit matching
+   updates.
+8. Add the desktop source ID, setup/auth classification, display metadata, and
    `apps/desktop/src/assets/connectors/<id>.svg` icon. Add OAuth-service routing
-   only when the connector actually uses the hosted OAuth broker.
-8. Add `docs/<id>-connector.md`, public
+   only when the connector actually uses the public OAuth broker.
+9. Add `docs/<id>-connector.md`, public
    `docs-site/connectors/<docs_slug>.mdx`, docs navigation, README support, and
    any provider-specific security or live-test instructions.
-9. Add the direct fixture layout below and use
+10. Add the direct fixture layout below and use
    `locality_connector::conformance` for identity, capability/operation, safe
    path, read-only, redaction, and fixture checks.
-10. Run the contract, provider, daemon, CLI, docs, formatting, and workspace
+11. Run the contract, provider, daemon, CLI, docs, formatting, and workspace
     commands listed below. Verify live behavior only with a dedicated scratch
     account and explicit live-test credentials.
 
