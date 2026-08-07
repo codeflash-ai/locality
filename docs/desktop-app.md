@@ -63,7 +63,10 @@ debug queue reports no active or queued work and Live Mode is not syncing.
 Manual checks in Settings use the same check, download, install, and relaunch
 path. Before the installer handoff, the app schedules a native relaunch fallback
 so the installed app opens again even if the updater closes the old process
-before the JavaScript restart call completes.
+before the JavaScript restart call completes. If installation returns to the
+app, it releases single-instance ownership immediately before asking Tauri to
+spawn the replacement, so the replacement cannot lose the ownership race and
+exit.
 User-initiated launches and Dock/Finder reopens should present the main window.
 Launch-at-login and automatic updater relaunches should pass the desktop
 background launch argument so Locality resumes tray and Live Mode work without
@@ -74,7 +77,9 @@ a later background launch exits quietly without creating another Dock, taskbar,
 or menu-bar icon. The exclusion guard must be claimed before Tauri setup and
 must fail closed if its activation receiver cannot start. Windows uses
 session-scoped kernel objects; macOS uses a namespaced directory under Darwin's
-private per-user temporary directory; Linux uses the user's runtime directory.
+private per-user temporary directory; Linux uses the user's runtime directory
+and falls back to `~/.locality-desktop-si`, never a predictable shared temporary
+path.
 The macOS activation socket is length-checked before binding so it stays within
 Darwin's Unix-socket path limit. Release smoke launches bypass this forwarding
 so the mounted bundle always executes its own setup validation even when

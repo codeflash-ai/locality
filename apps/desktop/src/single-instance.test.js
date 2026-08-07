@@ -46,4 +46,21 @@ describe("desktop single-instance startup", () => {
       singleInstance.indexOf("UnixListener::bind(&activation_socket_path)"),
     );
   });
+
+  it("uses a non-squattable Linux fallback", () => {
+    const fallbackStart = singleInstance.indexOf(
+      "fn linux_desktop_single_instance_coordination_dir",
+    );
+    const fallbackEnd = singleInstance.indexOf(
+      "#[cfg(all(unix, not(any(target_os = \"macos\", target_os = \"linux\"))))]",
+      fallbackStart,
+    );
+    const fallbackSource = singleInstance.slice(fallbackStart, fallbackEnd);
+
+    expect(fallbackStart).toBeGreaterThan(-1);
+    expect(fallbackEnd).toBeGreaterThan(fallbackStart);
+    expect(singleInstance).toContain("locality_platform::user_home()");
+    expect(fallbackSource).toContain('user_home.join(".locality-desktop-si")');
+    expect(fallbackSource).not.toContain("std::env::temp_dir()");
+  });
 });

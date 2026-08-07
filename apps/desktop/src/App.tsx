@@ -1410,6 +1410,10 @@ export default function App() {
       update: null,
       version: update.version,
     });
+    const ownershipRelease = await releaseUpdateRelaunchGuard();
+    if (!ownershipRelease.ok) {
+      throw new Error(ownershipRelease.message);
+    }
     await relaunch();
   }
 
@@ -1423,6 +1427,20 @@ export default function App() {
       return {
         ok: false,
         message: `Could not schedule relaunch fallback: ${errorMessage(error)}`,
+      };
+    }
+  }
+
+  async function releaseUpdateRelaunchGuard(): Promise<ActionReport> {
+    try {
+      return await callCommand<ActionReport>("release_update_relaunch_guard", undefined, {
+        ok: false,
+        message: "Relaunch ownership is only available in the packaged app.",
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        message: `Could not release relaunch ownership: ${errorMessage(error)}`,
       };
     }
   }

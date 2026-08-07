@@ -4070,6 +4070,25 @@ async fn schedule_update_relaunch() -> ActionReport {
     }
 }
 
+#[tauri::command]
+fn release_update_relaunch_guard(
+    state: tauri::State<'_, single_instance::DesktopSingleInstanceState>,
+) -> ActionReport {
+    match state.release_for_relaunch() {
+        Ok(true) => ActionReport {
+            ok: true,
+            message: "Locality is ready to relaunch.".to_string(),
+        },
+        Ok(false) => ActionReport {
+            ok: true,
+            message: "Locality relaunch ownership was already released.".to_string(),
+        },
+        Err(error) => action_error(format!(
+            "Could not release desktop ownership for relaunch: {error}"
+        )),
+    }
+}
+
 fn schedule_update_relaunch_blocking() -> Result<String, String> {
     let pid = std::process::id();
     let executable = env::current_exe()
@@ -21725,6 +21744,9 @@ fn main() {
 
     desktop_log("info", "app.start", "Locality desktop starting");
     let builder = tauri::Builder::default()
+        .manage(single_instance::DesktopSingleInstanceState::new(
+            single_instance_guard,
+        ))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init());
     let builder = if app_store_distribution() {
@@ -21843,6 +21865,7 @@ fn main() {
             hide_menubar,
             quit_completely,
             schedule_update_relaunch,
+            release_update_relaunch_guard,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Locality desktop app")

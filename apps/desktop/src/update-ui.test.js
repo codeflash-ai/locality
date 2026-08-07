@@ -34,4 +34,23 @@ describe("update notification UI", () => {
       /const relaunchFallback = await scheduleUpdateRelaunchFallback\(\);[\s\S]*?await update\.install\(\);/s,
     );
   });
+
+  it("releases single-instance ownership after install and before relaunch", () => {
+    const install = appSource.indexOf("await update.install();");
+    const release = appSource.indexOf(
+      "const ownershipRelease = await releaseUpdateRelaunchGuard();",
+      install,
+    );
+    const relaunch = appSource.indexOf("await relaunch();", release);
+
+    expect(install).toBeGreaterThan(-1);
+    expect(release).toBeGreaterThan(install);
+    expect(relaunch).toBeGreaterThan(release);
+    expect(appSource.slice(release, relaunch)).toMatch(
+      /if \(!ownershipRelease\.ok\) \{\s*throw new Error\(ownershipRelease\.message\);/s,
+    );
+    expect(appSource).toContain(
+      'callCommand<ActionReport>("release_update_relaunch_guard"',
+    );
+  });
 });

@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::Mutex;
 use std::thread;
 
 #[cfg(unix)]
@@ -41,9 +42,13 @@ pub struct DesktopSingleInstanceGuard {
     #[cfg(unix)]
     activation_socket_path: PathBuf,
     #[cfg(windows)]
-    mutex_handle: HANDLE,
+    mutex_handle: usize,
     #[cfg(windows)]
-    activation_event_handle: HANDLE,
+    activation_event_handle: usize,
+}
+
+pub struct DesktopSingleInstanceState {
+    guard: Mutex<Option<DesktopSingleInstanceGuard>>,
 }
 
 pub struct DesktopActivationReceiver {
@@ -51,6 +56,25 @@ pub struct DesktopActivationReceiver {
     activation_listener: UnixListener,
     #[cfg(windows)]
     activation_event_handle: usize,
+}
+
+impl DesktopSingleInstanceState {
+    pub fn new(guard: Option<DesktopSingleInstanceGuard>) -> Self {
+        Self {
+            guard: Mutex::new(guard),
+        }
+    }
+
+    pub fn release_for_relaunch(&self) -> io::Result<bool> {
+        let guard = self
+            .guard
+            .lock()
+            .map_err(|_| io::Error::other("desktop single-instance state lock is poisoned"))?
+            .take();
+        let released = guard.is_some();
+        drop(guard);
+        Ok(released)
+    }
 }
 
 impl DesktopSingleInstanceGuard {
@@ -66,8 +90,27 @@ impl DesktopSingleInstanceGuard {
 
         #[cfg(windows)]
         {
+            use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+            let current_process = unsafe { GetCurrentProcess() };
+            let mut activation_event_handle = std::ptr::null_mut();
+            if unsafe {
+                DuplicateHandle(
+                    current_process,
+                    self.activation_event_handle as HANDLE,
+                    current_process,
+                    &mut activation_event_handle,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
             Ok(DesktopActivationReceiver {
-                activation_event_handle: self.activation_event_handle as usize,
+                activation_event_handle: activation_event_handle as usize,
             })
         }
 
@@ -122,6 +165,17 @@ impl DesktopActivationReceiver {
     }
 }
 
+#[cfg(windows)]
+impl Drop for DesktopActivationReceiver {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+
+        unsafe {
+            let _ = CloseHandle(self.activation_event_handle as HANDLE);
+        }
+    }
+}
+
 #[cfg(unix)]
 impl Drop for DesktopSingleInstanceGuard {
     fn drop(&mut self) {
@@ -137,8 +191,8 @@ impl Drop for DesktopSingleInstanceGuard {
         use windows_sys::Win32::Foundation::CloseHandle;
 
         unsafe {
-            let _ = CloseHandle(self.activation_event_handle);
-            let _ = CloseHandle(self.mutex_handle);
+            let _ = CloseHandle(self.activation_event_handle as HANDLE);
+            let _ = CloseHandle(self.mutex_handle as HANDLE);
         }
     }
 }
@@ -229,14 +283,29 @@ fn macos_desktop_single_instance_coordination_dir(user_temp_dir: &Path) -> io::R
 
 #[cfg(target_os = "linux")]
 fn desktop_single_instance_coordination_dir() -> io::Result<PathBuf> {
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-    {
+    linux_desktop_single_instance_coordination_dir(
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        locality_platform::user_home(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_desktop_single_instance_coordination_dir(
+    runtime_dir: Option<PathBuf>,
+    user_home: Option<PathBuf>,
+) -> io::Result<PathBuf> {
+    if let Some(runtime_dir) = runtime_dir.filter(|path| path.is_absolute()) {
         return Ok(runtime_dir.join("locality-desktop-si"));
     }
-    let effective_user_id = unsafe { libc::geteuid() };
-    Ok(std::env::temp_dir().join(format!("locality-desktop-si-{effective_user_id}")))
+    let user_home = user_home
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Linux desktop single-instance coordination requires XDG_RUNTIME_DIR or an absolute user home",
+            )
+        })?;
+    Ok(user_home.join(".locality-desktop-si"))
 }
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
@@ -395,8 +464,8 @@ fn acquire_desktop_single_instance_windows(
     }
 
     Ok(Some(DesktopSingleInstanceGuard {
-        mutex_handle,
-        activation_event_handle,
+        mutex_handle: mutex_handle as usize,
+        activation_event_handle: activation_event_handle as usize,
     }))
 }
 
@@ -496,6 +565,52 @@ mod tests {
                 .is_none(),
             "the lock loser must exit even when activation forwarding is not ready"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relaunch_release_drops_ownership_before_a_successor_acquires_it() {
+        let temp = TestCoordinationDir::new("relaunch-release");
+        let primary = super::acquire_desktop_single_instance_at(&temp.path, true)
+            .expect("acquire primary")
+            .expect("primary guard");
+        let state = super::DesktopSingleInstanceState::new(Some(primary));
+
+        assert!(
+            super::acquire_desktop_single_instance_at(&temp.path, true)
+                .expect("overlap before release")
+                .is_none()
+        );
+        assert!(state.release_for_relaunch().expect("release ownership"));
+
+        let successor = super::acquire_desktop_single_instance_at(&temp.path, true)
+            .expect("acquire successor")
+            .expect("successor guard");
+        assert!(!state.release_for_relaunch().expect("idempotent release"));
+        drop(successor);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_coordination_falls_back_to_the_user_home() {
+        let home = std::path::PathBuf::from("/home/ada");
+        let path = super::linux_desktop_single_instance_coordination_dir(None, Some(home.clone()))
+            .expect("home fallback");
+
+        assert_eq!(path, home.join(".locality-desktop-si"));
+        assert!(!path.starts_with("/tmp"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_coordination_requires_a_private_base() {
+        let error = super::linux_desktop_single_instance_coordination_dir(
+            Some(std::path::PathBuf::from("relative-runtime")),
+            None,
+        )
+        .expect_err("relative runtime without a home must fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[cfg(target_os = "macos")]
