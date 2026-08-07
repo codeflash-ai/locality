@@ -400,3 +400,17 @@ Change the model with:
 ```bash
 CODEX_MODEL=<deployment-name> CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/run-agent-comparison.sh
 ```
+
+## Standup Summary Scenario
+
+Daily standup generation is intentionally separate from the launch-readiness
+comparison runner because it creates and pushes a Notion page. Use:
+
+```bash
+export NOTION_STANDUP_PARENT_PAGE_ID=<notion-page-id>
+scripts/run-amika-standup-summary.sh --sandbox <machine-id>
+```
+
+The runner lives in `experiment/standup-summary/` and uses Locality-mounted
+Linear, Slack, and Notion files plus git evidence from `codeflash-ai/locality`
+and `codeflash-ai/locality-internal`.
