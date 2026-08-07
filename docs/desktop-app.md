@@ -66,7 +66,9 @@ so the installed app opens again even if the updater closes the old process
 before the JavaScript restart call completes. If installation returns to the
 app, it releases single-instance ownership immediately before asking Tauri to
 spawn the replacement, so the replacement cannot lose the ownership race and
-exit.
+exit. On Windows, that release first signals and joins the old activation
+receiver, closing its duplicate of the named event before the ownership mutex is
+released; only the replacement can receive later activation signals.
 User-initiated launches and Dock/Finder reopens should present the main window.
 Launch-at-login and automatic updater relaunches should pass the desktop
 background launch argument so Locality resumes tray and Live Mode work without

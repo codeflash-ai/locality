@@ -48,7 +48,12 @@ pub struct DesktopSingleInstanceGuard {
 }
 
 pub struct DesktopSingleInstanceState {
-    guard: Mutex<Option<DesktopSingleInstanceGuard>>,
+    inner: Mutex<DesktopSingleInstanceStateInner>,
+}
+
+struct DesktopSingleInstanceStateInner {
+    guard: Option<DesktopSingleInstanceGuard>,
+    activation_receiver: Option<DesktopActivationReceiverControl>,
 }
 
 pub struct DesktopActivationReceiver {
@@ -58,20 +63,54 @@ pub struct DesktopActivationReceiver {
     activation_event_handle: usize,
 }
 
+pub struct DesktopActivationReceiverControl {
+    #[cfg(windows)]
+    shutdown_event_handle: Option<usize>,
+    #[cfg(windows)]
+    thread: Option<thread::JoinHandle<()>>,
+}
+
 impl DesktopSingleInstanceState {
     pub fn new(guard: Option<DesktopSingleInstanceGuard>) -> Self {
         Self {
-            guard: Mutex::new(guard),
+            inner: Mutex::new(DesktopSingleInstanceStateInner {
+                guard,
+                activation_receiver: None,
+            }),
         }
     }
 
-    pub fn release_for_relaunch(&self) -> io::Result<bool> {
-        let guard = self
-            .guard
+    pub fn register_activation_receiver(
+        &self,
+        activation_receiver: DesktopActivationReceiverControl,
+    ) -> io::Result<()> {
+        let mut inner = self
+            .inner
             .lock()
-            .map_err(|_| io::Error::other("desktop single-instance state lock is poisoned"))?
-            .take();
+            .map_err(|_| io::Error::other("desktop single-instance state lock is poisoned"))?;
+        if inner.activation_receiver.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "desktop activation receiver is already registered",
+            ));
+        }
+        inner.activation_receiver = Some(activation_receiver);
+        Ok(())
+    }
+
+    pub fn release_for_relaunch(&self) -> io::Result<bool> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("desktop single-instance state lock is poisoned"))?;
+        if let Some(activation_receiver) = inner.activation_receiver.as_mut() {
+            activation_receiver.stop()?;
+        }
+        let activation_receiver = inner.activation_receiver.take();
+        let guard = inner.guard.take();
+        drop(inner);
         let released = guard.is_some();
+        drop(activation_receiver);
         drop(guard);
         Ok(released)
     }
@@ -125,43 +164,119 @@ impl DesktopSingleInstanceGuard {
 }
 
 impl DesktopActivationReceiver {
-    pub fn start<F>(self, on_activate: F)
+    pub fn start<F>(self, on_activate: F) -> io::Result<DesktopActivationReceiverControl>
     where
         F: Fn() + Send + 'static,
     {
         #[cfg(unix)]
-        thread::spawn(move || {
-            loop {
-                match self.activation_listener.accept() {
-                    Ok((_stream, _address)) => on_activate(),
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-        });
+        {
+            thread::Builder::new()
+                .name("locality-desktop-activation".to_string())
+                .spawn(move || {
+                    loop {
+                        match self.activation_listener.accept() {
+                            Ok((_stream, _address)) => on_activate(),
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(_) => break,
+                        }
+                    }
+                })?;
+            Ok(DesktopActivationReceiverControl {})
+        }
 
         #[cfg(windows)]
-        thread::spawn(move || {
-            use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
-            use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+        {
+            use windows_sys::Win32::System::Threading::{
+                CreateEventW, INFINITE, WaitForMultipleObjects,
+            };
 
-            loop {
-                let result = unsafe {
-                    WaitForSingleObject(self.activation_event_handle as HANDLE, INFINITE)
-                };
-                if result == WAIT_OBJECT_0 {
-                    on_activate();
-                } else if result == WAIT_FAILED {
-                    break;
-                }
+            let shutdown_event_handle =
+                unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if shutdown_event_handle.is_null() {
+                return Err(io::Error::last_os_error());
             }
-        });
+            let shutdown_event_value = shutdown_event_handle as usize;
+            let thread = match thread::Builder::new()
+                .name("locality-desktop-activation".to_string())
+                .spawn(move || {
+                    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+
+                    let handles = [
+                        self.activation_event_handle as HANDLE,
+                        shutdown_event_value as HANDLE,
+                    ];
+                    loop {
+                        let result = unsafe {
+                            WaitForMultipleObjects(
+                                handles.len() as u32,
+                                handles.as_ptr(),
+                                0,
+                                INFINITE,
+                            )
+                        };
+                        if result == WAIT_OBJECT_0 {
+                            on_activate();
+                        } else {
+                            break;
+                        }
+                    }
+                }) {
+                Ok(thread) => thread,
+                Err(error) => {
+                    use windows_sys::Win32::Foundation::CloseHandle;
+
+                    unsafe {
+                        let _ = CloseHandle(shutdown_event_handle);
+                    }
+                    return Err(error);
+                }
+            };
+            Ok(DesktopActivationReceiverControl {
+                shutdown_event_handle: Some(shutdown_event_value),
+                thread: Some(thread),
+            })
+        }
 
         #[cfg(not(any(unix, windows)))]
         {
             let _ = self;
             let _ = on_activate;
+            Ok(DesktopActivationReceiverControl {})
         }
+    }
+}
+
+impl DesktopActivationReceiverControl {
+    fn stop(&mut self) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::SetEvent;
+
+            let Some(shutdown_event_handle) = self.shutdown_event_handle else {
+                return Ok(());
+            };
+            if self.thread.is_some() && unsafe { SetEvent(shutdown_event_handle as HANDLE) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let join_result = self.thread.take().map(thread::JoinHandle::join);
+            unsafe {
+                let _ = CloseHandle(shutdown_event_handle as HANDLE);
+            }
+            self.shutdown_event_handle = None;
+            if join_result.is_some_and(|result| result.is_err()) {
+                return Err(io::Error::other(
+                    "desktop activation receiver stopped with a panic",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DesktopActivationReceiverControl {
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 
@@ -637,6 +752,54 @@ mod tests {
             .expect_err("oversized activation socket path must fail");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_relaunch_release_closes_receiver_and_ownership_handles() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_INVALID_HANDLE, GetHandleInformation, GetLastError, HANDLE,
+        };
+        use windows_sys::Win32::System::Threading::{CreateEventW, CreateMutexW};
+
+        let activation_event_handle =
+            unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        assert!(!activation_event_handle.is_null());
+        let mutex_handle = unsafe { CreateMutexW(std::ptr::null(), 0, std::ptr::null()) };
+        assert!(!mutex_handle.is_null());
+
+        let guard = super::DesktopSingleInstanceGuard {
+            mutex_handle: mutex_handle as usize,
+            activation_event_handle: activation_event_handle as usize,
+        };
+        let receiver = guard
+            .activation_receiver()
+            .expect("duplicate activation event");
+        let receiver_event_handle = receiver.activation_event_handle;
+        let receiver_control = receiver.start(|| {}).expect("start activation receiver");
+        let shutdown_event_handle = receiver_control
+            .shutdown_event_handle
+            .expect("receiver shutdown event");
+        let state = super::DesktopSingleInstanceState::new(Some(guard));
+        state
+            .register_activation_receiver(receiver_control)
+            .expect("register activation receiver");
+
+        assert!(state.release_for_relaunch().expect("release for relaunch"));
+
+        for handle in [
+            activation_event_handle as usize,
+            mutex_handle as usize,
+            receiver_event_handle,
+            shutdown_event_handle,
+        ] {
+            let mut flags = 0;
+            assert_eq!(
+                unsafe { GetHandleInformation(handle as HANDLE, &mut flags) },
+                0
+            );
+            assert_eq!(unsafe { GetLastError() }, ERROR_INVALID_HANDLE);
+        }
     }
 
     #[cfg(windows)]

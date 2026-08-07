@@ -63,4 +63,22 @@ describe("desktop single-instance startup", () => {
     expect(fallbackSource).toContain('user_home.join(".locality-desktop-si")');
     expect(fallbackSource).not.toContain("std::env::temp_dir()");
   });
+
+  it("stops the Windows activation receiver before releasing ownership", () => {
+    const releaseStart = singleInstance.indexOf("pub fn release_for_relaunch");
+    const releaseEnd = singleInstance.indexOf(
+      "impl DesktopSingleInstanceGuard",
+      releaseStart,
+    );
+    const releaseSource = singleInstance.slice(releaseStart, releaseEnd);
+
+    expect(singleInstance).toContain("WaitForMultipleObjects");
+    expect(singleInstance).toContain("shutdown_event_handle");
+    expect(singleInstance).toContain("thread::JoinHandle::join");
+    expect(releaseSource.indexOf("activation_receiver.stop()?;")).toBeGreaterThan(-1);
+    expect(releaseSource.indexOf("inner.guard.take()")).toBeGreaterThan(
+      releaseSource.indexOf("activation_receiver.stop()?;"),
+    );
+    expect(tauriMain).toContain(".register_activation_receiver(receiver_control)");
+  });
 });

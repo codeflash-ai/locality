@@ -21794,7 +21794,20 @@ fn main() {
             build_tray(app)?;
             if let Some(receiver) = desktop_activation_receiver {
                 let app_handle = app.app_handle().clone();
-                receiver.start(move || show_main_window_with_view(&app_handle, None));
+                let receiver_control = receiver
+                    .start(move || show_main_window_with_view(&app_handle, None))
+                    .map_err(|error| {
+                        io::Error::other(format!(
+                            "Locality could not start its desktop activation receiver: {error}"
+                        ))
+                    })?;
+                app.state::<single_instance::DesktopSingleInstanceState>()
+                    .register_activation_receiver(receiver_control)
+                    .map_err(|error| {
+                        io::Error::other(format!(
+                            "Locality could not register its desktop activation receiver: {error}"
+                        ))
+                    })?;
             }
             sync_tray_visibility(app.app_handle(), &desktop_settings());
             start_state_change_watcher(app.app_handle().clone());
