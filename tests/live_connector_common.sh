@@ -224,6 +224,7 @@ emit_live_debug_diagnostics() {
     status_report \
     info_report \
     doctor_report \
+    issue_search_report \
     drive_search_report \
     calendar_search_report \
     drafts_list_report \

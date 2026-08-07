@@ -482,4 +482,5 @@ PATH="$fake_bin_dir:$PATH"
 wait_for_fuse "$locality_root" "$fake_fuse_pid"
 PATH="$old_path"
 
+"$script_dir/resolve_linear_live_issue_selftest.sh"
 echo "live connector helper self-test passed"

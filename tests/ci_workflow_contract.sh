@@ -104,6 +104,13 @@ for workflow in \
   done
 done
 
+for dependency in \
+  '      - "tests/resolve_linear_live_issue.py"' \
+  '      - "tests/resolve_linear_live_issue_selftest.sh"'; do
+  grep -Fqx "$dependency" "$ROOT/.github/workflows/connector-live-e2e.yml" ||
+    fail ".github/workflows/connector-live-e2e.yml push paths must include $dependency"
+done
+
 # Slack refresh tokens are single-use. Every live run must force refresh,
 # export the replacement, and persist it even if a later live assertion fails.
 assert_job_line ".github/workflows/connector-live-e2e.yml" "slack-live" \

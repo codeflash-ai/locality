@@ -110,6 +110,9 @@ ids as read-only before any `issueUpdate` mutation is attempted.
 mount/pull/diff/push flow, daemon, and Linux FUSE projection. It edits one
 existing scratch issue body through the mounted `page.md`, pushes the marker to
 Linear, pulls it back, and restores the original issue content before exiting.
+The test resolves the configured issue UUID through Locality's local search
+index and then verifies the projected `page.md` frontmatter identity. It does
+not recursively walk and hydrate unrelated Linear issues.
 
 Set the API key and scratch issue UUID before running it:
 
