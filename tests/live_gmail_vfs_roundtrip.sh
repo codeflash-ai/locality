@@ -104,18 +104,47 @@ wait_for_projected_mount_root() {
   live_fail "Gmail FUSE mount root did not appear at $mount_root"
 }
 
-wait_for_outbound_dirs() {
-  local draft_dir="$mount_root/draft"
-  local outbox_dir="$mount_root/outbox"
+wait_for_mailbox_dirs() {
   local attempts="${LOCALITY_GMAIL_LIVE_DRAFT_WAIT_ATTEMPTS:-80}"
   local attempt
+  local mailbox
+  local missing
+
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if [[ -d "$draft_dir" && -d "$outbox_dir" ]]; then
+    missing=0
+    for mailbox in inbox sent draft outbox; do
+      if [[ ! -d "$mount_root/$mailbox" ]]; then
+        missing=1
+        break
+      fi
+    done
+    if [[ "$missing" == "0" ]]; then
       return 0
     fi
     sleep 0.25
   done
-  live_fail "Gmail draft/ and outbox/ directories did not appear under the mount"
+  live_fail "Gmail inbox/, sent/, draft/, and outbox/ directories did not appear under the mount"
+}
+
+assert_optional_mailbox_message_readable() {
+  local mailbox="$1"
+  local projected_path
+
+  projected_path="$(find "$mount_root/$mailbox" -maxdepth 1 -type f -name '*.md' -print 2>/dev/null | sort | head -n 1 || true)"
+  if [[ -z "$projected_path" ]]; then
+    return 0
+  fi
+
+  if ! grep -F -q "connector: gmail" "$projected_path" 2>/dev/null; then
+    live_fail "Gmail $mailbox/ projected message was not readable as a Gmail Markdown file"
+  fi
+}
+
+assert_initial_mailboxes_retrievable() {
+  wait_for_mailbox_dirs
+  assert_optional_mailbox_message_readable inbox
+  assert_optional_mailbox_message_readable sent
+  assert_optional_mailbox_message_readable draft
 }
 
 projected_gmail_draft_matches_message() {
@@ -253,10 +282,17 @@ wait_for_marker_under_sent() {
   local sent_dir="$mount_root/sent"
   local attempts="${LOCALITY_GMAIL_LIVE_SENT_MARKER_WAIT_ATTEMPTS:-120}"
   local attempt
+  local path
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if [[ -d "$sent_dir" ]] && grep -R -F -q -- "$marker" "$sent_dir" 2>/dev/null; then
-      return 0
+    if [[ -d "$sent_dir" ]]; then
+      while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        if timeout "${LOCALITY_GMAIL_LIVE_FILE_READ_TIMEOUT:-3s}" \
+          grep -F -q -- "$marker" "$path" 2>/dev/null; then
+          return 0
+        fi
+      done < <(find "$sent_dir" -maxdepth 1 -type f -name '*.md' -print 2>/dev/null | sort -r)
     fi
     sleep 0.25
   done
@@ -937,7 +973,9 @@ if [[ -n "$oauth_refresh_marker" ]]; then
     "$oauth_refresh_marker" \
     "Gmail live credential"
 fi
-wait_for_outbound_dirs
+
+step="verifying retrieved Gmail mailbox projection"
+assert_initial_mailboxes_retrievable
 
 unique="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 subject="Locality live Gmail $unique"

@@ -155,14 +155,15 @@ export LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credenti
 LOCALITY_LIVE_GOOGLE_CALENDAR_VFS=1 tests/live_google_calendar_vfs_roundtrip.sh
 ```
 
-Run Gmail against a test mailbox and a safe recipient address:
+Run Gmail against a test mailbox and a safe recipient address. This scenario
+sends real email:
 
 ```sh
 secret_ref='connection:gmail-live'
 secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
 export LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
 export LOCALITY_GMAIL_LIVE_TO_EMAIL=...
-LOCALITY_LIVE_GMAIL_VFS=1 tests/live_gmail_vfs_roundtrip.sh
+LOCALITY_LIVE_GMAIL_SCENARIO=1 tests/live_gmail_workflow_scenario.sh
 ```
 
 Run Slack read-only against a stable private channel, DM, or group DM where the
@@ -305,7 +306,7 @@ Coverage labels:
 |---|---|---|
 | `tests/live_google_docs_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a stored Google Docs credential into isolated state, mounts a scratch Drive workspace folder, creates a document through a FUSE `page.md`, verifies `diff` and `push`, pulls the document back through the real Google Docs and Drive APIs, edits the created document through mounted Markdown, pulls the edit back, and trashes the scratch Drive file. Covers the live create/edit/read-back side of E2E-037. |
 | `tests/live_google_calendar_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a stored Google Calendar credential, creates a calendar event from a local draft under the mounted filesystem, verifies the event projection after pull, and deletes the scratch event through the Calendar API. Covers the live draft-create path for Google Calendar. |
-| `tests/live_gmail_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a stored Gmail credential, creates an unsent Gmail UI draft from a mounted `draft/` Markdown file, verifies the projected Gmail draft maps to the created message, and deletes the draft through the Gmail API. Covers the live Gmail draft-create path; direct sends use the sibling `outbox/` folder and are tracked in E2E-042. |
+| `tests/live_gmail_workflow_scenario.sh` / `tests/live_gmail_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a stored Gmail credential, pulls the mailbox projection, creates an unsent Gmail UI draft from mounted `draft/`, verifies the projected Gmail draft maps to the created message, updates a pulled remote draft, sends a new mounted `outbox/` Markdown file directly, moves the edited draft to `outbox/` to send it, verifies the sent message content, prunes a stale sent draft from `draft/`, and cleans up scratch draft/message resources where the Gmail scope allows it. |
 | `tests/live_slack_vfs_read.sh` | Live Linux FUSE product path | Seeds a stored Slack credential, mounts selected non-public Slack conversation types read-only, resolves the configured conversation by identity metadata, hydrates its `recent.md`, verifies status stays clean, and proves push is blocked before Slack writes. Covers the live Slack read-only projection and write guardrail. |
 | `tests/live_linear_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a Linear API key credential, mounts Linear through the real daemon and FUSE helper, resolves the configured issue through the local search index and verifies its projected frontmatter identity, appends a body marker, pushes and pulls it back, then restores only the original body under current generated frontmatter. Covers the live Linear issue edit/read-back/restore path without recursively hydrating unrelated workspace issues. |
 
@@ -465,7 +466,7 @@ Coverage labels:
 | Granola connector | Covered live read-only | The public API integrity test and Linux FUSE product-path test verify real note enumeration, summary/transcript rendering, incremental discovery, clean status, and read-only write rejection without exposing meeting payloads. |
 | Google Docs connector | Partial live plus local guardrails | Local e2e uses the real Google Docs connector with fake Drive/Docs APIs for workspace-folder enumeration, online-only stubs, explicit hydration, local Markdown document create, supported text edit push, journal/reconcile/status-clean behavior, and mounted Markdown guardrails for rendered inline objects, tables, invalid Locality frontmatter, and unsupported document-structure directives before journal/apply. The live Linux FUSE script covers real Drive/Docs create, edit, pull-back, and cleanup against a scratch folder. |
 | Google Calendar connector | Live draft create path | The live Linux FUSE script creates a real Calendar event from a mounted draft, verifies the projected event after pull, and deletes the scratch event through the Calendar API. |
-| Gmail connector | Live draft create path plus local direct-send coverage | The live Linux FUSE script creates an unsent Gmail draft from mounted `draft/` Markdown, verifies it projects with the created message identity, and deletes the draft through the Gmail API. The reviewed direct-send path uses mounted `outbox/` Markdown, reconciles to `sent/`, and is covered locally with macOS File Provider retesting tracked in E2E-042. |
+| Gmail connector | Live workflow scenario | The live Linux FUSE scenario pulls the Gmail mailbox projection, creates an unsent Gmail draft from mounted `draft/` Markdown, verifies it projects with the created message identity, updates a pulled remote draft, sends a new mounted `outbox/` Markdown file directly, moves the edited draft to `outbox/` to send it, verifies the sent message content through Gmail API/read-back paths, and prunes a stale sent draft from `draft/`. |
 | Slack connector | Covered live read-only | The live Linux FUSE script hydrates a configured non-public conversation's `recent.md` by identity, verifies the mount stays clean, and verifies push/write attempts are blocked before remote Slack writes. |
 | Linear connector | Live issue edit path | The live Linux FUSE script edits a configured scratch issue body, verifies push and pull-back, then restores the original body while preserving current generated frontmatter. |
 | Packaging/notarization | Manual/publish covered | `make publish` validates signing, stapling, and DMG integrity outside CI. |
