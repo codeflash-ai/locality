@@ -43,6 +43,7 @@ use crate::source::{
 pub const ROOT_CONTAINER_IDENTIFIER: &str = "root";
 pub const SOURCE_ROOT_PREFIX: &str = "source:";
 pub const MOUNT_POINT_PREFIX: &str = "mount:";
+pub const VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION: u32 = 1;
 const CHILDREN_PREFIX: &str = "children:";
 const PATH_PREFIX: &str = "path:";
 const LOCAL_PREFIX: &str = "local:";
@@ -305,6 +306,12 @@ pub struct VirtualFsItem {
     pub kind: VirtualFsItemKind,
     #[serde(default)]
     pub read_only: bool,
+    #[serde(default)]
+    pub mutation_permissions_version: u32,
+    #[serde(default)]
+    pub can_rename: bool,
+    #[serde(default)]
+    pub can_delete: bool,
     pub entity_kind: Option<EntityKind>,
     pub remote_id: Option<String>,
     pub path: String,
@@ -4785,6 +4792,9 @@ fn root_item(mount: &MountConfig) -> VirtualFsItem {
             .unwrap_or_else(|| mount.mount_id.0.clone()),
         kind: VirtualFsItemKind::Folder,
         read_only: source_root_read_only(mount),
+        mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+        can_rename: false,
+        can_delete: false,
         entity_kind: None,
         remote_id: None,
         path: String::new(),
@@ -4831,6 +4841,9 @@ fn guidance_item(mount: &MountConfig, filename: &str, identifier: &str) -> Virtu
         filename: filename.to_string(),
         kind: VirtualFsItemKind::File,
         read_only: true,
+        mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+        can_rename: false,
+        can_delete: false,
         entity_kind: None,
         remote_id: None,
         path: filename.to_string(),
@@ -4850,6 +4863,9 @@ fn source_root_item(mount: &MountConfig) -> VirtualFsItem {
         filename: filename.clone(),
         kind: VirtualFsItemKind::Folder,
         read_only: source_root_read_only(mount),
+        mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+        can_rename: false,
+        can_delete: false,
         entity_kind: None,
         remote_id: None,
         path: filename,
@@ -4867,6 +4883,14 @@ pub(crate) fn source_root_read_only(mount: &MountConfig) -> bool {
 
 fn item_file_read_only(mount: &MountConfig, path: &Path) -> bool {
     !source_write_decision_for_path(mount, path).is_writable()
+}
+
+fn page_file_can_mutate(mount: &MountConfig, path: &Path, entity_kind: &EntityKind) -> bool {
+    *entity_kind == EntityKind::Page && !item_file_read_only(mount, path)
+}
+
+fn page_directory_can_mutate(mount: &MountConfig, path: &Path) -> bool {
+    !item_file_read_only(mount, &page_document_path(path))
 }
 
 fn item_folder_read_only(
@@ -4910,6 +4934,7 @@ fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex
         VirtualFsItemKind::File => item_file_read_only(mount, &entity.path),
         VirtualFsItemKind::Folder => item_folder_read_only(mount, &entity.path, Some(&entity.kind)),
     };
+    let can_mutate = page_file_can_mutate(mount, &entity.path, &entity.kind);
 
     VirtualFsItem {
         identifier: entity.remote_id.0.clone(),
@@ -4921,6 +4946,9 @@ fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex
         filename: filename(&entity.path),
         kind,
         read_only,
+        mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+        can_rename: can_mutate,
+        can_delete: can_mutate,
         entity_kind: Some(entity.kind.clone()),
         remote_id: Some(entity.remote_id.0.clone()),
         path: path_string(&entity.path),
@@ -4948,6 +4976,11 @@ fn pending_item(
         filename: filename(&mutation.projected_path),
         kind: VirtualFsItemKind::File,
         read_only: item_file_read_only(mount, &mutation.projected_path),
+        mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+        can_rename: !is_database_draft_schema_path(&mutation.projected_path)
+            && !item_file_read_only(mount, &mutation.projected_path),
+        can_delete: !is_database_draft_schema_path(&mutation.projected_path)
+            && !item_file_read_only(mount, &mutation.projected_path),
         entity_kind: Some(if is_database_draft_schema_path(&mutation.projected_path) {
             EntityKind::Database
         } else {
@@ -4993,6 +5026,7 @@ fn pending_page_child_dir_item(
     } else {
         EntityKind::Page
     };
+    let can_mutate = entity_kind == EntityKind::Page && page_directory_can_mutate(mount, &path);
     VirtualFsItem {
         identifier: pending_page_child_dir_identifier(&mutation.local_id),
         parent_identifier: Some(container_identifier_for_path(
@@ -5003,6 +5037,9 @@ fn pending_page_child_dir_item(
         filename: filename(&path),
         kind: VirtualFsItemKind::Folder,
         read_only: item_folder_read_only(mount, &path, Some(&entity_kind)),
+        mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+        can_rename: can_mutate,
+        can_delete: can_mutate,
         entity_kind: Some(entity_kind),
         remote_id: None,
         path: path_string(&path),
@@ -5022,13 +5059,18 @@ fn pending_temp_item(
     let parent = pending_created_directory_path(mutation)
         .unwrap_or_else(|| page_container_path(&mutation.projected_path));
     let path = parent.join(filename);
+    let database_draft = is_database_draft_schema_path(&mutation.projected_path);
+    let can_mutate = !database_draft && !item_file_read_only(mount, &path);
     VirtualFsItem {
         identifier: mutation.local_id.clone(),
         parent_identifier: Some(pending_page_child_dir_identifier(&mutation.local_id)),
         filename: filename.to_string(),
         kind: VirtualFsItemKind::File,
         read_only: item_file_read_only(mount, &path),
-        entity_kind: Some(if is_database_draft_schema_path(&mutation.projected_path) {
+        mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+        can_rename: can_mutate,
+        can_delete: can_mutate,
+        entity_kind: Some(if database_draft {
             EntityKind::Database
         } else {
             EntityKind::Page
@@ -5116,6 +5158,9 @@ fn schema_item(
         filename: "_schema.yaml".to_string(),
         kind: VirtualFsItemKind::File,
         read_only: true,
+        mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+        can_rename: false,
+        can_delete: false,
         entity_kind: None,
         remote_id: Some(entity.remote_id.0.clone()),
         path: path_string(&path),
@@ -5273,6 +5318,9 @@ fn loc_asset_cache_dir_item(
         filename: filename(path),
         kind: VirtualFsItemKind::Folder,
         read_only: true,
+        mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+        can_rename: false,
+        can_delete: false,
         entity_kind: None,
         remote_id: None,
         path: path_string(path),
@@ -5296,6 +5344,9 @@ fn loc_asset_cache_file_item(
         filename: filename(path),
         kind: VirtualFsItemKind::File,
         read_only: true,
+        mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+        can_rename: false,
+        can_delete: false,
         entity_kind: None,
         remote_id: None,
         path: path_string(path),
@@ -5468,6 +5519,7 @@ fn page_child_dir_item(
     remote_id: &RemoteId,
     index: &ProviderIndex,
 ) -> VirtualFsItem {
+    let can_mutate = page_directory_can_mutate(mount, path);
     VirtualFsItem {
         identifier: format!("{CHILDREN_PREFIX}{}", remote_id.0),
         parent_identifier: Some(container_identifier_for_path(
@@ -5478,6 +5530,9 @@ fn page_child_dir_item(
         filename: filename(path),
         kind: VirtualFsItemKind::Folder,
         read_only: item_folder_read_only(mount, path, Some(&EntityKind::Page)),
+        mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+        can_rename: can_mutate,
+        can_delete: can_mutate,
         entity_kind: None,
         remote_id: Some(remote_id.0.clone()),
         path: path_string(path),
@@ -5500,6 +5555,9 @@ fn path_dir_item(mount: &MountConfig, path: &Path, index: &ProviderIndex) -> Vir
         filename: filename(path),
         kind: VirtualFsItemKind::Folder,
         read_only: item_folder_read_only(mount, path, None),
+        mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+        can_rename: false,
+        can_delete: false,
         entity_kind: None,
         remote_id: None,
         path: path_string(path),
@@ -6547,6 +6605,8 @@ mod tests {
             .find(|child| child.identifier == "children:page-1")
             .expect("notion page folder");
         assert!(!notion_page_folder.read_only);
+        assert!(notion_page_folder.can_rename);
+        assert!(notion_page_folder.can_delete);
         assert!(
             !virtual_fs_item(&notion_store, &notion_mount_id, "database-1")
                 .expect("notion database item")
@@ -6596,6 +6656,8 @@ mod tests {
             .find(|child| child.identifier == "children:doc-1")
             .expect("google docs page folder");
         assert!(google_page_folder.read_only);
+        assert!(google_page_folder.can_rename);
+        assert!(google_page_folder.can_delete);
     }
 
     #[test]

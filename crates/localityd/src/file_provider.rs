@@ -179,6 +179,10 @@ fn shared_domain_mount_point_item(mount: &MountConfig) -> FileProviderItem {
         filename: filename.clone(),
         kind: FileProviderItemKind::Folder,
         read_only: source_root_read_only(mount),
+        mutation_permissions_version:
+            crate::virtual_fs::VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+        can_rename: false,
+        can_delete: false,
         entity_kind: None,
         remote_id: None,
         path: filename,

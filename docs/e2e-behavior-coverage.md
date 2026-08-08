@@ -146,6 +146,14 @@ export LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER=...
 LOCALITY_LIVE_GOOGLE_DOCS_VFS=1 tests/live_google_docs_vfs_roundtrip.sh
 ```
 
+Run the deeper Google Docs mutation scenario when investigating connector apply
+quality across body edits, metadata, moves, and deletes:
+
+```sh
+export LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER=...
+LOCALITY_LIVE_GOOGLE_DOCS_SCENARIO=1 tests/live_google_docs_mutation_scenario.sh
+```
+
 Run Google Calendar against the primary calendar:
 
 ```sh

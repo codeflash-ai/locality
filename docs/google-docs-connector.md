@@ -148,6 +148,30 @@ Run the gated test explicitly:
 LOCALITY_LIVE_GOOGLE_DOCS_VFS=1 tests/live_google_docs_vfs_roundtrip.sh
 ```
 
+For deeper local connector quality work, run the mutation scenario:
+
+```bash
+LOCALITY_LIVE_GOOGLE_DOCS_SCENARIO=1 tests/live_google_docs_mutation_scenario.sh
+```
+
+The scenario uses the same isolated state and scratch workspace folder as the
+roundtrip test, then exercises the broader edit surface:
+
+- creates a scratch Google Doc from a mounted `page.md`
+- pulls it back as an existing one-line document
+- edits that existing body into one line, one blank line, then another text line
+- updates `title` frontmatter and verifies the Drive file name
+- renames the page directory and verifies the Drive file name
+- creates a scratch Drive folder through the Drive API, pulls it into the mount,
+  moves the document under it through the mounted filesystem, and verifies the
+  Drive parent
+- deletes the mounted page directory through the filesystem and verifies the
+  Drive file is trashed
+
+The scenario also trashes its scratch Drive folder during cleanup. Set
+`LOCALITY_GOOGLE_DOCS_SCENARIO_KEEP_TMP=1` to keep the temporary Locality state
+and mount root after a failure for inspection.
+
 ## Useful Commands
 
 Connect with the local broker:

@@ -216,6 +216,21 @@ emit_live_debug_diagnostics() {
     edit_diff_report \
     edit_push_report \
     pull_after_edit_report \
+    metadata_diff_report \
+    metadata_push_report \
+    pull_after_metadata_report \
+    rename_diff_report \
+    rename_push_report \
+    pull_after_rename_report \
+    folder_create_report \
+    folder_get_report \
+    move_pull_report \
+    move_diff_report \
+    move_push_report \
+    pull_after_move_report \
+    delete_diff_report \
+    delete_push_report \
+    pull_after_delete_report \
     restore_diff_report \
     restore_push_report \
     cleanup_diff_report \
@@ -815,12 +830,18 @@ connector_display_name() {
 
 _live_resolve_bin() {
   local candidate="$1"
+  local base
+  local dir
   if [[ "$candidate" = /* ]]; then
     printf '%s\n' "$candidate"
-  elif [[ -x "$candidate" ]]; then
-    printf '%s\n' "$candidate"
   elif [[ -x "$live_connector_repo_root/$candidate" ]]; then
-    printf '%s\n' "$live_connector_repo_root/$candidate"
+    dir="$(dirname "$live_connector_repo_root/$candidate")"
+    base="$(basename "$candidate")"
+    printf '%s/%s\n' "$(cd "$dir" && pwd)" "$base"
+  elif [[ -x "$candidate" ]]; then
+    dir="$(dirname "$candidate")"
+    base="$(basename "$candidate")"
+    printf '%s/%s\n' "$(cd "$dir" && pwd)" "$base"
   else
     printf '%s\n' "$candidate"
   fi

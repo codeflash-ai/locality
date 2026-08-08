@@ -16,6 +16,7 @@ on:
       - "tests/run_linux_fuse_ci.sh"
       - "tests/live_connector_common.sh"
       - "tests/live_connector_common_selftest.sh"
+      - "tests/live_google_docs_mutation_scenario.sh"
       - "tests/live_google_docs_vfs_roundtrip.sh"
       - "tests/live_google_calendar_vfs_roundtrip.sh"
       - "tests/live_gmail_vfs_roundtrip.sh"
@@ -58,7 +59,7 @@ jobs:
           sudo apt-get install -y sqlite3
       - name: Run live connector harness self-test
         run: |
-          bash -n tests/live_connector_common.sh tests/live_connector_common_selftest.sh
+          bash -n tests/live_connector_common.sh tests/live_connector_common_selftest.sh tests/live_google_docs_mutation_scenario.sh
           LOCALITY_LIVE_COMMON_SELFTEST=1 tests/live_connector_common_selftest.sh
 
   google-docs-live:
