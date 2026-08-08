@@ -214,13 +214,18 @@ or refresh Finder.
 
 ## Live E2E
 
-`tests/live_gmail_vfs_roundtrip.sh` exercises the live Gmail API, CLI
-mount/pull/diff/push, daemon, and Linux FUSE projection. It creates an unsent
-Gmail draft through the mounted `draft/` folder, verifies the draft projection,
-and deletes the Gmail draft through Gmail API cleanup. Direct-send behavior uses
-the same outbound document shape under `outbox/`; remote draft move-to-send
-behavior is covered by the outbox-folder push and File Provider reconciliation
-tests.
+`tests/live_gmail_workflow_scenario.sh` runs the full local live Gmail workflow
+scenario against the Gmail API, CLI mount/pull/diff/push, daemon, and Linux FUSE
+projection. It pulls the mounted mailbox projection, creates an unsent Gmail
+draft through `draft/`, verifies the draft projection, updates a pulled remote
+draft, sends a Markdown file directly from `outbox/`, moves the edited remote
+draft to `outbox/` to send it, verifies the sent messages, and cleans up scratch
+drafts/messages where the granted Gmail scope allows it.
+
+`tests/live_gmail_vfs_roundtrip.sh` is the underlying granular harness. With
+`LOCALITY_LIVE_GMAIL_SEND=1`, it runs the same send, stale-draft prune, and
+remote draft edit/send checks; without that flag, it stops after the safer draft
+create/read/delete path.
 
 Use a stored `connection:gmail-live` credential and a recipient address:
 
@@ -235,7 +240,21 @@ Use the full stored credential JSON. The live harness requires
 `access_token`, `oauth_broker_url`, `refresh_token_handle`, and numeric
 `expires_at` so it can exercise broker refresh when the token expires.
 
-Run the gated live check:
+Run the full local workflow scenario. This sends real email to
+`LOCALITY_GMAIL_LIVE_TO_EMAIL`; use a scratch account or a recipient you control.
+
+```bash
+LOCALITY_LIVE_GMAIL_SCENARIO=1 tests/run_linux_fuse_ci.sh tests/live_gmail_workflow_scenario.sh
+```
+
+On a Linux machine with FUSE and build dependencies already installed, the
+scenario can also be run directly:
+
+```bash
+LOCALITY_LIVE_GMAIL_SCENARIO=1 tests/live_gmail_workflow_scenario.sh
+```
+
+Run only the safer draft create/read/delete check:
 
 ```bash
 LOCALITY_LIVE_GMAIL_VFS=1 tests/live_gmail_vfs_roundtrip.sh

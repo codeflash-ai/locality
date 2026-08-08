@@ -19,6 +19,7 @@ on:
       - "tests/live_google_docs_mutation_scenario.sh"
       - "tests/live_google_docs_vfs_roundtrip.sh"
       - "tests/live_google_calendar_vfs_roundtrip.sh"
+      - "tests/live_gmail_workflow_scenario.sh"
       - "tests/live_gmail_vfs_roundtrip.sh"
       - "tests/live_slack_vfs_read.sh"
       - "tests/live_linear_vfs_roundtrip.sh"
