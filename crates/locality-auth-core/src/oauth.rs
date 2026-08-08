@@ -58,8 +58,52 @@ impl OAuthConnector {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OAuthHostMode {
+    /// Backend-brokered OAuth where the completed credential is handed back to
+    /// a local desktop/CLI host and source sync remains local authority.
     LocalBrokered,
+    /// Administrator-owned OAuth where the backend stores an opaque credential
+    /// reference and owns hosted source hydration.
     HostedAdmin,
+}
+
+impl OAuthHostMode {
+    pub const fn authority_mode(self) -> ConnectorAuthorityMode {
+        match self {
+            Self::LocalBrokered => ConnectorAuthorityMode::LocalDirect,
+            Self::HostedAdmin => ConnectorAuthorityMode::HostedManaged,
+        }
+    }
+}
+
+/// Data-authority mode created by a connector authorization flow.
+///
+/// This is intentionally separate from the provider's OAuth mechanics. A
+/// backend may broker either flow, but only `hosted_managed` authorizes backend
+/// credential retention and hosted source hydration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorAuthorityMode {
+    /// Desktop/CLI owns the connection after brokered credential handoff.
+    LocalDirect,
+    /// Hosted backend owns credential storage, refresh, and hydration.
+    HostedManaged,
+}
+
+impl ConnectorAuthorityMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalDirect => "local_direct",
+            Self::HostedManaged => "hosted_managed",
+        }
+    }
+
+    pub const fn stores_provider_data_in_hosted_backend(self) -> bool {
+        matches!(self, Self::HostedManaged)
+    }
+
+    pub const fn is_local_direct(self) -> bool {
+        matches!(self, Self::LocalDirect)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +114,12 @@ pub struct OAuthProfile {
     pub required_scopes: &'static [&'static str],
     pub client_completion_redirect_uri: &'static str,
     pub broker_callback_path: &'static str,
+}
+
+impl OAuthProfile {
+    pub const fn authority_mode(self) -> ConnectorAuthorityMode {
+        self.host.authority_mode()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -591,6 +641,15 @@ mod tests {
                 .expect("local broker profile");
             assert_eq!(profile.connector, *connector);
             assert_eq!(profile.host, OAuthHostMode::LocalBrokered);
+            assert_eq!(
+                profile.authority_mode(),
+                ConnectorAuthorityMode::LocalDirect
+            );
+            assert!(
+                !profile
+                    .authority_mode()
+                    .stores_provider_data_in_hosted_backend()
+            );
             assert!(
                 profile
                     .client_completion_redirect_uri
@@ -602,9 +661,59 @@ mod tests {
     }
 
     #[test]
+    fn oauth_host_modes_map_to_explicit_connector_authority_modes() {
+        assert_eq!(
+            OAuthHostMode::LocalBrokered.authority_mode(),
+            ConnectorAuthorityMode::LocalDirect
+        );
+        assert_eq!(
+            OAuthHostMode::HostedAdmin.authority_mode(),
+            ConnectorAuthorityMode::HostedManaged
+        );
+        assert!(!ConnectorAuthorityMode::LocalDirect.stores_provider_data_in_hosted_backend());
+        assert!(ConnectorAuthorityMode::HostedManaged.stores_provider_data_in_hosted_backend());
+
+        for connector in OAuthConnector::all() {
+            let local = oauth_profile(*connector, OAuthHostMode::LocalBrokered)
+                .expect("local broker profile");
+            let hosted = oauth_profile(*connector, OAuthHostMode::HostedAdmin)
+                .expect("hosted admin profile");
+
+            assert_eq!(local.authority_mode(), ConnectorAuthorityMode::LocalDirect);
+            assert_eq!(
+                hosted.authority_mode(),
+                ConnectorAuthorityMode::HostedManaged
+            );
+        }
+    }
+
+    #[test]
+    fn connector_authority_wire_names_are_stable() {
+        assert_eq!(ConnectorAuthorityMode::LocalDirect.as_str(), "local_direct");
+        assert_eq!(
+            ConnectorAuthorityMode::HostedManaged.as_str(),
+            "hosted_managed"
+        );
+        assert_eq!(
+            serde_json::to_string(&ConnectorAuthorityMode::LocalDirect)
+                .expect("serialize local authority"),
+            "\"local_direct\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ConnectorAuthorityMode>("\"hosted_managed\"")
+                .expect("deserialize hosted authority"),
+            ConnectorAuthorityMode::HostedManaged
+        );
+    }
+
+    #[test]
     fn hosted_slack_profile_is_reduced_from_local_slack_profile() {
         let hosted = oauth_profile(OAuthConnector::Slack, OAuthHostMode::HostedAdmin)
             .expect("hosted Slack profile");
+        assert_eq!(
+            hosted.authority_mode(),
+            ConnectorAuthorityMode::HostedManaged
+        );
         assert_eq!(
             hosted.scopes,
             &[
