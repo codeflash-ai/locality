@@ -17689,6 +17689,10 @@ mod tests {
             filename: filename.to_string(),
             kind: localityd::virtual_fs::VirtualFsItemKind::Folder,
             read_only: false,
+            mutation_permissions_version:
+                localityd::virtual_fs::VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+            can_rename: true,
+            can_delete: true,
             entity_kind: None,
             remote_id: remote_id.map(str::to_string),
             path: filename.to_string(),
@@ -17807,7 +17811,15 @@ mod tests {
     fn startup_restores_supervision_before_clearing_persisted_daemon_fence() {
         let temp = TestTempDir::new("startup-daemon-remount-fence");
         let mount_id = MountId::new("notion-main");
-        drop(super::persist_daemon_remount_fence(temp.path(), &mount_id).expect("persist fence"));
+        drop(
+            loc_cli::mount::WorkspaceRemountOwnership::begin(
+                temp.path(),
+                &mount_id,
+                "desktop-test",
+                "1",
+            )
+            .expect("persist stopped fence"),
+        );
         let restored = std::cell::Cell::new(false);
         let mut ownership = loc_cli::mount::WorkspaceRemountOwnership::recover(temp.path())
             .expect("recover fence ownership");
@@ -17920,7 +17932,15 @@ mod tests {
     fn startup_crash_during_supervision_restore_keeps_persisted_daemon_fence() {
         let temp = TestTempDir::new("startup-daemon-remount-fence-crash");
         let mount_id = MountId::new("notion-main");
-        drop(super::persist_daemon_remount_fence(temp.path(), &mount_id).expect("persist fence"));
+        drop(
+            loc_cli::mount::WorkspaceRemountOwnership::begin(
+                temp.path(),
+                &mount_id,
+                "desktop-test",
+                "1",
+            )
+            .expect("persist stopped fence"),
+        );
 
         let crashed = std::panic::catch_unwind(|| {
             let _ = super::reconcile_daemon_remount_fence_with(temp.path(), |_| {
@@ -18024,7 +18044,15 @@ mod tests {
     fn drain_failure_crash_before_supervision_restore_keeps_persisted_fence() {
         let temp = TestTempDir::new("drain-failure-supervision-crash");
         let mount_id = MountId::new("notion-main");
-        drop(super::persist_daemon_remount_fence(temp.path(), &mount_id).expect("persist fence"));
+        drop(
+            loc_cli::mount::WorkspaceRemountOwnership::begin(
+                temp.path(),
+                &mount_id,
+                "desktop-test",
+                "1",
+            )
+            .expect("persist stopped fence"),
+        );
         let mut ownership = loc_cli::mount::WorkspaceRemountOwnership::recover(temp.path())
             .expect("recover fence ownership");
 
