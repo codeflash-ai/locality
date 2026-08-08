@@ -3,7 +3,7 @@ import Foundation
 import UniformTypeIdentifiers
 
 final class LocalityFileProviderItem: NSObject, NSFileProviderItem {
-  private static let metadataSchemaVersion = "metadata-v4"
+  private static let metadataSchemaVersion = "metadata-v5"
 
   let itemIdentifier: NSFileProviderItemIdentifier
   let parentItemIdentifier: NSFileProviderItemIdentifier
@@ -21,17 +21,23 @@ final class LocalityFileProviderItem: NSObject, NSFileProviderItem {
     )
     self.filename = metadata.filename
     self.contentType = UTType(metadata.contentType) ?? .data
+    var capabilities: NSFileProviderItemCapabilities = [.allowsReading]
     if metadata.kind == "folder" {
+      capabilities.insert(.allowsContentEnumerating)
       if !metadata.readOnly {
-        self.capabilities = [.allowsReading, .allowsContentEnumerating, .allowsAddingSubItems]
-      } else {
-        self.capabilities = [.allowsReading, .allowsContentEnumerating]
+        capabilities.insert(.allowsAddingSubItems)
       }
     } else if metadata.entityKind == "page", !metadata.readOnly {
-      self.capabilities = [.allowsReading, .allowsWriting, .allowsRenaming]
-    } else {
-      self.capabilities = [.allowsReading]
+      capabilities.insert(.allowsWriting)
     }
+    if metadata.canRename {
+      capabilities.insert(.allowsRenaming)
+      capabilities.insert(.allowsReparenting)
+    }
+    if metadata.canDelete {
+      capabilities.insert(.allowsDeleting)
+    }
+    self.capabilities = capabilities
     self.documentSize =
       metadata.kind == "folder"
       ? nil
@@ -53,6 +59,9 @@ final class LocalityFileProviderItem: NSObject, NSFileProviderItem {
         metadata.kind,
         metadata.entityKind ?? "",
         metadata.readOnly ? "read_only" : "writable",
+        String(metadata.mutationPermissionsVersion),
+        metadata.canRename ? "can_rename" : "cannot_rename",
+        metadata.canDelete ? "can_delete" : "cannot_delete",
       ])
     )
     super.init()
@@ -93,6 +102,9 @@ extension LocalityItemMetadata {
       kind: kind,
       entityKind: entityKind,
       readOnly: readOnly,
+      mutationPermissionsVersion: mutationPermissionsVersion,
+      canRename: canRename,
+      canDelete: canDelete,
       remoteId: remoteId,
       path: path,
       hydration: hydration,

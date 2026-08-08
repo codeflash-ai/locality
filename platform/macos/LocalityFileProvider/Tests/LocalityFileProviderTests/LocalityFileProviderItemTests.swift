@@ -253,7 +253,8 @@ final class LocalityFileProviderItemTests: XCTestCase {
         ),
         filename: "page.md",
         kind: "file",
-        entityKind: "page"
+        entityKind: "page",
+        canRename: true
       )
     )
 
@@ -293,6 +294,37 @@ final class LocalityFileProviderItemTests: XCTestCase {
 
     XCTAssertTrue(item.capabilities.contains(.allowsReading))
     XCTAssertTrue(item.capabilities.contains(.allowsContentEnumerating))
+    XCTAssertFalse(item.capabilities.contains(.allowsAddingSubItems))
+  }
+
+  func testReadOnlyPageChildFolderUsesExplicitMutationCapabilities() throws {
+    let json = Data(
+      """
+      {
+        "identifier": "children:page-1",
+        "parent_identifier": "root",
+        "filename": "Project",
+        "kind": "folder",
+        "entity_kind": "page",
+        "read_only": true,
+        "mutation_permissions_version": 2,
+        "can_rename": true,
+        "can_delete": true,
+        "remote_id": "page-1",
+        "path": "Project",
+        "content_type": "public.folder"
+      }
+      """.utf8
+    )
+    let metadata = try JSONDecoder().decode(LocalityItemMetadata.self, from: json)
+
+    let item = LocalityFileProviderItem(metadata: metadata)
+
+    XCTAssertTrue(item.capabilities.contains(.allowsReading))
+    XCTAssertTrue(item.capabilities.contains(.allowsContentEnumerating))
+    XCTAssertTrue(item.capabilities.contains(.allowsRenaming))
+    XCTAssertTrue(item.capabilities.contains(.allowsReparenting))
+    XCTAssertTrue(item.capabilities.contains(.allowsDeleting))
     XCTAssertFalse(item.capabilities.contains(.allowsAddingSubItems))
   }
 
@@ -341,13 +373,46 @@ final class LocalityFileProviderItemTests: XCTestCase {
     XCTAssertFalse(metadata.readOnly)
   }
 
+  func testMetadataDecodingDefaultsMissingMutationCapabilitiesToFalse() throws {
+    let json = Data(
+      """
+      {
+        "identifier": "page-1",
+        "parent_identifier": "root",
+        "filename": "page.md",
+        "kind": "file",
+        "entity_kind": "page",
+        "remote_id": "remote-page-1",
+        "path": "page.md",
+        "content_type": "net.daringfireball.markdown"
+      }
+      """.utf8
+    )
+
+    let metadata = try JSONDecoder().decode(LocalityItemMetadata.self, from: json)
+
+    XCTAssertEqual(metadata.mutationPermissionsVersion, 0)
+    XCTAssertFalse(metadata.canRename)
+    XCTAssertFalse(metadata.canDelete)
+  }
+
+  func testRemotePageDirectoryDeleteShouldReachDaemonPolicy() {
+    XCTAssertTrue(shouldRequestDaemonTrash(daemonIdentifier: "children:page-1"))
+    XCTAssertTrue(shouldRequestDaemonTrash(daemonIdentifier: "page-1"))
+    XCTAssertTrue(shouldRequestDaemonTrash(daemonIdentifier: "local:123"))
+    XCTAssertFalse(shouldRequestDaemonTrash(daemonIdentifier: LocalityIdentifier.root))
+  }
+
   private func metadata(
     identifier: String,
     parentIdentifier: String = LocalityIdentifier.root,
     filename: String,
     kind: String,
     entityKind: String? = nil,
-    readOnly: Bool = false
+    readOnly: Bool = false,
+    mutationPermissionsVersion: UInt32 = 0,
+    canRename: Bool = false,
+    canDelete: Bool = false
   ) -> LocalityItemMetadata {
     LocalityItemMetadata(
       identifier: identifier,
@@ -356,6 +421,9 @@ final class LocalityFileProviderItemTests: XCTestCase {
       kind: kind,
       entityKind: entityKind,
       readOnly: readOnly,
+      mutationPermissionsVersion: mutationPermissionsVersion,
+      canRename: canRename,
+      canDelete: canDelete,
       remoteId: nil,
       path: filename,
       hydration: nil,

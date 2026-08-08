@@ -340,7 +340,7 @@ final class LocalityFileProviderExtension: NSObject, NSFileProviderReplicatedExt
     do {
       client = try daemonClient()
       resolved = try resolveIdentifier(identifier)
-      guard resolved.daemonIdentifier.hasPrefix("local:") else {
+      guard shouldRequestDaemonTrash(daemonIdentifier: resolved.daemonIdentifier) else {
         completionHandler(unsupportedWriteError())
         progress.completedUnitCount = 1
         return progress
@@ -406,6 +406,9 @@ final class LocalityFileProviderExtension: NSObject, NSFileProviderReplicatedExt
       kind: "folder",
       entityKind: nil,
       readOnly: true,
+      mutationPermissionsVersion: 0,
+      canRename: false,
+      canDelete: false,
       remoteId: nil,
       path: "",
       hydration: nil,
@@ -435,7 +438,7 @@ final class LocalityFileProviderExtension: NSObject, NSFileProviderReplicatedExt
 
   private func unsupportedWriteError() -> NSError {
     unsupportedWriteError(
-      "Locality currently supports editing existing page.md files. Create, rename, and delete support will be added through the daemon write pipeline."
+      "Locality cannot apply this File Provider write to this item."
     )
   }
 
@@ -457,6 +460,10 @@ func shouldAcceptAlreadyReconciledLocalDeletion(
   return code == "invalid_state"
     && message.contains("virtual filesystem item")
     && message.contains("is not present in daemon state")
+}
+
+func shouldRequestDaemonTrash(daemonIdentifier: String) -> Bool {
+  daemonIdentifier != LocalityIdentifier.root
 }
 
 private func agentFSUnsupportedWriteError(_ message: String) -> NSError {

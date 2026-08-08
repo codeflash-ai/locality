@@ -183,6 +183,7 @@ pub struct SourceDescriptor {
     source_root_create_parent_kind: Option<EntityKind>,
     create_entity_parent_kinds: Vec<EntityKind>,
     move_entity_parent_kinds: Vec<EntityKind>,
+    supports_archive_entity: bool,
     periodic_discovery_interval: Option<Duration>,
     body_diff_mode: BodyDiffMode,
     virtual_rename_policy: VirtualRenamePolicy,
@@ -234,6 +235,10 @@ impl SourceDescriptor {
 
     pub fn move_entity_parent_kinds(&self) -> &[EntityKind] {
         &self.move_entity_parent_kinds
+    }
+
+    pub fn supports_archive_entity(&self) -> bool {
+        self.supports_archive_entity
     }
 
     pub fn periodic_discovery_interval(&self) -> Option<Duration> {
@@ -440,6 +445,7 @@ fn notion_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         move_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
+        supports_archive_entity: true,
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
@@ -459,6 +465,7 @@ fn google_docs_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: Some(EntityKind::Directory),
         create_entity_parent_kinds: vec![EntityKind::Directory],
         move_entity_parent_kinds: vec![EntityKind::Directory],
+        supports_archive_entity: true,
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
@@ -478,6 +485,7 @@ fn google_calendar_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Directory],
         move_entity_parent_kinds: Vec::new(),
+        supports_archive_entity: false,
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
@@ -497,6 +505,7 @@ fn gmail_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Directory],
         move_entity_parent_kinds: vec![EntityKind::Directory],
+        supports_archive_entity: false,
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::WholeEntity,
         virtual_rename_policy: VirtualRenamePolicy::PreserveCanonical,
@@ -516,6 +525,7 @@ fn granola_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: Vec::new(),
         move_entity_parent_kinds: Vec::new(),
+        supports_archive_entity: false,
         periodic_discovery_interval: Some(Duration::from_secs(300)),
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
@@ -535,6 +545,7 @@ fn slack_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: Vec::new(),
         move_entity_parent_kinds: Vec::new(),
+        supports_archive_entity: false,
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
@@ -612,6 +623,7 @@ fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         move_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
+        supports_archive_entity: true,
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
@@ -631,6 +643,7 @@ fn linear_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: Vec::new(),
         move_entity_parent_kinds: vec![EntityKind::Directory],
+        supports_archive_entity: false,
         periodic_discovery_interval: Some(Duration::from_secs(300)),
         body_diff_mode: BodyDiffMode::WholeEntity,
         virtual_rename_policy: VirtualRenamePolicy::PreserveCanonical,

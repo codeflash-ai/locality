@@ -60,6 +60,13 @@ assert_job_line ".github/workflows/e2e.yml" "linux-fuse" "    runs-on: ubuntu-la
 assert_job_line ".github/workflows/e2e.yml" "linux-fuse" \
   "        run: LOCALITY_FUSE_SMOKE=1 LOCALITY_FUSE_SMOKE_REQUIRED=1 tests/run_linux_fuse_ci.sh tests/linux_fuse_smoke.sh"
 
+assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
+  "          bash -n tests/live_connector_common.sh"
+assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
+  "          bash -n tests/live_connector_common_selftest.sh"
+assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
+  "          bash -n tests/live_google_docs_mutation_scenario.sh"
+
 assert_job_line ".github/workflows/notion-live-e2e.yml" "linux-fuse-live" "    runs-on: ubuntu-latest"
 assert_job_line ".github/workflows/notion-live-e2e.yml" "linux-fuse-live" \
   "        run: tests/run_linux_fuse_ci.sh env -u NOTION_TOKEN -u NOTION_AT tests/live_notion_vfs_push_pull.sh"
@@ -105,6 +112,7 @@ for workflow in \
 done
 
 for dependency in \
+  '      - "tests/live_google_docs_mutation_scenario.sh"' \
   '      - "tests/resolve_linear_live_issue.py"' \
   '      - "tests/resolve_linear_live_issue_selftest.sh"'; do
   grep -Fqx "$dependency" "$ROOT/.github/workflows/connector-live-e2e.yml" ||

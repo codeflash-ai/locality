@@ -262,6 +262,10 @@ fn directory_metadata_item() -> VirtualFsItem {
         filename: DIRECTORY_METADATA_FILENAME.to_string(),
         kind: VirtualFsItemKind::File,
         read_only: true,
+        mutation_permissions_version:
+            localityd::virtual_fs::VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+        can_rename: false,
+        can_delete: false,
         entity_kind: None,
         remote_id: None,
         path: DIRECTORY_METADATA_FILENAME.to_string(),
@@ -586,6 +590,10 @@ impl DaemonClient {
             filename: String::new(),
             kind: VirtualFsItemKind::Folder,
             read_only: false,
+            mutation_permissions_version:
+                localityd::virtual_fs::VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+            can_rename: false,
+            can_delete: false,
             entity_kind: None,
             remote_id: None,
             path: String::new(),
@@ -909,7 +917,7 @@ where
                 VirtualFsItemKind::Folder => FuseError::NotDirectory,
             });
         }
-        ensure_writable_item(&item)?;
+        ensure_deletable_item(&item)?;
         self.client.trash(&item.identifier)?;
         self.remove_cached_path(&path);
         Ok(())
@@ -922,9 +930,9 @@ where
         filename: &str,
     ) -> Result<(), FuseError> {
         let item = self.resolve_path(old_path)?;
-        ensure_writable_item(&item)?;
+        ensure_renamable_item(&item)?;
         let new_parent = self.resolve_path(new_parent_path)?;
-        ensure_creatable_parent(&new_parent)?;
+        ensure_rename_parent(&new_parent, &item)?;
         let report = self
             .client
             .rename(&item.identifier, &new_parent.identifier, filename)?;
@@ -1607,6 +1615,62 @@ fn ensure_writable_item(item: &VirtualFsItem) -> Result<(), FuseError> {
     Ok(())
 }
 
+fn has_explicit_mutation_permissions(item: &VirtualFsItem) -> bool {
+    item.mutation_permissions_version
+        >= localityd::virtual_fs::VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION
+}
+
+fn legacy_page_directory_item(item: &VirtualFsItem) -> bool {
+    item.kind == VirtualFsItemKind::Folder && item.remote_id.is_some() && item.entity_kind.is_none()
+}
+
+fn page_directory_mutation_item(item: &VirtualFsItem) -> bool {
+    item.kind == VirtualFsItemKind::Folder
+        && (item
+            .entity_kind
+            .as_ref()
+            .is_some_and(|kind| *kind == EntityKind::Page)
+            || legacy_page_directory_item(item))
+}
+
+fn ensure_renamable_item(item: &VirtualFsItem) -> Result<(), FuseError> {
+    if has_explicit_mutation_permissions(item) {
+        if item.can_rename {
+            Ok(())
+        } else {
+            Err(FuseError::ReadOnly)
+        }
+    } else if legacy_page_directory_item(item) {
+        Ok(())
+    } else {
+        ensure_writable_item(item)
+    }
+}
+
+fn ensure_deletable_item(item: &VirtualFsItem) -> Result<(), FuseError> {
+    if has_explicit_mutation_permissions(item) {
+        if item.can_delete {
+            Ok(())
+        } else {
+            Err(FuseError::ReadOnly)
+        }
+    } else if legacy_page_directory_item(item) {
+        Ok(())
+    } else {
+        ensure_writable_item(item)
+    }
+}
+
+fn ensure_rename_parent(parent: &VirtualFsItem, item: &VirtualFsItem) -> Result<(), FuseError> {
+    if parent.kind != VirtualFsItemKind::Folder {
+        return Err(FuseError::NotDirectory);
+    }
+    if parent.read_only && !page_directory_mutation_item(item) {
+        return Err(FuseError::ReadOnly);
+    }
+    Ok(())
+}
+
 fn ensure_creatable_parent(item: &VirtualFsItem) -> Result<(), FuseError> {
     if item.kind != VirtualFsItemKind::Folder {
         return Err(FuseError::NotDirectory);
@@ -1622,7 +1686,12 @@ fn ensure_access_allowed(item: &VirtualFsItem, mask: u32) -> Result<(), FuseErro
         return Ok(());
     }
     if item.kind == VirtualFsItemKind::Folder {
-        if item.read_only {
+        let mutation_probe_allowed = if has_explicit_mutation_permissions(item) {
+            item.can_rename || item.can_delete
+        } else {
+            legacy_page_directory_item(item)
+        };
+        if item.read_only && !mutation_probe_allowed {
             return Err(FuseError::ReadOnly);
         }
         return Ok(());
@@ -2038,6 +2107,70 @@ mod tests {
             .expect_err("read-only item rejects write access");
 
         assert_eq!(error, libc::EROFS.into());
+    }
+
+    #[tokio::test]
+    async fn access_write_mask_allows_mutable_read_only_page_directory() {
+        let root = test_root_item();
+        let mut item = test_named_item("children:doc-1", "Doc", VirtualFsItemKind::Folder);
+        item.read_only = true;
+        item.can_rename = true;
+        item.can_delete = true;
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "google-docs-main".to_string(),
+                root: root.clone(),
+                children: fake_children(&root, vec![item.clone()]),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Doc"), item),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        fs.access(Request::default(), OsStr::new("/Doc"), libc::W_OK as u32)
+            .await
+            .expect("mutable read-only page directory allows write access probe");
+    }
+
+    #[tokio::test]
+    async fn access_write_mask_allows_legacy_read_only_page_directory() {
+        let root = test_root_item();
+        let mut item = test_named_item("children:doc-1", "Doc", VirtualFsItemKind::Folder);
+        item.read_only = true;
+        item.mutation_permissions_version = 0;
+        item.can_rename = false;
+        item.can_delete = false;
+        item.remote_id = Some("doc-1".to_string());
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "google-docs-main".to_string(),
+                root: root.clone(),
+                children: fake_children(&root, vec![item.clone()]),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Doc"), item),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        fs.access(Request::default(), OsStr::new("/Doc"), libc::W_OK as u32)
+            .await
+            .expect("legacy page directory allows write access probe");
     }
 
     #[tokio::test]
@@ -2494,6 +2627,114 @@ mod tests {
     }
 
     #[test]
+    fn trash_path_accepts_read_only_folder_items_for_page_directory_delete() {
+        let root = test_root_item();
+        let mut page_dir =
+            test_named_item("children:page-draft", "Draft", VirtualFsItemKind::Folder);
+        page_dir.read_only = true;
+        let page_file = test_named_item("page-draft", "page.md", VirtualFsItemKind::File);
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: fake_children(&root, vec![page_dir.clone()]),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Draft"), page_dir),
+                (PathBuf::from("/Draft/page.md"), page_file),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        fs.trash_path(Path::new("/Draft"), VirtualFsItemKind::Folder)
+            .expect("trash read-only page folder");
+
+        assert_eq!(
+            fs.client.trashed.lock().expect("trashed").as_slice(),
+            &["children:page-draft".to_string()]
+        );
+    }
+
+    #[test]
+    fn trash_path_accepts_legacy_read_only_page_directory_without_permission_flags() {
+        let root = test_root_item();
+        let mut page_dir =
+            test_named_item("children:page-draft", "Draft", VirtualFsItemKind::Folder);
+        page_dir.read_only = true;
+        page_dir.mutation_permissions_version = 0;
+        page_dir.can_rename = false;
+        page_dir.can_delete = false;
+        page_dir.remote_id = Some("page-draft".to_string());
+        let page_file = test_named_item("page-draft", "page.md", VirtualFsItemKind::File);
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: fake_children(&root, vec![page_dir.clone()]),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Draft"), page_dir),
+                (PathBuf::from("/Draft/page.md"), page_file),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        fs.trash_path(Path::new("/Draft"), VirtualFsItemKind::Folder)
+            .expect("trash legacy page folder");
+
+        assert_eq!(
+            fs.client.trashed.lock().expect("trashed").as_slice(),
+            &["children:page-draft".to_string()]
+        );
+    }
+
+    #[test]
+    fn trash_path_rejects_explicit_non_deletable_folder() {
+        let root = test_root_item();
+        let mut folder = test_named_item("path:Folder", "Folder", VirtualFsItemKind::Folder);
+        folder.can_delete = false;
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: fake_children(&root, vec![folder.clone()]),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Folder"), folder),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let error = fs
+            .trash_path(Path::new("/Folder"), VirtualFsItemKind::Folder)
+            .expect_err("explicit non-deletable folder rejects trash");
+
+        assert!(matches!(error, FuseError::ReadOnly));
+        assert!(fs.client.trashed.lock().expect("trashed").is_empty());
+    }
+
+    #[test]
     fn trash_path_treats_stale_pending_page_directory_as_already_removed() {
         let root = test_root_item();
         let stale_dir = test_named_item("children:local:draft", "Draft", VirtualFsItemKind::Folder);
@@ -2584,6 +2825,180 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rename_path_accepts_read_only_folder_items_for_page_directory_rename() {
+        let root = test_root_item();
+        let mut page_dir =
+            test_named_item("children:page-draft", "Draft", VirtualFsItemKind::Folder);
+        page_dir.read_only = true;
+        let page_file = test_named_item("page-draft", "page.md", VirtualFsItemKind::File);
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: fake_children(&root, vec![page_dir.clone()]),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Draft"), page_dir),
+                (PathBuf::from("/Draft/page.md"), page_file),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        fs.rename_path(Path::new("/Draft"), Path::new(ROOT_PATH), "Published")
+            .expect("rename read-only page folder");
+
+        assert_eq!(
+            fs.client.renamed.lock().expect("renamed").as_slice(),
+            &[(
+                "children:page-draft".to_string(),
+                "mount:notion-main".to_string(),
+                "Published".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn rename_path_accepts_page_directory_move_into_read_only_parent() {
+        let root = test_root_item();
+        let mut todo = test_named_item("linear-status:todo", "Todo", VirtualFsItemKind::Folder);
+        todo.read_only = true;
+        let mut done = test_named_item("linear-status:done", "Done", VirtualFsItemKind::Folder);
+        done.read_only = true;
+        let mut page_dir = test_named_item(
+            "children:issue-1",
+            "ENG-1 Improve sync",
+            VirtualFsItemKind::Folder,
+        );
+        page_dir.read_only = true;
+        page_dir.entity_kind = Some(EntityKind::Page);
+        let page_file = test_named_item("issue-1", "page.md", VirtualFsItemKind::File);
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "linear-main".to_string(),
+                root: root.clone(),
+                children: BTreeMap::from([
+                    (root.identifier.clone(), vec![todo.clone(), done.clone()]),
+                    (todo.identifier.clone(), vec![page_dir.clone()]),
+                    (page_dir.identifier.clone(), vec![page_file.clone()]),
+                ]),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Todo"), todo),
+                (PathBuf::from("/Done"), done),
+                (PathBuf::from("/Todo/ENG-1 Improve sync"), page_dir),
+                (PathBuf::from("/Todo/ENG-1 Improve sync/page.md"), page_file),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        fs.rename_path(
+            Path::new("/Todo/ENG-1 Improve sync"),
+            Path::new("/Done"),
+            "ENG-1 Improve sync",
+        )
+        .expect("move renamable page directory into read-only parent");
+
+        assert_eq!(
+            fs.client.renamed.lock().expect("renamed").as_slice(),
+            &[(
+                "children:issue-1".to_string(),
+                "linear-status:done".to_string(),
+                "ENG-1 Improve sync".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn rename_path_accepts_legacy_read_only_page_directory_without_permission_flags() {
+        let root = test_root_item();
+        let mut page_dir =
+            test_named_item("children:page-draft", "Draft", VirtualFsItemKind::Folder);
+        page_dir.read_only = true;
+        page_dir.mutation_permissions_version = 0;
+        page_dir.can_rename = false;
+        page_dir.can_delete = false;
+        page_dir.remote_id = Some("page-draft".to_string());
+        let page_file = test_named_item("page-draft", "page.md", VirtualFsItemKind::File);
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: fake_children(&root, vec![page_dir.clone()]),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Draft"), page_dir),
+                (PathBuf::from("/Draft/page.md"), page_file),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        fs.rename_path(Path::new("/Draft"), Path::new(ROOT_PATH), "Published")
+            .expect("rename legacy page folder");
+
+        assert_eq!(
+            fs.client.renamed.lock().expect("renamed").as_slice(),
+            &[(
+                "children:page-draft".to_string(),
+                "mount:notion-main".to_string(),
+                "Published".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn rename_path_rejects_explicit_non_renamable_folder() {
+        let root = test_root_item();
+        let mut folder = test_named_item("path:Folder", "Folder", VirtualFsItemKind::Folder);
+        folder.can_rename = false;
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: fake_children(&root, vec![folder.clone()]),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Folder"), folder),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let error = fs
+            .rename_path(Path::new("/Folder"), Path::new(ROOT_PATH), "Renamed")
+            .expect_err("explicit non-renamable folder rejects rename");
+
+        assert!(matches!(error, FuseError::ReadOnly));
+        assert!(fs.client.renamed.lock().expect("renamed").is_empty());
+    }
+
     fn test_item(
         kind: VirtualFsItemKind,
         materialized_path: Option<PathBuf>,
@@ -2595,6 +3010,10 @@ mod tests {
             filename: "Item".to_string(),
             kind,
             read_only: false,
+            mutation_permissions_version:
+                localityd::virtual_fs::VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+            can_rename: true,
+            can_delete: true,
             entity_kind: None,
             remote_id: None,
             path: "Item".to_string(),
@@ -2613,6 +3032,10 @@ mod tests {
             filename: filename.to_string(),
             kind,
             read_only: false,
+            mutation_permissions_version:
+                localityd::virtual_fs::VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+            can_rename: true,
+            can_delete: true,
             entity_kind: None,
             remote_id: None,
             path: filename.to_string(),
@@ -2638,6 +3061,10 @@ mod tests {
             filename: String::new(),
             kind: VirtualFsItemKind::Folder,
             read_only: false,
+            mutation_permissions_version:
+                localityd::virtual_fs::VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+            can_rename: false,
+            can_delete: false,
             entity_kind: None,
             remote_id: None,
             path: String::new(),
@@ -2656,6 +3083,10 @@ mod tests {
             filename: String::new(),
             kind: VirtualFsItemKind::Folder,
             read_only: false,
+            mutation_permissions_version:
+                localityd::virtual_fs::VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
+            can_rename: false,
+            can_delete: false,
             entity_kind: None,
             remote_id: None,
             path: String::new(),
