@@ -137,6 +137,15 @@ It creates a scratch draft event through the mounted `draft/` directory,
 verifies the pushed event appears under `events/`, and deletes the event through
 Google Calendar API cleanup.
 
+`tests/live_google_calendar_scenario.sh` is the broader local bug-finding
+scenario. It seeds scratch timed, all-day, meeting, and recurring events through
+the Google Calendar API, pulls them through the Locality mount, creates a new
+event from `draft/`, verifies the provider event, patches a seeded event through
+the provider API and verifies Locality reads the update back, then confirms
+local edits to projected `events/` files are blocked as read-only. Set
+`LOCALITY_GOOGLE_CALENDAR_LIVE_ATTENDEE_EMAIL` to add an attendee to the seeded
+meeting without sending updates.
+
 To reuse a stored `connection:google-calendar-live` credential:
 
 ```bash
@@ -153,6 +162,12 @@ Run the gated live test:
 
 ```bash
 LOCALITY_LIVE_GOOGLE_CALENDAR_VFS=1 tests/live_google_calendar_vfs_roundtrip.sh
+```
+
+Run the broader local scenario:
+
+```bash
+LOCALITY_LIVE_GOOGLE_CALENDAR_SCENARIO=1 tests/live_google_calendar_scenario.sh
 ```
 
 ## Useful Commands

@@ -155,6 +155,15 @@ export LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credenti
 LOCALITY_LIVE_GOOGLE_CALENDAR_VFS=1 tests/live_google_calendar_vfs_roundtrip.sh
 ```
 
+Run the broader Google Calendar local scenario against the primary calendar:
+
+```sh
+secret_ref='connection:google-calendar-live'
+secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
+export LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
+LOCALITY_LIVE_GOOGLE_CALENDAR_SCENARIO=1 tests/live_google_calendar_scenario.sh
+```
+
 Run Gmail against a test mailbox and a safe recipient address:
 
 ```sh
@@ -305,6 +314,7 @@ Coverage labels:
 |---|---|---|
 | `tests/live_google_docs_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a stored Google Docs credential into isolated state, mounts a scratch Drive workspace folder, creates a document through a FUSE `page.md`, verifies `diff` and `push`, pulls the document back through the real Google Docs and Drive APIs, edits the created document through mounted Markdown, pulls the edit back, and trashes the scratch Drive file. Covers the live create/edit/read-back side of E2E-037. |
 | `tests/live_google_calendar_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a stored Google Calendar credential, creates a calendar event from a local draft under the mounted filesystem, verifies the event projection after pull, and deletes the scratch event through the Calendar API. Covers the live draft-create path for Google Calendar. |
+| `tests/live_google_calendar_scenario.sh` | Live Linux FUSE product path | Seeds scratch timed, all-day, meeting, and recurring events through the Google Calendar API, verifies Locality retrieval/projection, creates an event from `draft/`, verifies the provider event and post-create projection, reads back a provider-side event update, and confirms local edits to projected `events/` files are blocked before provider mutation. |
 | `tests/live_gmail_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a stored Gmail credential, creates an unsent Gmail UI draft from a mounted `draft/` Markdown file, verifies the projected Gmail draft maps to the created message, and deletes the draft through the Gmail API. Covers the live Gmail draft-create path; direct sends use the sibling `outbox/` folder and are tracked in E2E-042. |
 | `tests/live_slack_vfs_read.sh` | Live Linux FUSE product path | Seeds a stored Slack credential, mounts selected non-public Slack conversation types read-only, resolves the configured conversation by identity metadata, hydrates its `recent.md`, verifies status stays clean, and proves push is blocked before Slack writes. Covers the live Slack read-only projection and write guardrail. |
 | `tests/live_linear_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a Linear API key credential, mounts Linear through the real daemon and FUSE helper, resolves the configured issue through the local search index and verifies its projected frontmatter identity, appends a body marker, pushes and pulls it back, then restores only the original body under current generated frontmatter. Covers the live Linear issue edit/read-back/restore path without recursively hydrating unrelated workspace issues. |
