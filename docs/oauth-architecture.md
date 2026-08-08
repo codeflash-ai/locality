@@ -52,3 +52,16 @@ Postgres.
 Hosted connectors may consume `locality-auth-core` for IDs and scope profiles,
 but hosted availability, tenant binding, finalization, grants, and jobs remain
 private runtime responsibilities.
+
+## Backend Image Boundary
+
+The public `apps/oauth-service` broker is the desktop/local-direct OAuth helper.
+It completes provider authorization through localhost and must not be deployed
+as the hosted credential authority for enterprise/admin sources.
+
+Hosted/admin OAuth is a backend process mode in `locality-internal`. That mode
+owns tenant-bound intents, provider callbacks, managed secret references,
+Postgres finalization, and worker handoff. Keeping the boundary explicit lets
+the public repo share connector identity and callback vocabulary without
+shipping hosted tenant authorization, Secrets Manager policy, or admin
+credential lifecycle code.
