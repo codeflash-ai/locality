@@ -1743,6 +1743,7 @@ where
             ));
         }
         ensure_source_path_writable(&mount, &entity.path)?;
+        ensure_source_supports_archive_entity(&mount)?;
         return record_virtual_fs_page_delete(store, content_root, &mount, &entities, entity, true);
     }
 
@@ -1764,6 +1765,7 @@ where
         ));
     }
     ensure_source_path_writable(&mount, &entity.path)?;
+    ensure_source_supports_archive_entity(&mount)?;
     record_virtual_fs_page_delete(store, content_root, &mount, &entities, entity, false)
 }
 
@@ -4889,8 +4891,20 @@ fn page_file_can_mutate(mount: &MountConfig, path: &Path, entity_kind: &EntityKi
     *entity_kind == EntityKind::Page && !item_file_read_only(mount, path)
 }
 
+fn source_supports_archive_entity(mount: &MountConfig) -> bool {
+    source_descriptor(&mount.connector).supports_archive_entity()
+}
+
+fn page_file_can_delete(mount: &MountConfig, path: &Path, entity_kind: &EntityKind) -> bool {
+    page_file_can_mutate(mount, path, entity_kind) && source_supports_archive_entity(mount)
+}
+
 fn page_directory_can_mutate(mount: &MountConfig, path: &Path) -> bool {
     !item_file_read_only(mount, &page_document_path(path))
+}
+
+fn page_directory_can_delete(mount: &MountConfig, path: &Path) -> bool {
+    page_directory_can_mutate(mount, path) && source_supports_archive_entity(mount)
 }
 
 fn item_folder_read_only(
@@ -4935,6 +4949,7 @@ fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex
         VirtualFsItemKind::Folder => item_folder_read_only(mount, &entity.path, Some(&entity.kind)),
     };
     let can_mutate = page_file_can_mutate(mount, &entity.path, &entity.kind);
+    let can_delete = page_file_can_delete(mount, &entity.path, &entity.kind);
 
     VirtualFsItem {
         identifier: entity.remote_id.0.clone(),
@@ -4948,7 +4963,7 @@ fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex
         read_only,
         mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
         can_rename: can_mutate,
-        can_delete: can_mutate,
+        can_delete,
         entity_kind: Some(entity.kind.clone()),
         remote_id: Some(entity.remote_id.0.clone()),
         path: path_string(&entity.path),
@@ -5520,6 +5535,7 @@ fn page_child_dir_item(
     index: &ProviderIndex,
 ) -> VirtualFsItem {
     let can_mutate = page_directory_can_mutate(mount, path);
+    let can_delete = page_directory_can_delete(mount, path);
     VirtualFsItem {
         identifier: format!("{CHILDREN_PREFIX}{}", remote_id.0),
         parent_identifier: Some(container_identifier_for_path(
@@ -5532,7 +5548,7 @@ fn page_child_dir_item(
         read_only: item_folder_read_only(mount, path, Some(&EntityKind::Page)),
         mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
         can_rename: can_mutate,
-        can_delete: can_mutate,
+        can_delete,
         entity_kind: None,
         remote_id: Some(remote_id.0.clone()),
         path: path_string(path),
@@ -5756,6 +5772,17 @@ fn ensure_source_path_writable(mount: &MountConfig, relative_path: &Path) -> Loc
         crate::source::SourceWriteDecision::ReadOnly { reason } => {
             Err(LocalityError::Unsupported(reason))
         }
+    }
+}
+
+fn ensure_source_supports_archive_entity(mount: &MountConfig) -> LocalityResult<()> {
+    let descriptor = source_descriptor(&mount.connector);
+    if descriptor.supports_archive_entity() {
+        Ok(())
+    } else {
+        Err(LocalityError::Unsupported(
+            "source does not support deleting or archiving entities",
+        ))
     }
 }
 
@@ -6658,6 +6685,51 @@ mod tests {
         assert!(google_page_folder.read_only);
         assert!(google_page_folder.can_rename);
         assert!(google_page_folder.can_delete);
+    }
+
+    #[test]
+    fn linear_issue_page_directory_is_renamable_but_not_deletable() {
+        let mount_id = MountId::new("linear-main");
+        let state_root = temp_root("loc-linear-virtual-delete-capability");
+        let content_root = state_root.join("content/linear-main/files");
+        let issue_path = PathBuf::from("Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
+            .expect("save linear mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("issue-1"),
+                EntityKind::Page,
+                "ENG-1 Improve sync",
+                issue_path.clone(),
+            ))
+            .expect("save linear issue");
+
+        let parent_identifier = "path:Teams/Engineering/Issues/Todo";
+        let children = virtual_fs_children(&store, &mount_id, parent_identifier)
+            .expect("list linear status folder");
+        let issue_folder = children
+            .children
+            .iter()
+            .find(|child| child.identifier == "children:issue-1")
+            .expect("linear issue directory");
+        assert!(issue_folder.read_only);
+        assert!(issue_folder.can_rename);
+        assert!(!issue_folder.can_delete);
+
+        let error = trash_virtual_fs_item(&mut store, &content_root, &mount_id, "children:issue-1")
+            .expect_err("Linear issue directory delete is unsupported");
+        assert!(matches!(error, LocalityError::Unsupported(_)));
+        assert!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")
+                .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
