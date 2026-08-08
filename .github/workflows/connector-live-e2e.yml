@@ -59,7 +59,9 @@ jobs:
           sudo apt-get install -y sqlite3
       - name: Run live connector harness self-test
         run: |
-          bash -n tests/live_connector_common.sh tests/live_connector_common_selftest.sh tests/live_google_docs_mutation_scenario.sh
+          bash -n tests/live_connector_common.sh
+          bash -n tests/live_connector_common_selftest.sh
+          bash -n tests/live_google_docs_mutation_scenario.sh
           LOCALITY_LIVE_COMMON_SELFTEST=1 tests/live_connector_common_selftest.sh
 
   google-docs-live:

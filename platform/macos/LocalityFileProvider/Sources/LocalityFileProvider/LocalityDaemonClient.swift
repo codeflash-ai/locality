@@ -165,6 +165,9 @@ struct LocalityItemMetadata: Decodable {
   let kind: String
   let entityKind: String?
   let readOnly: Bool
+  let mutationPermissionsVersion: UInt32
+  let canRename: Bool
+  let canDelete: Bool
   let remoteId: String?
   let path: String
   let hydration: String?
@@ -180,6 +183,9 @@ struct LocalityItemMetadata: Decodable {
     case kind
     case entityKind = "entity_kind"
     case readOnly = "read_only"
+    case mutationPermissionsVersion = "mutation_permissions_version"
+    case canRename = "can_rename"
+    case canDelete = "can_delete"
     case remoteId = "remote_id"
     case path
     case hydration
@@ -200,6 +206,10 @@ extension LocalityItemMetadata {
     kind = try container.decode(String.self, forKey: .kind)
     entityKind = try container.decodeIfPresent(String.self, forKey: .entityKind)
     readOnly = try container.decodeIfPresent(Bool.self, forKey: .readOnly) ?? false
+    mutationPermissionsVersion =
+      try container.decodeIfPresent(UInt32.self, forKey: .mutationPermissionsVersion) ?? 0
+    canRename = try container.decodeIfPresent(Bool.self, forKey: .canRename) ?? false
+    canDelete = try container.decodeIfPresent(Bool.self, forKey: .canDelete) ?? false
     remoteId = try container.decodeIfPresent(String.self, forKey: .remoteId)
     path = try container.decode(String.self, forKey: .path)
     hydration = try container.decodeIfPresent(String.self, forKey: .hydration)
