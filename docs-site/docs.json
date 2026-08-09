@@ -53,7 +53,8 @@
         "pages": [
           "overview",
           "install",
-          "quickstart"
+          "quickstart",
+          "admin-console"
         ]
       },
       {
