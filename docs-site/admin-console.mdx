@@ -19,7 +19,7 @@ Start with the outcome you need.
 | Automate a personal local workflow | **Desktop + `loc`** | Commands for local mounts, status, diff, pull, and push |
 
 <Note>
-  Admin and Desktop solve different problems. Connecting Notion in Admin does not create a Desktop mount. Connecting Notion in Desktop does not add an organization source in Admin.
+  Admin and Desktop solve different problems. Connecting a provider in Admin does not create a Desktop mount. Connecting the same provider in Desktop does not add an organization source in Admin.
 </Note>
 
 <Frame caption="The Locality Desktop source view manages personal mounts on this computer.">
@@ -38,17 +38,17 @@ Connected source
     -> Read-only files for an agent
 ```
 
-Each part answers one question:
+Each part has one responsibility:
 
-| Part | Question it answers | Example |
-| --- | --- | --- |
-| **Connected source** | Where does the data come from? | The company Notion workspace |
-| **Data Grant** | Who may use which folders, and how? | Sarthak may read and search Engineering Wiki |
-| **Workspace Profile** | Which grants and freshness rules belong in one sandbox? | Engineering research, refreshed if older than 24 hours |
-| **Sandbox key** | How may this person launch that profile? | A secret key used by `loc sandbox init` |
-| **Sandbox** | Where does the approved snapshot appear? | `$HOME/locality-sandboxes/engineering` |
+| Part | Responsibility |
+| --- | --- |
+| **Connected source** | Authorizes Locality to ingest selected content from a provider |
+| **Data Grant** | Defines which recipient may use which folders and actions |
+| **Workspace Profile** | Combines that recipient's grants, folder layout, and freshness requirement into a reusable setup |
+| **Sandbox key** | Allows the recipient to launch sandboxes from one assigned Workspace Profile |
+| **Sandbox** | Materializes the approved data as a sealed, read-only local filesystem |
 
-A sandbox key is not a Notion token. It cannot choose extra folders or bypass a grant. It can only launch the Workspace Profile for the recipient it was created for.
+A sandbox key is not a source-provider credential. It cannot choose extra folders or bypass a grant. It can only launch the Workspace Profile for the recipient it was created for.
 
 ## Set up Locality from start to finish
 
@@ -83,22 +83,21 @@ An Owner or Admin opens **Team** and selects **Add team member**.
 
 The person must appear as an active member before you can assign a Workspace Profile to them.
 
-### 3. Connect Notion and choose roots
+### 3. Connect a source and choose content
 
-Open **Sources**, select **Connect Notion**, and approve the Locality integration in Notion. Locality can only discover content that the integration is allowed to see.
+Open **Sources** and select an available provider. The connection buttons shown there are authoritative for your environment. Complete the provider's authorization flow, return to Locality, and choose the content that this organization should ingest.
 
-After the browser returns to Locality:
+The selection step depends on the provider:
 
-1. Select the pages or databases that should become top-level folders.
-2. Paste a shared Notion page or database URL if it is not in the discovered list.
-3. Select **Use selected roots**.
-4. Wait for the source to become **Ready**.
+- For **Notion**, select pages or databases as top-level roots. You can select up to 16 roots, and child pages beneath them are included. If a shared root is not discovered, paste its Notion URL or ID.
+- For **Slack**, select the channels to include. Slack appears only in environments where hosted Slack is enabled.
+- Future providers can use their own content picker while keeping the same Data Grant and Workspace Profile flow described below.
 
-You can select up to 16 Notion roots for a connection. Child pages beneath a selected root are included during ingestion.
+Finish the provider-specific setup and wait for the source to become **Ready** before creating access rules.
 
 | Source status | Meaning | What to do |
 | --- | --- | --- |
-| **Setup required** | Authorization succeeded, but roots still need to be selected | Select **Finish Notion setup** |
+| **Setup required** | Authorization succeeded, but content still needs to be selected | Finish the setup shown on the source card |
 | **Ingesting** | Locality is discovering, validating, or importing content | Keep the page open or return later and refresh |
 | **Ready** | A usable snapshot is available | Continue to **Access** |
 | **Needs attention** | Setup, authorization, or freshness needs review | Read **Action required**, review setup, then refresh the status |
@@ -109,7 +108,7 @@ Each source card is an independent connection. Connect the same provider again o
 
 Open **Access** and select **New data grant** under **Step 1**.
 
-1. Give the grant a clear name, such as `Engineering knowledge`.
+1. Give the grant a clear name, such as `Quarterly reporting data`.
 2. Choose the named team member as the **Recipient**.
 3. Choose the connected source and folders.
 4. Keep **Read files** enabled.
@@ -124,7 +123,7 @@ One grant belongs to one recipient and one source connection. You can reuse it i
 
 Under **Step 2**, select **New workspace profile**.
 
-1. Name the intended job, such as `Engineering research`.
+1. Name the intended job, such as `Quarterly analysis`.
 2. Select one or more existing Data Grants.
 3. Choose the maximum acceptable data age.
 4. Confirm the folders that will appear in the sandbox.
@@ -147,7 +146,7 @@ There are two supported paths:
 - A Developer opens **Team**, finds an assigned profile under **Your access**, and selects **Create key**.
 - An Owner or Admin opens **Access**, finds the profile, and selects **Create key**.
 
-Give the key a recognizable name such as `Amika demo` or `Research agent`. Copy it immediately.
+Give the key a recognizable name such as `Analyst workspace`. Copy it immediately.
 
 <Warning>
   Locality shows the plaintext key once and stores only its hash. Treat it like a password. Do not put it in a command argument, shell history, source file, log, issue, or chat message.
@@ -169,25 +168,26 @@ read -rs LOCALITY_PROFILE_KEY
 printf '%s\n' "$LOCALITY_PROFILE_KEY" | \
   loc sandbox init \
     --api-url https://api.dev.locality.dev \
-    --root "$HOME/locality-sandboxes/engineering" \
+    --root "$HOME/locality-sandboxes/quarterly-analysis" \
     --profile-key-stdin
 unset LOCALITY_PROFILE_KEY
 ```
 
-The first run creates the `engineering` root. Inspect the materialized files with ordinary tools:
+The first run creates the `quarterly-analysis` root. Inspect the materialized files with ordinary tools:
 
 ```bash
-find "$HOME/locality-sandboxes/engineering" -maxdepth 2 -type f | head
-rg "launch plan" "$HOME/locality-sandboxes/engineering"
+find "$HOME/locality-sandboxes/quarterly-analysis" -maxdepth 2 -type f | head
+rg "retention" "$HOME/locality-sandboxes/quarterly-analysis"
 ```
 
 Give an agent a precise path and task:
 
 ```text
-Work only inside ~/locality-sandboxes/engineering.
+Work only inside ~/locality-sandboxes/quarterly-analysis.
 Read the local guidance files first.
-Find the current launch plan and summarize the open decisions with source paths.
-Do not claim that you changed Notion. This workspace is read-only.
+Summarize the assumptions used in the latest retention analysis.
+Cite the local source path for every finding.
+Do not claim that you changed the source provider. This workspace is read-only.
 ```
 
 To refresh an existing generation-2 replica, run the same command with the exact same key and root. A replacement key for the same profile does not own the old root. After rotating or revoking a key, materialize into a new root.
@@ -212,24 +212,24 @@ Developers only see **Team** because that page contains everything they need for
 
 Create at least one Data Grant, include it in a Workspace Profile, and make sure every grant in that profile has the same recipient. A Developer also needs the profile assigned on **Team** before it appears under **Your access**.
 
-### Why is a Notion page missing?
+### Why is source content missing?
 
-Confirm that the page is shared with the Locality integration and sits beneath a selected root. If it is outside the discovered list, open the source setup and paste the page or database URL directly.
+Confirm that the content is visible to the provider connection and included in its selected roots or channels. Then check the source status and last refresh time. For Notion, a missing shared page or database can also be added by pasting its URL or ID in source setup.
 
 ### Why did sandbox creation stop on freshness?
 
 The profile required data newer than the latest published snapshot. Check the source status and **Last refreshed** time. Resolve **Needs attention**, or ask an Owner or Admin whether the profile's maximum data age is appropriate for this workflow.
 
-### Can an Admin sandbox edit Notion?
+### Can an Admin sandbox edit the connected source?
 
 No. `loc sandbox init` materializes a sealed, read-only replica for an agent. Use Locality Desktop when a person or agent needs a reviewed edit and sync workflow back to a supported source.
 
-### What should I do after a demo or temporary job?
+### When should I revoke or replace a sandbox key?
 
-Open **Team** or **Access** and revoke the temporary key. Revocation also invalidates capabilities and active sandbox sessions created from that key. Remove the local sandbox directory when its files are no longer needed.
+Revoke a key when its job is complete, its owner no longer needs access, or you suspect it was exposed. Revocation also invalidates capabilities and active sandbox sessions created from that key. Create a replacement key only when access should continue, and materialize it into a new root because a new key does not own an existing replica.
 
 ## A reliable first test
 
-Use a small Notion root that contains a few recognizable pages. Complete the setup with one Developer, one Data Grant, one Workspace Profile, and one key. Materialize it into a new local path, verify two known files, and ask an agent to answer one question with file paths as evidence.
+Use a small source scope that contains a few recognizable items. For example, a data analyst can select a reporting folder, receive one Data Grant and one Workspace Profile, then create one key. Materialize it into a new local path, verify two known files, and ask an agent to summarize one metric with file paths as evidence.
 
 That test proves the complete path from organization authorization to source ingestion, policy, key issuance, sandbox materialization, and agent-readable files.
