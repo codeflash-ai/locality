@@ -133,6 +133,9 @@ run_amika_shell_command() {
     attempt=$((attempt + 1))
   done
 
+  if [[ "$local_rc" -eq 0 ]]; then
+    return 255
+  fi
   return "$local_rc"
 }
 
@@ -144,10 +147,13 @@ run_amika_shell_checked() {
   local stderr_file="$5"
   local status
 
-  if run_amika_shell_command "$sandbox" "$remote_command" "$stdout_file" "$stderr_file"; then
+  set +e
+  run_amika_shell_command "$sandbox" "$remote_command" "$stdout_file" "$stderr_file"
+  status=$?
+  set -e
+  if [[ "$status" -eq 0 ]]; then
     return 0
   fi
-  status=$?
   remote_stdout_without_marker "$stdout_file" >&2
   cat "$stderr_file" >&2
   fail "$label failed with status $status"
