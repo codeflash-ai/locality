@@ -83,12 +83,25 @@ printf 'amika ' >> "$FAKE_LOG"
 log_args "$@"
 test "${1:-}" = "sandbox" || { echo "expected amika sandbox" >&2; exit 1; }
 test "${2:-}" = "ssh" || { echo "expected amika sandbox ssh" >&2; exit 1; }
-test "${3:-}" = "fake-machine" || { echo "expected fake-machine sandbox" >&2; exit 1; }
-shift 3
+shift 2
+while [[ "${1:-}" = -* && "${1:-}" != "--" ]]; do
+  case "${1:-}" in
+    -t|--tty)
+      shift
+      ;;
+    *)
+      echo "unexpected amika ssh flag: ${1:-}" >&2
+      exit 1
+      ;;
+  esac
+done
+test "${1:-}" = "fake-machine" || { echo "expected fake-machine sandbox" >&2; exit 1; }
+shift
 if [[ "${1:-}" = "--" ]]; then
   shift
 fi
 test "$#" -eq 1 || { echo "expected one remote shell command argument" >&2; exit 1; }
+test "${#1}" -le 8000 || { echo "remote shell command is too large: ${#1}" >&2; exit 1; }
 case "${1:-}" in
   "bash -lc "*) ;;
   *) echo "expected bash -lc remote shell command" >&2; exit 1 ;;

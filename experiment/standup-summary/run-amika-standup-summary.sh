@@ -75,7 +75,8 @@ PY
 fi
 
 amika_flags=()
-if [[ -n "${AMIKA_SANDBOX_FLAGS:-}" ]]; then
+AMIKA_SANDBOX_FLAGS="${AMIKA_SANDBOX_FLAGS--t}"
+if [[ -n "$AMIKA_SANDBOX_FLAGS" ]]; then
   read -r -a amika_flags <<< "$AMIKA_SANDBOX_FLAGS"
 fi
 
@@ -91,6 +92,120 @@ amika_sandbox_ssh() {
   local machine="$1"
   shift
   amika sandbox ssh "${amika_flags[@]}" "$machine" "$@"
+}
+
+remote_stdout_without_marker() {
+  local output_file="$1"
+  sed '/__AMIKA_REMOTE_RC__=/d' "$output_file"
+}
+
+run_amika_shell_command() {
+  local sandbox="$1"
+  local remote_command="$2"
+  local stdout_file="$3"
+  local stderr_file="$4"
+  local marker_command
+  local remote_shell_command
+  local attempt=1
+  local max_attempts=5
+  local local_rc=255
+  local remote_rc
+
+  marker_command="( $remote_command ); remote_rc=\$?; printf '\n__AMIKA_REMOTE_RC__=%s\n' \"\$remote_rc\"; exit 0"
+  remote_shell_command="bash -lc $(shell_quote "$marker_command")"
+
+  while [[ "$attempt" -le "$max_attempts" ]]; do
+    : > "$stdout_file"
+    : > "$stderr_file"
+    set +e
+    amika_sandbox_ssh "$sandbox" -- "$remote_shell_command" > "$stdout_file" 2> "$stderr_file"
+    local_rc=$?
+    set -e
+
+    remote_rc="$(sed -n 's/.*__AMIKA_REMOTE_RC__=//p' "$stdout_file" | tr -d '\r' | tail -1)"
+    if [[ -n "$remote_rc" ]]; then
+      return "$remote_rc"
+    fi
+
+    if [[ "$attempt" -lt "$max_attempts" ]]; then
+      sleep "$attempt"
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  return "$local_rc"
+}
+
+run_amika_shell_checked() {
+  local sandbox="$1"
+  local label="$2"
+  local remote_command="$3"
+  local stdout_file="$4"
+  local stderr_file="$5"
+  local status
+
+  if run_amika_shell_command "$sandbox" "$remote_command" "$stdout_file" "$stderr_file"; then
+    return 0
+  fi
+  status=$?
+  remote_stdout_without_marker "$stdout_file" >&2
+  cat "$stderr_file" >&2
+  fail "$label failed with status $status"
+}
+
+upload_b64_file() {
+  local sandbox="$1"
+  local label="$2"
+  local local_b64_file="$3"
+  local remote_chunk_dir="$4"
+  local remote_output_file="$5"
+  local transport_tmp="$6"
+  local init_command
+  local assemble_command
+  local chunk
+  local chunk_index=0
+  local chunk_file
+  local chunk_file_q
+  local chunk_q
+  local remote_command
+  local expected_size
+  local stdout_file
+  local stderr_file
+
+  init_command="set -euo pipefail; rm -rf $(shell_quote "$remote_chunk_dir"); mkdir -p $(shell_quote "$remote_chunk_dir"); rm -f $(shell_quote "$remote_output_file")"
+  run_amika_shell_checked \
+    "$sandbox" \
+    "initializing $label upload" \
+    "$init_command" \
+    "$transport_tmp/$label-init.out" \
+    "$transport_tmp/$label-init.err"
+
+  while IFS= read -r chunk || [[ -n "$chunk" ]]; do
+    chunk_index=$((chunk_index + 1))
+    chunk_file="$remote_chunk_dir/chunk-$(printf '%05d' "$chunk_index")"
+    chunk_file_q="$(shell_quote "$chunk_file")"
+    chunk_q="$(shell_quote "$chunk")"
+    stdout_file="$transport_tmp/$label-chunk-$chunk_index.out"
+    stderr_file="$transport_tmp/$label-chunk-$chunk_index.err"
+    remote_command="set -euo pipefail; mkdir -p $(shell_quote "$remote_chunk_dir"); printf %s $chunk_q > $chunk_file_q"
+    run_amika_shell_checked \
+      "$sandbox" \
+      "uploading $label chunk $chunk_index" \
+      "$remote_command" \
+      "$stdout_file" \
+      "$stderr_file"
+  done < <(fold -w 4000 "$local_b64_file")
+
+  [[ "$chunk_index" -gt 0 ]] || fail "$label upload produced no chunks"
+
+  expected_size="$(wc -c < "$local_b64_file" | tr -d ' ')"
+  assemble_command="set -euo pipefail; cat $(shell_quote "$remote_chunk_dir")/chunk-* > $(shell_quote "$remote_output_file"); actual=\$(wc -c < $(shell_quote "$remote_output_file") | tr -d ' '); test \"\$actual\" = $(shell_quote "$expected_size")"
+  run_amika_shell_checked \
+    "$sandbox" \
+    "assembling $label upload" \
+    "$assemble_command" \
+    "$transport_tmp/$label-assemble.out" \
+    "$transport_tmp/$label-assemble.err"
 }
 
 remote_script_b64="$(b64 <<'REMOTE_WORKER'
@@ -524,13 +639,49 @@ remote_args=(
   "${LOCALITY_REPO_DIR:-}"
   "${LOCALITY_INTERNAL_REPO_DIR:-}"
   "${STANDUP_REMOTE_RUN_ROOT:-}"
-  "$prompt_b64"
 )
 
-remote_command="printf %s $(shell_quote "$remote_script_b64") | base64 -d | bash -s --"
+transport_tmp="$(mktemp -d)"
+trap 'rm -rf "$transport_tmp"' EXIT
+
+remote_upload_dir="${STANDUP_REMOTE_UPLOAD_DIR:-/tmp/locality-standup-summary-$RUN_ID}"
+remote_worker_b64="$remote_upload_dir/worker.b64"
+remote_prompt_b64="$remote_upload_dir/prompt.b64"
+remote_worker="$remote_upload_dir/worker.sh"
+
+printf '%s' "$remote_script_b64" > "$transport_tmp/worker.b64"
+printf '%s' "$prompt_b64" > "$transport_tmp/prompt.b64"
+
+upload_b64_file \
+  "$sandbox" \
+  "worker" \
+  "$transport_tmp/worker.b64" \
+  "$remote_upload_dir/worker-chunks" \
+  "$remote_worker_b64" \
+  "$transport_tmp"
+
+upload_b64_file \
+  "$sandbox" \
+  "prompt" \
+  "$transport_tmp/prompt.b64" \
+  "$remote_upload_dir/prompt-chunks" \
+  "$remote_prompt_b64" \
+  "$transport_tmp"
+
+remote_command="set -euo pipefail; base64 -d $(shell_quote "$remote_worker_b64") > $(shell_quote "$remote_worker"); chmod +x $(shell_quote "$remote_worker"); prompt_b64=\$(cat $(shell_quote "$remote_prompt_b64")); set +e; $(shell_quote "$remote_worker")"
 for arg in "${remote_args[@]}"; do
   remote_command+=" $(shell_quote "$arg")"
 done
+remote_command+=" \"\$prompt_b64\"; worker_rc=\$?; rm -rf $(shell_quote "$remote_upload_dir"); exit \"\$worker_rc\""
 
-remote_shell_command="bash -lc $(shell_quote "$remote_command")"
-amika_sandbox_ssh "$sandbox" -- "$remote_shell_command"
+final_stdout="$transport_tmp/final.out"
+final_stderr="$transport_tmp/final.err"
+if run_amika_shell_command "$sandbox" "$remote_command" "$final_stdout" "$final_stderr"; then
+  remote_stdout_without_marker "$final_stdout"
+  cat "$final_stderr" >&2
+else
+  final_status=$?
+  remote_stdout_without_marker "$final_stdout"
+  cat "$final_stderr" >&2
+  exit "$final_status"
+fi
