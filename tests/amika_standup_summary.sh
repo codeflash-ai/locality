@@ -88,10 +88,11 @@ shift 3
 if [[ "${1:-}" = "--" ]]; then
   shift
 fi
-test "${1:-}" = "bash" || { echo "expected bash remote argv" >&2; exit 1; }
-test "${2:-}" = "-lc" || { echo "expected -lc remote argv" >&2; exit 1; }
-test "$#" -eq 3 || { echo "expected bash -lc and one remote command argument" >&2; exit 1; }
-shift 2
+test "$#" -eq 1 || { echo "expected one remote shell command argument" >&2; exit 1; }
+case "${1:-}" in
+  "bash -lc "*) ;;
+  *) echo "expected bash -lc remote shell command" >&2; exit 1 ;;
+esac
 HOME="$FAKE_REMOTE_HOME" PATH="$FAKE_BIN:$PATH" bash -lc "$1"
 FAKE_AMIKA
 

@@ -532,4 +532,5 @@ for arg in "${remote_args[@]}"; do
   remote_command+=" $(shell_quote "$arg")"
 done
 
-amika_sandbox_ssh "$sandbox" -- bash -lc "$remote_command"
+remote_shell_command="bash -lc $(shell_quote "$remote_command")"
+amika_sandbox_ssh "$sandbox" -- "$remote_shell_command"
