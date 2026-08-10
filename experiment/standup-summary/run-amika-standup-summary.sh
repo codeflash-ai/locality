@@ -593,34 +593,20 @@ STANDUP_SINCE_ISO="$standup_since_iso"
 STANDUP_UNTIL_ISO="$standup_until_iso"
 STANDUP_PAGE_TITLE="standup-$standup_date"
 LOC_BIN="$loc_bin"
-
-codex_env=(
-  env -i
-  "PATH=${PATH:-/usr/bin:/bin}"
-  "HOME=$HOME"
-)
-[[ -n "${USER+x}" ]] && codex_env+=("USER=$USER")
-[[ -n "${LOGNAME+x}" ]] && codex_env+=("LOGNAME=$LOGNAME")
-[[ -n "${SHELL+x}" ]] && codex_env+=("SHELL=$SHELL")
-[[ -n "${LANG+x}" ]] && codex_env+=("LANG=$LANG")
-[[ -n "${LC_ALL+x}" ]] && codex_env+=("LC_ALL=$LC_ALL")
-[[ -n "${TERM+x}" ]] && codex_env+=("TERM=$TERM")
-codex_env+=(
-  "STANDUP_MOUNT_ROOT=$STANDUP_MOUNT_ROOT"
-  "STANDUP_CONTEXT_INVENTORY=$STANDUP_CONTEXT_INVENTORY"
-  "STANDUP_EVIDENCE_DIR=$STANDUP_EVIDENCE_DIR"
-  "LOCALITY_REPO_DIR=$LOCALITY_REPO_DIR"
-  "LOCALITY_INTERNAL_REPO_DIR=$LOCALITY_INTERNAL_REPO_DIR"
-  "LOCALITY_INTERNAL_REPO_AVAILABLE=$LOCALITY_INTERNAL_REPO_AVAILABLE"
-  "STANDUP_NOTION_PARENT_DIR=$STANDUP_NOTION_PARENT_DIR"
-  "STANDUP_ARTIFACT_FILE=$STANDUP_ARTIFACT_FILE"
-  "STANDUP_TRACE_FILE=$STANDUP_TRACE_FILE"
-  "STANDUP_DATE=$STANDUP_DATE"
-  "STANDUP_SINCE_ISO=$STANDUP_SINCE_ISO"
-  "STANDUP_UNTIL_ISO=$STANDUP_UNTIL_ISO"
-  "STANDUP_PAGE_TITLE=$STANDUP_PAGE_TITLE"
-  "LOC_BIN=$LOC_BIN"
-)
+export STANDUP_MOUNT_ROOT
+export STANDUP_CONTEXT_INVENTORY
+export STANDUP_EVIDENCE_DIR
+export LOCALITY_REPO_DIR
+export LOCALITY_INTERNAL_REPO_DIR
+export LOCALITY_INTERNAL_REPO_AVAILABLE
+export STANDUP_NOTION_PARENT_DIR
+export STANDUP_ARTIFACT_FILE
+export STANDUP_TRACE_FILE
+export STANDUP_DATE
+export STANDUP_SINCE_ISO
+export STANDUP_UNTIL_ISO
+export STANDUP_PAGE_TITLE
+export LOC_BIN
 
 codex_cmd=(
   codex exec
@@ -677,11 +663,7 @@ run_codex_with_redacted_events() {
   local codex_status filter_status
   local -a statuses
   set +e
-  if [[ "$code_timeout" != "0" ]] && command -v timeout >/dev/null 2>&1; then
-    timeout "$code_timeout" "${codex_env[@]}" "${codex_cmd[@]}" < /dev/null | redact_codex_events "$codex_events_file"
-  else
-    "${codex_env[@]}" "${codex_cmd[@]}" < /dev/null | redact_codex_events "$codex_events_file"
-  fi
+  run_codex_process | redact_codex_events "$codex_events_file"
   statuses=("${PIPESTATUS[@]}")
   codex_status="${statuses[0]}"
   filter_status="${statuses[1]}"
@@ -691,6 +673,57 @@ run_codex_with_redacted_events() {
     return "$codex_status"
   fi
   return "$filter_status"
+}
+
+run_codex_process() {
+  python3 - "$code_timeout" "${codex_cmd[@]}" <<'PY'
+import os
+import subprocess
+import sys
+
+timeout_arg = sys.argv[1]
+cmd = sys.argv[2:]
+
+pass_exact = {
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "STANDUP_MOUNT_ROOT",
+    "STANDUP_CONTEXT_INVENTORY",
+    "STANDUP_EVIDENCE_DIR",
+    "LOCALITY_REPO_DIR",
+    "LOCALITY_INTERNAL_REPO_DIR",
+    "LOCALITY_INTERNAL_REPO_AVAILABLE",
+    "STANDUP_NOTION_PARENT_DIR",
+    "STANDUP_ARTIFACT_FILE",
+    "STANDUP_TRACE_FILE",
+    "STANDUP_DATE",
+    "STANDUP_SINCE_ISO",
+    "STANDUP_UNTIL_ISO",
+    "STANDUP_PAGE_TITLE",
+    "LOC_BIN",
+}
+pass_prefixes = ("AZURE_OPENAI_", "OPENAI_", "CODEX_")
+
+env = {}
+for name, value in os.environ.items():
+    if name in pass_exact or any(name.startswith(prefix) for prefix in pass_prefixes):
+        env[name] = value
+
+timeout = None if timeout_arg == "0" else float(timeout_arg)
+try:
+    completed = subprocess.run(cmd, env=env, stdin=subprocess.DEVNULL, timeout=timeout)
+except subprocess.TimeoutExpired:
+    print(f"codex timed out after {timeout_arg} seconds", file=sys.stderr)
+    raise SystemExit(124)
+
+raise SystemExit(completed.returncode)
+PY
 }
 
 run_codex_with_redacted_events
