@@ -413,7 +413,10 @@ ensure_repo() {
   local label="$1"
   local slug="$2"
   local dir="$3"
+  local access_policy="${4:-required}"
   local log_ref
+  local command_stderr
+  local command_status
   if [[ -d "$dir" ]] && git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     :
   else
@@ -426,16 +429,40 @@ ensure_repo() {
       fi
     fi
     mkdir -p "$(dirname "$dir")"
+    command_stderr="$evidence_dir/$label-clone.err"
+    set +e
     if command -v gh >/dev/null 2>&1; then
-      gh repo clone "$slug" "$dir"
+      gh repo clone "$slug" "$dir" 2> "$command_stderr"
     else
-      git clone "https://github.com/$slug.git" "$dir"
+      git clone "https://github.com/$slug.git" "$dir" 2> "$command_stderr"
+    fi
+    command_status=$?
+    set -e
+    if [[ "$command_status" -ne 0 ]]; then
+      if [[ "$access_policy" = "skip-on-access-denied" ]] && git_access_denied "$command_stderr"; then
+        record_skipped_repo "$label" "$slug" "$dir" clone "$command_status" "git credentials not granted"
+        return 2
+      fi
+      redact_file_for_stderr "$command_stderr" >&2
+      fail "could not clone repo for $label ($slug)"
     fi
   fi
 
   validate_repo_origin "$label" "$slug" "$dir"
   require_clean_repo "$label" "$slug" "$dir"
-  git -C "$dir" fetch --prune origin
+  command_stderr="$evidence_dir/$label-fetch.err"
+  set +e
+  git -C "$dir" fetch --prune origin 2> "$command_stderr"
+  command_status=$?
+  set -e
+  if [[ "$command_status" -ne 0 ]]; then
+    if [[ "$access_policy" = "skip-on-access-denied" ]] && git_access_denied "$command_stderr"; then
+      record_skipped_repo "$label" "$slug" "$dir" fetch "$command_status" "git credentials not granted"
+      return 2
+    fi
+    redact_file_for_stderr "$command_stderr" >&2
+    fail "could not fetch repo for $label ($slug)"
+  fi
   if log_ref="$(git -C "$dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"; then
     printf 'ref\t%s\n' "$log_ref" > "$evidence_dir/git-log-$label-ref.txt"
     git -C "$dir" log "$log_ref" --since="$standup_since_iso" --date=iso-strict --pretty=format:'%H%x09%ad%x09%an%x09%ae%x09%s' > "$evidence_dir/$label-commits.tsv"
@@ -445,6 +472,43 @@ ensure_repo() {
     git -C "$dir" log --remotes=origin --since="$standup_since_iso" --date=iso-strict --pretty=format:'%H%x09%ad%x09%an%x09%ae%x09%s' > "$evidence_dir/$label-commits.tsv"
     git -C "$dir" log --remotes=origin --since="$standup_since_iso" --stat --date=iso-strict > "$evidence_dir/$label-stat.log"
   fi
+}
+
+redact_file_for_stderr() {
+  local path="$1"
+  sed -E 's#(https?://)[^/@[:space:]]+@#\1<redacted>@#g' "$path"
+}
+
+git_access_denied() {
+  local path="$1"
+  grep -E -i -q \
+    'could not resolve to a Repository|Repository not found|not found|Authentication failed|Permission denied|access denied|Resource not accessible|could not read Username|HTTP Basic: Access denied|403|404' \
+    "$path"
+}
+
+record_skipped_repo() {
+  local label="$1"
+  local slug="$2"
+  local dir="$3"
+  local step="$4"
+  local status="$5"
+  local reason="$6"
+
+  python3 - "$label" "$slug" "$dir" "$step" "$status" "$reason" > "$evidence_dir/$label-skip.json" <<'PY'
+import json
+import sys
+
+label, slug, path, step, status, reason = sys.argv[1:7]
+print(json.dumps({
+    "label": label,
+    "slug": slug,
+    "path": path,
+    "step": step,
+    "status": int(status),
+    "reason": reason,
+    "skipped": True,
+}, sort_keys=True))
+PY
 }
 
 origin_has_embedded_credentials() {
@@ -509,13 +573,18 @@ require_clean_repo() {
 }
 
 ensure_repo locality codeflash-ai/locality "$locality_repo_dir"
-ensure_repo locality-internal codeflash-ai/locality-internal "$locality_internal_repo_dir"
+locality_internal_repo_available=1
+if ! ensure_repo locality-internal codeflash-ai/locality-internal "$locality_internal_repo_dir" skip-on-access-denied; then
+  locality_internal_repo_available=0
+  locality_internal_repo_dir=""
+fi
 
 STANDUP_MOUNT_ROOT="$mount_root"
 STANDUP_CONTEXT_INVENTORY="$context_inventory"
 STANDUP_EVIDENCE_DIR="$evidence_dir"
 LOCALITY_REPO_DIR="$locality_repo_dir"
 LOCALITY_INTERNAL_REPO_DIR="$locality_internal_repo_dir"
+LOCALITY_INTERNAL_REPO_AVAILABLE="$locality_internal_repo_available"
 STANDUP_NOTION_PARENT_DIR="$notion_parent_dir"
 STANDUP_ARTIFACT_FILE="$artifact_file"
 STANDUP_TRACE_FILE="$trace_file"
@@ -542,6 +611,7 @@ codex_env+=(
   "STANDUP_EVIDENCE_DIR=$STANDUP_EVIDENCE_DIR"
   "LOCALITY_REPO_DIR=$LOCALITY_REPO_DIR"
   "LOCALITY_INTERNAL_REPO_DIR=$LOCALITY_INTERNAL_REPO_DIR"
+  "LOCALITY_INTERNAL_REPO_AVAILABLE=$LOCALITY_INTERNAL_REPO_AVAILABLE"
   "STANDUP_NOTION_PARENT_DIR=$STANDUP_NOTION_PARENT_DIR"
   "STANDUP_ARTIFACT_FILE=$STANDUP_ARTIFACT_FILE"
   "STANDUP_TRACE_FILE=$STANDUP_TRACE_FILE"
@@ -562,7 +632,11 @@ codex_cmd=(
   --add-dir "$mount_root"
   --add-dir "$evidence_dir"
   --add-dir "$locality_repo_dir"
-  --add-dir "$locality_internal_repo_dir"
+)
+if [[ "$locality_internal_repo_available" -eq 1 ]]; then
+  codex_cmd+=(--add-dir "$locality_internal_repo_dir")
+fi
+codex_cmd+=(
   --output-last-message "$final_message_file"
   "$(cat "$prompt_file")"
 )

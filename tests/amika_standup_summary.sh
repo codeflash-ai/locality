@@ -36,6 +36,8 @@ assert_file_contains "$PROMPT" "Run \`loc diff\`"
 assert_file_contains "$PROMPT" "Run \`loc push -y\`"
 assert_file_contains "$PROMPT" "STANDUP_ARTIFACT_FILE"
 assert_file_contains "$PROMPT" "STANDUP_TRACE_FILE"
+assert_file_contains "$PROMPT" "LOCALITY_INTERNAL_REPO_AVAILABLE=0"
+assert_file_contains "$PROMPT" "locality-internal-skip.json"
 
 printf 'prompt contract passed\n'
 
@@ -259,6 +261,39 @@ case "${1:-}" in
 esac
 FAKE_GIT
 
+cat > "${fake_bin}/gh" <<'FAKE_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+log_args() {
+  local first=1
+  for arg in "$@"; do
+    if [[ "$first" -eq 1 ]]; then
+      first=0
+    else
+      printf ' ' >> "$FAKE_LOG"
+    fi
+    printf '%q' "$arg" >> "$FAKE_LOG"
+  done
+  printf '\n' >> "$FAKE_LOG"
+}
+printf 'gh ' >> "$FAKE_LOG"
+log_args "$@"
+
+if [[ "${1:-}" = "repo" && "${2:-}" = "clone" ]]; then
+  slug="${3:?repo slug required}"
+  dest="${4:?repo destination required}"
+  if [[ "$slug" = "codeflash-ai/locality-internal" && "${FAKE_GH_INTERNAL_ACCESS_DENIED:-}" = "1" ]]; then
+    printf "GraphQL: Could not resolve to a Repository with the name '%s'. (repository)\n" "$slug" >&2
+    exit 1
+  fi
+  mkdir -p "$dest/.git"
+  exit 0
+fi
+
+echo "unexpected gh command: $*" >&2
+exit 1
+FAKE_GH
+
 cat > "${fake_bin}/codex" <<'FAKE_CODEX'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -283,6 +318,7 @@ test -z "${FAKE_REMOTE_HOME:-}"
 test -z "${SECRET_SHOULD_NOT_LEAK:-}"
 test -n "${STANDUP_ARTIFACT_FILE:-}"
 test -n "${STANDUP_TRACE_FILE:-}"
+test -n "${LOCALITY_INTERNAL_REPO_AVAILABLE:-}"
 test -s "${STANDUP_EVIDENCE_DIR:-}/hydration.jsonl"
 grep -F -q '/notion/page.md' "$STANDUP_EVIDENCE_DIR/hydration.jsonl"
 grep -F -q '/notion/child/page.md' "$STANDUP_EVIDENCE_DIR/hydration.jsonl"
@@ -314,7 +350,14 @@ test "$codex_cwd" = "$expected_cwd"
 test "$has_mount_root" -eq 1
 test "$has_evidence_dir" -eq 1
 test "$has_locality_repo" -eq 1
-test "$has_internal_repo" -eq 1
+if [[ "$LOCALITY_INTERNAL_REPO_AVAILABLE" = "1" ]]; then
+  test "$has_internal_repo" -eq 1
+  test -n "${LOCALITY_INTERNAL_REPO_DIR:-}"
+else
+  test "$has_internal_repo" -eq 0
+  test -z "${LOCALITY_INTERNAL_REPO_DIR:-}"
+  test -s "${STANDUP_EVIDENCE_DIR:-}/locality-internal-skip.json"
+fi
 if [[ "$expected_cwd" = */standup-codex-fail ]]; then
   printf '{"type":"turn.failed","exit_code":42,"payload":"codex-failure-secret"}\n'
   exit 42
@@ -324,13 +367,13 @@ printf '# Trace\n' > "$STANDUP_TRACE_FILE"
 printf '{"type":"turn.completed","event":"secret mounted evidence","payload":"codex-secret-payload","message":"mounted evidence should not persist"}\n'
 FAKE_CODEX
 
-chmod +x "${fake_bin}/amika" "${fake_bin}/loc" "${fake_bin}/git" "${fake_bin}/codex"
+chmod +x "${fake_bin}/amika" "${fake_bin}/loc" "${fake_bin}/git" "${fake_bin}/gh" "${fake_bin}/codex"
 
 missing_bin="${TMPDIR}/missing_bin"
 multiple_bin="${TMPDIR}/multiple_bin"
 mkdir -p "$missing_bin" "$multiple_bin"
-cp "${fake_bin}/amika" "${fake_bin}/git" "${fake_bin}/codex" "${fake_bin}/loc" "$missing_bin/"
-cp "${fake_bin}/amika" "${fake_bin}/git" "${fake_bin}/codex" "${fake_bin}/loc" "$multiple_bin/"
+cp "${fake_bin}/amika" "${fake_bin}/git" "${fake_bin}/gh" "${fake_bin}/codex" "${fake_bin}/loc" "$missing_bin/"
+cp "${fake_bin}/amika" "${fake_bin}/git" "${fake_bin}/gh" "${fake_bin}/codex" "${fake_bin}/loc" "$multiple_bin/"
 missing_slack_connections_json='[
   {"id":"linear-work","connector":"linear","status":"active"},
   {"id":"notion-work","connector":"notion","status":"active"}
@@ -461,6 +504,32 @@ PATH="$multiple_bin:$PATH" \
   STANDUP_UNTIL_ISO="2026-08-06T00:00:00Z" \
   "$RUNNER" --sandbox fake-machine >/dev/null
 assert_file_contains "$fake_log" "--connection notion-a"
+
+: > "$fake_log"
+missing_internal_repo="${fake_remote_home}/private/missing-internal"
+missing_internal_repo_q="$(printf '%q' "$missing_internal_repo")"
+skip_internal_output="$(
+  PATH="$fake_bin:$PATH" \
+    FAKE_BIN="$fake_bin" \
+    FAKE_LOG="$fake_log" \
+    FAKE_REMOTE_HOME="$fake_remote_home" \
+    FAKE_GH_INTERNAL_ACCESS_DENIED="1" \
+    LOCALITY_REPO_DIR="$same_name_locality_repo" \
+    LOCALITY_INTERNAL_REPO_DIR="$missing_internal_repo" \
+    NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
+    RUN_ID="standup-skip-internal-access" \
+    STANDUP_DATE="2026-08-06" \
+    STANDUP_SINCE_ISO="2026-08-05T00:00:00Z" \
+    STANDUP_UNTIL_ISO="2026-08-06T00:00:00Z" \
+    "$RUNNER" --sandbox fake-machine
+)"
+skip_internal_evidence_dir="$(
+  printf '%s\n' "$skip_internal_output" | python3 -c 'import json, sys; print(json.load(sys.stdin)["evidence_dir"])'
+)"
+test -s "$skip_internal_evidence_dir/locality-internal-skip.json" || fail "missing internal repo skip evidence"
+assert_file_contains "$skip_internal_evidence_dir/locality-internal-skip.json" "git credentials not granted"
+assert_file_contains "$fake_log" "gh repo clone codeflash-ai/locality-internal"
+assert_file_not_contains "$fake_log" "git -C ${missing_internal_repo_q} log"
 
 : > "$fake_log"
 token_origin_stderr="${TMPDIR}/token-origin.err"

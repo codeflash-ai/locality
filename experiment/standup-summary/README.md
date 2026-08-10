@@ -4,8 +4,8 @@ This scenario runs inside a prepared Amika sandbox that already has stored
 Locality connections for Notion, Linear, and Slack. The runner does the setup
 work: it checks `loc connections`, mounts each connector as plain files,
 hydrates the mounted Markdown, collects recent git evidence from
-`codeflash-ai/locality` and `codeflash-ai/locality-internal`, and then starts
-Codex.
+`codeflash-ai/locality` and, when sandbox git credentials allow it,
+`codeflash-ai/locality-internal`, and then starts Codex.
 
 Codex owns the final workflow after setup: it reads the mounted evidence,
 creates a Notion page named `standup-YYYY-MM-DD`, writes the standup summary,
@@ -68,5 +68,10 @@ separate runs.
 Existing repository checkouts must have clean working trees and origins matching
 `codeflash-ai/locality` and `codeflash-ai/locality-internal`; otherwise the
 runner stops before collecting git evidence.
+
+If `codeflash-ai/locality-internal` cannot be cloned or fetched because the
+sandbox git credentials do not have access, the runner records
+`evidence/locality-internal-skip.json` and continues. Other internal checkout
+problems, such as a dirty tree or mismatched origin, still fail the run.
 
 Codex event logs are redacted before being written to the run evidence.
