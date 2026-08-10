@@ -168,8 +168,10 @@ upload_b64_file() {
   local transport_tmp="$6"
   local init_command
   local assemble_command
-  local chunk
   local chunk_index=0
+  local local_chunk_dir
+  local local_chunk_file
+  local chunk
   local chunk_file
   local chunk_file_q
   local chunk_q
@@ -186,8 +188,14 @@ upload_b64_file() {
     "$transport_tmp/$label-init.out" \
     "$transport_tmp/$label-init.err"
 
-  while IFS= read -r chunk || [[ -n "$chunk" ]]; do
+  local_chunk_dir="$transport_tmp/$label-local-chunks"
+  mkdir -p "$local_chunk_dir"
+  split -b 4000 -d -a 5 "$local_b64_file" "$local_chunk_dir/chunk-"
+
+  for local_chunk_file in "$local_chunk_dir"/chunk-*; do
+    [[ -f "$local_chunk_file" ]] || continue
     chunk_index=$((chunk_index + 1))
+    chunk="$(cat "$local_chunk_file")"
     chunk_file="$remote_chunk_dir/chunk-$(printf '%05d' "$chunk_index")"
     chunk_file_q="$(shell_quote "$chunk_file")"
     chunk_q="$(shell_quote "$chunk")"
@@ -200,7 +208,7 @@ upload_b64_file() {
       "$remote_command" \
       "$stdout_file" \
       "$stderr_file"
-  done < <(fold -w 4000 "$local_b64_file")
+  done
 
   [[ "$chunk_index" -gt 0 ]] || fail "$label upload produced no chunks"
 
