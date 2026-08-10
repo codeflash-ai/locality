@@ -678,9 +678,9 @@ run_codex_with_redacted_events() {
   local -a statuses
   set +e
   if [[ "$code_timeout" != "0" ]] && command -v timeout >/dev/null 2>&1; then
-    timeout "$code_timeout" "${codex_env[@]}" "${codex_cmd[@]}" | redact_codex_events "$codex_events_file"
+    timeout "$code_timeout" "${codex_env[@]}" "${codex_cmd[@]}" < /dev/null | redact_codex_events "$codex_events_file"
   else
-    "${codex_env[@]}" "${codex_cmd[@]}" | redact_codex_events "$codex_events_file"
+    "${codex_env[@]}" "${codex_cmd[@]}" < /dev/null | redact_codex_events "$codex_events_file"
   fi
   statuses=("${PIPESTATUS[@]}")
   codex_status="${statuses[0]}"
