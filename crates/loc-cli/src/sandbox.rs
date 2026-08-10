@@ -484,7 +484,7 @@ impl Display for SandboxInitError {
                 formatter.write_str("LOCALITY_SESSION_CREDENTIAL is not valid Unicode")
             }
             Self::AmbiguousSandboxCredential => formatter.write_str(
-                "provide either a bootstrap token or a Workspace Profile key, not both",
+                "select only one sandbox credential source: bootstrap token, Workspace Profile key, or session credential",
             ),
             Self::ReadBootstrapToken(error) => {
                 write!(formatter, "failed to read bootstrap token from stdin: {error}")

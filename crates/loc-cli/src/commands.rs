@@ -1738,20 +1738,26 @@ fn sandbox_init(options: SandboxInitArgs, json: bool) -> i32 {
     let bootstrap_environment = std::env::var_os("LOCALITY_BOOTSTRAP_TOKEN");
     let profile_key_environment = std::env::var_os("LOCALITY_PROFILE_KEY");
     let session_credential_environment = std::env::var_os("LOCALITY_SESSION_CREDENTIAL");
-    let uses_bootstrap = options.bootstrap_token_stdin || bootstrap_environment.is_some();
-    let uses_profile_key = options.profile_key_stdin || profile_key_environment.is_some();
-    let uses_session_credential =
-        options.session_credential_stdin || session_credential_environment.is_some();
-    if usize::from(uses_bootstrap)
-        + usize::from(uses_profile_key)
-        + usize::from(uses_session_credential)
-        > 1
-    {
+    let explicit_sources = usize::from(options.bootstrap_token_stdin)
+        + usize::from(options.profile_key_stdin)
+        + usize::from(options.session_credential_stdin);
+    let environment_sources = usize::from(bootstrap_environment.is_some())
+        + usize::from(profile_key_environment.is_some())
+        + usize::from(session_credential_environment.is_some());
+    if explicit_sources > 1 || (explicit_sources == 0 && environment_sources > 1) {
         return sandbox_init_command_error(
             json,
             crate::sandbox::SandboxInitError::AmbiguousSandboxCredential,
         );
     }
+    // An explicit stdin flag selects the credential kind. Unrelated ambient
+    // credentials must not prevent a caller from supplying that explicit
+    // source, while the selected resolver still rejects its matching
+    // environment variable as a second source for the same credential.
+    let uses_profile_key =
+        options.profile_key_stdin || (explicit_sources == 0 && profile_key_environment.is_some());
+    let uses_session_credential = options.session_credential_stdin
+        || (explicit_sources == 0 && session_credential_environment.is_some());
     let credential_result = {
         let mut stdin = io::stdin().lock();
         if uses_profile_key {

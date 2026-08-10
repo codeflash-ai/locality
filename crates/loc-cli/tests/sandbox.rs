@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
@@ -2220,6 +2220,49 @@ fn token_sources_are_exclusive_trim_only_line_endings_and_redact_debug() {
         SandboxInitError::AmbiguousBootstrapToken
     ));
     assert!(matches!(missing, SandboxInitError::MissingBootstrapToken));
+}
+
+#[test]
+fn cli_explicit_profile_key_stdin_ignores_unrelated_ambient_credentials() {
+    let directory = TestDirectory::new("cli-explicit-profile-key");
+    let root = directory.root().to_string_lossy().into_owned();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .args([
+            "sandbox",
+            "init",
+            "--api-url",
+            "http://127.0.0.1:9",
+            "--root",
+            &root,
+            "--profile-key-stdin",
+            "--json",
+        ])
+        .env("LOCALITY_STATE_DIR", directory.0.join("state"))
+        .env("LOCALITY_BOOTSTRAP_TOKEN", "unrelated-ambient-bootstrap")
+        .env_remove("LOCALITY_PROFILE_KEY")
+        .env_remove("LOCALITY_SESSION_CREDENTIAL")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run loc sandbox init");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(b"invalid-profile-key\n")
+        .expect("write profile key");
+    let output = child.wait_with_output().expect("wait for loc sandbox init");
+
+    assert!(!output.status.success());
+    assert!(output.stderr.is_empty());
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON command error");
+    assert_eq!(report["code"], "profile_key_invalid");
+    assert_eq!(
+        report["message"],
+        "Workspace Profile key must contain exactly 64 lowercase hexadecimal characters"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("unrelated-ambient-bootstrap"));
 }
 
 #[test]

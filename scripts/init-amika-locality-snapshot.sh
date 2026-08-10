@@ -590,6 +590,7 @@ amika_ssh "$SANDBOX_NAME" -- sh -c '
 printf 'Materializing scoped workspace at %s:%s...\n' "$SANDBOX_NAME" "$REMOTE_ROOT"
 amika_ssh_secret_line "$SANDBOX_NAME" "$PROFILE_KEY" -- sh -c '
   set -eu
+  unset LOCALITY_BOOTSTRAP_TOKEN LOCALITY_PROFILE_KEY LOCALITY_SESSION_CREDENTIAL
   if [ -t 0 ]; then
     stty -echo
   fi
