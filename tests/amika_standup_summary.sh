@@ -417,6 +417,22 @@ fi
 assert_file_contains "$missing_amika_stderr" "missing required tool: amika"
 grep -F -q "command not found" "$missing_amika_stderr" && fail "missing amika used shell command-not-found"
 
+unsafe_upload_dir_stderr="${TMPDIR}/unsafe-upload-dir.err"
+: > "$fake_log"
+if PATH="$fake_bin:$PATH" \
+  FAKE_LOG="$fake_log" \
+  NOTION_STANDUP_PARENT_PAGE_ID="notion-parent" \
+  RUN_ID="standup-unsafe-upload-dir" \
+  STANDUP_DATE="2026-08-06" \
+  STANDUP_SINCE_ISO="2026-08-05T00:00:00Z" \
+  STANDUP_UNTIL_ISO="2026-08-06T00:00:00Z" \
+  STANDUP_REMOTE_UPLOAD_DIR="$fake_remote_home" \
+  "$RUNNER" --sandbox fake-machine 2>"$unsafe_upload_dir_stderr"; then
+  fail "unsafe STANDUP_REMOTE_UPLOAD_DIR unexpectedly succeeded"
+fi
+assert_file_contains "$unsafe_upload_dir_stderr" "STANDUP_REMOTE_UPLOAD_DIR"
+grep -F -q "amika " "$fake_log" && fail "unsafe STANDUP_REMOTE_UPLOAD_DIR invoked amika"
+
 root_page_only_stderr="${TMPDIR}/root-page-only.err"
 : > "$fake_log"
 if PATH="$fake_bin:$PATH" \

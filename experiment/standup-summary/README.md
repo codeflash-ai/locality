@@ -65,6 +65,12 @@ that connector. The runner fails rather than guessing.
 Existing `$RUN_ID` output directories fail fast to avoid mixing evidence from
 separate runs.
 
+`STANDUP_REMOTE_UPLOAD_DIR`, when set, must be under the run-specific
+`/tmp/locality-standup-summary-$RUN_ID` path. The runner removes this temporary
+upload directory after the remote worker exits, so broad paths such as `$HOME`,
+repository checkouts, `/tmp`, or paths containing `..` are rejected before any
+remote command runs.
+
 Existing repository checkouts must have clean working trees and origins matching
 `codeflash-ai/locality` and `codeflash-ai/locality-internal`; otherwise the
 runner stops before collecting git evidence.

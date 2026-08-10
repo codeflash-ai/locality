@@ -159,6 +159,26 @@ run_amika_shell_checked() {
   fail "$label failed with status $status"
 }
 
+validate_remote_upload_dir() {
+  local dir="$1"
+  local expected="/tmp/locality-standup-summary-$RUN_ID"
+
+  [[ -n "$dir" ]] || fail "STANDUP_REMOTE_UPLOAD_DIR must not be empty"
+  case "$dir" in
+    "$expected"|"$expected"/*)
+      ;;
+    *)
+      fail "STANDUP_REMOTE_UPLOAD_DIR must be under $expected"
+      ;;
+  esac
+  [[ "$dir" =~ ^[A-Za-z0-9._/-]+$ ]] || fail "STANDUP_REMOTE_UPLOAD_DIR contains unsupported characters"
+  case "$dir" in
+    */../*|*/..|*/./*|*/.)
+      fail "STANDUP_REMOTE_UPLOAD_DIR must not contain . or .. path components"
+      ;;
+  esac
+}
+
 upload_b64_file() {
   local sandbox="$1"
   local label="$2"
@@ -766,6 +786,7 @@ transport_tmp="$(mktemp -d)"
 trap 'rm -rf "$transport_tmp"' EXIT
 
 remote_upload_dir="${STANDUP_REMOTE_UPLOAD_DIR:-/tmp/locality-standup-summary-$RUN_ID}"
+validate_remote_upload_dir "$remote_upload_dir"
 remote_worker_b64="$remote_upload_dir/worker.b64"
 remote_prompt_b64="$remote_upload_dir/prompt.b64"
 remote_worker="$remote_upload_dir/worker.sh"
