@@ -32,9 +32,30 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  release-eligibility:
+    name: Check release repository eligibility
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.artifact.outputs.publish }}
+    steps:
+      - name: Check for stable repository inputs
+        id: artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          publish="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts" --jq \
+            '[.artifacts[] | select(.name == "linux-repository-input" and (.expired | not))] | length > 0')"
+          echo "publish=${publish}" >> "${GITHUB_OUTPUT}"
+
   publish:
     name: Publish signed APT and RPM repositories
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    needs: release-eligibility
+    if: >-
+      always() &&
+      (github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' && needs.release-eligibility.outputs.publish == 'true'))
     runs-on: ubuntu-24.04
     environment:
       name: github-pages

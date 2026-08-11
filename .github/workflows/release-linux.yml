@@ -256,9 +256,15 @@ jobs:
           sha256sum target/release/github-assets/* > target/release/github-assets/SHA256SUMS-linux
           ls -la target/release/github-assets
 
-      - name: Collect package repository inputs
+      - name: Collect stable package repository inputs
+        id: repository-input
         if: env.PRERELEASE != 'true'
         run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::notice::Skipping package repository publishing for prerelease tag ${RELEASE_TAG}."
+            echo "eligible=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
           rm -rf target/release/linux-repository-input
           mkdir -p target/release/linux-repository-input
           find target/release/bundle/linux -maxdepth 1 -type f \
@@ -267,9 +273,10 @@ jobs:
           printf '%s\n' "${RELEASE_TAG}" > target/release/linux-repository-input/release-tag.txt
           test "$(find target/release/linux-repository-input -maxdepth 1 -name '*.deb' | wc -l)" -eq 1
           test "$(find target/release/linux-repository-input -maxdepth 1 -name '*.rpm' | wc -l)" -eq 1
+          echo "eligible=true" >> "${GITHUB_OUTPUT}"
 
       - name: Upload package repository inputs
-        if: env.PRERELEASE != 'true'
+        if: steps.repository-input.outputs.eligible == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: linux-repository-input

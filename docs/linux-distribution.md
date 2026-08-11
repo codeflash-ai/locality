@@ -149,7 +149,9 @@ all expected public download assets are present. Until then,
 release.
 
 For stable releases, the Linux workflow uploads the date-and-commit packages as
-a short-lived workflow artifact. The separate
+a short-lived workflow artifact. Manual prerelease runs and prerelease-form
+tags do not upload that artifact, so repository publishing skips them. The
+separate
 `.github/workflows/publish-linux-repositories.yml` workflow runs from `main`,
 renders signed APT and RPM metadata, rebuilds the existing Jekyll documentation
 site, switches Pages from its legacy branch build to Actions deployments,

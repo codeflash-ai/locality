@@ -84,9 +84,17 @@ if grep -F -q 'edit_args+=(--prerelease=false --latest=true)' "${LINUX_WORKFLOW}
 fi
 grep -F -q 'name: linux-repository-input' "${LINUX_WORKFLOW}" \
   || fail "Linux release workflow must hand stable packages to repository publishing"
+grep -F -q 'if: steps.repository-input.outputs.eligible == '\''true'\''' "${LINUX_WORKFLOW}" \
+  || fail "Linux release workflow must not publish repository inputs for prerelease tags"
+grep -F -q '[[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]' "${LINUX_WORKFLOW}" \
+  || fail "Linux repository inputs must be restricted to stable release tags"
 
 grep -F -q -- '- release Linux' "${LINUX_REPOSITORY_WORKFLOW}" \
   || fail "Linux repositories must publish after the Linux release succeeds"
+grep -F -q 'needs.release-eligibility.outputs.publish == '\''true'\''' "${LINUX_REPOSITORY_WORKFLOW}" \
+  || fail "Linux repository workflow must skip release runs without stable repository inputs"
+grep -F -q 'select(.name == "linux-repository-input" and (.expired | not))' "${LINUX_REPOSITORY_WORKFLOW}" \
+  || fail "Linux repository workflow must use the stable artifact as its eligibility signal"
 grep -F -q -- '- "docs/**"' "${LINUX_REPOSITORY_WORKFLOW}" \
   || fail "Pages deployment must continue publishing documentation changes from main"
 grep -F -q 'uses: actions/jekyll-build-pages@v1' "${LINUX_REPOSITORY_WORKFLOW}" \
