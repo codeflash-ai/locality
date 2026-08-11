@@ -81,9 +81,11 @@ jobs:
 
       - name: Recover repository inputs from a GitHub Release
         if: github.event_name != 'workflow_run'
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
         run: |
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            release_tag="${{ inputs.tag }}"
+            release_tag="${DISPATCH_TAG}"
           else
             release_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=30" --jq \
               '[.[] | select(.draft == false) | select(any(.assets[]; .name == "linux-repository.json"))][0].tag_name // empty')"

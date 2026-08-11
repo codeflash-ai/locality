@@ -141,3 +141,29 @@ printf '%s' "${config_json}" | jq -e '
   .bundle.linux.rpm.files["/etc/yum.repos.d/locality.repo"] == "linux/repository/locality.repo" and
   .bundle.linux.rpm.files["/etc/zypp/repos.d/locality.repo"] == "linux/repository/locality.repo"
 ' >/dev/null || fail "Tauri release override must package repository enrollment files"
+
+repository_only_config_json="$({
+  unset TAURI_UPDATER_PUBKEY TAURI_SIGNING_PRIVATE_KEY
+  export LINUX_REPO_GPG_PRIVATE_KEY="test-repository-key"
+  source "${ROOT}/scripts/publish-linux.sh"
+  build_config_json
+})"
+printf '%s' "${repository_only_config_json}" | jq -e '
+  .bundle.createUpdaterArtifacts == null and
+  .plugins.updater == null and
+  .bundle.linux.deb.files["/etc/apt/sources.list.d/locality.sources"] == "linux/repository/locality.sources" and
+  .bundle.linux.rpm.files["/etc/yum.repos.d/locality.repo"] == "linux/repository/locality.repo"
+' >/dev/null || fail "repository-only Tauri override must package enrollment files without enabling the updater"
+
+repository_only_build_args="$({
+  unset TAURI_UPDATER_PUBKEY TAURI_SIGNING_PRIVATE_KEY
+  export LINUX_REPO_GPG_PRIVATE_KEY="test-repository-key"
+  source "${ROOT}/scripts/publish-linux.sh"
+  npm() {
+    printf '%s\n' "$*"
+  }
+  build_linux_packages "$(build_config_json)"
+})"
+expected_repository_only_build_args="--prefix ${ROOT}/apps/desktop run tauri -- build --bundles deb,rpm --config ${repository_only_config_json}"
+[[ "${repository_only_build_args}" == "${expected_repository_only_build_args}" ]] \
+  || fail "repository-only builds must pass the enrollment override to Tauri"

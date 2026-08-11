@@ -95,6 +95,13 @@ grep -F -q 'needs.release-eligibility.outputs.publish == '\''true'\''' "${LINUX_
   || fail "Linux repository workflow must skip release runs without stable repository inputs"
 grep -F -q 'select(.name == "linux-repository-input" and (.expired | not))' "${LINUX_REPOSITORY_WORKFLOW}" \
   || fail "Linux repository workflow must use the stable artifact as its eligibility signal"
+grep -F -q 'DISPATCH_TAG: ${{ inputs.tag }}' "${LINUX_REPOSITORY_WORKFLOW}" \
+  || fail "Linux repository dispatch tags must enter the shell through the environment"
+grep -F -q 'release_tag="${DISPATCH_TAG}"' "${LINUX_REPOSITORY_WORKFLOW}" \
+  || fail "Linux repository recovery must read the dispatch tag from the environment"
+if grep -F -q 'release_tag="${{ inputs.tag }}"' "${LINUX_REPOSITORY_WORKFLOW}"; then
+  fail "Linux repository recovery must not interpolate an untrusted dispatch tag into shell code"
+fi
 grep -F -q -- '- "docs/**"' "${LINUX_REPOSITORY_WORKFLOW}" \
   || fail "Pages deployment must continue publishing documentation changes from main"
 grep -F -q 'uses: actions/jekyll-build-pages@v1' "${LINUX_REPOSITORY_WORKFLOW}" \

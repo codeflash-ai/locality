@@ -134,6 +134,18 @@ build_config_json() {
   fi
 }
 
+build_linux_packages() {
+  local config_json="$1"
+
+  if updater_enabled; then
+    npm --prefix "${DESKTOP_DIR}" run tauri -- build --bundles deb,rpm,appimage --config "${config_json}"
+  elif repository_enrollment_enabled; then
+    npm --prefix "${DESKTOP_DIR}" run tauri -- build --bundles deb,rpm --config "${config_json}"
+  else
+    npm --prefix "${DESKTOP_DIR}" run build:linux
+  fi
+}
+
 pkg_config_has_appindicator() {
   pkg-config --exists ayatana-appindicator3-0.1 2>/dev/null \
     || pkg-config --exists appindicator3-0.1 2>/dev/null
@@ -327,11 +339,7 @@ main() {
   log "building Tauri Debian, RPM, and optional AppImage packages"
   rm -rf "${DEB_DIR}" "${RPM_DIR}" "${APPIMAGE_DIR}" "${UPDATER_DIR}"
   mkdir -p "${DEB_DIR}" "${RPM_DIR}" "${APPIMAGE_DIR}" "${LINUX_OUT_DIR}"
-  if updater_enabled; then
-    npm --prefix "${DESKTOP_DIR}" run tauri -- build --bundles deb,rpm,appimage --config "${config_json}"
-  else
-    npm --prefix "${DESKTOP_DIR}" run build:linux
-  fi
+  build_linux_packages "${config_json}"
 
   deb="$(latest_artifact "${DEB_DIR}" '*.deb')"
   rpm="$(latest_artifact "${RPM_DIR}" '*.rpm')"
