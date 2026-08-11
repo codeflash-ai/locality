@@ -13,7 +13,7 @@ source "${ROOT}/scripts/publish-linux.sh"
 
 if [[ "$(uname -s)" == "Linux" ]]; then
   mkdir -p "${tmp_root}/deb/control" "${tmp_root}/deb/data/usr/bin"
-  printf 'Package: loc\nVersion: 0.1.0\nArchitecture: amd64\nMaintainer: Locality\nDescription: test\n' \
+  printf 'Package: locality\nVersion: 0.1.0\nArchitecture: amd64\nMaintainer: Locality\nDescription: test\n' \
     > "${tmp_root}/deb/control/control"
   touch \
     "${tmp_root}/deb/data/usr/bin/loc" \

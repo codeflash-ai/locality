@@ -5,7 +5,7 @@
 ## Get Started
 
 - [Overview](overview.mdx): Product model, core surfaces, and safety model.
-- [Install Locality](install.mdx): OS-specific GitHub release assets, supported Linux distributions, verification, and updates.
+- [Install Locality](install.mdx): OS-specific release assets, supported Linux distributions, native package-manager enrollment, verification, and updates.
 - [Quickstart](quickstart.mdx): Install, connect, mount, edit, diff, and push.
 - [Admin console guide](admin-console.mdx): Create or join an organization, connect a hosted source, grant access, create a Workspace Profile and key, and materialize a read-only sandbox.
 

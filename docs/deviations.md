@@ -29,8 +29,8 @@ None.
   loop should batch or sequence all selected pending changes.
 - Desktop bundling now targets macOS `.app` and `.dmg`, Linux `.deb`/`.rpm`,
   and Linux AppImage updater artifacts with the required sidecars staged before
-  Tauri bundling. App Store submission, public APT/DNF repository activation,
-  and production icon sets remain distribution milestones.
+  Tauri bundling. App Store submission and production icon sets remain
+  distribution milestones.
 - Toggle blocks currently render as anchored directives with their summary in the `title` attribute. This preserves identity and child content, but it is not yet the clean nested-list or `<details>` round-trip targeted by `plan.md`.
 - Layout-rich blocks such as columns, tabs, synced blocks, AI/custom blocks, and meeting notes are directive-backed until the diff/apply layer can preserve their nesting and source-specific semantics safely.
 - Database row creation currently validates writable property names and types against the live Notion data source during apply. The `plan.md` target is local `_schema.yaml` validation during the parse/validate stage; that schema-backed preflight remains the next property-validation milestone.

@@ -86,6 +86,7 @@ required_assets=(
   "Locality_Linux.AppImage.sha256"
   "latest-linux.json"
   "SHA256SUMS-linux"
+  "linux-repository.json"
   "Locality_Windows_v${APP_VERSION}.exe"
   "Locality_Windows_v${APP_VERSION}.exe.sha256"
   "Locality_Windows_v${APP_VERSION}.exe.sig"

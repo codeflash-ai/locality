@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MACOS_WORKFLOW="${ROOT}/.github/workflows/release-macos.yml"
 WINDOWS_WORKFLOW="${ROOT}/.github/workflows/release-windows.yml"
 LINUX_WORKFLOW="${ROOT}/.github/workflows/release-linux.yml"
+LINUX_REPOSITORY_WORKFLOW="${ROOT}/.github/workflows/publish-linux-repositories.yml"
 RELEASE_NOTES_WORKFLOW="${ROOT}/.github/workflows/release-notes.yml"
 RELEASE_FINALIZE_WORKFLOW="${ROOT}/.github/workflows/release-finalize.yml"
 UPDATER_SCRIPT="${ROOT}/scripts/render-tauri-updater-manifest.sh"
@@ -81,6 +82,21 @@ grep -F -q 'create_args+=(--prerelease --latest=false)' "${LINUX_WORKFLOW}" \
 if grep -F -q 'edit_args+=(--prerelease=false --latest=true)' "${LINUX_WORKFLOW}"; then
   fail "Linux platform release edits must not promote latest with placeholder notes"
 fi
+grep -F -q 'name: linux-repository-input' "${LINUX_WORKFLOW}" \
+  || fail "Linux release workflow must hand stable packages to repository publishing"
+
+grep -F -q -- '- release Linux' "${LINUX_REPOSITORY_WORKFLOW}" \
+  || fail "Linux repositories must publish after the Linux release succeeds"
+grep -F -q -- '- "docs/**"' "${LINUX_REPOSITORY_WORKFLOW}" \
+  || fail "Pages deployment must continue publishing documentation changes from main"
+grep -F -q 'uses: actions/jekyll-build-pages@v1' "${LINUX_REPOSITORY_WORKFLOW}" \
+  || fail "package repository deployment must preserve the existing Pages documentation"
+grep -F -q -- '-f build_type=workflow' "${LINUX_REPOSITORY_WORKFLOW}" \
+  || fail "package repository deployment must switch legacy Pages to Actions deployments"
+grep -F -q 'uses: actions/deploy-pages@v4' "${LINUX_REPOSITORY_WORKFLOW}" \
+  || fail "Linux repositories must deploy to GitHub Pages"
+grep -F -q 'linux-repository.json' "${LINUX_REPOSITORY_WORKFLOW}" \
+  || fail "repository deployment must mark the matching GitHub Release"
 
 grep -F -q 'scripts/render-release-notes.sh' "${RELEASE_NOTES_WORKFLOW}" \
   || fail "release notes workflow must generate LLM release notes"
@@ -105,6 +121,8 @@ grep -F -q 'Locality_Mac.dmg' "${RELEASE_FINALIZE_SCRIPT}" \
   || fail "release finalizer must require the stable macOS download asset"
 grep -F -q 'Locality_Linux.AppImage' "${RELEASE_FINALIZE_SCRIPT}" \
   || fail "release finalizer must require stable Linux download assets"
+grep -F -q 'linux-repository.json' "${RELEASE_FINALIZE_SCRIPT}" \
+  || fail "release finalizer must wait until Linux package repositories are live"
 grep -F -q 'Locality_Windows.exe' "${RELEASE_FINALIZE_SCRIPT}" \
   || fail "release finalizer must require the stable Windows download asset"
 grep -F -q 'Locality_Windows_ARM64.exe' "${RELEASE_FINALIZE_SCRIPT}" \

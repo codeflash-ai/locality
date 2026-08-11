@@ -115,6 +115,9 @@ jobs:
       TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      LINUX_REPO_BASE_URL: ${{ vars.LINUX_REPO_BASE_URL || 'https://codeflash-ai.github.io/locality' }}
+      LINUX_REPO_GPG_PRIVATE_KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
+      LINUX_REPO_GPG_PASSPHRASE: ${{ secrets.LINUX_REPO_GPG_PASSPHRASE }}
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v4
@@ -174,6 +177,7 @@ jobs:
             libgtk-3-dev \
             librsvg2-dev \
             libwebkit2gtk-4.1-dev \
+            gnupg \
             patchelf \
             pkg-config \
             rpm \
@@ -184,10 +188,10 @@ jobs:
         run: npm ci
         working-directory: apps/desktop
 
-      - name: Verify updater secrets
+      - name: Verify updater and repository secrets
         run: |
           missing=0
-          for name in TAURI_UPDATER_PUBKEY TAURI_SIGNING_PRIVATE_KEY; do
+          for name in TAURI_UPDATER_PUBKEY TAURI_SIGNING_PRIVATE_KEY LINUX_REPO_GPG_PRIVATE_KEY; do
             if [[ -z "${!name}" ]]; then
               echo "::error::Missing required secret or environment value: ${name}"
               missing=1
@@ -251,6 +255,27 @@ jobs:
           cp target/release/bundle/updater/latest-linux.json target/release/github-assets/
           sha256sum target/release/github-assets/* > target/release/github-assets/SHA256SUMS-linux
           ls -la target/release/github-assets
+
+      - name: Collect package repository inputs
+        if: env.PRERELEASE != 'true'
+        run: |
+          rm -rf target/release/linux-repository-input
+          mkdir -p target/release/linux-repository-input
+          find target/release/bundle/linux -maxdepth 1 -type f \
+            \( -name 'Locality-release-[0-9]*-*.deb' -o -name 'Locality-release-[0-9]*-*.rpm' \) \
+            -exec cp {} target/release/linux-repository-input/ \;
+          printf '%s\n' "${RELEASE_TAG}" > target/release/linux-repository-input/release-tag.txt
+          test "$(find target/release/linux-repository-input -maxdepth 1 -name '*.deb' | wc -l)" -eq 1
+          test "$(find target/release/linux-repository-input -maxdepth 1 -name '*.rpm' | wc -l)" -eq 1
+
+      - name: Upload package repository inputs
+        if: env.PRERELEASE != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-repository-input
+          path: target/release/linux-repository-input
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Create GitHub Release
         env:

@@ -1,0 +1,161 @@
+name: publish Linux repositories
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - ".github/workflows/publish-linux-repositories.yml"
+      - "scripts/linux-repository-config.sh"
+      - "scripts/render-linux-repositories.sh"
+  workflow_run:
+    workflows:
+      - release Linux
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Stable GitHub Release tag to republish, for example v0.3.8"
+        required: true
+        type: string
+
+permissions:
+  actions: write
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish signed APT and RPM repositories
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+      LINUX_REPO_BASE_URL: ${{ vars.LINUX_REPO_BASE_URL || 'https://codeflash-ai.github.io/locality' }}
+      LINUX_REPO_GPG_PRIVATE_KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
+      LINUX_REPO_GPG_PASSPHRASE: ${{ secrets.LINUX_REPO_GPG_PASSPHRASE }}
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@v4
+
+      - name: Download repository inputs from the Linux release
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-repository-input
+          path: target/release/bundle/linux
+          github-token: ${{ github.token }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+
+      - name: Recover repository inputs from a GitHub Release
+        if: github.event_name != 'workflow_run'
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            release_tag="${{ inputs.tag }}"
+          else
+            release_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=30" --jq \
+              '[.[] | select(.draft == false) | select(any(.assets[]; .name == "linux-repository.json"))][0].tag_name // empty')"
+            if [[ -z "${release_tag}" ]]; then
+              release_tag="$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName --jq .tagName)"
+            fi
+          fi
+          if [[ ! "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid stable release tag: ${release_tag}"
+            exit 1
+          fi
+          version="${release_tag#v}"
+          mkdir -p target/release/bundle/linux
+          gh release download "${release_tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "Locality_Linux_v${version}.deb" \
+            --pattern "Locality_Linux_v${version}.rpm" \
+            --dir target/release/bundle/linux
+          mv "target/release/bundle/linux/Locality_Linux_v${version}.deb" \
+            "target/release/bundle/linux/Locality-release-${version}-recovery-x86_64.deb"
+          mv "target/release/bundle/linux/Locality_Linux_v${version}.rpm" \
+            "target/release/bundle/linux/Locality-release-${version}-recovery-x86_64.rpm"
+          printf '%s\n' "${release_tag}" > target/release/bundle/linux/release-tag.txt
+
+      - name: Resolve release tag
+        run: |
+          release_tag="$(cat target/release/bundle/linux/release-tag.txt)"
+          if [[ ! "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid stable release tag in repository input: ${release_tag}"
+            exit 1
+          fi
+          echo "RELEASE_TAG=${release_tag}" >> "${GITHUB_ENV}"
+
+      - name: Install repository tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-utils createrepo-c dpkg-dev gnupg rpm
+
+      - name: Verify repository signing secret
+        run: |
+          if [[ -z "${LINUX_REPO_GPG_PRIVATE_KEY}" ]]; then
+            echo "::error::Missing required secret: LINUX_REPO_GPG_PRIVATE_KEY"
+            exit 1
+          fi
+
+      - name: Render signed package repositories
+        run: make render-linux-repositories
+
+      - name: Use Actions deployments for the existing Pages site
+        run: |
+          gh api \
+            --method PUT \
+            "repos/${GITHUB_REPOSITORY}/pages" \
+            -f build_type=workflow >/dev/null
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Build the existing documentation site
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./docs
+          destination: ./_site
+
+      - name: Add package repositories to the Pages site
+        run: |
+          cp -R target/release/linux-repo/apt _site/apt
+          cp -R target/release/linux-repo/rpm _site/rpm
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy documentation and package repositories
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Mark the GitHub Release repository as published
+        if: github.event_name != 'push'
+        run: |
+          marker="${RUNNER_TEMP}/linux-repository.json"
+          jq -n \
+            --arg tag "${RELEASE_TAG}" \
+            --arg repository "${LINUX_REPO_BASE_URL}" \
+            --arg deployment "${{ steps.deployment.outputs.page_url }}" \
+            '{tag: $tag, repository: $repository, deployment: $deployment}' > "${marker}"
+          gh release upload "${RELEASE_TAG}" "${marker}" --repo "${GITHUB_REPOSITORY}" --clobber
+
+      - name: Retry release finalization
+        if: github.event_name != 'push'
+        run: |
+          gh workflow run release-finalize.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref main \
+            -f "tag=${RELEASE_TAG}"
