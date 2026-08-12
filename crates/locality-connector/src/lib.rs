@@ -8,7 +8,7 @@
 use locality_core::LocalityResult;
 use locality_core::freshness::RemoteObservation;
 use locality_core::journal::PushId;
-use locality_core::model::{CanonicalDocument, MountId, RemoteId, TreeEntry};
+use locality_core::model::{CanonicalDocument, EntityKind, MountId, RemoteId, TreeEntry};
 use locality_core::planner::{PushOperationKind, PushPlan};
 use locality_core::portable::{ProjectionEntry, SourceConnectionId, SourceObject};
 use locality_core::push::RemotePrecondition;
@@ -249,6 +249,28 @@ pub struct PortableChangeBatch {
     pub changes: Vec<PortableSourceChange>,
     pub next_checkpoint: PortableCheckpoint,
     pub completeness: PortableCompleteness,
+    /// Whether omission from this batch is meaningful for reconciliation.
+    ///
+    /// This is independent of [`PortableCompleteness`]: completeness describes
+    /// gaps in the returned data, while authority decides whether an omitted
+    /// object may be treated as absent from the requested scope.
+    #[serde(default)]
+    pub authority: PortableBatchAuthority,
+}
+
+/// The deletion authority carried by one portable change batch.
+///
+/// Missing serialized values default to [`Self::Incremental`], so older
+/// payloads can never gain deletion authority during an upgrade.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortableBatchAuthority {
+    /// Only explicit changes, including explicit tombstones, are authoritative.
+    #[default]
+    Incremental,
+    /// A terminal batch describes the complete requested scope, so omission is
+    /// authoritative after the host has validated the complete result.
+    CompleteScopeSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,6 +284,35 @@ pub struct PortableBootstrapRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortableSyncHint {
     pub remote_id: RemoteId,
+    /// Last provider version accepted by the host, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_version: Option<String>,
+    /// Last accepted projected path, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_path: Option<locality_core::portable::LogicalPath>,
+    /// Last accepted connector-owned source kind, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<EntityKind>,
+    /// Stable provider identity of the scope root that owned the object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owning_root_remote_id: Option<RemoteId>,
+}
+
+/// Host intent for one portable synchronization request.
+///
+/// Missing serialized values default to [`Self::HintsOnly`]. A legacy request
+/// therefore cannot accidentally ask a connector for omission-authoritative
+/// scope reconciliation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortableSyncMode {
+    /// Reconcile only the explicitly supplied hints and provider checkpoint.
+    #[default]
+    HintsOnly,
+    /// Reconcile the entire requested scope. The returned batch still needs
+    /// [`PortableBatchAuthority::CompleteScopeSnapshot`] before omission is
+    /// authoritative.
+    ReconcileScope,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,6 +320,8 @@ pub struct PortableSyncRequest {
     pub source_connection_id: SourceConnectionId,
     pub scope: PortableSourceScope,
     pub checkpoint: PortableCheckpoint,
+    #[serde(default)]
+    pub mode: PortableSyncMode,
     #[serde(default)]
     pub hints: Vec<PortableSyncHint>,
     pub max_changes: u32,

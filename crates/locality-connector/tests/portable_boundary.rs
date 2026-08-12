@@ -3,12 +3,15 @@ use std::collections::BTreeSet;
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, NativeEntity,
-    ParsedEntity, PortableBootstrapRequest, PortableEnumerateRequest, PortableFetchReason,
-    PortableFetchRequest, PortableSourceScope,
+    ParsedEntity, PortableBatchAuthority, PortableBootstrapRequest, PortableChangeBatch,
+    PortableCheckpoint, PortableCompleteness, PortableEnumerateRequest, PortableFetchReason,
+    PortableFetchRequest, PortableSourceScope, PortableSyncHint, PortableSyncMode,
+    PortableSyncRequest,
 };
 use locality_core::LocalityResult;
-use locality_core::model::{CanonicalDocument, TreeEntry};
-use locality_core::portable::SourceConnectionId;
+use locality_core::model::{CanonicalDocument, EntityKind, TreeEntry};
+use locality_core::portable::{LogicalPath, SourceConnectionId};
+use serde_json::json;
 
 #[derive(Clone)]
 struct LegacyOnlyConnector;
@@ -104,4 +107,88 @@ fn legacy_connectors_compile_and_do_not_invent_portable_identity() {
         error,
         locality_core::LocalityError::Unsupported("connector does not support portable fetch")
     );
+}
+
+#[test]
+fn portable_batch_authority_defaults_to_incremental_and_rejects_unknown_values() {
+    let complete = PortableChangeBatch {
+        changes: Vec::new(),
+        next_checkpoint: PortableCheckpoint {
+            format_version: 7,
+            opaque: r#"{"provider_cursor":"keep-opaque"}"#.to_string(),
+        },
+        completeness: PortableCompleteness::complete(),
+        authority: PortableBatchAuthority::CompleteScopeSnapshot,
+    };
+    let serialized = serde_json::to_value(&complete).expect("portable batch JSON");
+    assert_eq!(
+        serialized.get("authority"),
+        Some(&json!("complete_scope_snapshot"))
+    );
+
+    let mut legacy = serialized.clone();
+    legacy
+        .as_object_mut()
+        .expect("portable batch object")
+        .remove("authority");
+    let legacy: PortableChangeBatch =
+        serde_json::from_value(legacy).expect("legacy portable batch");
+    assert_eq!(legacy.authority, PortableBatchAuthority::Incremental);
+    assert_eq!(
+        legacy.next_checkpoint.opaque,
+        r#"{"provider_cursor":"keep-opaque"}"#
+    );
+
+    let mut unknown = serialized;
+    unknown["authority"] = json!("future_authority");
+    assert!(serde_json::from_value::<PortableChangeBatch>(unknown).is_err());
+}
+
+#[test]
+fn portable_sync_defaults_to_hints_only_and_prior_metadata_is_optional() {
+    let legacy = json!({
+        "source_connection_id": "source-1",
+        "scope": { "root_remote_ids": ["root-1"] },
+        "checkpoint": {
+            "format_version": 3,
+            "opaque": "provider-owned-not-host-json"
+        },
+        "hints": [{ "remote_id": "page-1" }],
+        "max_changes": 50
+    });
+    let request: PortableSyncRequest =
+        serde_json::from_value(legacy).expect("legacy portable sync request");
+    assert_eq!(request.mode, PortableSyncMode::HintsOnly);
+    assert_eq!(request.checkpoint.opaque, "provider-owned-not-host-json");
+    assert_eq!(request.hints.len(), 1);
+    assert_eq!(request.hints[0].provider_version, None);
+    assert_eq!(request.hints[0].logical_path, None);
+    assert_eq!(request.hints[0].source_kind, None);
+    assert_eq!(request.hints[0].owning_root_remote_id, None);
+    assert_eq!(
+        serde_json::to_value(&request.hints[0]).expect("portable sync hint JSON"),
+        json!({ "remote_id": "page-1" })
+    );
+
+    let rich_hint = PortableSyncHint {
+        remote_id: locality_core::model::RemoteId::new("page-2"),
+        provider_version: Some("provider-version-2".to_string()),
+        logical_path: Some(LogicalPath::new("Roadmap/page.md").expect("logical path")),
+        source_kind: Some(EntityKind::Page),
+        owning_root_remote_id: Some(locality_core::model::RemoteId::new("root-1")),
+    };
+    assert_eq!(
+        serde_json::to_value(rich_hint).expect("rich portable sync hint JSON"),
+        json!({
+            "remote_id": "page-2",
+            "provider_version": "provider-version-2",
+            "logical_path": "Roadmap/page.md",
+            "source_kind": "page",
+            "owning_root_remote_id": "root-1"
+        })
+    );
+
+    let mut unknown = serde_json::to_value(request).expect("portable sync request JSON");
+    unknown["mode"] = json!("future_mode");
+    assert!(serde_json::from_value::<PortableSyncRequest>(unknown).is_err());
 }

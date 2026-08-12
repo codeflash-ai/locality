@@ -4,11 +4,11 @@ use std::sync::Mutex;
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, NativeEntity,
-    PORTABLE_SCOPE_ROOT_RELATIONSHIP, ParsedEntity, PortableArtifactKey, PortableBootstrapRequest,
-    PortableChangeBatch, PortableCheckpoint, PortableCompleteness, PortableContentArtifact,
-    PortableFetchRequest, PortableFetchResult, PortableIncompleteReason,
+    PORTABLE_SCOPE_ROOT_RELATIONSHIP, ParsedEntity, PortableArtifactKey, PortableBatchAuthority,
+    PortableBootstrapRequest, PortableChangeBatch, PortableCheckpoint, PortableCompleteness,
+    PortableContentArtifact, PortableFetchRequest, PortableFetchResult, PortableIncompleteReason,
     PortableProjectionArtifact, PortableRenderRequest, PortableRenderResult, PortableSourceChange,
-    PortableSyncRequest,
+    PortableSyncMode, PortableSyncRequest,
 };
 use locality_core::LocalityResult;
 use locality_core::model::{CanonicalDocument, EntityKind, RemoteId, TreeEntry};
@@ -87,6 +87,7 @@ impl Connector for FixtureConnector {
             } else {
                 PortableCompleteness::complete()
             },
+            authority: PortableBatchAuthority::Incremental,
         })
     }
 
@@ -301,6 +302,7 @@ impl Connector for PagedFixtureConnector {
                 opaque: next_opaque,
             },
             completeness,
+            authority: PortableBatchAuthority::Incremental,
         })
     }
 
@@ -448,6 +450,7 @@ fn synchronization_uses_the_same_deterministic_candidate_pipeline() {
                 format_version: 1,
                 opaque: "ready".to_string(),
             },
+            mode: PortableSyncMode::HintsOnly,
             hints: Vec::new(),
             max_changes: 100,
         },

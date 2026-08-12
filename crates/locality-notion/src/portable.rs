@@ -8,9 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use locality_connector::{
-    NativeEntity, PORTABLE_SCOPE_ROOT_RELATIONSHIP, PortableArtifactKey, PortableBootstrapRequest,
-    PortableChangeBatch, PortableCheckpoint, PortableCompleteness, PortableContentArtifact,
-    PortableFetchRequest, PortableFetchResult, PortableIncompleteReason,
+    NativeEntity, PORTABLE_SCOPE_ROOT_RELATIONSHIP, PortableArtifactKey, PortableBatchAuthority,
+    PortableBootstrapRequest, PortableChangeBatch, PortableCheckpoint, PortableCompleteness,
+    PortableContentArtifact, PortableFetchRequest, PortableFetchResult, PortableIncompleteReason,
     PortableProjectionArtifact, PortableRenderRequest, PortableRenderResult, PortableSourceChange,
     PortableSyncRequest,
 };
@@ -1823,6 +1823,7 @@ fn page_batch(
         changes: inventory[offset..end].to_vec(),
         next_checkpoint,
         completeness,
+        authority: PortableBatchAuthority::Incremental,
     })
 }
 

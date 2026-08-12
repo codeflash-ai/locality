@@ -83,6 +83,23 @@ metadata record suitable for reconciliation and later lazy hydration. A
 configured remote scope. An `Incremental` result never turns omission into a
 deletion; only an explicit tombstone authorizes deletion handling.
 
+Portable synchronization makes the same safety boundary explicit.
+`PortableSyncMode::HintsOnly` asks for differential work from the opaque
+checkpoint and supplied object hints; omission from its result never means
+deletion. `PortableSyncMode::ReconcileScope` asks the connector to inspect the
+whole requested scope, but omission is authoritative only when the returned
+terminal batch declares `PortableBatchAuthority::CompleteScopeSnapshot` and
+its `PortableCompleteness` is complete. Non-terminal or incremental batches can
+delete only through an explicit tombstone. Missing serialized mode or authority
+fields default to `HintsOnly` and `Incremental`, so older payloads fail safe
+instead of gaining deletion authority.
+
+Portable sync hints may include the host's prior provider version, logical
+path, source kind, and owning root. These values support differential provider
+decisions; they are hints, not identity or deletion authority. Connector
+checkpoints remain opaque connector-owned values and hosts must persist and
+return them without parsing their contents.
+
 The host must validate and reconcile the entire result before persisting
 `next_checkpoint`. If validation, store mutation, or projection reconciliation
 fails, the previous checkpoint remains current so the connector can safely
