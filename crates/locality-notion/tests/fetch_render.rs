@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use locality_connector::{
     ChildContainer, Connector, ConnectorExecutionPolicy, EnumerateRequest, FetchRequest,
-    ListChildrenRequest, NativeEntity, PORTABLE_SCOPE_ROOT_RELATIONSHIP, PortableBatchAuthority,
-    PortableBootstrapRequest, PortableFetchReason, PortableFetchRequest, PortableIncompleteReason,
-    PortableRenderRequest, PortableSourceScope, PortableSyncMode, PortableSyncRequest,
+    ListChildrenRequest, NativeEntity, PORTABLE_SCOPE_ROOT_RELATIONSHIP, PortableBootstrapRequest,
+    PortableFetchReason, PortableFetchRequest, PortableIncompleteReason, PortableRenderRequest,
+    PortableSourceScope, PortableSyncRequest,
 };
 use locality_core::canonical::render_canonical_markdown;
 use locality_core::model::{EntityKind, MountId, RemoteId};
@@ -2042,7 +2042,6 @@ fn portable_bootstrap_resumes_and_completes_database_coverage() {
             .incomplete_reasons()
             .contains(&PortableIncompleteReason::CheckpointContinuation)
     );
-    assert_eq!(first.authority, PortableBatchAuthority::Incremental);
 
     let second = connector
         .bootstrap_portable(PortableBootstrapRequest {
@@ -2061,7 +2060,6 @@ fn portable_bootstrap_resumes_and_completes_database_coverage() {
             .contains(&PortableIncompleteReason::CheckpointContinuation)
     );
     assert!(second.completeness.incomplete_reasons().is_empty());
-    assert_eq!(second.authority, PortableBatchAuthority::Incremental);
 
     let synchronized = connector
         .sync_portable(PortableSyncRequest {
@@ -2070,14 +2068,12 @@ fn portable_bootstrap_resumes_and_completes_database_coverage() {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             )]),
             checkpoint: second.next_checkpoint,
-            mode: PortableSyncMode::HintsOnly,
             hints: Vec::new(),
             max_changes: 10,
         })
         .expect("scheduled explicit-root synchronization");
     assert_eq!(synchronized.changes.len(), 4);
     assert!(synchronized.completeness.is_complete());
-    assert_eq!(synchronized.authority, PortableBatchAuthority::Incremental);
 }
 
 #[test]

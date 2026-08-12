@@ -1,14 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, NativeEntity,
     PORTABLE_SCOPE_ROOT_RELATIONSHIP, ParsedEntity, PortableArtifactKey, PortableBatchAuthority,
-    PortableBootstrapRequest, PortableChangeBatch, PortableCheckpoint, PortableCompleteness,
-    PortableContentArtifact, PortableFetchRequest, PortableFetchResult, PortableIncompleteReason,
-    PortableProjectionArtifact, PortableRenderRequest, PortableRenderResult, PortableSourceChange,
-    PortableSyncMode, PortableSyncRequest,
+    PortableBootstrapRequest, PortableChangeBatch, PortableChangeBatchV2, PortableCheckpoint,
+    PortableCompleteness, PortableContentArtifact, PortableFetchRequest, PortableFetchResult,
+    PortableIncompleteReason, PortableProjectionArtifact, PortableRenderRequest,
+    PortableRenderResult, PortableSourceChange, PortableSyncHintV2, PortableSyncMode,
+    PortableSyncRequest, PortableSyncRequestV2,
 };
 use locality_core::LocalityResult;
 use locality_core::model::{CanonicalDocument, EntityKind, RemoteId, TreeEntry};
@@ -17,7 +19,7 @@ use locality_core::portable::{
 };
 use locality_engine::synchronize_project::{
     BootstrapAggregationLimits, bootstrap_and_project, bootstrap_and_project_to_completion,
-    synchronize_and_project_portable,
+    synchronize_and_project_portable, synchronize_and_project_portable_v2,
 };
 
 #[derive(Clone)]
@@ -87,7 +89,6 @@ impl Connector for FixtureConnector {
             } else {
                 PortableCompleteness::complete()
             },
-            authority: PortableBatchAuthority::Incremental,
         })
     }
 
@@ -142,6 +143,95 @@ impl Connector for FixtureConnector {
             }],
             completeness: PortableCompleteness::complete(),
         })
+    }
+
+    fn fetch(&self, _request: FetchRequest) -> LocalityResult<NativeEntity> {
+        unreachable!("portable engine uses fetch_portable")
+    }
+
+    fn render(&self, _entity: &NativeEntity) -> LocalityResult<CanonicalDocument> {
+        unreachable!("portable engine uses render_portable")
+    }
+
+    fn parse(&self, _document: &CanonicalDocument) -> LocalityResult<ParsedEntity> {
+        unreachable!("not used")
+    }
+
+    fn check_concurrency(&self, _request: ApplyPlanRequest<'_>) -> LocalityResult<()> {
+        unreachable!("not used")
+    }
+
+    fn apply(&self, _request: ApplyPlanRequest<'_>) -> LocalityResult<ApplyPlanResult> {
+        unreachable!("not used")
+    }
+
+    fn apply_undo(&self, _request: ApplyUndoRequest<'_>) -> LocalityResult<ApplyUndoResult> {
+        unreachable!("not used")
+    }
+}
+
+struct V2FixtureConnector {
+    authority: PortableBatchAuthority,
+    complete: bool,
+    dispatches: AtomicUsize,
+}
+
+impl V2FixtureConnector {
+    fn new(authority: PortableBatchAuthority, complete: bool) -> Self {
+        Self {
+            authority,
+            complete,
+            dispatches: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Connector for V2FixtureConnector {
+    fn kind(&self) -> ConnectorKind {
+        ConnectorKind("v2-fixture")
+    }
+
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::read_only()
+    }
+
+    fn supported_push_operations(&self) -> BTreeSet<locality_core::planner::PushOperationKind> {
+        BTreeSet::new()
+    }
+
+    fn enumerate(&self, _request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>> {
+        Ok(Vec::new())
+    }
+
+    fn sync_portable_v2(
+        &self,
+        request: PortableSyncRequestV2,
+    ) -> LocalityResult<PortableChangeBatchV2> {
+        self.dispatches.fetch_add(1, Ordering::SeqCst);
+        Ok(PortableChangeBatchV2 {
+            changes: vec![change(&request.source_connection_id, "page-a", "A/page.md")],
+            next_checkpoint: PortableCheckpoint {
+                format_version: 1,
+                opaque: "v2-ready".to_string(),
+            },
+            completeness: if self.complete {
+                PortableCompleteness::complete()
+            } else {
+                PortableCompleteness::incomplete(PortableIncompleteReason::CheckpointContinuation)
+            },
+            authority: self.authority,
+        })
+    }
+
+    fn fetch_portable(&self, request: PortableFetchRequest) -> LocalityResult<PortableFetchResult> {
+        FixtureConnector::complete().fetch_portable(request)
+    }
+
+    fn render_portable(
+        &self,
+        request: &PortableRenderRequest,
+    ) -> LocalityResult<PortableRenderResult> {
+        FixtureConnector::complete().render_portable(request)
     }
 
     fn fetch(&self, _request: FetchRequest) -> LocalityResult<NativeEntity> {
@@ -302,7 +392,6 @@ impl Connector for PagedFixtureConnector {
                 opaque: next_opaque,
             },
             completeness,
-            authority: PortableBatchAuthority::Incremental,
         })
     }
 
@@ -450,7 +539,6 @@ fn synchronization_uses_the_same_deterministic_candidate_pipeline() {
                 format_version: 1,
                 opaque: "ready".to_string(),
             },
-            mode: PortableSyncMode::HintsOnly,
             hints: Vec::new(),
             max_changes: 100,
         },
@@ -461,6 +549,103 @@ fn synchronization_uses_the_same_deterministic_candidate_pipeline() {
     assert_eq!(bootstrap.source_versions, synchronized.source_versions);
     assert_eq!(bootstrap.contents, synchronized.contents);
     assert_eq!(bootstrap.projections, synchronized.projections);
+}
+
+fn v2_request(mode: PortableSyncMode) -> PortableSyncRequestV2 {
+    PortableSyncRequestV2 {
+        source_connection_id: SourceConnectionId::new("source-fixture"),
+        scope: locality_connector::PortableSourceScope::explicit_roots([RemoteId::new("root")]),
+        checkpoint: PortableCheckpoint {
+            format_version: 1,
+            opaque: "ready".to_string(),
+        },
+        mode,
+        hints: Vec::new(),
+        max_changes: 100,
+    }
+}
+
+#[test]
+fn default_v2_adapter_preserves_mode_but_never_authorizes_omission() {
+    let synchronized = synchronize_and_project_portable_v2(
+        &FixtureConnector::complete(),
+        v2_request(PortableSyncMode::ReconcileScope),
+        1,
+    )
+    .expect("legacy connector through v2 adapter");
+
+    assert_eq!(synchronized.mode, PortableSyncMode::ReconcileScope);
+    assert_eq!(synchronized.authority, PortableBatchAuthority::Incremental);
+    assert!(synchronized.batch.completeness.is_complete());
+    assert!(!synchronized.authorizes_omission());
+}
+
+#[test]
+fn v2_omission_authority_requires_all_three_conditions() {
+    let mut authorized_cases = 0;
+    let mut unauthorized_cases = 0;
+    for mode in [
+        PortableSyncMode::HintsOnly,
+        PortableSyncMode::ReconcileScope,
+    ] {
+        for complete in [false, true] {
+            for authority in [
+                PortableBatchAuthority::Incremental,
+                PortableBatchAuthority::CompleteScopeSnapshot,
+            ] {
+                let connector = V2FixtureConnector::new(authority, complete);
+                let synchronized =
+                    synchronize_and_project_portable_v2(&connector, v2_request(mode), 1)
+                        .expect("v2 synchronization");
+                let expected = mode == PortableSyncMode::ReconcileScope
+                    && complete
+                    && authority == PortableBatchAuthority::CompleteScopeSnapshot;
+                assert_eq!(synchronized.mode, mode);
+                assert_eq!(synchronized.authority, authority);
+                assert_eq!(synchronized.authorizes_omission(), expected);
+                assert_eq!(connector.dispatches.load(Ordering::SeqCst), 1);
+                if expected {
+                    authorized_cases += 1;
+                } else {
+                    unauthorized_cases += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(authorized_cases, 1);
+    assert_eq!(unauthorized_cases, 7);
+}
+
+#[test]
+fn v2_validation_rejects_invalid_hints_before_connector_dispatch() {
+    let connector = V2FixtureConnector::new(PortableBatchAuthority::Incremental, true);
+    let mut request = v2_request(PortableSyncMode::HintsOnly);
+    request.hints = vec![
+        PortableSyncHintV2 {
+            remote_id: RemoteId::new("duplicate"),
+            provider_version: None,
+            logical_path: None,
+            source_kind: None,
+            owning_root_remote_id: Some(RemoteId::new("root")),
+        },
+        PortableSyncHintV2 {
+            remote_id: RemoteId::new("duplicate"),
+            provider_version: None,
+            logical_path: None,
+            source_kind: None,
+            owning_root_remote_id: Some(RemoteId::new("root")),
+        },
+    ];
+
+    let error = synchronize_and_project_portable_v2(&connector, request, 1)
+        .expect_err("duplicate hints must fail before connector dispatch");
+    assert_eq!(
+        error,
+        locality_core::LocalityError::InvalidState(
+            "portable sync v2 contains duplicate hint remote IDs".to_string()
+        )
+    );
+    assert_eq!(connector.dispatches.load(Ordering::SeqCst), 0);
 }
 
 #[test]

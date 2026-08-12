@@ -249,13 +249,6 @@ pub struct PortableChangeBatch {
     pub changes: Vec<PortableSourceChange>,
     pub next_checkpoint: PortableCheckpoint,
     pub completeness: PortableCompleteness,
-    /// Whether omission from this batch is meaningful for reconciliation.
-    ///
-    /// This is independent of [`PortableCompleteness`]: completeness describes
-    /// gaps in the returned data, while authority decides whether an omitted
-    /// object may be treated as absent from the requested scope.
-    #[serde(default)]
-    pub authority: PortableBatchAuthority,
 }
 
 /// The deletion authority carried by one portable change batch.
@@ -273,6 +266,32 @@ pub enum PortableBatchAuthority {
     CompleteScopeSnapshot,
 }
 
+/// Versioned portable synchronization result with explicit omission authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableChangeBatchV2 {
+    pub changes: Vec<PortableSourceChange>,
+    pub next_checkpoint: PortableCheckpoint,
+    pub completeness: PortableCompleteness,
+    /// Whether omission from this batch is meaningful for reconciliation.
+    ///
+    /// This is independent of [`PortableCompleteness`]: completeness describes
+    /// gaps in the returned data, while authority decides whether an omitted
+    /// object may be treated as absent from the requested scope.
+    #[serde(default)]
+    pub authority: PortableBatchAuthority,
+}
+
+impl From<PortableChangeBatch> for PortableChangeBatchV2 {
+    fn from(batch: PortableChangeBatch) -> Self {
+        Self {
+            changes: batch.changes,
+            next_checkpoint: batch.next_checkpoint,
+            completeness: batch.completeness,
+            authority: PortableBatchAuthority::Incremental,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortableBootstrapRequest {
     pub source_connection_id: SourceConnectionId,
@@ -283,6 +302,23 @@ pub struct PortableBootstrapRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortableSyncHint {
+    pub remote_id: RemoteId,
+}
+
+/// Maximum number of differential hints accepted by one v2 sync request.
+pub const PORTABLE_SYNC_V2_MAX_HINTS: usize = 4_096;
+/// Maximum UTF-8 bytes accepted for each v2 source, remote, or owning-root ID.
+pub const PORTABLE_SYNC_V2_MAX_ID_BYTES: usize = 1_024;
+/// Maximum UTF-8 bytes accepted for a v2 prior provider version.
+pub const PORTABLE_SYNC_V2_MAX_PROVIDER_VERSION_BYTES: usize = 1_024;
+/// Maximum UTF-8 bytes accepted for a connector-defined v2 source kind.
+pub const PORTABLE_SYNC_V2_MAX_SOURCE_KIND_BYTES: usize = 128;
+/// Maximum UTF-8 bytes accepted for an opaque v2 connector checkpoint.
+pub const PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES: usize = 65_536;
+
+/// Differential metadata supplied to a connector by a v2 sync host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableSyncHintV2 {
     pub remote_id: RemoteId,
     /// Last provider version accepted by the host, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -321,10 +357,116 @@ pub struct PortableSyncRequest {
     pub scope: PortableSourceScope,
     pub checkpoint: PortableCheckpoint,
     #[serde(default)]
-    pub mode: PortableSyncMode,
-    #[serde(default)]
     pub hints: Vec<PortableSyncHint>,
     pub max_changes: u32,
+}
+
+/// Versioned portable synchronization request with explicit host intent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableSyncRequestV2 {
+    pub source_connection_id: SourceConnectionId,
+    pub scope: PortableSourceScope,
+    pub checkpoint: PortableCheckpoint,
+    #[serde(default)]
+    pub mode: PortableSyncMode,
+    #[serde(default)]
+    pub hints: Vec<PortableSyncHintV2>,
+    pub max_changes: u32,
+}
+
+impl PortableSyncRequestV2 {
+    /// Validate host-controlled bounds and scope relationships before provider
+    /// connector dispatch.
+    pub fn validate(&self) -> LocalityResult<()> {
+        validate_portable_sync_v2_id(self.source_connection_id.as_str(), "source connection ID")?;
+        if self.checkpoint.opaque.len() > PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES {
+            return Err(locality_core::LocalityError::InvalidState(format!(
+                "portable sync v2 checkpoint is {} UTF-8 bytes; maximum is {}",
+                self.checkpoint.opaque.len(),
+                PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES
+            )));
+        }
+        if self.hints.len() > PORTABLE_SYNC_V2_MAX_HINTS {
+            return Err(locality_core::LocalityError::InvalidState(format!(
+                "portable sync v2 has {} hints; maximum is {}",
+                self.hints.len(),
+                PORTABLE_SYNC_V2_MAX_HINTS
+            )));
+        }
+
+        let mut scope_roots = BTreeSet::new();
+        for root_remote_id in &self.scope.root_remote_ids {
+            validate_portable_sync_v2_id(root_remote_id.as_str(), "scope root remote ID")?;
+            if !scope_roots.insert(root_remote_id) {
+                return Err(locality_core::LocalityError::InvalidState(
+                    "portable sync v2 contains duplicate scope root remote IDs".to_string(),
+                ));
+            }
+        }
+        let mut remote_ids = BTreeSet::new();
+        for hint in &self.hints {
+            validate_portable_sync_v2_id(hint.remote_id.as_str(), "hint remote ID")?;
+            if !remote_ids.insert(&hint.remote_id) {
+                return Err(locality_core::LocalityError::InvalidState(
+                    "portable sync v2 contains duplicate hint remote IDs".to_string(),
+                ));
+            }
+            if hint
+                .provider_version
+                .as_ref()
+                .is_some_and(|version| version.len() > PORTABLE_SYNC_V2_MAX_PROVIDER_VERSION_BYTES)
+            {
+                return Err(locality_core::LocalityError::InvalidState(format!(
+                    "portable sync v2 provider version exceeds {} UTF-8 bytes",
+                    PORTABLE_SYNC_V2_MAX_PROVIDER_VERSION_BYTES
+                )));
+            }
+            if let Some(EntityKind::Unknown(source_kind)) = &hint.source_kind
+                && source_kind.len() > PORTABLE_SYNC_V2_MAX_SOURCE_KIND_BYTES
+            {
+                return Err(locality_core::LocalityError::InvalidState(format!(
+                    "portable sync v2 source kind exceeds {} UTF-8 bytes",
+                    PORTABLE_SYNC_V2_MAX_SOURCE_KIND_BYTES
+                )));
+            }
+            if let Some(root_remote_id) = &hint.owning_root_remote_id {
+                validate_portable_sync_v2_id(root_remote_id.as_str(), "owning root remote ID")?;
+                if !scope_roots.contains(root_remote_id) {
+                    return Err(locality_core::LocalityError::InvalidState(
+                        "portable sync v2 hint owning root is outside the request scope"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn into_legacy(self) -> PortableSyncRequest {
+        PortableSyncRequest {
+            source_connection_id: self.source_connection_id,
+            scope: self.scope,
+            checkpoint: self.checkpoint,
+            hints: self
+                .hints
+                .into_iter()
+                .map(|hint| PortableSyncHint {
+                    remote_id: hint.remote_id,
+                })
+                .collect(),
+            max_changes: self.max_changes,
+        }
+    }
+}
+
+fn validate_portable_sync_v2_id(value: &str, label: &str) -> LocalityResult<()> {
+    if value.is_empty() || value.len() > PORTABLE_SYNC_V2_MAX_ID_BYTES {
+        return Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 {label} must contain 1..={} UTF-8 bytes",
+            PORTABLE_SYNC_V2_MAX_ID_BYTES
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -620,6 +762,20 @@ pub trait Connector {
         Err(locality_core::LocalityError::Unsupported(
             "connector does not support portable synchronization",
         ))
+    }
+    /// Observe portable changes with explicit sync intent and omission
+    /// authority.
+    ///
+    /// The compatibility adapter validates the v2 request, forwards only the
+    /// legacy fields to [`Self::sync_portable`], and always returns incremental
+    /// authority. Connectors must override this method to honor
+    /// [`PortableSyncMode::ReconcileScope`] or return complete-scope authority.
+    fn sync_portable_v2(
+        &self,
+        request: PortableSyncRequestV2,
+    ) -> LocalityResult<PortableChangeBatchV2> {
+        request.validate()?;
+        self.sync_portable(request.into_legacy()).map(Into::into)
     }
     /// Fetch one authoritative native provider object.
     fn fetch_portable(

@@ -7,11 +7,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use locality_connector::{
-    Connector, PortableArtifactKey, PortableBootstrapRequest, PortableChangeBatch,
-    PortableCompleteness, PortableContentArtifact, PortableEnumerateRequest,
+    Connector, PortableArtifactKey, PortableBatchAuthority, PortableBootstrapRequest,
+    PortableChangeBatch, PortableCompleteness, PortableContentArtifact, PortableEnumerateRequest,
     PortableEnumerateResult, PortableFetchReason, PortableFetchRequest, PortableIncompleteReason,
-    PortableProjectionArtifact, PortableRenderRequest, PortableSourceChange, PortableSyncRequest,
-    portable_scope_root_remote_id,
+    PortableProjectionArtifact, PortableRenderRequest, PortableSourceChange, PortableSyncMode,
+    PortableSyncRequest, PortableSyncRequestV2, portable_scope_root_remote_id,
 };
 use locality_core::model::RemoteId;
 use locality_core::portable::{
@@ -90,6 +90,29 @@ impl UnpersistedSynchronizationBatch {
                 "portable synchronization batch is incomplete and cannot be published".to_string(),
             ))
         }
+    }
+}
+
+/// One v2 synchronization result with the host's request mode and the
+/// connector's omission authority preserved alongside projected candidates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnpersistedSynchronizationBatchV2 {
+    pub batch: UnpersistedSynchronizationBatch,
+    pub mode: PortableSyncMode,
+    pub authority: PortableBatchAuthority,
+}
+
+impl UnpersistedSynchronizationBatchV2 {
+    /// Whether omission from this terminal batch may be reconciled as absence.
+    ///
+    /// Explicit tombstones do not require omission authority. Every other
+    /// omission stays non-destructive unless the host requested full-scope
+    /// reconciliation, the connector returned complete terminal coverage, and
+    /// the connector explicitly granted complete-scope snapshot authority.
+    pub fn authorizes_omission(&self) -> bool {
+        self.mode == PortableSyncMode::ReconcileScope
+            && self.batch.completeness.is_complete()
+            && self.authority == PortableBatchAuthority::CompleteScopeSnapshot
     }
 }
 
@@ -416,6 +439,39 @@ pub fn synchronize_and_project_portable<C: Connector + ?Sized>(
         PortableFetchReason::Synchronization,
         format_version,
     )
+}
+
+/// Run one v2 synchronization checkpoint through fetch and render.
+///
+/// Request bounds and scope relationships are validated before connector
+/// dispatch. The returned wrapper keeps sync intent and connector authority so
+/// a host has one fail-safe predicate for omission-based reconciliation.
+pub fn synchronize_and_project_portable_v2<C: Connector + ?Sized>(
+    connector: &C,
+    request: PortableSyncRequestV2,
+    format_version: u32,
+) -> LocalityResult<UnpersistedSynchronizationBatchV2> {
+    request.validate()?;
+    let source_connection_id = request.source_connection_id.clone();
+    let mode = request.mode;
+    let batch = connector.sync_portable_v2(request)?;
+    let authority = batch.authority;
+    let batch = project_batch(
+        connector,
+        source_connection_id,
+        PortableChangeBatch {
+            changes: batch.changes,
+            next_checkpoint: batch.next_checkpoint,
+            completeness: batch.completeness,
+        },
+        PortableFetchReason::Synchronization,
+        format_version,
+    )?;
+    Ok(UnpersistedSynchronizationBatchV2 {
+        batch,
+        mode,
+        authority,
+    })
 }
 
 fn project_batch<C: Connector + ?Sized>(

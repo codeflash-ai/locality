@@ -83,22 +83,41 @@ metadata record suitable for reconciliation and later lazy hydration. A
 configured remote scope. An `Incremental` result never turns omission into a
 deletion; only an explicit tombstone authorizes deletion handling.
 
-Portable synchronization makes the same safety boundary explicit.
-`PortableSyncMode::HintsOnly` asks for differential work from the opaque
-checkpoint and supplied object hints; omission from its result never means
-deletion. `PortableSyncMode::ReconcileScope` asks the connector to inspect the
-whole requested scope, but omission is authoritative only when the returned
-terminal batch declares `PortableBatchAuthority::CompleteScopeSnapshot` and
-its `PortableCompleteness` is complete. Non-terminal or incremental batches can
-delete only through an explicit tombstone. Missing serialized mode or authority
-fields default to `HintsOnly` and `Incremental`, so older payloads fail safe
-instead of gaining deletion authority.
+The original `PortableSyncRequest`, `PortableSyncHint`, `PortableChangeBatch`,
+and `Connector::sync_portable` contract remains unchanged and carries no
+omission authority. The additive v2 contract makes the safety boundary
+explicit. `PortableSyncMode::HintsOnly` asks for differential work from the
+opaque checkpoint and supplied object hints; omission from its result never
+means deletion. `PortableSyncMode::ReconcileScope` asks the connector to inspect
+the whole requested scope, but omission is authoritative only when the engine's
+single `authorizes_omission` predicate sees all three conditions: the request
+mode is `ReconcileScope`, the terminal connector coverage is complete, and the
+batch declares `PortableBatchAuthority::CompleteScopeSnapshot`. Non-terminal
+or incremental batches can delete only through an explicit tombstone. Missing
+v2 mode or authority fields default to `HintsOnly` and `Incremental`; unknown
+enum values are rejected.
 
-Portable sync hints may include the host's prior provider version, logical
-path, source kind, and owning root. These values support differential provider
-decisions; they are hints, not identity or deletion authority. Connector
-checkpoints remain opaque connector-owned values and hosts must persist and
-return them without parsing their contents.
+`Connector::sync_portable_v2` has a compatibility adapter on the same trait. It
+validates the v2 request, forwards legacy remote-ID hints to `sync_portable`,
+and converts every legacy result to `Incremental`. SDK implementers can migrate
+without a crate major-version bump: keep the legacy method for old hosts, add a
+v2 override when the connector can honor prior metadata and full-scope
+reconciliation, and return `CompleteScopeSnapshot` only for a terminal complete
+inventory of the requested scope. Current Notion uses the compatibility adapter;
+it ignores v2 prior metadata and full-inventory intent and cannot authorize
+omission until its dedicated implementation PR.
+
+Portable v2 sync hints may include the host's prior provider version, validated
+logical path, source kind, and owning root. They support differential provider
+decisions but are not identity or deletion authority. Before connector
+dispatch, v2 accepts at most 4,096 hints; source, remote, scope-root, and
+owning-root IDs must contain 1..=1,024 UTF-8 bytes; provider versions are at
+most 1,024 UTF-8 bytes; connector-defined source kinds are at most 128 UTF-8
+bytes; and opaque checkpoints are at most 65,536 UTF-8 bytes. Logical paths
+retain the portable core's 1,024-byte ceiling. Duplicate scope-root or hint
+remote IDs and owning roots outside the request scope are rejected. Checkpoint
+bytes remain connector-owned and opaque: hosts bound, persist, and return them
+without parsing their contents.
 
 The host must validate and reconcile the entire result before persisting
 `next_checkpoint`. If validation, store mutation, or projection reconciliation
