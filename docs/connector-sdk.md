@@ -90,34 +90,50 @@ explicit. `PortableSyncMode::HintsOnly` asks for differential work from the
 opaque checkpoint and supplied object hints; omission from its result never
 means deletion. `PortableSyncMode::ReconcileScope` asks the connector to inspect
 the whole requested scope, but omission is authoritative only when the engine's
-single `authorizes_omission` predicate sees all three conditions: the request
-mode is `ReconcileScope`, the terminal connector coverage is complete, and the
-batch declares `PortableBatchAuthority::CompleteScopeSnapshot`. Non-terminal
-or incremental batches can delete only through an explicit tombstone. Missing
-v2 mode or authority fields default to `HintsOnly` and `Incremental`; unknown
-enum values are rejected.
+single `authorizes_omission` predicate sees the three semantic conditions—the
+request mode is `ReconcileScope`, terminal connector coverage is complete, and
+the batch declares `PortableBatchAuthority::CompleteScopeSnapshot`—plus the
+scope-validation gates below. Non-terminal or incremental batches can delete
+only through an explicit tombstone. Missing v2 mode or authority fields default
+to `HintsOnly` and `Incremental`; unknown enum values are rejected. Each v2
+batch explicitly lists
+`covered_root_remote_ids`; omission requires that validated, unique set to equal
+the exact requested root set. The engine preserves that requested scope,
+rejects returned owning-root provenance outside it, and derives the omission
+flag only after coverage and projection validation. A batch covering only A for
+a request of A+B is non-authoritative. An empty change result can authorize
+omission only when it explicitly covers every requested root; missing coverage
+never can. The v2 result's scope, mode, connector authority, completeness, and
+derived flag are private and available only through read-only accessors.
 
-`Connector::sync_portable_v2` has a compatibility adapter on the same trait. It
-validates the v2 request, forwards legacy remote-ID hints to `sync_portable`,
-and converts every legacy result to `Incremental`. SDK implementers can migrate
-without a crate major-version bump: keep the legacy method for old hosts, add a
-v2 override when the connector can honor prior metadata and full-scope
-reconciliation, and return `CompleteScopeSnapshot` only for a terminal complete
-inventory of the requested scope. Current Notion uses the compatibility adapter;
-it ignores v2 prior metadata and full-inventory intent and cannot authorize
-omission until its dedicated implementation PR.
+`dispatch_portable_sync_v2` is the validated trust boundary. It validates the
+request and then calls the connector's `sync_portable_v2_impl` hook. The default
+hook forwards legacy remote-ID hints to `sync_portable` and converts every
+legacy result to `Incremental`. The convenience trait method
+`Connector::sync_portable_v2` uses the dispatcher by default, but trait methods
+are overrideable, so hosts must not treat a direct override call as validated;
+the engine calls the free dispatcher. SDK implementers can migrate without a
+crate major-version bump: keep the legacy method for old hosts, override only
+the v2 implementation hook when the connector can honor prior metadata and
+full-scope reconciliation, and return `CompleteScopeSnapshot` only for a
+terminal complete inventory of the requested scope. Current Notion uses the
+compatibility adapter; it ignores v2 prior metadata and full-inventory intent
+and returns no covered roots, so it cannot authorize omission until its
+dedicated implementation PR.
 
 Portable v2 sync hints may include the host's prior provider version, validated
 logical path, source kind, and owning root. They support differential provider
 decisions but are not identity or deletion authority. Before connector
-dispatch, v2 accepts at most 4,096 hints; source, remote, scope-root, and
-owning-root IDs must contain 1..=1,024 UTF-8 bytes; provider versions are at
-most 1,024 UTF-8 bytes; connector-defined source kinds are at most 128 UTF-8
-bytes; and opaque checkpoints are at most 65,536 UTF-8 bytes. Logical paths
-retain the portable core's 1,024-byte ceiling. Duplicate scope-root or hint
-remote IDs and owning roots outside the request scope are rejected. Checkpoint
-bytes remain connector-owned and opaque: hosts bound, persist, and return them
-without parsing their contents.
+dispatch, v2 requires 1..=256 explicit scope roots, accepts at most 4,096 hints,
+and bounds `max_changes` to 1..=10,000. Source, remote, scope-root, and owning-root
+IDs must contain 1..=1,024 UTF-8 bytes; provider versions are at most 1,024
+UTF-8 bytes; connector-defined source kinds are at most 128 UTF-8 bytes; and
+opaque checkpoints are at most 65,536 UTF-8 bytes. Logical paths retain the
+portable core's 1,024-byte ceiling. Duplicate scope-root or hint remote IDs and
+owning roots outside the request scope are rejected. Response coverage uses the
+same 256-root and 1,024-byte ID ceilings; duplicate or foreign covered roots are
+rejected. Checkpoint bytes remain connector-owned and opaque: hosts bound,
+persist, and return them without parsing their contents.
 
 The host must validate and reconcile the entire result before persisting
 `next_checkpoint`. If validation, store mutation, or projection reconciliation

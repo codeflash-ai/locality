@@ -10,8 +10,9 @@ use locality_connector::{
     Connector, PortableArtifactKey, PortableBatchAuthority, PortableBootstrapRequest,
     PortableChangeBatch, PortableCompleteness, PortableContentArtifact, PortableEnumerateRequest,
     PortableEnumerateResult, PortableFetchReason, PortableFetchRequest, PortableIncompleteReason,
-    PortableProjectionArtifact, PortableRenderRequest, PortableSourceChange, PortableSyncMode,
-    PortableSyncRequest, PortableSyncRequestV2, portable_scope_root_remote_id,
+    PortableProjectionArtifact, PortableRenderRequest, PortableSourceChange, PortableSourceScope,
+    PortableSyncMode, PortableSyncRequest, PortableSyncRequestV2, dispatch_portable_sync_v2,
+    portable_scope_root_remote_id,
 };
 use locality_core::model::RemoteId;
 use locality_core::portable::{
@@ -95,24 +96,53 @@ impl UnpersistedSynchronizationBatch {
 
 /// One v2 synchronization result with the host's request mode and the
 /// connector's omission authority preserved alongside projected candidates.
+/// Its authority-bearing state cannot be changed after construction:
+///
+/// ```compile_fail
+/// use locality_connector::PortableSyncMode;
+/// use locality_engine::synchronize_project::UnpersistedSynchronizationBatchV2;
+///
+/// fn forge(mut result: UnpersistedSynchronizationBatchV2) {
+///     result.mode = PortableSyncMode::ReconcileScope;
+///     result.authorizes_omission = true;
+/// }
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnpersistedSynchronizationBatchV2 {
-    pub batch: UnpersistedSynchronizationBatch,
-    pub mode: PortableSyncMode,
-    pub authority: PortableBatchAuthority,
+    batch: UnpersistedSynchronizationBatch,
+    scope: PortableSourceScope,
+    mode: PortableSyncMode,
+    authority: PortableBatchAuthority,
+    authorizes_omission: bool,
 }
 
 impl UnpersistedSynchronizationBatchV2 {
+    pub fn batch(&self) -> &UnpersistedSynchronizationBatch {
+        &self.batch
+    }
+
+    pub fn scope(&self) -> &PortableSourceScope {
+        &self.scope
+    }
+
+    pub fn mode(&self) -> PortableSyncMode {
+        self.mode
+    }
+
+    pub fn authority(&self) -> PortableBatchAuthority {
+        self.authority
+    }
+
     /// Whether omission from this terminal batch may be reconciled as absence.
     ///
     /// Explicit tombstones do not require omission authority. Every other
     /// omission stays non-destructive unless the host requested full-scope
-    /// reconciliation, the connector returned complete terminal coverage, and
-    /// the connector explicitly granted complete-scope snapshot authority.
+    /// reconciliation, the connector returned complete terminal coverage and
+    /// explicit coverage of every requested root, every returned source has
+    /// in-scope root provenance, and the connector explicitly granted
+    /// complete-scope snapshot authority.
     pub fn authorizes_omission(&self) -> bool {
-        self.mode == PortableSyncMode::ReconcileScope
-            && self.batch.completeness.is_complete()
-            && self.authority == PortableBatchAuthority::CompleteScopeSnapshot
+        self.authorizes_omission
     }
 }
 
@@ -451,11 +481,13 @@ pub fn synchronize_and_project_portable_v2<C: Connector + ?Sized>(
     request: PortableSyncRequestV2,
     format_version: u32,
 ) -> LocalityResult<UnpersistedSynchronizationBatchV2> {
-    request.validate()?;
     let source_connection_id = request.source_connection_id.clone();
+    let scope = request.scope.clone();
     let mode = request.mode;
-    let batch = connector.sync_portable_v2(request)?;
+    let batch = dispatch_portable_sync_v2(connector, request)?;
     let authority = batch.authority;
+    let has_exact_scope_coverage = batch.has_exact_scope_coverage(&scope)?;
+    let has_complete_scope_provenance = validate_v2_batch_scope_provenance(&scope, &batch.changes)?;
     let batch = project_batch(
         connector,
         source_connection_id,
@@ -467,11 +499,38 @@ pub fn synchronize_and_project_portable_v2<C: Connector + ?Sized>(
         PortableFetchReason::Synchronization,
         format_version,
     )?;
+    let authorizes_omission = mode == PortableSyncMode::ReconcileScope
+        && authority == PortableBatchAuthority::CompleteScopeSnapshot
+        && batch.completeness.is_complete()
+        && has_exact_scope_coverage
+        && has_complete_scope_provenance;
     Ok(UnpersistedSynchronizationBatchV2 {
         batch,
+        scope,
         mode,
         authority,
+        authorizes_omission,
     })
+}
+
+fn validate_v2_batch_scope_provenance(
+    scope: &PortableSourceScope,
+    changes: &[PortableSourceChange],
+) -> LocalityResult<bool> {
+    let roots = scope.root_remote_ids.iter().collect::<BTreeSet<_>>();
+    let mut complete = true;
+    for change in changes {
+        match portable_scope_root_remote_id(&change.source_object)? {
+            Some(root_remote_id) if roots.contains(root_remote_id) => {}
+            Some(_) => {
+                return Err(LocalityError::InvalidState(
+                    "portable v2 connector returned source outside the requested scope".to_string(),
+                ));
+            }
+            None => complete = false,
+        }
+    }
+    Ok(complete)
 }
 
 fn project_batch<C: Connector + ?Sized>(

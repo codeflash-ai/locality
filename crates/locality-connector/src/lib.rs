@@ -272,6 +272,10 @@ pub struct PortableChangeBatchV2 {
     pub changes: Vec<PortableSourceChange>,
     pub next_checkpoint: PortableCheckpoint,
     pub completeness: PortableCompleteness,
+    /// Exact requested roots whose terminal coverage this response proves.
+    /// Missing coverage defaults to none and cannot authorize omission.
+    #[serde(default)]
+    pub covered_root_remote_ids: Vec<RemoteId>,
     /// Whether omission from this batch is meaningful for reconciliation.
     ///
     /// This is independent of [`PortableCompleteness`]: completeness describes
@@ -287,8 +291,39 @@ impl From<PortableChangeBatch> for PortableChangeBatchV2 {
             changes: batch.changes,
             next_checkpoint: batch.next_checkpoint,
             completeness: batch.completeness,
+            covered_root_remote_ids: Vec::new(),
             authority: PortableBatchAuthority::Incremental,
         }
+    }
+}
+
+impl PortableChangeBatchV2 {
+    /// Validate response coverage and report whether it exactly equals the
+    /// requested scope. A strict subset is valid but non-authoritative.
+    pub fn has_exact_scope_coverage(&self, scope: &PortableSourceScope) -> LocalityResult<bool> {
+        if self.covered_root_remote_ids.len() > PORTABLE_SYNC_V2_MAX_SCOPE_ROOTS {
+            return Err(locality_core::LocalityError::InvalidState(format!(
+                "portable sync v2 batch covers {} scope roots; maximum is {}",
+                self.covered_root_remote_ids.len(),
+                PORTABLE_SYNC_V2_MAX_SCOPE_ROOTS
+            )));
+        }
+        let requested = validate_portable_sync_v2_scope(scope)?;
+        let mut covered = BTreeSet::new();
+        for root_remote_id in &self.covered_root_remote_ids {
+            validate_portable_sync_v2_id(root_remote_id.as_str(), "covered root remote ID")?;
+            if !covered.insert(root_remote_id) {
+                return Err(locality_core::LocalityError::InvalidState(
+                    "portable sync v2 batch contains duplicate covered root remote IDs".to_string(),
+                ));
+            }
+            if !requested.contains(root_remote_id) {
+                return Err(locality_core::LocalityError::InvalidState(
+                    "portable sync v2 batch covers a root outside the requested scope".to_string(),
+                ));
+            }
+        }
+        Ok(covered == requested)
     }
 }
 
@@ -307,6 +342,10 @@ pub struct PortableSyncHint {
 
 /// Maximum number of differential hints accepted by one v2 sync request.
 pub const PORTABLE_SYNC_V2_MAX_HINTS: usize = 4_096;
+/// Maximum number of explicit scope roots accepted by one v2 sync request.
+pub const PORTABLE_SYNC_V2_MAX_SCOPE_ROOTS: usize = 256;
+/// Maximum provider changes requested in one v2 sync batch.
+pub const PORTABLE_SYNC_V2_MAX_CHANGES: u32 = 10_000;
 /// Maximum UTF-8 bytes accepted for each v2 source, remote, or owning-root ID.
 pub const PORTABLE_SYNC_V2_MAX_ID_BYTES: usize = 1_024;
 /// Maximum UTF-8 bytes accepted for a v2 prior provider version.
@@ -393,16 +432,14 @@ impl PortableSyncRequestV2 {
                 PORTABLE_SYNC_V2_MAX_HINTS
             )));
         }
-
-        let mut scope_roots = BTreeSet::new();
-        for root_remote_id in &self.scope.root_remote_ids {
-            validate_portable_sync_v2_id(root_remote_id.as_str(), "scope root remote ID")?;
-            if !scope_roots.insert(root_remote_id) {
-                return Err(locality_core::LocalityError::InvalidState(
-                    "portable sync v2 contains duplicate scope root remote IDs".to_string(),
-                ));
-            }
+        if self.max_changes == 0 || self.max_changes > PORTABLE_SYNC_V2_MAX_CHANGES {
+            return Err(locality_core::LocalityError::InvalidState(format!(
+                "portable sync v2 max_changes must be in 1..={}",
+                PORTABLE_SYNC_V2_MAX_CHANGES
+            )));
         }
+
+        let scope_roots = validate_portable_sync_v2_scope(&self.scope)?;
         let mut remote_ids = BTreeSet::new();
         for hint in &self.hints {
             validate_portable_sync_v2_id(hint.remote_id.as_str(), "hint remote ID")?;
@@ -467,6 +504,46 @@ fn validate_portable_sync_v2_id(value: &str, label: &str) -> LocalityResult<()> 
         )));
     }
     Ok(())
+}
+
+fn validate_portable_sync_v2_scope(
+    scope: &PortableSourceScope,
+) -> LocalityResult<BTreeSet<&RemoteId>> {
+    if scope.root_remote_ids.is_empty() {
+        return Err(locality_core::LocalityError::InvalidState(
+            "portable sync v2 scope must contain at least one root".to_string(),
+        ));
+    }
+    if scope.root_remote_ids.len() > PORTABLE_SYNC_V2_MAX_SCOPE_ROOTS {
+        return Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 has {} scope roots; maximum is {}",
+            scope.root_remote_ids.len(),
+            PORTABLE_SYNC_V2_MAX_SCOPE_ROOTS
+        )));
+    }
+    let mut roots = BTreeSet::new();
+    for root_remote_id in &scope.root_remote_ids {
+        validate_portable_sync_v2_id(root_remote_id.as_str(), "scope root remote ID")?;
+        if !roots.insert(root_remote_id) {
+            return Err(locality_core::LocalityError::InvalidState(
+                "portable sync v2 contains duplicate scope root remote IDs".to_string(),
+            ));
+        }
+    }
+    Ok(roots)
+}
+
+/// Validate and dispatch one v2 synchronization request.
+///
+/// This is the trust boundary for hosts accepting untrusted request values.
+/// Connector implementations customize behavior through
+/// [`Connector::sync_portable_v2_impl`], which is called only after validation.
+pub fn dispatch_portable_sync_v2<C: Connector + ?Sized>(
+    connector: &C,
+    request: PortableSyncRequestV2,
+) -> LocalityResult<PortableChangeBatchV2> {
+    request.validate()?;
+    connector.sync_portable_v2_impl(request)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -763,18 +840,29 @@ pub trait Connector {
             "connector does not support portable synchronization",
         ))
     }
-    /// Observe portable changes with explicit sync intent and omission
-    /// authority.
+    /// Compatibility entry point for v2 portable synchronization.
     ///
-    /// The compatibility adapter validates the v2 request, forwards only the
-    /// legacy fields to [`Self::sync_portable`], and always returns incremental
-    /// authority. Connectors must override this method to honor
-    /// [`PortableSyncMode::ReconcileScope`] or return complete-scope authority.
+    /// The default calls [`dispatch_portable_sync_v2`]. Because Rust trait
+    /// methods remain overrideable, hosts must use that free dispatcher rather
+    /// than trusting a connector override of this method to validate input.
+    /// Connector implementations should override only
+    /// [`Self::sync_portable_v2_impl`].
     fn sync_portable_v2(
         &self,
         request: PortableSyncRequestV2,
     ) -> LocalityResult<PortableChangeBatchV2> {
-        request.validate()?;
+        dispatch_portable_sync_v2(self, request)
+    }
+    /// Connector implementation hook for already validated v2 requests.
+    ///
+    /// Hosts must not call this directly. The default compatibility adapter
+    /// forwards only legacy fields to [`Self::sync_portable`] and always
+    /// returns incremental authority. Connectors override this hook to honor
+    /// [`PortableSyncMode::ReconcileScope`] or return complete-scope authority.
+    fn sync_portable_v2_impl(
+        &self,
+        request: PortableSyncRequestV2,
+    ) -> LocalityResult<PortableChangeBatchV2> {
         self.sync_portable(request.into_legacy()).map(Into::into)
     }
     /// Fetch one authoritative native provider object.
