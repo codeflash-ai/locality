@@ -206,7 +206,7 @@ fn legacy_portable_sync_wire_shape_remains_unchanged() {
 }
 
 #[test]
-fn portable_sync_v2_defaults_to_hints_only_and_prior_metadata_is_optional() {
+fn portable_sync_v2_defaults_mode_and_prior_metadata_but_requires_owning_root() {
     let v2_without_additive_fields = json!({
         "source_connection_id": "source-1",
         "scope": { "root_remote_ids": ["root-1"] },
@@ -226,6 +226,12 @@ fn portable_sync_v2_defaults_to_hints_only_and_prior_metadata_is_optional() {
     assert_eq!(request.hints[0].logical_path, None);
     assert_eq!(request.hints[0].source_kind, None);
     assert_eq!(request.hints[0].owning_root_remote_id, None);
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(
+            "portable sync v2 hint must include an owning root".to_string()
+        ))
+    );
     assert_eq!(
         serde_json::to_value(&request.hints[0]).expect("portable sync hint JSON"),
         json!({ "remote_id": "page-1" })
@@ -463,6 +469,15 @@ fn portable_sync_v2_rejects_duplicate_ids_and_out_of_scope_owners() {
         request.validate(),
         Err(locality_core::LocalityError::InvalidState(
             "portable sync v2 contains duplicate hint remote IDs".to_string()
+        ))
+    );
+
+    let mut request = valid_v2_request(vec![valid_v2_hint("page-1")]);
+    request.hints[0].owning_root_remote_id = None;
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(
+            "portable sync v2 hint must include an owning root".to_string()
         ))
     );
 

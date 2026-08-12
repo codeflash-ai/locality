@@ -99,12 +99,13 @@ to `HintsOnly` and `Incremental`; unknown enum values are rejected. Each v2
 batch explicitly lists
 `covered_root_remote_ids`; omission requires that validated, unique set to equal
 the exact requested root set. The engine preserves that requested scope,
-rejects returned owning-root provenance outside it, and derives the omission
-flag only after coverage and projection validation. A batch covering only A for
-a request of A+B is non-authoritative. An empty change result can authorize
-omission only when it explicitly covers every requested root; missing coverage
-never can. The v2 result's scope, mode, connector authority, completeness, and
-derived flag are private and available only through read-only accessors.
+rejects every returned change or tombstone with missing or foreign owning-root
+provenance, and derives the omission flag only after coverage and projection
+validation. A batch covering only A for a request of A+B is non-authoritative.
+An empty change result can authorize omission only when it explicitly covers
+every requested root; missing coverage never can. The v2 result's scope, mode,
+connector authority, completeness, and derived flag are private and available
+only through read-only accessors.
 
 `dispatch_portable_sync_v2` is the validated trust boundary. It validates the
 request and then calls the connector's `sync_portable_v2_impl` hook. The default
@@ -119,19 +120,21 @@ full-scope reconciliation, and return `CompleteScopeSnapshot` only for a
 terminal complete inventory of the requested scope. Current Notion uses the
 compatibility adapter; it ignores v2 prior metadata and full-inventory intent
 and returns no covered roots, so it cannot authorize omission until its
-dedicated implementation PR.
+dedicated implementation PR. A legacy result without explicit owning-root
+provenance also fails the v2 engine workflow before projection.
 
 Portable v2 sync hints may include the host's prior provider version, validated
-logical path, source kind, and owning root. They support differential provider
-decisions but are not identity or deletion authority. Before connector
-dispatch, v2 requires 1..=256 explicit scope roots, accepts at most 4,096 hints,
-and bounds `max_changes` to 1..=10,000. Source, remote, scope-root, and owning-root
-IDs must contain 1..=1,024 UTF-8 bytes; provider versions are at most 1,024
-UTF-8 bytes; connector-defined source kinds are at most 128 UTF-8 bytes; and
-opaque checkpoints are at most 65,536 UTF-8 bytes. Logical paths retain the
-portable core's 1,024-byte ceiling. Duplicate scope-root or hint remote IDs and
-owning roots outside the request scope are rejected. Response coverage uses the
-same 256-root and 1,024-byte ID ceilings; duplicate or foreign covered roots are
+logical path, and source kind; every hint must include an owning root from the
+request scope. These values support differential provider decisions but are not
+identity or deletion authority. Before connector dispatch, v2 requires 1..=256
+explicit scope roots, accepts at most 4,096 hints, and bounds `max_changes` to
+1..=10,000. Source, remote, scope-root, and owning-root IDs must contain
+1..=1,024 UTF-8 bytes; provider versions are at most 1,024 UTF-8 bytes;
+connector-defined source kinds are at most 128 UTF-8 bytes; and opaque
+checkpoints are at most 65,536 UTF-8 bytes. Logical paths retain the portable
+core's 1,024-byte ceiling. Duplicate scope-root or hint remote IDs and missing
+or out-of-scope hint owning roots are rejected. Response coverage uses the same
+256-root and 1,024-byte ID ceilings; duplicate or foreign covered roots are
 rejected. Checkpoint bytes remain connector-owned and opaque: hosts bound,
 persist, and return them without parsing their contents.
 

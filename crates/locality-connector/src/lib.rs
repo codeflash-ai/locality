@@ -369,6 +369,7 @@ pub struct PortableSyncHintV2 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_kind: Option<EntityKind>,
     /// Stable provider identity of the scope root that owned the object.
+    /// Validation requires this field and binds it to the request scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owning_root_remote_id: Option<RemoteId>,
 }
@@ -466,14 +467,16 @@ impl PortableSyncRequestV2 {
                     PORTABLE_SYNC_V2_MAX_SOURCE_KIND_BYTES
                 )));
             }
-            if let Some(root_remote_id) = &hint.owning_root_remote_id {
-                validate_portable_sync_v2_id(root_remote_id.as_str(), "owning root remote ID")?;
-                if !scope_roots.contains(root_remote_id) {
-                    return Err(locality_core::LocalityError::InvalidState(
-                        "portable sync v2 hint owning root is outside the request scope"
-                            .to_string(),
-                    ));
-                }
+            let root_remote_id = hint.owning_root_remote_id.as_ref().ok_or_else(|| {
+                locality_core::LocalityError::InvalidState(
+                    "portable sync v2 hint must include an owning root".to_string(),
+                )
+            })?;
+            validate_portable_sync_v2_id(root_remote_id.as_str(), "owning root remote ID")?;
+            if !scope_roots.contains(root_remote_id) {
+                return Err(locality_core::LocalityError::InvalidState(
+                    "portable sync v2 hint owning root is outside the request scope".to_string(),
+                ));
             }
         }
         Ok(())

@@ -182,6 +182,7 @@ struct V2FixtureConnector {
 enum V2FixtureProvenance {
     InScope,
     Missing,
+    MissingTombstone,
     Empty,
     Foreign,
     Mixed,
@@ -247,6 +248,12 @@ impl Connector for V2FixtureConnector {
             V2FixtureProvenance::InScope => vec![in_scope],
             V2FixtureProvenance::Missing => {
                 in_scope.source_object.edges.clear();
+                vec![in_scope]
+            }
+            V2FixtureProvenance::MissingTombstone => {
+                in_scope.source_object.edges.clear();
+                in_scope.source_object.deleted = true;
+                in_scope.requires_fetch = false;
                 vec![in_scope]
             }
             V2FixtureProvenance::Empty => Vec::new(),
@@ -686,19 +693,26 @@ fn v2_omission_authority_requires_all_three_conditions() {
 
 #[test]
 fn v2_scope_provenance_is_required_and_foreign_roots_fail_closed() {
-    let connector = V2FixtureConnector::new(PortableBatchAuthority::CompleteScopeSnapshot, true)
-        .with_provenance(V2FixtureProvenance::Missing);
-    let synchronized = synchronize_and_project_portable_v2(
-        &connector,
-        v2_request(PortableSyncMode::ReconcileScope),
-        1,
-    )
-    .expect("missing provenance remains inspectable");
-    assert!(!synchronized.authorizes_omission());
-    assert_eq!(
-        synchronized.scope().root_remote_ids,
-        vec![RemoteId::new("root")]
-    );
+    for provenance in [
+        V2FixtureProvenance::Missing,
+        V2FixtureProvenance::MissingTombstone,
+    ] {
+        let connector =
+            V2FixtureConnector::new(PortableBatchAuthority::CompleteScopeSnapshot, true)
+                .with_provenance(provenance);
+        let error = synchronize_and_project_portable_v2(
+            &connector,
+            v2_request(PortableSyncMode::ReconcileScope),
+            1,
+        )
+        .expect_err("unbound changes and tombstones must fail the workflow");
+        assert_eq!(
+            error,
+            locality_core::LocalityError::InvalidState(
+                "portable v2 connector returned source without owning-root provenance".to_string()
+            )
+        );
+    }
 
     let connector = V2FixtureConnector::new(PortableBatchAuthority::CompleteScopeSnapshot, true)
         .with_provenance(V2FixtureProvenance::Empty)

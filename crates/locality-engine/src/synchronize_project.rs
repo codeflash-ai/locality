@@ -487,7 +487,7 @@ pub fn synchronize_and_project_portable_v2<C: Connector + ?Sized>(
     let batch = dispatch_portable_sync_v2(connector, request)?;
     let authority = batch.authority;
     let has_exact_scope_coverage = batch.has_exact_scope_coverage(&scope)?;
-    let has_complete_scope_provenance = validate_v2_batch_scope_provenance(&scope, &batch.changes)?;
+    validate_v2_batch_scope_provenance(&scope, &batch.changes)?;
     let batch = project_batch(
         connector,
         source_connection_id,
@@ -502,8 +502,7 @@ pub fn synchronize_and_project_portable_v2<C: Connector + ?Sized>(
     let authorizes_omission = mode == PortableSyncMode::ReconcileScope
         && authority == PortableBatchAuthority::CompleteScopeSnapshot
         && batch.completeness.is_complete()
-        && has_exact_scope_coverage
-        && has_complete_scope_provenance;
+        && has_exact_scope_coverage;
     Ok(UnpersistedSynchronizationBatchV2 {
         batch,
         scope,
@@ -516,9 +515,8 @@ pub fn synchronize_and_project_portable_v2<C: Connector + ?Sized>(
 fn validate_v2_batch_scope_provenance(
     scope: &PortableSourceScope,
     changes: &[PortableSourceChange],
-) -> LocalityResult<bool> {
+) -> LocalityResult<()> {
     let roots = scope.root_remote_ids.iter().collect::<BTreeSet<_>>();
-    let mut complete = true;
     for change in changes {
         match portable_scope_root_remote_id(&change.source_object)? {
             Some(root_remote_id) if roots.contains(root_remote_id) => {}
@@ -527,10 +525,15 @@ fn validate_v2_batch_scope_provenance(
                     "portable v2 connector returned source outside the requested scope".to_string(),
                 ));
             }
-            None => complete = false,
+            None => {
+                return Err(LocalityError::InvalidState(
+                    "portable v2 connector returned source without owning-root provenance"
+                        .to_string(),
+                ));
+            }
         }
     }
-    Ok(complete)
+    Ok(())
 }
 
 fn project_batch<C: Connector + ?Sized>(
