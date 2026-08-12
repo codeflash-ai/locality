@@ -1,3 +1,4 @@
+use locality_connector::hosted::{HOSTED_CONNECTOR_PRODUCTS, hosted_connector_product};
 use locality_connector::manifest::{
     CONNECTOR_REGISTRY_JSON, CONNECTOR_REGISTRY_SCHEMA_JSON, ConnectorRegistry, ManifestError,
     MembershipOperation, bundled_connector_registry,
@@ -174,6 +175,37 @@ fn public_channel_membership_mutation_requires_its_oauth_scope() {
         ConnectorRegistry::parse(&invalid.to_string()).expect_err("missing scope must fail"),
     );
     assert!(messages.contains("join_public_channels requires a profile with channels:join scope"));
+}
+
+#[test]
+fn hosted_connector_products_match_descriptive_registry() {
+    let registry =
+        ConnectorRegistry::parse(CONNECTOR_REGISTRY_JSON).expect("connector registry parses");
+    assert_eq!(
+        HOSTED_CONNECTOR_PRODUCTS
+            .iter()
+            .map(|product| product.provider_kind)
+            .collect::<Vec<_>>(),
+        vec!["notion", "google-docs", "google-calendar", "gmail", "slack"]
+    );
+
+    for product in HOSTED_CONNECTOR_PRODUCTS {
+        let manifest = registry
+            .connectors
+            .iter()
+            .find(|connector| connector.id == product.provider_kind)
+            .expect("hosted product exists in public registry");
+        assert_eq!(manifest.display_name, product.display_name);
+        assert!(!product.content_singular.is_empty());
+        assert!(!product.content_plural.is_empty());
+        assert_eq!(
+            hosted_connector_product(product.provider_kind),
+            Some(product)
+        );
+    }
+
+    assert_eq!(hosted_connector_product("google-docs-extra"), None);
+    assert_eq!(hosted_connector_product("slack_extra"), None);
 }
 
 #[test]
