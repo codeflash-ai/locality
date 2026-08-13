@@ -42,6 +42,7 @@ use crate::media::{
     sanitize_portable_hosted_media_url, sanitize_portable_media_type,
     validate_portable_external_media_url,
 };
+use crate::projection::{ExplicitRootTreeEntry, enumerate_explicit_root_trees_bounded};
 use crate::projection::{database_title, enumerate_explicit_root_trees};
 use crate::render::{
     RenderOptions, page_title, render_native_entity, render_native_entity_with_options,
@@ -111,10 +112,10 @@ enum DecodedCheckpoint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CanonicalRootSet {
-    roots: Vec<RemoteId>,
-    normalized_ids: Vec<String>,
-    identity: String,
+pub(crate) struct CanonicalRootSet {
+    pub(crate) roots: Vec<RemoteId>,
+    pub(crate) normalized_ids: Vec<String>,
+    pub(crate) identity: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1111,6 +1112,89 @@ pub(crate) fn fetch(
     }
 }
 
+pub(crate) fn fetch_bounded(
+    api: &dyn NotionApi,
+    media_policy: PortableMediaCapturePolicy,
+    media_fetcher: Option<&dyn PortableMediaCaptureFetcher>,
+    request: PortableFetchRequest,
+    budget: &locality_connector::hydration_budget::InitialHydrationBudget,
+) -> locality_connector::hydration_budget::InitialHydrationResult<PortableFetchResult> {
+    use locality_connector::hydration_budget::InitialHydrationError;
+
+    match crate::hydration::fetch_page_bundle_bounded(api, request.remote_id.as_str(), budget) {
+        Ok(bundle) => {
+            if media_policy.captures_hosted_media() {
+                fetch_portable_media_page_result_bounded(
+                    bundle,
+                    &request.remote_id,
+                    media_fetcher,
+                    budget,
+                )
+            } else {
+                fetch_page_result_bounded(bundle, &request.remote_id, budget)
+            }
+        }
+        Err(InitialHydrationError::ProviderNotFound) => {
+            let bundle = crate::hydration::fetch_database_bundle_bounded(
+                api,
+                request.remote_id.as_str(),
+                budget,
+            )?;
+            let bundle_bytes = crate::hydration::encoded_len(&bundle)?;
+            let provider_version = Some(
+                database_bundle_provider_version_token(&bundle)
+                    .map_err(InitialHydrationError::from_connector_error)?,
+            );
+            let remote_id = RemoteId::new(bundle.database.id.clone());
+            if !notion_ids_equal(remote_id.as_str(), request.remote_id.as_str()) {
+                return Err(InitialHydrationError::ProviderResponseInvalid);
+            }
+            let kind = "notion_database".to_string();
+            budget.account_retained_bytes(remote_id.as_str().len() + kind.len())?;
+            let raw = crate::hydration::encode_native_json_bounded(&bundle, budget)?;
+            budget.release_retained_bytes(bundle_bytes)?;
+            Ok(PortableFetchResult {
+                native: NativeEntity {
+                    remote_id,
+                    kind,
+                    raw,
+                },
+                provider_version,
+                completeness: PortableCompleteness::complete(),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn fetch_page_result_bounded(
+    bundle: NotionPageBundle,
+    requested_remote_id: &RemoteId,
+    budget: &locality_connector::hydration_budget::InitialHydrationBudget,
+) -> locality_connector::hydration_budget::InitialHydrationResult<PortableFetchResult> {
+    use locality_connector::hydration_budget::InitialHydrationError;
+
+    let bundle_bytes = crate::hydration::encoded_len(&bundle)?;
+    let provider_version = bundle.page.last_edited_time.clone();
+    let remote_id = RemoteId::new(bundle.page.id.clone());
+    if !notion_ids_equal(remote_id.as_str(), requested_remote_id.as_str()) {
+        return Err(InitialHydrationError::ProviderResponseInvalid);
+    }
+    let kind = "notion_page".to_string();
+    budget.account_retained_bytes(remote_id.as_str().len() + kind.len())?;
+    let raw = crate::hydration::encode_native_json_bounded(&bundle, budget)?;
+    budget.release_retained_bytes(bundle_bytes)?;
+    Ok(PortableFetchResult {
+        native: NativeEntity {
+            remote_id,
+            kind,
+            raw,
+        },
+        provider_version,
+        completeness: PortableCompleteness::complete(),
+    })
+}
+
 fn fetch_portable_media_page_result(
     mut bundle: NotionPageBundle,
     requested_remote_id: &RemoteId,
@@ -1162,6 +1246,66 @@ fn fetch_portable_media_page_result(
     })
 }
 
+fn fetch_portable_media_page_result_bounded(
+    mut bundle: NotionPageBundle,
+    requested_remote_id: &RemoteId,
+    media_fetcher: Option<&dyn PortableMediaCaptureFetcher>,
+    budget: &locality_connector::hydration_budget::InitialHydrationBudget,
+) -> locality_connector::hydration_budget::InitialHydrationResult<PortableFetchResult> {
+    use locality_connector::hydration_budget::InitialHydrationError;
+
+    let original_bundle_bytes = crate::hydration::encoded_len(&bundle)?;
+    let provider_version = bundle.page.last_edited_time.clone();
+    let remote_id = RemoteId::new(bundle.page.id.clone());
+    if !notion_ids_equal(remote_id.as_str(), requested_remote_id.as_str()) {
+        return Err(InitialHydrationError::ProviderResponseInvalid);
+    }
+    let asset_count =
+        portable_media_asset_count(&bundle).map_err(InitialHydrationError::from_connector_error)?;
+    let limit_exceeded = asset_count > PORTABLE_MEDIA_MAX_ASSETS;
+    let default_fetcher = default_portable_media_fetcher();
+    let fetcher = media_fetcher.unwrap_or(default_fetcher.as_ref());
+    let mut capture = PortableMediaCaptureState::new(fetcher, limit_exceeded);
+    for tree in &mut bundle.blocks {
+        capture.capture_tree_bounded(tree, budget)?;
+    }
+    capture
+        .sanitize_page_file_properties(&mut bundle)
+        .map_err(InitialHydrationError::from_connector_error)?;
+    if limit_exceeded {
+        capture.record_incomplete(
+            PORTABLE_MEDIA_LIMIT_OUTCOME_ID,
+            "page",
+            "asset_limit_exceeded",
+        );
+    }
+    let completeness = portable_media_completeness(&capture.incomplete);
+    let captured_retained_bytes = capture.bounded_capture_retained_bytes;
+    let incomplete_retained_bytes = crate::hydration::encoded_len(&capture.incomplete)?;
+    budget.account_retained_bytes(incomplete_retained_bytes)?;
+    let portable_bundle = NotionPortablePageBundleV1 {
+        format_version: PORTABLE_MEDIA_NATIVE_FORMAT_VERSION,
+        page: bundle,
+        captured_media: capture.captured,
+        incomplete_media: capture.incomplete,
+    };
+    let kind = PORTABLE_MEDIA_NATIVE_KIND.to_string();
+    budget.account_retained_bytes(remote_id.as_str().len() + kind.len())?;
+    let raw = crate::hydration::encode_native_json_bounded(&portable_bundle, budget)?;
+    budget.release_retained_bytes(original_bundle_bytes)?;
+    budget.release_retained_bytes(captured_retained_bytes)?;
+    budget.release_retained_bytes(incomplete_retained_bytes)?;
+    Ok(PortableFetchResult {
+        native: NativeEntity {
+            remote_id,
+            kind,
+            raw,
+        },
+        provider_version,
+        completeness,
+    })
+}
+
 struct PortableMediaCaptureState<'a> {
     fetcher: &'a dyn PortableMediaCaptureFetcher,
     captured: Vec<NotionPortableCapturedMediaV1>,
@@ -1169,6 +1313,7 @@ struct PortableMediaCaptureState<'a> {
     seen_block_ids: BTreeSet<String>,
     aggregate_bytes: usize,
     limit_exceeded: bool,
+    bounded_capture_retained_bytes: usize,
 }
 
 impl<'a> PortableMediaCaptureState<'a> {
@@ -1180,6 +1325,7 @@ impl<'a> PortableMediaCaptureState<'a> {
             seen_block_ids: BTreeSet::new(),
             aggregate_bytes: 0,
             limit_exceeded,
+            bounded_capture_retained_bytes: 0,
         }
     }
 
@@ -1203,6 +1349,32 @@ impl<'a> PortableMediaCaptureState<'a> {
         }
         for child in &mut tree.children {
             self.capture_tree(child)?;
+        }
+        Ok(())
+    }
+
+    fn capture_tree_bounded(
+        &mut self,
+        tree: &mut BlockTreeDto,
+        budget: &locality_connector::hydration_budget::InitialHydrationBudget,
+    ) -> locality_connector::hydration_budget::InitialHydrationResult<()> {
+        use locality_connector::hydration_budget::InitialHydrationError;
+
+        let block_id = tree.block.id.clone();
+        let kind = tree.block.kind.clone();
+        validate_exclusive_typed_media_payload(&tree.block)
+            .map_err(InitialHydrationError::from_connector_error)?;
+        self.sanitize_block_arbitrary_json(&mut tree.block);
+        if is_media_kind(&kind) {
+            if !self.seen_block_ids.insert(block_id.clone()) {
+                return Err(InitialHydrationError::ProviderResponseInvalid);
+            }
+            let payload = selected_media_payload_mut(&mut tree.block)
+                .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+            self.capture_payload_bounded(&block_id, &kind, payload, budget)?;
+        }
+        for child in &mut tree.children {
+            self.capture_tree_bounded(child, budget)?;
         }
         Ok(())
     }
@@ -1347,6 +1519,130 @@ impl<'a> PortableMediaCaptureState<'a> {
             kind: kind.to_string(),
             media_type: sanitize_portable_media_type(Some(&captured.media_type)),
             bytes: captured.bytes,
+        });
+        Ok(())
+    }
+
+    fn capture_payload_bounded(
+        &mut self,
+        block_id: &str,
+        kind: &str,
+        payload: &mut FileBlockDto,
+        budget: &locality_connector::hydration_budget::InitialHydrationBudget,
+    ) -> locality_connector::hydration_budget::InitialHydrationResult<()> {
+        use locality_connector::hydration_budget::InitialHydrationError;
+
+        let external_present = payload.external.is_some();
+        let hosted_present = payload.file.is_some();
+        if external_present && hosted_present {
+            if let Some(external) = payload.external.as_mut() {
+                external.url.clear();
+            }
+            if let Some(hosted) = payload.file.as_mut() {
+                hosted.url.clear();
+                hosted.expiry_time = None;
+            }
+            if !self.limit_exceeded {
+                self.record_incomplete(block_id, kind, "ambiguous_file_source");
+            }
+            return Ok(());
+        }
+        if let Some(external) = payload.external.as_mut() {
+            if payload.kind != "external" {
+                return Err(InitialHydrationError::ProviderResponseInvalid);
+            }
+            let code = match classify_portable_external_media_url(&external.url) {
+                Ok(()) => return Ok(()),
+                Err(failure) => failure.omission_code(),
+            };
+            external.url.clear();
+            if !self.limit_exceeded {
+                self.record_incomplete(block_id, kind, code);
+            }
+            return Ok(());
+        }
+        if self.limit_exceeded {
+            if let Some(hosted) = payload.file.as_mut() {
+                hosted.url.clear();
+                hosted.expiry_time = None;
+            }
+            return Ok(());
+        }
+        let Some(hosted) = payload.file.as_mut() else {
+            if !matches!(payload.kind.as_str(), "external" | "file") {
+                return Err(InitialHydrationError::ProviderResponseInvalid);
+            }
+            self.record_incomplete(block_id, kind, "missing_file");
+            return Ok(());
+        };
+        if payload.kind != "file" {
+            return Err(InitialHydrationError::ProviderResponseInvalid);
+        }
+        let original_url = std::mem::take(&mut hosted.url);
+        let expiry_time = hosted.expiry_time.take();
+        if original_url.is_empty() {
+            self.record_incomplete(block_id, kind, "unavailable_hosted_media");
+            return Ok(());
+        }
+        let sanitized_url = match sanitize_portable_hosted_media_url(&original_url) {
+            Ok(url) => url,
+            Err(_) => {
+                self.record_incomplete(block_id, kind, "unsafe_hosted_media");
+                return Ok(());
+            }
+        };
+        if let Some(expiry_time) = expiry_time.as_deref() {
+            match portable_media_expired(expiry_time) {
+                Ok(false) => {}
+                Ok(true) => {
+                    self.record_incomplete(block_id, kind, "unavailable_hosted_media");
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.record_incomplete(block_id, kind, "unsafe_hosted_media");
+                    return Ok(());
+                }
+            }
+        }
+        let capture = crate::hydration::fetch_media_bounded(
+            self.fetcher,
+            &original_url,
+            PORTABLE_MEDIA_MAX_ASSET_BYTES,
+            budget,
+        )?;
+        let sanitized_media_type = sanitize_portable_media_type(Some(&capture.media_type));
+        let original_retained_bytes = capture
+            .bytes
+            .len()
+            .checked_add(capture.media_type.len())
+            .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+        let sanitized_retained_bytes = capture
+            .bytes
+            .len()
+            .checked_add(sanitized_media_type.len())
+            .and_then(|bytes| bytes.checked_add(block_id.len()))
+            .and_then(|bytes| bytes.checked_add(kind.len()))
+            .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+        budget.replace_retained_bytes(original_retained_bytes, sanitized_retained_bytes)?;
+        self.bounded_capture_retained_bytes = self
+            .bounded_capture_retained_bytes
+            .checked_add(sanitized_retained_bytes)
+            .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+        let Some(aggregate_bytes) =
+            checked_portable_media_aggregate(self.aggregate_bytes, capture.bytes.len())
+        else {
+            return Err(InitialHydrationError::LimitExceeded {
+                resource:
+                    locality_connector::hydration_budget::HydrationResource::MediaDecodedBytes,
+            });
+        };
+        self.aggregate_bytes = aggregate_bytes;
+        hosted.url = sanitized_url;
+        self.captured.push(NotionPortableCapturedMediaV1 {
+            block_id: block_id.to_string(),
+            kind: kind.to_string(),
+            media_type: sanitized_media_type,
+            bytes: capture.bytes,
         });
         Ok(())
     }
@@ -2501,7 +2797,7 @@ pub(crate) fn validate_configured_roots(configured_roots: &[RemoteId]) -> Locali
     canonical_root_set(configured_roots).map(|_| ())
 }
 
-fn validate_explicit_roots(
+pub(crate) fn validate_explicit_roots(
     configured_roots: &[RemoteId],
     requested_roots: &[RemoteId],
 ) -> LocalityResult<CanonicalRootSet> {
@@ -2520,7 +2816,7 @@ fn validate_explicit_roots(
     Ok(configured)
 }
 
-fn canonical_root_set(roots: &[RemoteId]) -> LocalityResult<CanonicalRootSet> {
+pub(crate) fn canonical_root_set(roots: &[RemoteId]) -> LocalityResult<CanonicalRootSet> {
     if roots.is_empty() {
         return Err(LocalityError::InvalidState(
             "Notion explicit root set must not be empty".to_string(),
@@ -2568,6 +2864,42 @@ fn inventory(
     // The sentinel mount identity is consumed inside the legacy traversal and
     // is never returned in a portable value.
     let entries = enumerate_explicit_root_trees(api, MountId::new("portable-notion"), roots)?;
+    changes_from_inventory_entries(entries, source_connection_id, include_root_provenance)
+}
+
+pub(crate) fn inventory_bounded(
+    api: &dyn NotionApi,
+    source_connection_id: &locality_core::portable::SourceConnectionId,
+    roots: &[RemoteId],
+    include_root_provenance: bool,
+    budget: &locality_connector::hydration_budget::InitialHydrationBudget,
+) -> locality_connector::hydration_budget::InitialHydrationResult<Vec<PortableSourceChange>> {
+    let entries =
+        enumerate_explicit_root_trees_bounded(api, MountId::new("portable-notion"), roots, budget)?;
+    let retained_entry_bytes = entries.iter().try_fold(0_usize, |total, entry| {
+        crate::hydration::encoded_len(&entry.entry)
+            .and_then(|bytes| bytes.checked_add(entry.scope_root_remote_id.as_str().len()).ok_or(
+                locality_connector::hydration_budget::InitialHydrationError::ProviderResponseInvalid,
+            ))
+            .and_then(|bytes| total.checked_add(bytes).ok_or(
+                locality_connector::hydration_budget::InitialHydrationError::ProviderResponseInvalid,
+            ))
+    })?;
+    let changes =
+        changes_from_inventory_entries(entries, source_connection_id, include_root_provenance)
+            .map_err(
+                locality_connector::hydration_budget::InitialHydrationError::from_connector_error,
+            )?;
+    let retained_change_bytes = crate::hydration::encoded_len(&changes)?;
+    budget.replace_retained_bytes(retained_entry_bytes, retained_change_bytes)?;
+    Ok(changes)
+}
+
+fn changes_from_inventory_entries(
+    entries: Vec<ExplicitRootTreeEntry>,
+    source_connection_id: &locality_core::portable::SourceConnectionId,
+    include_root_provenance: bool,
+) -> LocalityResult<Vec<PortableSourceChange>> {
     let mut changes = entries
         .into_iter()
         .map(|projected| {
@@ -2710,6 +3042,38 @@ fn page_batch(
     })
 }
 
+pub(crate) fn terminal_bootstrap_checkpoint(
+    roots: &CanonicalRootSet,
+    inventory_sha256: String,
+    inventory_len: usize,
+    explicit_root_set: bool,
+) -> LocalityResult<PortableCheckpoint> {
+    let offset = u64::try_from(inventory_len).map_err(|_| {
+        LocalityError::InvalidState(
+            "Notion portable inventory is too large to checkpoint".to_string(),
+        )
+    })?;
+    if explicit_root_set {
+        encode_checkpoint(&NotionCheckpoint {
+            component_version: CHECKPOINT_COMPONENT_VERSION,
+            operation: CheckpointOperation::Bootstrap,
+            root_set_sha256: roots.identity.clone(),
+            root_remote_ids: roots.normalized_ids.clone(),
+            inventory_sha256,
+            offset,
+            complete: true,
+        })
+    } else {
+        encode_legacy_checkpoint(&LegacyNotionCheckpoint {
+            operation: CheckpointOperation::Bootstrap,
+            root_remote_id: roots.roots[0].as_str().to_string(),
+            inventory_sha256,
+            offset,
+            complete: true,
+        })
+    }
+}
+
 fn source_kind(kind: &EntityKind) -> String {
     match kind {
         EntityKind::Page => "page".to_string(),
@@ -2755,7 +3119,10 @@ fn database_artifact_key(
     )))
 }
 
-fn inventory_sha256(inventory: &[PortableSourceChange], include_root_provenance: bool) -> String {
+pub(crate) fn inventory_sha256(
+    inventory: &[PortableSourceChange],
+    include_root_provenance: bool,
+) -> String {
     let mut hasher = Sha256::new();
     for change in inventory {
         hash_field(&mut hasher, change.source_object.remote_id.as_str());

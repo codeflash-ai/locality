@@ -8,6 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use locality_connector::ChildContainer;
+use locality_connector::hydration_budget::{
+    InitialHydrationBudget, InitialHydrationError, InitialHydrationResult,
+};
 use locality_core::freshness::{RemoteObservation, RemoteVersion};
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
 use locality_core::path_projection::{page_container_path, page_document_path};
@@ -15,10 +18,14 @@ use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::{LocalityError, LocalityResult};
 
 use crate::client::NotionApi;
+use crate::database::database_bundle_provider_version_token;
 use crate::dto::{
-    BlockDto, DatabaseDto, DateMentionDto, PageDto, PagePropertyDto, ParentDto, UserMentionDto,
+    BlockDto, DatabaseDto, DateMentionDto, NotionDatabaseBundle, PageDto, PagePropertyDto,
+    ParentDto, UserMentionDto,
 };
 use crate::render::{page_frontmatter, page_title, rich_text_plain_text};
+
+use crate::hydration::encoded_len;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExplicitRootTreeEntry {
@@ -51,10 +58,8 @@ pub(crate) fn enumerate_explicit_root_trees(
         .iter()
         .map(|root_id| retrieve_explicit_root(api, root_id))
         .collect::<LocalityResult<Vec<_>>>()?;
-    root_children.sort_by(|left, right| {
-        explicit_root_identity_key(left.remote_id())
-            .cmp(&explicit_root_identity_key(right.remote_id()))
-    });
+    root_children
+        .sort_by(|left, right| compare_explicit_root_identity(left.remote_id(), right.remote_id()));
 
     for projected in allocate_child_paths(Path::new(""), root_children, &mut used_paths) {
         let scope_root_remote_id = RemoteId::new(projected.child.remote_id().to_string());
@@ -67,6 +72,172 @@ pub(crate) fn enumerate_explicit_root_trees(
     }
 
     Ok(entries)
+}
+
+/// Exhaustively enumerate configured roots through the bounded Notion API.
+///
+/// This mirrors [`enumerate_explicit_root_trees`] so path allocation, overlap
+/// detection, and source completeness cannot drift. Provider objects are
+/// charged before they are retained, and each retained DTO reservation is
+/// replaced by its projected entry reservation as soon as it is converted.
+pub(crate) fn enumerate_explicit_root_trees_bounded(
+    api: &dyn NotionApi,
+    mount_id: MountId,
+    root_page_ids: &[RemoteId],
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<Vec<ExplicitRootTreeEntry>> {
+    let mut used_paths = BTreeSet::new();
+    let mut entries = Vec::new();
+    let mut owners = BTreeMap::new();
+    let mut owner_map_retained_bytes = 0_usize;
+    let mut root_children = root_page_ids
+        .iter()
+        .map(|root_id| retrieve_explicit_root_bounded(api, root_id, 0, budget))
+        .collect::<InitialHydrationResult<Vec<_>>>()?;
+    root_children
+        .sort_by(|left, right| compare_explicit_root_identity(left.remote_id(), right.remote_id()));
+
+    for projected in
+        allocate_child_paths_bounded(Path::new(""), root_children, &mut used_paths, budget)?
+    {
+        let scope_root_bytes = projected.child.remote_id().len();
+        budget.account_retained_bytes(scope_root_bytes)?;
+        let scope_root_remote_id = RemoteId::new(projected.child.remote_id().to_string());
+        let mut sink = BoundedExplicitRootSink {
+            scope_root_remote_id: &scope_root_remote_id,
+            entries: &mut entries,
+            owners: &mut owners,
+            budget,
+            owner_map_retained_bytes: &mut owner_map_retained_bytes,
+        };
+        push_projected_tree_entry_bounded(
+            api,
+            &mount_id,
+            projected,
+            0,
+            &mut used_paths,
+            &mut sink,
+            budget,
+        )?;
+        budget.release_retained_bytes(scope_root_bytes)?;
+    }
+    let used_path_retained_bytes = retained_path_set_bytes(&used_paths)?;
+    budget.release_retained_bytes(used_path_retained_bytes)?;
+    budget.release_retained_bytes(owner_map_retained_bytes)?;
+    Ok(entries)
+}
+
+fn retrieve_explicit_root_bounded(
+    api: &dyn NotionApi,
+    root_id: &RemoteId,
+    depth: usize,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<ProjectedChild> {
+    preflight_inventory_call(depth, budget)?;
+    match api.retrieve_page_bounded(root_id.as_str(), budget) {
+        Ok(page) => {
+            validate_explicit_root_identity(root_id, &page.id, "page")
+                .map_err(InitialHydrationError::from_connector_error)?;
+            retain_inventory_value(&page, depth, budget)?;
+            let title = page_title(&page);
+            budget.account_retained_bytes(title.len())?;
+            Ok(ProjectedChild::Page { page, title })
+        }
+        Err(InitialHydrationError::ProviderNotFound) => {
+            preflight_inventory_call(depth, budget)?;
+            let database = api.retrieve_database_bounded(root_id.as_str(), budget)?;
+            validate_explicit_root_identity(root_id, &database.id, "database")
+                .map_err(InitialHydrationError::from_connector_error)?;
+            let database_bytes = retain_inventory_value(&database, depth, budget)?;
+            let database = bind_database_inventory_version_bounded(
+                api,
+                database,
+                database_bytes,
+                depth,
+                budget,
+            )?;
+            let title =
+                database_title(&database).unwrap_or_else(|| "Untitled database".to_string());
+            budget.account_retained_bytes(title.len())?;
+            Ok(ProjectedChild::Database { database, title })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn preflight_inventory_call(
+    depth: usize,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<()> {
+    budget.check_deadline()?;
+    budget.preflight_inventory(1, 1)?;
+    budget.preflight_traversal_node(depth)
+}
+
+fn retain_inventory_value<T: serde::Serialize>(
+    value: &T,
+    depth: usize,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<usize> {
+    let bytes = encoded_len(value)?;
+    budget.account_inventory(1, bytes)?;
+    budget.visit_traversal_node(depth)?;
+    Ok(bytes)
+}
+
+fn bind_database_inventory_version_bounded(
+    api: &dyn NotionApi,
+    database: DatabaseDto,
+    database_bytes: usize,
+    depth: usize,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<DatabaseDto> {
+    let child_depth = depth
+        .checked_add(1)
+        .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+    let mut seen = BTreeSet::new();
+    let mut data_sources = Vec::new();
+    let mut retained_data_source_bytes = 0_usize;
+    for summary in &database.data_sources {
+        let canonical = canonical_notion_uuid(&summary.id)
+            .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+        if !seen.insert(canonical) {
+            return Err(InitialHydrationError::ProviderResponseInvalid);
+        }
+        preflight_inventory_call(child_depth, budget)?;
+        let data_source = api.retrieve_data_source_bounded(&summary.id, budget)?;
+        validate_exact_notion_uuid(&summary.id, &data_source.id)?;
+        let parent_database_id = data_source
+            .parent
+            .as_ref()
+            .filter(|parent| {
+                parent.kind == "database_id"
+                    && parent.page_id.is_none()
+                    && parent.data_source_id.is_none()
+                    && parent.block_id.is_none()
+                    && parent.workspace.is_none()
+            })
+            .and_then(|parent| parent.database_id.as_deref())
+            .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+        validate_exact_notion_uuid(&database.id, parent_database_id)?;
+        let bytes = retain_inventory_value(&data_source, child_depth, budget)?;
+        retained_data_source_bytes = retained_data_source_bytes
+            .checked_add(bytes)
+            .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+        data_sources.push(data_source);
+    }
+    budget.account_retained_bytes(database_bytes)?;
+    let provider_version = database_bundle_provider_version_token(&NotionDatabaseBundle {
+        database: database.clone(),
+        data_sources,
+    })
+    .map_err(InitialHydrationError::from_connector_error)?;
+    budget.release_retained_bytes(database_bytes)?;
+    budget.release_retained_bytes(retained_data_source_bytes)?;
+    let mut database = database;
+    database.last_edited_time = Some(provider_version);
+    budget.replace_retained_bytes(database_bytes, encoded_len(&database)?)?;
+    Ok(database)
 }
 
 fn retrieve_explicit_root(
@@ -521,12 +692,65 @@ impl TreeEntrySink for ExplicitRootSink<'_> {
     }
 }
 
+struct BoundedExplicitRootSink<'a> {
+    scope_root_remote_id: &'a RemoteId,
+    entries: &'a mut Vec<ExplicitRootTreeEntry>,
+    owners: &'a mut BTreeMap<String, RemoteId>,
+    budget: &'a InitialHydrationBudget,
+    owner_map_retained_bytes: &'a mut usize,
+}
+
+impl BoundedExplicitRootSink<'_> {
+    fn push_entry(&mut self, entry: TreeEntry) -> InitialHydrationResult<()> {
+        let canonical_key_bytes = entry
+            .remote_id
+            .as_str()
+            .bytes()
+            .filter(|byte| *byte != b'-')
+            .count();
+        let root_bytes = self.scope_root_remote_id.as_str().len();
+        let added = canonical_key_bytes
+            .checked_add(root_bytes.saturating_mul(2))
+            .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+        self.budget.account_retained_bytes(added)?;
+        let owner_map_bytes = canonical_key_bytes
+            .checked_add(root_bytes)
+            .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+        *self.owner_map_retained_bytes = self
+            .owner_map_retained_bytes
+            .checked_add(owner_map_bytes)
+            .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+        let key = explicit_root_identity_key(entry.remote_id.as_str());
+        if let Some(existing_owner) = self.owners.insert(key, self.scope_root_remote_id.clone()) {
+            let _ = existing_owner;
+            return Err(InitialHydrationError::ProviderResponseInvalid);
+        }
+        self.entries.push(ExplicitRootTreeEntry {
+            entry,
+            scope_root_remote_id: self.scope_root_remote_id.clone(),
+        });
+        Ok(())
+    }
+}
+
 pub(crate) fn explicit_root_identity_key(value: &str) -> String {
     value
         .chars()
         .filter(|character| *character != '-')
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn compare_explicit_root_identity(left: &str, right: &str) -> std::cmp::Ordering {
+    left.bytes()
+        .filter(|byte| *byte != b'-')
+        .map(|byte| byte.to_ascii_lowercase())
+        .cmp(
+            right
+                .bytes()
+                .filter(|byte| *byte != b'-')
+                .map(|byte| byte.to_ascii_lowercase()),
+        )
 }
 
 fn push_projected_tree_entry<S: TreeEntrySink>(
@@ -572,6 +796,288 @@ fn push_projected_tree_entry<S: TreeEntrySink>(
     }
 
     Ok(())
+}
+
+fn push_projected_tree_entry_bounded(
+    api: &dyn NotionApi,
+    mount_id: &MountId,
+    projected: ProjectedChildWithPath,
+    depth: usize,
+    used_paths: &mut BTreeSet<PathBuf>,
+    entries: &mut BoundedExplicitRootSink<'_>,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<()> {
+    let projected_path_bytes = retained_path_bytes(&projected.path)?;
+    match projected.child {
+        ProjectedChild::Page { page, title } => {
+            let provider_bytes = encoded_len(&page)?
+                .checked_add(title.len())
+                .and_then(|bytes| bytes.checked_add(projected_path_bytes))
+                .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+            let page_id = page.id.clone();
+            let entry = page_entry(mount_id.clone(), &page, title, projected.path.clone());
+            budget.replace_retained_bytes(provider_bytes, encoded_len(&entry)?)?;
+            entries.push_entry(entry)?;
+            enumerate_page_children_bounded(
+                api,
+                mount_id,
+                &page_id,
+                page_child_dir(&projected.path),
+                depth,
+                used_paths,
+                entries,
+                budget,
+            )?;
+        }
+        ProjectedChild::Database { database, title } => {
+            let provider_bytes = encoded_len(&database)?
+                .checked_add(title.len())
+                .and_then(|bytes| bytes.checked_add(projected_path_bytes))
+                .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+            let entry = database_entry(mount_id.clone(), &database, title, projected.path.clone());
+            budget.replace_retained_bytes(provider_bytes, encoded_len(&entry)?)?;
+            entries.push_entry(entry)?;
+            enumerate_database_rows_bounded(
+                api,
+                mount_id,
+                &database,
+                &projected.path,
+                depth,
+                used_paths,
+                entries,
+                budget,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enumerate_page_children_bounded(
+    api: &dyn NotionApi,
+    mount_id: &MountId,
+    block_id: &str,
+    parent_dir: PathBuf,
+    parent_depth: usize,
+    used_paths: &mut BTreeSet<PathBuf>,
+    entries: &mut BoundedExplicitRootSink<'_>,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<()> {
+    let child_depth = parent_depth
+        .checked_add(1)
+        .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+    let children = collect_page_child_projections_bounded(api, block_id, child_depth, budget)?;
+    for projected in allocate_child_paths_bounded(&parent_dir, children, used_paths, budget)? {
+        push_projected_tree_entry_bounded(
+            api,
+            mount_id,
+            projected,
+            child_depth,
+            used_paths,
+            entries,
+            budget,
+        )?;
+    }
+    Ok(())
+}
+
+fn collect_page_child_projections_bounded(
+    api: &dyn NotionApi,
+    block_id: &str,
+    depth: usize,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<Vec<ProjectedChild>> {
+    let mut cursors = Vec::new();
+    let mut children = Vec::new();
+    loop {
+        preflight_inventory_call(depth, budget)?;
+        let page = api.retrieve_block_children_bounded(
+            block_id,
+            cursors.last().map(String::as_str),
+            budget,
+        )?;
+        let page_bytes = encoded_len(&page.results)?;
+        budget.account_inventory(page.results.len(), page_bytes)?;
+        let mut released_item_bytes = 0_usize;
+        for block in page.results {
+            let block_bytes = encoded_len(&block)?;
+            budget.visit_traversal_node(depth)?;
+            collect_child_block_projection_bounded(api, block, depth, &mut children, budget)?;
+            budget.release_retained_bytes(block_bytes)?;
+            released_item_bytes = released_item_bytes
+                .checked_add(block_bytes)
+                .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+        }
+        budget.release_retained_bytes(
+            page_bytes
+                .checked_sub(released_item_bytes)
+                .ok_or(InitialHydrationError::ProviderResponseInvalid)?,
+        )?;
+        if !page.has_more {
+            break;
+        }
+        let Some(cursor) = page.next_cursor.filter(|cursor| !cursor.is_empty()) else {
+            return Err(InitialHydrationError::ProviderResponseInvalid);
+        };
+        if cursors.iter().any(|seen| seen == &cursor) {
+            return Err(InitialHydrationError::ProviderResponseInvalid);
+        }
+        budget.account_retained_bytes(cursor.len())?;
+        cursors.push(cursor);
+    }
+    let cursor_bytes = cursors.iter().map(String::len).sum();
+    budget.release_retained_bytes(cursor_bytes)?;
+    Ok(children)
+}
+
+fn collect_child_block_projection_bounded(
+    api: &dyn NotionApi,
+    block: BlockDto,
+    depth: usize,
+    children: &mut Vec<ProjectedChild>,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<()> {
+    match block.kind.as_str() {
+        "child_page" => {
+            let child_depth = depth
+                .checked_add(1)
+                .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+            preflight_inventory_call(child_depth, budget)?;
+            let page = api.retrieve_page_bounded(block.id.as_str(), budget)?;
+            validate_explicit_root_identity(&RemoteId::new(block.id.clone()), &page.id, "page")
+                .map_err(InitialHydrationError::from_connector_error)?;
+            retain_inventory_value(&page, child_depth, budget)?;
+            let title = block
+                .child_page
+                .as_ref()
+                .map(|child| child.title.clone())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| page_title(&page));
+            budget.account_retained_bytes(title.len())?;
+            children.push(ProjectedChild::Page { page, title });
+        }
+        "child_database" => {
+            let child_depth = depth
+                .checked_add(1)
+                .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+            preflight_inventory_call(child_depth, budget)?;
+            let database = api.retrieve_database_bounded(block.id.as_str(), budget)?;
+            validate_explicit_root_identity(
+                &RemoteId::new(block.id.clone()),
+                &database.id,
+                "database",
+            )
+            .map_err(InitialHydrationError::from_connector_error)?;
+            let database_bytes = retain_inventory_value(&database, child_depth, budget)?;
+            let database = bind_database_inventory_version_bounded(
+                api,
+                database,
+                database_bytes,
+                child_depth,
+                budget,
+            )?;
+            let title = block
+                .child_database
+                .as_ref()
+                .map(|child| child.title.clone())
+                .filter(|title| !title.trim().is_empty())
+                .or_else(|| database_title(&database))
+                .unwrap_or_else(|| "Untitled database".to_string());
+            budget.account_retained_bytes(title.len())?;
+            children.push(ProjectedChild::Database { database, title });
+        }
+        _ if block.has_children => {
+            let child_depth = depth
+                .checked_add(1)
+                .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+            children.extend(collect_page_child_projections_bounded(
+                api,
+                &block.id,
+                child_depth,
+                budget,
+            )?);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enumerate_database_rows_bounded(
+    api: &dyn NotionApi,
+    mount_id: &MountId,
+    database: &DatabaseDto,
+    database_dir: &Path,
+    parent_depth: usize,
+    used_paths: &mut BTreeSet<PathBuf>,
+    entries: &mut BoundedExplicitRootSink<'_>,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<()> {
+    let row_depth = parent_depth
+        .checked_add(1)
+        .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+    let rows = collect_database_row_projections_bounded(api, database, row_depth, budget)?;
+    for projected in allocate_child_paths_bounded(database_dir, rows, used_paths, budget)? {
+        if matches!(projected.child, ProjectedChild::Page { .. }) {
+            push_projected_tree_entry_bounded(
+                api, mount_id, projected, row_depth, used_paths, entries, budget,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_database_row_projections_bounded(
+    api: &dyn NotionApi,
+    database: &DatabaseDto,
+    depth: usize,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<Vec<ProjectedChild>> {
+    let mut rows = Vec::new();
+    for data_source in &database.data_sources {
+        let mut cursors = Vec::new();
+        loop {
+            preflight_inventory_call(depth, budget)?;
+            let page = api.query_data_source_bounded(
+                &data_source.id,
+                cursors.last().map(String::as_str),
+                budget,
+            )?;
+            let page_bytes = encoded_len(&page.results)?;
+            budget.account_inventory(page.results.len(), page_bytes)?;
+            let mut retained_item_bytes = 0_usize;
+            for row in page.results {
+                let row_bytes = encoded_len(&row)?;
+                budget.visit_traversal_node(depth)?;
+                validate_bounded_database_row_parent(&row, database, &data_source.id)?;
+                retained_item_bytes = retained_item_bytes
+                    .checked_add(row_bytes)
+                    .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+                let title = page_title(&row);
+                budget.account_retained_bytes(title.len())?;
+                rows.push(ProjectedChild::Page { page: row, title });
+            }
+            budget.release_retained_bytes(
+                page_bytes
+                    .checked_sub(retained_item_bytes)
+                    .ok_or(InitialHydrationError::ProviderResponseInvalid)?,
+            )?;
+            if !page.has_more {
+                break;
+            }
+            let Some(cursor) = page.next_cursor.filter(|cursor| !cursor.is_empty()) else {
+                return Err(InitialHydrationError::ProviderResponseInvalid);
+            };
+            if cursors.iter().any(|seen| seen == &cursor) {
+                return Err(InitialHydrationError::ProviderResponseInvalid);
+            }
+            budget.account_retained_bytes(cursor.len())?;
+            cursors.push(cursor);
+        }
+        let cursor_bytes = cursors.iter().map(String::len).sum();
+        budget.release_retained_bytes(cursor_bytes)?;
+    }
+    Ok(rows)
 }
 
 fn list_root_children(
@@ -951,6 +1457,66 @@ fn is_database_row_for_database(
         && parent.database_id.is_none()
 }
 
+fn validate_bounded_database_row_parent(
+    page: &PageDto,
+    database: &DatabaseDto,
+    queried_data_source_id: &str,
+) -> InitialHydrationResult<()> {
+    let parent = page
+        .parent
+        .as_ref()
+        .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+    if parent.kind != "data_source_id"
+        || parent.page_id.is_some()
+        || parent.block_id.is_some()
+        || parent.workspace.is_some()
+    {
+        return Err(InitialHydrationError::ProviderResponseInvalid);
+    }
+    let returned_data_source_id = parent
+        .data_source_id
+        .as_deref()
+        .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+    validate_exact_notion_uuid(queried_data_source_id, returned_data_source_id)?;
+    if let Some(returned_database_id) = parent.database_id.as_deref() {
+        validate_exact_notion_uuid(&database.id, returned_database_id)?;
+    }
+    Ok(())
+}
+
+fn validate_exact_notion_uuid(expected: &str, returned: &str) -> InitialHydrationResult<()> {
+    let expected =
+        canonical_notion_uuid(expected).ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+    let returned =
+        canonical_notion_uuid(returned).ok_or(InitialHydrationError::ProviderResponseInvalid)?;
+    if expected != returned {
+        return Err(InitialHydrationError::ProviderResponseInvalid);
+    }
+    Ok(())
+}
+
+fn canonical_notion_uuid(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let valid = match bytes.len() {
+        32 => bytes.iter().all(u8::is_ascii_hexdigit),
+        36 => bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        }),
+        _ => false,
+    };
+    valid.then(|| {
+        value
+            .bytes()
+            .filter(|byte| *byte != b'-')
+            .map(|byte| char::from(byte.to_ascii_lowercase()))
+            .collect()
+    })
+}
+
 fn page_entry(mount_id: MountId, page: &PageDto, title: String, path: PathBuf) -> TreeEntry {
     let stub_frontmatter = page_frontmatter(page, &title);
     TreeEntry {
@@ -1274,6 +1840,176 @@ fn allocate_child_paths(
         .collect()
 }
 
+fn allocate_child_paths_bounded(
+    parent_dir: &Path,
+    children: Vec<ProjectedChild>,
+    used_paths: &mut BTreeSet<PathBuf>,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<Vec<ProjectedChildWithPath>> {
+    let bases = children
+        .iter()
+        .map(|child| projected_title_stem(child.title()))
+        .collect::<Vec<_>>();
+    let base_collision_keys = bases
+        .iter()
+        .map(|base| projected_path_collision_key(Path::new(base)))
+        .collect::<Vec<_>>();
+    let mut base_counts = BTreeMap::new();
+    for key in &base_collision_keys {
+        *base_counts.entry(key.clone()).or_insert(0_usize) += 1;
+    }
+
+    let mut paths = (0..children.len()).map(|_| None).collect::<Vec<_>>();
+    let mut suffix_groups = BTreeMap::<String, Vec<usize>>::new();
+    for (index, child) in children.iter().enumerate() {
+        let base = &bases[index];
+        let base_collision_key = &base_collision_keys[index];
+        let clean = retain_projection_reservation(
+            projection_reservation(parent_dir, child.kind(), base),
+            budget,
+        )?;
+        if base_counts
+            .get(base_collision_key)
+            .copied()
+            .unwrap_or_default()
+            == 1
+            && projection_available(used_paths, &clean)
+        {
+            paths[index] = Some(reserve_projection_bounded(used_paths, clean));
+        } else {
+            release_projection_reservation(&clean, budget)?;
+            suffix_groups
+                .entry(base_collision_key.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+
+    for (_collision_key, indexes) in suffix_groups {
+        for (index, path) in allocate_suffixed_group_bounded(
+            parent_dir, &children, &bases, &indexes, used_paths, budget,
+        )? {
+            paths[index] = Some(path);
+        }
+    }
+
+    Ok(children
+        .into_iter()
+        .zip(paths)
+        .map(|(child, path)| ProjectedChildWithPath {
+            child,
+            path: path.expect("projection path allocated"),
+        })
+        .collect())
+}
+
+fn allocate_suffixed_group_bounded(
+    parent_dir: &Path,
+    children: &[ProjectedChild],
+    bases: &[String],
+    indexes: &[usize],
+    used_paths: &mut BTreeSet<PathBuf>,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<Vec<(usize, PathBuf)>> {
+    for short_len in [6, 8, 10, 12, 32] {
+        let mut projections = Vec::new();
+        let mut available = true;
+        for index in indexes {
+            let child = &children[*index];
+            let stem = suffixed_stem(&bases[*index], child.remote_id(), short_len);
+            let projection = retain_projection_reservation(
+                projection_reservation(parent_dir, child.kind(), &stem),
+                budget,
+            )?;
+            if projection.reserved.iter().any(|path| {
+                path_collides(used_paths, path)
+                    || projections
+                        .iter()
+                        .any(|(_, prior): &(usize, ProjectedPathReservation)| {
+                            prior
+                                .reserved
+                                .iter()
+                                .any(|prior_path| projected_paths_collide(prior_path, path))
+                        })
+            }) {
+                release_projection_reservation(&projection, budget)?;
+                available = false;
+                break;
+            }
+            projections.push((*index, projection));
+        }
+        if available {
+            return Ok(projections
+                .into_iter()
+                .map(|(index, projection)| {
+                    (index, reserve_projection_bounded(used_paths, projection))
+                })
+                .collect());
+        }
+        for (_, projection) in &projections {
+            release_projection_reservation(projection, budget)?;
+        }
+    }
+    Err(InitialHydrationError::ProviderResponseInvalid)
+}
+
+fn retain_projection_reservation(
+    projection: ProjectedPathReservation,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<ProjectedPathReservation> {
+    let bytes = projection_retained_bytes(&projection)?;
+    budget.account_retained_bytes(bytes)?;
+    Ok(projection)
+}
+
+fn release_projection_reservation(
+    projection: &ProjectedPathReservation,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<()> {
+    budget.release_retained_bytes(projection_retained_bytes(projection)?)
+}
+
+fn reserve_projection_bounded(
+    used_paths: &mut BTreeSet<PathBuf>,
+    projection: ProjectedPathReservation,
+) -> PathBuf {
+    for path in projection.reserved {
+        used_paths.insert(path);
+    }
+    projection.path
+}
+
+fn projection_retained_bytes(
+    projection: &ProjectedPathReservation,
+) -> InitialHydrationResult<usize> {
+    projection
+        .reserved
+        .iter()
+        .try_fold(retained_path_bytes(&projection.path)?, |total, path| {
+            total
+                .checked_add(retained_path_bytes(path)?)
+                .ok_or(InitialHydrationError::ProviderResponseInvalid)
+        })
+}
+
+fn retained_path_set_bytes(paths: &BTreeSet<PathBuf>) -> InitialHydrationResult<usize> {
+    paths.iter().try_fold(0_usize, |total, path| {
+        total
+            .checked_add(retained_path_bytes(path)?)
+            .ok_or(InitialHydrationError::ProviderResponseInvalid)
+    })
+}
+
+fn retained_path_bytes(path: &Path) -> InitialHydrationResult<usize> {
+    path.to_str()
+        .map(str::len)
+        .ok_or(InitialHydrationError::ProviderResponseInvalid)
+}
+
+fn projected_paths_collide(left: &Path, right: &Path) -> bool {
+    left == right || projected_path_collision_key(left) == projected_path_collision_key(right)
+}
+
 fn allocate_suffixed_group(
     parent_dir: &Path,
     children: &[ProjectedChild],
@@ -1515,10 +2251,16 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ProjectedChild, allocate_child_paths, allocate_page_path, enumerate_explicit_root_trees,
+        BoundedExplicitRootSink, ExplicitRootTreeEntry, ProjectedChild, allocate_child_paths,
+        allocate_child_paths_bounded, allocate_page_path, enumerate_explicit_root_trees,
         projected_title_stem, resolve_notion_object_path_entries, resolve_page_path_entries,
+        retained_path_bytes,
+    };
+    use locality_connector::hydration_budget::{
+        HydrationResource, InitialHydrationBudget, InitialHydrationError, InitialHydrationLimits,
     };
     use locality_core::model::{EntityKind, MountId, RemoteId};
+    use locality_core::model::{HydrationState, TreeEntry};
     use locality_core::path_projection::PAGE_DOCUMENT_FILENAME;
     use locality_core::{LocalityError, LocalityResult};
 
@@ -1527,6 +2269,126 @@ mod tests {
         BlockDto, BlockListDto, DataSourceDto, DataSourceSummaryDto, DatabaseDto, DatabaseListDto,
         PageDto, PageListDto, PagePropertyDto, ParentDto, RichTextDto,
     };
+
+    #[test]
+    fn bounded_collision_paths_have_exact_cumulative_retained_cap() {
+        fn colliding_children(count: usize) -> Vec<ProjectedChild> {
+            (0..count)
+                .map(|index| ProjectedChild::Page {
+                    page: page(&format!("{index:032x}")),
+                    title: "Collision".to_string(),
+                })
+                .collect()
+        }
+
+        let mut expected_used = BTreeSet::new();
+        let expected =
+            allocate_child_paths(Path::new(""), colliding_children(64), &mut expected_used);
+        let exact = expected_used
+            .iter()
+            .chain(expected.iter().map(|projected| &projected.path))
+            .try_fold(0_u64, |total, path| {
+                let bytes = u64::try_from(retained_path_bytes(path).expect("UTF-8 path"))
+                    .expect("path bytes");
+                total.checked_add(bytes)
+            })
+            .expect("exact path bytes");
+
+        let exact_budget = InitialHydrationBudget::new(test_limits(exact)).expect("budget");
+        let mut used = BTreeSet::new();
+        let projected = allocate_child_paths_bounded(
+            Path::new(""),
+            colliding_children(64),
+            &mut used,
+            &exact_budget,
+        )
+        .expect("exact cap");
+        assert_eq!(projected.len(), 64);
+
+        let short_budget = InitialHydrationBudget::new(test_limits(exact - 1)).expect("budget");
+        let error = allocate_child_paths_bounded(
+            Path::new(""),
+            colliding_children(64),
+            &mut BTreeSet::new(),
+            &short_budget,
+        )
+        .err()
+        .expect("cap minus one");
+        assert_eq!(
+            error,
+            InitialHydrationError::LimitExceeded {
+                resource: HydrationResource::RetainedBytes
+            }
+        );
+    }
+
+    #[test]
+    fn bounded_owner_index_preserves_typed_retained_limit() {
+        let root = RemoteId::new("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        let entry = TreeEntry {
+            mount_id: MountId::new("mount"),
+            remote_id: RemoteId::new("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+            kind: EntityKind::Page,
+            title: "Page".to_string(),
+            path: "Page/_page.md".into(),
+            hydration: HydrationState::Stub,
+            content_hash: None,
+            remote_edited_at: None,
+            stub_frontmatter: None,
+        };
+        let exact =
+            entry.remote_id.as_str().replace('-', "").len() + root.as_str().len().saturating_mul(2);
+        let mut exact_entries = Vec::<ExplicitRootTreeEntry>::new();
+        let mut exact_owners = BTreeMap::new();
+        let mut exact_owner_bytes = 0;
+        let exact_budget = InitialHydrationBudget::new(test_limits(exact as u64)).expect("budget");
+        BoundedExplicitRootSink {
+            scope_root_remote_id: &root,
+            entries: &mut exact_entries,
+            owners: &mut exact_owners,
+            budget: &exact_budget,
+            owner_map_retained_bytes: &mut exact_owner_bytes,
+        }
+        .push_entry(entry.clone())
+        .expect("exact cap");
+
+        let short_budget =
+            InitialHydrationBudget::new(test_limits(exact as u64 - 1)).expect("budget");
+        let error = BoundedExplicitRootSink {
+            scope_root_remote_id: &root,
+            entries: &mut Vec::new(),
+            owners: &mut BTreeMap::new(),
+            budget: &short_budget,
+            owner_map_retained_bytes: &mut 0,
+        }
+        .push_entry(entry)
+        .expect_err("cap minus one");
+        assert_eq!(
+            error,
+            InitialHydrationError::LimitExceeded {
+                resource: HydrationResource::RetainedBytes
+            }
+        );
+    }
+
+    fn test_limits(max_retained_bytes: u64) -> InitialHydrationLimits {
+        InitialHydrationLimits {
+            max_response_body_bytes: 1_000_000,
+            max_provider_calls: 1_000_000,
+            provider_deadline_ms: 60_000,
+            max_inventory_items: 1_000_000,
+            max_inventory_encoded_bytes: 1_000_000,
+            max_traversal_nodes: 1_000_000,
+            max_traversal_depth: 1_000_000,
+            max_native_bytes: 1_000_000,
+            max_media_assets: 1_000_000,
+            max_media_decoded_bytes: 1_000_000,
+            max_rendered_content_bytes: 1_000_000,
+            max_projections: 1_000_000,
+            max_changes: 1_000_000,
+            max_retained_bytes,
+        }
+    }
 
     #[test]
     fn title_stem_preserves_representable_title_text() {

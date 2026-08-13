@@ -10,6 +10,7 @@ pub mod database_create;
 pub mod dto;
 pub mod fetch;
 pub mod hydration;
+mod initial_hydration_session;
 pub mod mapping;
 pub mod markdown_table;
 pub mod media;
@@ -54,6 +55,8 @@ use crate::render::{
     NotionRenderedEntity, RenderOptions, render_native_entity, render_native_entity_with_options,
 };
 use crate::root_setup::NotionRootSetup;
+
+pub use crate::initial_hydration_session::NotionInitialHydrationSession;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct NotionConfig {
@@ -219,6 +222,27 @@ impl NotionConnector {
 
     pub fn portable_media_capture_policy(&self) -> PortableMediaCapturePolicy {
         self.portable_media_capture_policy
+    }
+
+    /// Start one fail-closed initial-hydration job over this connector's
+    /// configured explicit roots.
+    ///
+    /// `source_connection_identity_sha256` is produced by the trusted caller
+    /// and is the only connection identity serialized into ephemeral progress
+    /// checkpoints. The returned wrapper privately owns the shared budget used
+    /// by enumeration, native fetch, hosted media, render, and projection.
+    pub fn initial_hydration_session(
+        &self,
+        source_connection_identity_sha256: impl Into<String>,
+        page_size: u32,
+        limits: locality_connector::hydration_budget::InitialHydrationLimits,
+    ) -> InitialHydrationResult<NotionInitialHydrationSession> {
+        NotionInitialHydrationSession::new(
+            self.clone(),
+            source_connection_identity_sha256.into(),
+            page_size,
+            limits,
+        )
     }
 
     /// Opt-in initial-hydration page fetch. The caller owns the job-scoped

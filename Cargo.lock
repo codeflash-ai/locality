@@ -2473,9 +2473,11 @@ name = "locality-notion"
 version = "0.3.9"
 dependencies = [
  "base64 0.22.1",
+ "getrandom 0.3.4",
  "locality-auth-core",
  "locality-connector",
  "locality-core",
+ "locality-engine",
  "mime_guess",
  "reqwest",
  "rustls",

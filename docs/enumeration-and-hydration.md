@@ -783,6 +783,13 @@ they call one of the trigger paths above.
   their opaque plans.
 - `list_children` paths must not fetch page bodies according to the connector
   contract.
+- The opt-in Notion initial-hydration session is the bounded exception that
+  deliberately composes explicit-root inventory with native fetch, hosted
+  media, render, and projection. It retains one deterministic inventory for the
+  life of a job and pages over that inventory without re-enumerating. Its
+  intermediate checkpoint is session-bound control flow, never durable source
+  state; only its validated terminal Notion checkpoint may replace the prior
+  durable checkpoint.
 - `loc status` and `loc diff` may inspect local projection and shadow state, but
   they are not remote enumeration triggers.
 - Background child refreshes do not queue when background connector sync is
