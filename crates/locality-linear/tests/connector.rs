@@ -3,19 +3,23 @@ use std::sync::{Arc, Mutex};
 
 use locality_connector::{
     ApplyPlanRequest, BatchObserveRequest, ChildContainer, Connector, ConnectorCheckpoint,
-    EnumerateRequest, ListChildrenRequest, ObserveRequest,
+    ConnectorExecutionPolicy, EnumerateRequest, ListChildrenRequest, ObserveRequest,
+    PortableBootstrapRequest, PortableCheckpoint, PortableFetchReason, PortableFetchRequest,
+    PortableRenderRequest, PortableSourceScope, PortableSyncRequest,
 };
 use locality_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
+use locality_core::portable::{LogicalPath, ProjectionFileKind, SourceAction, SourceConnectionId};
 use locality_core::push::RemotePrecondition;
 use locality_core::search::RAW_SEARCH_METADATA_KEY;
 use locality_linear::{
-    LinearApi, LinearAttachment, LinearAttachmentDownload, LinearComment, LinearConfig,
-    LinearConnector, LinearIssue, LinearIssueContext, LinearIssueContextKind,
-    LinearIssueHistoryEntry, LinearIssuePage, LinearIssuePriority, LinearIssueState,
-    LinearIssueUpdateInput, LinearLabel, LinearProject, LinearTeam, LinearUser,
-    linear_context_remote_id, render_linear_issue, render_linear_issue_context,
+    DEFAULT_LINEAR_ATTACHMENT_DOWNLOAD_BYTES, LinearApi, LinearAttachment,
+    LinearAttachmentDownload, LinearComment, LinearConfig, LinearConnector, LinearIssue,
+    LinearIssueContext, LinearIssueContextKind, LinearIssueHistoryEntry, LinearIssuePage,
+    LinearIssuePriority, LinearIssueState, LinearIssueUpdateInput, LinearLabel, LinearProject,
+    LinearTeam, LinearUser, enrich_linear_attachment_downloads, linear_context_remote_id,
+    render_linear_issue, render_linear_issue_context,
 };
 
 #[test]
@@ -373,6 +377,93 @@ fn rendering_attachments_includes_download_status_and_metadata() {
 }
 
 #[test]
+fn public_attachment_enrichment_sets_status_and_returns_assets() {
+    let mut context = issue_context(&issue());
+    context.attachments = vec![
+        attachment(
+            "attach-file",
+            "Spec PDF",
+            "https://files.linear.app/spec.pdf",
+        ),
+        attachment("attach-local", "Local path", "file:///tmp/spec.pdf"),
+        attachment(
+            "attach-denied",
+            "Denied",
+            "https://files.linear.app/denied.pdf",
+        ),
+    ];
+    let mut calls = Vec::new();
+
+    let assets = enrich_linear_attachment_downloads(
+        &mut context,
+        |url, max_bytes| {
+            calls.push((url.to_string(), max_bytes));
+            if url.ends_with("spec.pdf") {
+                Ok(b"pdf-bytes".to_vec())
+            } else {
+                Err(locality_core::LocalityError::Guardrail(
+                    "Linear attachment download returned HTTP 403".to_string(),
+                ))
+            }
+        },
+        DEFAULT_LINEAR_ATTACHMENT_DOWNLOAD_BYTES,
+    );
+
+    assert_eq!(assets.len(), 1);
+    assert_eq!(assets[0].bytes, b"pdf-bytes");
+    assert_eq!(
+        assets[0].path.to_string_lossy(),
+        ".loc/linear/attachments/issue-1-69737375652d31/spec-attach-file-6174746163682d66696c65.pdf"
+    );
+    assert_eq!(
+        context
+            .attachments
+            .iter()
+            .map(|attachment| attachment
+                .download
+                .as_ref()
+                .expect("download")
+                .status
+                .clone())
+            .collect::<Vec<_>>(),
+        vec!["downloaded", "skipped", "skipped"]
+    );
+    assert_eq!(
+        context.attachments[0]
+            .download
+            .as_ref()
+            .expect("download")
+            .local_path
+            .as_deref(),
+        Some(
+            ".loc/linear/attachments/issue-1-69737375652d31/spec-attach-file-6174746163682d66696c65.pdf"
+        )
+    );
+    assert_eq!(
+        context.attachments[1]
+            .download
+            .as_ref()
+            .expect("download")
+            .error
+            .as_deref(),
+        Some("only HTTP(S) attachment URLs can be downloaded")
+    );
+    assert_eq!(
+        calls,
+        vec![
+            (
+                "https://files.linear.app/spec.pdf".to_string(),
+                DEFAULT_LINEAR_ATTACHMENT_DOWNLOAD_BYTES
+            ),
+            (
+                "https://files.linear.app/denied.pdf".to_string(),
+                DEFAULT_LINEAR_ATTACHMENT_DOWNLOAD_BYTES
+            )
+        ]
+    );
+}
+
+#[test]
 fn rendering_pull_requests_includes_branch_even_without_pr_attachments() {
     let mut context = issue_context(&issue());
     context.attachments.clear();
@@ -564,6 +655,282 @@ fn apply_rejects_linear_context_remote_ids_as_read_only() {
     assert!(api.updates.lock().unwrap().is_empty());
 }
 
+#[test]
+fn portable_bootstrap_returns_issue_and_context_document_changes() {
+    let api = Arc::new(FakeLinearApi::with_issues(vec![issue()]));
+    let connector = LinearConnector::with_api(LinearConfig::new("secret"), api);
+
+    let batch = connector
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("linear-connection"),
+            scope: PortableSourceScope::explicit_roots(Vec::<RemoteId>::new()),
+            checkpoint: None,
+            max_changes: 100,
+        })
+        .expect("portable bootstrap");
+
+    assert!(batch.completeness.is_complete());
+    assert_eq!(
+        batch
+            .changes
+            .iter()
+            .map(|change| (
+                change.source_object.remote_id.as_str().to_string(),
+                change.source_object.kind.clone(),
+                change
+                    .logical_path
+                    .as_ref()
+                    .map(|path| path.as_str().to_string()),
+                change.requires_fetch,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "linear-context:issue-1:attachments".to_string(),
+                EntityKind::Asset,
+                Some("Teams/Engineering/Issues/Todo/ENG-1 Improve sync/attachments.md".to_string()),
+                true,
+            ),
+            (
+                "linear-context:issue-1:comments".to_string(),
+                EntityKind::Asset,
+                Some("Teams/Engineering/Issues/Todo/ENG-1 Improve sync/comments.md".to_string()),
+                true,
+            ),
+            (
+                "linear-context:issue-1:history".to_string(),
+                EntityKind::Asset,
+                Some("Teams/Engineering/Issues/Todo/ENG-1 Improve sync/history.md".to_string()),
+                true,
+            ),
+            (
+                "issue-1".to_string(),
+                EntityKind::Page,
+                Some("Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md".to_string()),
+                true,
+            ),
+            (
+                "linear-context:issue-1:pull-requests".to_string(),
+                EntityKind::Asset,
+                Some(
+                    "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/pull-requests.md".to_string()
+                ),
+                true,
+            ),
+        ]
+    );
+}
+
+#[test]
+fn portable_sync_uses_updated_after_checkpoint_json_shape() {
+    let api = Arc::new(FakeLinearApi::with_issues(vec![issue()]));
+    let connector = LinearConnector::with_api(LinearConfig::new("secret"), api.clone());
+
+    let batch = connector
+        .sync_portable(PortableSyncRequest {
+            source_connection_id: SourceConnectionId::new("linear-connection"),
+            scope: PortableSourceScope::explicit_roots(Vec::<RemoteId>::new()),
+            checkpoint: PortableCheckpoint {
+                format_version: 1,
+                opaque: serde_json::json!({ "updated_after": "2026-07-14T00:00:00Z" }).to_string(),
+            },
+            hints: Vec::new(),
+            max_changes: 100,
+        })
+        .expect("portable sync");
+
+    assert!(batch.completeness.is_complete());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&batch.next_checkpoint.opaque)
+            .expect("checkpoint json"),
+        serde_json::json!({ "updated_after": "2026-07-15T12:00:00Z" })
+    );
+    assert_eq!(
+        api.list_calls.lock().unwrap().as_slice(),
+        &[(Some("2026-07-14T00:00:00Z".to_string()), None)]
+    );
+}
+
+#[test]
+fn portable_fetch_and_render_issue_page_and_context_sidecar() {
+    let api = Arc::new(FakeLinearApi::with_issues(vec![issue()]));
+    let connector = LinearConnector::with_api(LinearConfig::new("secret"), api);
+
+    let issue_fetch = connector
+        .fetch_portable(PortableFetchRequest {
+            source_connection_id: SourceConnectionId::new("linear-connection"),
+            remote_id: RemoteId::new("issue-1"),
+            reason: PortableFetchReason::Bootstrap,
+        })
+        .expect("portable issue fetch");
+    assert_eq!(
+        issue_fetch.provider_version.as_deref(),
+        Some("linear:issue-1:2026-07-15T12:00:00Z")
+    );
+    let issue_render = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("linear-connection"),
+            logical_path: LogicalPath::new(
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md",
+            )
+            .expect("issue logical path"),
+            native: issue_fetch.native,
+            format_version: 5,
+        })
+        .expect("portable issue render");
+    assert_eq!(
+        issue_render.canonical.artifact_key.as_str(),
+        "linear:issue:issue-1:canonical:v5"
+    );
+    assert_eq!(issue_render.projections.len(), 1);
+    assert_eq!(
+        issue_render.projections[0].artifact.artifact_key.as_str(),
+        "linear:issue:issue-1:page:v5"
+    );
+    assert_eq!(
+        issue_render.projections[0].logical_path.as_str(),
+        "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md"
+    );
+    assert_eq!(
+        issue_render.projections[0].file_kind,
+        ProjectionFileKind::Markdown
+    );
+    let issue_markdown =
+        String::from_utf8(issue_render.projections[0].artifact.body.clone()).expect("utf8");
+    assert!(issue_markdown.starts_with("---\nloc:\n  id: issue-1\n"));
+    assert!(issue_markdown.ends_with("Existing description.\n"));
+
+    let context_fetch = connector
+        .fetch_portable(PortableFetchRequest {
+            source_connection_id: SourceConnectionId::new("linear-connection"),
+            remote_id: RemoteId::new("linear-context:issue-1:comments"),
+            reason: PortableFetchReason::Bootstrap,
+        })
+        .expect("portable context fetch");
+    assert_eq!(
+        context_fetch.provider_version.as_deref(),
+        Some("linear-context:issue-1:comments:2026-07-15T12:00:00Z")
+    );
+    let context_render = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("linear-connection"),
+            logical_path: LogicalPath::new(
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/comments.md",
+            )
+            .expect("context logical path"),
+            native: context_fetch.native,
+            format_version: 5,
+        })
+        .expect("portable context render");
+    assert_eq!(
+        context_render.canonical.artifact_key.as_str(),
+        "linear:context:issue-1:comments:canonical:v5"
+    );
+    assert_eq!(
+        context_render.projections[0].artifact.artifact_key.as_str(),
+        "linear:context:issue-1:comments:markdown:v5"
+    );
+    assert_eq!(
+        context_render.projections[0].logical_path.as_str(),
+        "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/comments.md"
+    );
+    let comments =
+        String::from_utf8(context_render.projections[0].artifact.body.clone()).expect("utf8");
+    assert!(comments.starts_with("---\nloc:\n  id: \"linear-context:issue-1:comments\"\n"));
+    assert!(comments.contains("# Comments\n\n"));
+}
+
+#[test]
+fn portable_fetch_enriches_linear_attachment_download_status() {
+    let mut context = issue_context(&issue());
+    context.attachments = vec![
+        attachment(
+            "attach-file",
+            "Spec PDF",
+            "https://files.linear.app/spec.pdf",
+        ),
+        attachment("attach-local", "Local path", "file:///tmp/spec.pdf"),
+    ];
+    let api = Arc::new(
+        FakeLinearApi::with_issues(vec![issue()])
+            .with_context("issue-1", context)
+            .with_download("https://files.linear.app/spec.pdf", b"pdf-bytes"),
+    );
+    let connector = LinearConnector::with_api(LinearConfig::new("secret"), api.clone());
+
+    let fetched = connector
+        .fetch_portable(PortableFetchRequest {
+            source_connection_id: SourceConnectionId::new("linear-connection"),
+            remote_id: RemoteId::new("linear-context:issue-1:attachments"),
+            reason: PortableFetchReason::Bootstrap,
+        })
+        .expect("portable attachment fetch");
+    let rendered = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("linear-connection"),
+            logical_path: LogicalPath::new(
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/attachments.md",
+            )
+            .expect("logical path"),
+            native: fetched.native,
+            format_version: 5,
+        })
+        .expect("portable attachment render");
+
+    let attachments =
+        String::from_utf8(rendered.projections[0].artifact.body.clone()).expect("utf8");
+    assert!(attachments.contains("- download_status: downloaded"));
+    assert!(attachments.contains("- local_path: .loc/linear/attachments/issue-1-69737375652d31/spec-attach-file-6174746163682d66696c65.pdf"));
+    assert!(attachments.contains("- download_status: skipped"));
+    assert!(attachments.contains("only HTTP(S) attachment URLs can be downloaded"));
+    let binary = rendered
+        .projections
+        .iter()
+        .find(|projection| projection.file_kind == ProjectionFileKind::Binary)
+        .expect("downloaded attachment binary projection");
+    assert_eq!(
+        binary.artifact.artifact_key.as_str(),
+        "linear:attachment:issue-1:attach-file:binary:v5"
+    );
+    assert_eq!(binary.artifact.media_type, "application/octet-stream");
+    assert_eq!(binary.artifact.body, b"pdf-bytes");
+    assert_eq!(
+        binary.logical_path.as_str(),
+        ".loc/linear/attachments/issue-1-69737375652d31/spec-attach-file-6174746163682d66696c65.pdf"
+    );
+    assert!(
+        binary
+            .supported_actions
+            .contains(&SourceAction::DownloadAttachment)
+    );
+    assert_eq!(
+        api.download_calls.lock().unwrap().as_slice(),
+        &["https://files.linear.app/spec.pdf".to_string()]
+    );
+}
+
+#[test]
+fn portable_linear_config_supports_execution_policy_parity() {
+    let connector = LinearConnector::new(
+        LinearConfig::new("secret")
+            .with_execution_policy(ConnectorExecutionPolicy::DeferProviderCooldown),
+    );
+    assert_eq!(
+        connector.execution_policy(),
+        ConnectorExecutionPolicy::DeferProviderCooldown
+    );
+
+    let connector = LinearConnector::with_api(
+        LinearConfig::new("secret"),
+        Arc::new(FakeLinearApi::with_issues(vec![issue()])),
+    );
+    let deferred = connector.with_execution_policy(ConnectorExecutionPolicy::DeferProviderCooldown);
+    assert_eq!(
+        deferred.execution_policy(),
+        ConnectorExecutionPolicy::DeferProviderCooldown
+    );
+}
+
 fn entry_paths(entries: &[locality_core::model::TreeEntry]) -> Vec<String> {
     entries
         .iter()
@@ -575,6 +942,9 @@ fn entry_paths(entries: &[locality_core::model::TreeEntry]) -> Vec<String> {
 struct FakeLinearApi {
     issues: Mutex<Vec<LinearIssue>>,
     contexts: Mutex<BTreeMap<String, LinearIssueContext>>,
+    list_calls: Mutex<Vec<(Option<String>, Option<String>)>>,
+    downloads: Mutex<BTreeMap<String, Vec<u8>>>,
+    download_calls: Mutex<Vec<String>>,
     updates: Mutex<Vec<LinearIssueUpdateInput>>,
 }
 
@@ -587,8 +957,27 @@ impl FakeLinearApi {
         Self {
             issues: Mutex::new(issues),
             contexts: Mutex::new(contexts),
+            list_calls: Mutex::new(Vec::new()),
+            downloads: Mutex::new(BTreeMap::new()),
+            download_calls: Mutex::new(Vec::new()),
             updates: Mutex::new(Vec::new()),
         }
+    }
+
+    fn with_context(self, issue_id: &str, context: LinearIssueContext) -> Self {
+        self.contexts
+            .lock()
+            .unwrap()
+            .insert(issue_id.to_string(), context);
+        self
+    }
+
+    fn with_download(self, url: &str, bytes: &[u8]) -> Self {
+        self.downloads
+            .lock()
+            .unwrap()
+            .insert(url.to_string(), bytes.to_vec());
+        self
     }
 }
 
@@ -596,9 +985,13 @@ impl LinearApi for FakeLinearApi {
     fn list_issues(
         &self,
         _cursor: Option<&str>,
-        _updated_after: Option<&str>,
+        updated_after: Option<&str>,
         team_id: Option<&str>,
     ) -> locality_core::LocalityResult<LinearIssuePage> {
+        self.list_calls.lock().unwrap().push((
+            updated_after.map(str::to_string),
+            team_id.map(str::to_string),
+        ));
         let issues = self
             .issues
             .lock()
@@ -638,12 +1031,18 @@ impl LinearApi for FakeLinearApi {
 
     fn download_attachment(
         &self,
-        _url: &str,
+        url: &str,
         _max_bytes: u64,
     ) -> locality_core::LocalityResult<Vec<u8>> {
-        Err(locality_core::LocalityError::Unsupported(
-            "fake Linear attachment download",
-        ))
+        self.download_calls.lock().unwrap().push(url.to_string());
+        self.downloads
+            .lock()
+            .unwrap()
+            .get(url)
+            .cloned()
+            .ok_or_else(|| {
+                locality_core::LocalityError::Unsupported("fake Linear attachment download")
+            })
     }
 
     fn update_issue(
@@ -823,5 +1222,21 @@ fn issue_context(issue: &LinearIssue) -> LinearIssueContext {
             removed_labels: Vec::new(),
             changes: Some(serde_json::json!({ "description": true })),
         }],
+    }
+}
+
+fn attachment(id: &str, title: &str, url: &str) -> LinearAttachment {
+    LinearAttachment {
+        id: id.to_string(),
+        title: title.to_string(),
+        url: url.to_string(),
+        created_at: "2026-07-15T14:00:00Z".to_string(),
+        updated_at: "2026-07-15T14:10:00Z".to_string(),
+        source_type: Some("linear".to_string()),
+        subtitle: None,
+        creator: None,
+        external_user_creator: None,
+        metadata: serde_json::json!({}),
+        download: None,
     }
 }

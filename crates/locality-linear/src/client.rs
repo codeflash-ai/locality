@@ -3,6 +3,7 @@ use std::io::Read;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use locality_connector::ConnectorExecutionPolicy;
 use locality_connector::network::{ConnectorNetworkConfig, ConnectorNetworkGate, RetryConfig};
 use locality_core::{LocalityError, LocalityResult};
 use reqwest::StatusCode;
@@ -50,6 +51,7 @@ pub struct HttpLinearApiClient {
     token: String,
     graphql_url: String,
     client: Client,
+    execution_policy: ConnectorExecutionPolicy,
 }
 
 impl fmt::Debug for HttpLinearApiClient {
@@ -63,10 +65,33 @@ impl fmt::Debug for HttpLinearApiClient {
 
 impl HttpLinearApiClient {
     pub fn new(token: impl Into<String>) -> Self {
-        Self::with_graphql_url(token, DEFAULT_LINEAR_GRAPHQL_URL)
+        Self::with_execution_policy(token, ConnectorExecutionPolicy::Inline)
+    }
+
+    pub fn with_execution_policy(
+        token: impl Into<String>,
+        execution_policy: ConnectorExecutionPolicy,
+    ) -> Self {
+        Self::with_graphql_url_and_execution_policy(
+            token,
+            DEFAULT_LINEAR_GRAPHQL_URL,
+            execution_policy,
+        )
     }
 
     pub fn with_graphql_url(token: impl Into<String>, graphql_url: impl Into<String>) -> Self {
+        Self::with_graphql_url_and_execution_policy(
+            token,
+            graphql_url,
+            ConnectorExecutionPolicy::Inline,
+        )
+    }
+
+    pub fn with_graphql_url_and_execution_policy(
+        token: impl Into<String>,
+        graphql_url: impl Into<String>,
+        execution_policy: ConnectorExecutionPolicy,
+    ) -> Self {
         ensure_reqwest_crypto_provider();
         let client = Client::builder()
             .timeout(LINEAR_HTTP_TIMEOUT)
@@ -76,6 +101,7 @@ impl HttpLinearApiClient {
             token: token.into(),
             graphql_url: graphql_url.into(),
             client,
+            execution_policy,
         }
     }
 
@@ -116,6 +142,18 @@ impl HttpLinearApiClient {
             if is_retryable_status(status) && attempt < DEFAULT_LINEAR_RATE_LIMIT_RETRIES {
                 let delay = retry_after(&response).unwrap_or_else(|| linear_backoff(attempt));
                 linear_network_gate().record_cooldown(delay);
+                if status == StatusCode::TOO_MANY_REQUESTS
+                    && self.execution_policy.defers_provider_cooldown()
+                {
+                    let body = response
+                        .text()
+                        .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+                    return Err(LocalityError::RateLimited {
+                        provider: "linear".to_string(),
+                        retry_after: delay,
+                        message: body,
+                    });
+                }
                 continue;
             }
             return decode_graphql_response(response);
@@ -347,6 +385,18 @@ impl LinearApi for HttpLinearApiClient {
             if is_retryable_status(status) && attempt < DEFAULT_LINEAR_RATE_LIMIT_RETRIES {
                 let delay = retry_after(&response).unwrap_or_else(|| linear_backoff(attempt));
                 linear_network_gate().record_cooldown(delay);
+                if status == StatusCode::TOO_MANY_REQUESTS
+                    && self.execution_policy.defers_provider_cooldown()
+                {
+                    let body = response
+                        .text()
+                        .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+                    return Err(LocalityError::RateLimited {
+                        provider: "linear".to_string(),
+                        retry_after: delay,
+                        message: body,
+                    });
+                }
                 continue;
             }
             return decode_attachment_response(response, max_bytes);
@@ -1018,6 +1068,14 @@ fn ensure_reqwest_crypto_provider() {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use locality_connector::ConnectorExecutionPolicy;
+    use locality_core::LocalityError;
     use serde_json::json;
 
     use super::*;
@@ -1184,6 +1242,65 @@ mod tests {
             &reqwest::Url::parse("https://github.com/acme/app/pull/42").expect("url"),
             DEFAULT_LINEAR_GRAPHQL_URL,
         ));
+    }
+
+    #[test]
+    fn portable_deferred_execution_returns_structured_rate_limit_without_inline_retry() {
+        let (graphql_url, request_rx, server) =
+            spawn_response("HTTP/1.1 429 Too Many Requests", "slow down");
+        let client = HttpLinearApiClient::with_graphql_url_and_execution_policy(
+            "lin_secret",
+            graphql_url,
+            ConnectorExecutionPolicy::DeferProviderCooldown,
+        );
+
+        let error = client
+            .list_issues(None, None, None)
+            .expect_err("rate limit");
+
+        request_rx.recv().expect("one request");
+        server.join().expect("server");
+        assert_eq!(
+            error,
+            LocalityError::RateLimited {
+                provider: "linear".to_string(),
+                retry_after: Duration::from_secs(1),
+                message: "slow down".to_string(),
+            }
+        );
+    }
+
+    fn spawn_response(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base_url = format!("http://{}", listener.local_addr().expect("address"));
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut buffer).expect("read");
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_tx
+                .send(String::from_utf8_lossy(&bytes).to_string())
+                .expect("send request");
+            let response = format!(
+                "{status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("respond");
+        });
+        (base_url, request_rx, handle)
     }
 }
 

@@ -6,18 +6,30 @@ use std::sync::Arc;
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, BatchObservationChange,
     BatchObserveRequest, BatchObserveResult, ChildContainer, Connector, ConnectorCapabilities,
-    ConnectorCheckpoint, ConnectorKind, EnumerateRequest, FetchRequest, ListChildrenRequest,
-    ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
+    ConnectorCheckpoint, ConnectorExecutionPolicy, ConnectorKind, EnumerateRequest, FetchRequest,
+    ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
+    PortableArtifactKey, PortableBootstrapRequest, PortableChangeBatch, PortableCheckpoint,
+    PortableCompleteness, PortableContentArtifact, PortableFetchRequest, PortableFetchResult,
+    PortableProjectionArtifact, PortableRenderRequest, PortableRenderResult, PortableSourceChange,
+    PortableSyncRequest,
 };
+use locality_core::canonical::render_canonical_markdown;
 use locality_core::freshness::{RemoteObservation, RemoteVersion};
 use locality_core::journal::JournalApplyEffect;
 use locality_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind};
+use locality_core::portable::{
+    LogicalPath, ProjectionFileKind, SourceAction, SourceConnectionId, SourceObject,
+};
 use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::{LocalityError, LocalityResult};
+use serde::{Deserialize, Serialize};
 
+use crate::attachments::{
+    DEFAULT_LINEAR_ATTACHMENT_DOWNLOAD_BYTES, enrich_linear_attachment_downloads,
+};
 use crate::client::{HttpLinearApiClient, LinearApi};
 use crate::dto::{
     LinearIssue, LinearIssueContext, LinearIssueContextKind, LinearIssueState,
@@ -29,6 +41,7 @@ use crate::render::{
 };
 
 pub const LINEAR_CONNECTOR_ID: &str = "linear";
+const PORTABLE_CHECKPOINT_VERSION: u16 = 1;
 const TEAMS_DIRECTORY_NAME: &str = "Teams";
 const ISSUES_DIRECTORY_NAME: &str = "Issues";
 const TEAMS_ROOT_REMOTE_ID: &str = "linear:teams";
@@ -36,6 +49,7 @@ const TEAM_REMOTE_ID_PREFIX: &str = "team:";
 const TEAM_ISSUES_REMOTE_ID_PREFIX: &str = "team-issues:";
 const TEAM_STATE_REMOTE_ID_PREFIX: &str = "team-state:";
 const LINEAR_CONTEXT_REMOTE_ID_PREFIX: &str = "linear-context:";
+const LINEAR_PORTABLE_NATIVE_KIND: &str = "linear_portable_issue";
 const LINEAR_CONTEXT_KINDS: &[LinearIssueContextKind] = &[
     LinearIssueContextKind::Comments,
     LinearIssueContextKind::Attachments,
@@ -43,9 +57,30 @@ const LINEAR_CONTEXT_KINDS: &[LinearIssueContextKind] = &[
     LinearIssueContextKind::History,
 ];
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct LinearPortableNativeBundle {
+    bundle: LinearNativeBundle,
+    #[serde(default)]
+    attachment_assets: Vec<LinearPortableAttachmentAsset>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LinearPortableAttachmentAsset {
+    issue_id: String,
+    attachment_id: String,
+    logical_path: String,
+    bytes: Vec<u8>,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct LinearConfig {
     pub token: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LinearConnectorConfig {
+    config: LinearConfig,
+    execution_policy: ConnectorExecutionPolicy,
 }
 
 impl LinearConfig {
@@ -53,6 +88,35 @@ impl LinearConfig {
         Self {
             token: token.into(),
         }
+    }
+
+    pub fn with_execution_policy(
+        self,
+        execution_policy: ConnectorExecutionPolicy,
+    ) -> LinearConnectorConfig {
+        LinearConnectorConfig {
+            config: self,
+            execution_policy,
+        }
+    }
+}
+
+impl From<LinearConfig> for LinearConnectorConfig {
+    fn from(config: LinearConfig) -> Self {
+        Self {
+            config,
+            execution_policy: ConnectorExecutionPolicy::Inline,
+        }
+    }
+}
+
+impl LinearConnectorConfig {
+    pub fn config(&self) -> &LinearConfig {
+        &self.config
+    }
+
+    pub fn execution_policy(&self) -> ConnectorExecutionPolicy {
+        self.execution_policy
     }
 }
 
@@ -64,9 +128,19 @@ impl fmt::Debug for LinearConfig {
     }
 }
 
+impl fmt::Debug for LinearConnectorConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LinearConnectorConfig")
+            .field("config", &self.config)
+            .field("execution_policy", &self.execution_policy)
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 pub struct LinearConnector {
     config: LinearConfig,
+    execution_policy: ConnectorExecutionPolicy,
     api: Arc<dyn LinearApi>,
 }
 
@@ -79,17 +153,41 @@ impl fmt::Debug for LinearConnector {
 }
 
 impl LinearConnector {
-    pub fn new(config: LinearConfig) -> Self {
-        let api = Arc::new(HttpLinearApiClient::new(config.token.clone()));
-        Self::with_api(config, api)
+    pub fn new(config: impl Into<LinearConnectorConfig>) -> Self {
+        let config = config.into();
+        let api = Arc::new(HttpLinearApiClient::with_execution_policy(
+            config.config.token.clone(),
+            config.execution_policy,
+        ));
+        Self {
+            config: config.config,
+            execution_policy: config.execution_policy,
+            api,
+        }
     }
 
     pub fn with_api(config: LinearConfig, api: Arc<dyn LinearApi>) -> Self {
-        Self { config, api }
+        Self::with_api_and_execution_policy(config, ConnectorExecutionPolicy::Inline, api)
+    }
+
+    pub fn with_api_and_execution_policy(
+        config: LinearConfig,
+        execution_policy: ConnectorExecutionPolicy,
+        api: Arc<dyn LinearApi>,
+    ) -> Self {
+        Self {
+            config,
+            execution_policy,
+            api,
+        }
     }
 
     pub fn config(&self) -> &LinearConfig {
         &self.config
+    }
+
+    pub fn execution_policy(&self) -> ConnectorExecutionPolicy {
+        self.execution_policy
     }
 
     pub fn get_issue_context(&self, issue_id: &str) -> LocalityResult<LinearIssueContext> {
@@ -127,6 +225,10 @@ impl LinearConnector {
 }
 
 impl Connector for LinearConnector {
+    fn with_execution_policy(&self, policy: ConnectorExecutionPolicy) -> Self {
+        Self::new(self.config.clone().with_execution_policy(policy))
+    }
+
     fn kind(&self) -> ConnectorKind {
         ConnectorKind(LINEAR_CONNECTOR_ID)
     }
@@ -159,6 +261,43 @@ impl Connector for LinearConnector {
             Path::new(""),
             self.all_issues(None, None)?,
         ))
+    }
+
+    fn bootstrap_portable(
+        &self,
+        request: PortableBootstrapRequest,
+    ) -> LocalityResult<PortableChangeBatch> {
+        let issues = self.all_issues(None, None)?;
+        let next_checkpoint = portable_checkpoint(
+            issues
+                .iter()
+                .map(|issue| issue.updated_at.as_str())
+                .max()
+                .unwrap_or_default(),
+        );
+        Ok(PortableChangeBatch {
+            changes: portable_issue_changes(&request.source_connection_id, issues)?,
+            next_checkpoint,
+            completeness: PortableCompleteness::complete(),
+        })
+    }
+
+    fn sync_portable(&self, request: PortableSyncRequest) -> LocalityResult<PortableChangeBatch> {
+        let updated_after = portable_checkpoint_updated_after(&request.checkpoint)?;
+        let issues = self.all_issues(updated_after.as_deref(), None)?;
+        let next_checkpoint = portable_checkpoint(
+            issues
+                .iter()
+                .map(|issue| issue.updated_at.as_str())
+                .max()
+                .or(updated_after.as_deref())
+                .unwrap_or_default(),
+        );
+        Ok(PortableChangeBatch {
+            changes: portable_issue_changes(&request.source_connection_id, issues)?,
+            next_checkpoint,
+            completeness: PortableCompleteness::complete(),
+        })
     }
 
     fn observe(&self, request: ObserveRequest) -> LocalityResult<RemoteObservation> {
@@ -254,6 +393,51 @@ impl Connector for LinearConnector {
         })
     }
 
+    fn fetch_portable(&self, request: PortableFetchRequest) -> LocalityResult<PortableFetchResult> {
+        let mut native = self.fetch(FetchRequest {
+            remote_id: request.remote_id,
+        })?;
+        let mut bundle = serde_json::from_slice::<LinearNativeBundle>(&native.raw)
+            .map_err(|error| LocalityError::Io(format!("Linear native decode failed: {error}")))?;
+        let mut attachment_assets = Vec::new();
+        if let Some(context) = &mut bundle.context
+            && context.kind == LinearIssueContextKind::Attachments
+        {
+            attachment_assets = enrich_linear_attachment_downloads(
+                &mut context.context,
+                |url, max_bytes| self.download_attachment(url, max_bytes),
+                DEFAULT_LINEAR_ATTACHMENT_DOWNLOAD_BYTES,
+            )
+            .into_iter()
+            .map(|asset| LinearPortableAttachmentAsset {
+                issue_id: asset.issue_id,
+                attachment_id: asset.attachment_id,
+                logical_path: asset.path.to_string_lossy().replace('\\', "/"),
+                bytes: asset.bytes,
+            })
+            .collect();
+        }
+        let provider_version = if let Some(context) = &bundle.context {
+            Some(crate::render::context_remote_version(
+                &context.context,
+                context.kind,
+            ))
+        } else {
+            Some(remote_version(&bundle.issue))
+        };
+        native.kind = LINEAR_PORTABLE_NATIVE_KIND.to_string();
+        native.raw = serde_json::to_vec(&LinearPortableNativeBundle {
+            bundle,
+            attachment_assets,
+        })
+        .map_err(|error| LocalityError::Io(format!("Linear native encode failed: {error}")))?;
+        Ok(PortableFetchResult {
+            native,
+            provider_version,
+            completeness: PortableCompleteness::complete(),
+        })
+    }
+
     fn render(&self, entity: &NativeEntity) -> LocalityResult<CanonicalDocument> {
         let bundle = serde_json::from_slice::<LinearNativeBundle>(&entity.raw)
             .map_err(|error| LocalityError::Io(format!("Linear native decode failed: {error}")))?;
@@ -261,6 +445,81 @@ impl Connector for LinearConnector {
             return render_linear_issue_context(&context.context, context.kind);
         }
         render_linear_issue(&bundle.issue)
+    }
+
+    fn render_portable(
+        &self,
+        request: &PortableRenderRequest,
+    ) -> LocalityResult<PortableRenderResult> {
+        let LinearPortableNativeBundle {
+            bundle,
+            attachment_assets,
+        } = portable_native_bundle(&request.native)?;
+        let (document, canonical_key, projection_key, supported_actions) = if let Some(context) =
+            &bundle.context
+        {
+            let document = render_linear_issue_context(&context.context, context.kind)?;
+            (
+                document,
+                linear_context_artifact_key(
+                    &context.context.issue_id,
+                    context.kind,
+                    "canonical",
+                    request.format_version,
+                ),
+                linear_context_artifact_key(
+                    &context.context.issue_id,
+                    context.kind,
+                    "markdown",
+                    request.format_version,
+                ),
+                [SourceAction::Read, SourceAction::Search]
+                    .into_iter()
+                    .collect(),
+            )
+        } else {
+            let document = render_linear_issue(&bundle.issue)?;
+            (
+                document,
+                linear_issue_artifact_key(&bundle.issue.id, "canonical", request.format_version),
+                linear_issue_artifact_key(&bundle.issue.id, "page", request.format_version),
+                [
+                    SourceAction::Read,
+                    SourceAction::Search,
+                    SourceAction::Update,
+                    SourceAction::Move,
+                    SourceAction::UpdateProperties,
+                ]
+                .into_iter()
+                .collect(),
+            )
+        };
+        let body = render_canonical_markdown(&document).into_bytes();
+        let canonical = PortableContentArtifact {
+            artifact_key: canonical_key,
+            media_type: "text/markdown; charset=utf-8".to_string(),
+            body: body.clone(),
+        };
+        let mut projections = vec![PortableProjectionArtifact {
+            artifact: PortableContentArtifact {
+                artifact_key: projection_key,
+                media_type: "text/markdown; charset=utf-8".to_string(),
+                body,
+            },
+            logical_path: request.logical_path.clone(),
+            file_kind: ProjectionFileKind::Markdown,
+            format_version: request.format_version,
+            supported_actions,
+        }];
+        projections.extend(portable_attachment_projections(
+            attachment_assets,
+            request.format_version,
+        )?);
+        Ok(PortableRenderResult {
+            canonical: canonical.clone(),
+            projections,
+            completeness: PortableCompleteness::complete(),
+        })
     }
 
     fn parse(&self, _document: &CanonicalDocument) -> LocalityResult<ParsedEntity> {
@@ -367,6 +626,180 @@ impl Connector for LinearConnector {
     fn apply_undo(&self, _request: ApplyUndoRequest<'_>) -> LocalityResult<ApplyUndoResult> {
         Err(LocalityError::Unsupported("Linear undo"))
     }
+}
+
+fn portable_issue_changes(
+    source_connection_id: &SourceConnectionId,
+    issues: Vec<LinearIssue>,
+) -> LocalityResult<Vec<PortableSourceChange>> {
+    let mount_id = MountId::new("linear-portable");
+    let mut changes = Vec::new();
+    for issue in issues {
+        let deleted = issue.archived_at.is_some();
+        changes.push(portable_change_from_entry(
+            source_connection_id,
+            issue_entry(&mount_id, Path::new(""), &issue),
+            deleted,
+        )?);
+        for entry in context_entries(&mount_id, Path::new(""), &issue) {
+            changes.push(portable_change_from_entry(
+                source_connection_id,
+                entry,
+                deleted,
+            )?);
+        }
+    }
+    changes.sort_by(|left, right| {
+        left.logical_path
+            .as_ref()
+            .map(LogicalPath::as_str)
+            .cmp(&right.logical_path.as_ref().map(LogicalPath::as_str))
+            .then_with(|| {
+                left.source_object
+                    .remote_id
+                    .cmp(&right.source_object.remote_id)
+            })
+    });
+    Ok(changes)
+}
+
+fn portable_change_from_entry(
+    source_connection_id: &SourceConnectionId,
+    entry: TreeEntry,
+    deleted: bool,
+) -> LocalityResult<PortableSourceChange> {
+    Ok(PortableSourceChange {
+        source_object: SourceObject {
+            source_connection_id: source_connection_id.clone(),
+            remote_id: entry.remote_id.clone(),
+            kind: entry.kind,
+            edges: Vec::new(),
+            opaque_version: entry.remote_edited_at,
+            deleted,
+            connector_metadata: BTreeMap::new(),
+            acl_observations: Vec::new(),
+            discovered_at: None,
+            observed_at: None,
+        },
+        logical_path: Some(logical_path_from_tree_path(&entry.path)?),
+        requires_fetch: !deleted,
+    })
+}
+
+fn logical_path_from_tree_path(path: &Path) -> LocalityResult<LogicalPath> {
+    LogicalPath::new(path.to_string_lossy().replace('\\', "/")).map_err(|error| {
+        LocalityError::InvalidState(format!("Linear portable logical path is invalid: {error}"))
+    })
+}
+
+fn portable_checkpoint(updated_after: &str) -> PortableCheckpoint {
+    PortableCheckpoint {
+        format_version: PORTABLE_CHECKPOINT_VERSION,
+        opaque: serde_json::json!({ "updated_after": updated_after }).to_string(),
+    }
+}
+
+fn portable_checkpoint_updated_after(
+    checkpoint: &PortableCheckpoint,
+) -> LocalityResult<Option<String>> {
+    if checkpoint.format_version != PORTABLE_CHECKPOINT_VERSION {
+        return Err(LocalityError::InvalidState(format!(
+            "unsupported Linear portable checkpoint version {}",
+            checkpoint.format_version
+        )));
+    }
+    updated_after_from_json(&checkpoint.opaque).map_err(|error| {
+        LocalityError::InvalidState(format!(
+            "Linear portable checkpoint JSON is invalid: {error}"
+        ))
+    })
+}
+
+fn updated_after_from_json(state_json: &str) -> serde_json::Result<Option<String>> {
+    Ok(serde_json::from_str::<serde_json::Value>(state_json)?
+        .get("updated_after")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned))
+}
+
+fn linear_issue_artifact_key(
+    issue_id: &str,
+    role: &str,
+    format_version: u32,
+) -> PortableArtifactKey {
+    PortableArtifactKey::new(format!("linear:issue:{issue_id}:{role}:v{format_version}"))
+}
+
+fn linear_context_artifact_key(
+    issue_id: &str,
+    kind: LinearIssueContextKind,
+    role: &str,
+    format_version: u32,
+) -> PortableArtifactKey {
+    PortableArtifactKey::new(format!(
+        "linear:context:{issue_id}:{}:{role}:v{format_version}",
+        kind.as_str()
+    ))
+}
+
+fn linear_attachment_artifact_key(
+    issue_id: &str,
+    attachment_id: &str,
+    role: &str,
+    format_version: u32,
+) -> PortableArtifactKey {
+    PortableArtifactKey::new(format!(
+        "linear:attachment:{issue_id}:{attachment_id}:{role}:v{format_version}"
+    ))
+}
+
+fn portable_native_bundle(native: &NativeEntity) -> LocalityResult<LinearPortableNativeBundle> {
+    if native.kind == LINEAR_PORTABLE_NATIVE_KIND {
+        return serde_json::from_slice::<LinearPortableNativeBundle>(&native.raw)
+            .map_err(|error| LocalityError::Io(format!("Linear native decode failed: {error}")));
+    }
+
+    serde_json::from_slice::<LinearNativeBundle>(&native.raw)
+        .map(|bundle| LinearPortableNativeBundle {
+            bundle,
+            attachment_assets: Vec::new(),
+        })
+        .map_err(|error| LocalityError::Io(format!("Linear native decode failed: {error}")))
+}
+
+fn portable_attachment_projections(
+    assets: Vec<LinearPortableAttachmentAsset>,
+    format_version: u32,
+) -> LocalityResult<Vec<PortableProjectionArtifact>> {
+    assets
+        .into_iter()
+        .map(|asset| {
+            let logical_path = LogicalPath::new(asset.logical_path.clone()).map_err(|error| {
+                LocalityError::InvalidState(format!(
+                    "Linear portable attachment path is invalid: {error}"
+                ))
+            })?;
+            Ok(PortableProjectionArtifact {
+                artifact: PortableContentArtifact {
+                    artifact_key: linear_attachment_artifact_key(
+                        &asset.issue_id,
+                        &asset.attachment_id,
+                        "binary",
+                        format_version,
+                    ),
+                    media_type: "application/octet-stream".to_string(),
+                    body: asset.bytes,
+                },
+                logical_path,
+                file_kind: ProjectionFileKind::Binary,
+                format_version,
+                supported_actions: [SourceAction::Read, SourceAction::DownloadAttachment]
+                    .into_iter()
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 fn update_for<'a>(

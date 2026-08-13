@@ -11,9 +11,10 @@ use locality_core::shadow::{ShadowDocument, rendered_bodies_equivalent, segment_
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
 use locality_linear::{
-    LINEAR_CONNECTOR_ID, LinearAttachmentDownload, LinearConfig, LinearConnector,
-    LinearIssueContext, LinearIssueContextKind, LinearNativeBundle, attachment_local_path,
-    context_remote_version, remote_version, render_linear_issue, render_linear_issue_context,
+    DEFAULT_LINEAR_ATTACHMENT_DOWNLOAD_BYTES, LINEAR_CONNECTOR_ID, LinearConfig, LinearConnector,
+    LinearIssueContextKind, LinearNativeBundle, context_remote_version,
+    enrich_linear_attachment_downloads, remote_version, render_linear_issue,
+    render_linear_issue_context,
 };
 use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
@@ -25,7 +26,6 @@ use crate::notion::ConnectorResolveError;
 use crate::source::{SourceAdapter, SourcePushValidator, SourceValidationContext};
 
 pub(crate) const LINEAR_CONNECT_COMMAND: &str = "loc connect linear --api-key-stdin";
-const MAX_LINEAR_ATTACHMENT_DOWNLOAD_BYTES: u64 = 25 * 1024 * 1024;
 
 pub fn resolve_linear_connector_for_mount<S>(
     store: &S,
@@ -194,7 +194,18 @@ impl HydrationSource for LinearConnector {
         if let Some(context) = bundle.context {
             let mut context_value = context.context;
             let assets = if context.kind == LinearIssueContextKind::Attachments {
-                download_linear_attachment_assets(self, &mut context_value)
+                enrich_linear_attachment_downloads(
+                    &mut context_value,
+                    |url, max_bytes| self.download_attachment(url, max_bytes),
+                    DEFAULT_LINEAR_ATTACHMENT_DOWNLOAD_BYTES,
+                )
+                .into_iter()
+                .map(|asset| HydratedAsset {
+                    path: asset.path,
+                    bytes: asset.bytes,
+                    media: None,
+                })
+                .collect()
             } else {
                 Vec::new()
             };
@@ -251,63 +262,6 @@ fn hydrated_linear_document(
     })
 }
 
-fn download_linear_attachment_assets(
-    connector: &LinearConnector,
-    context: &mut LinearIssueContext,
-) -> Vec<HydratedAsset> {
-    let mut assets = Vec::new();
-    for attachment in &mut context.attachments {
-        if !is_http_url(&attachment.url) {
-            attachment.download = Some(LinearAttachmentDownload {
-                status: "skipped".to_string(),
-                local_path: None,
-                error: Some("only HTTP(S) attachment URLs can be downloaded".to_string()),
-            });
-            continue;
-        }
-        let local_path = attachment_local_path(
-            &context.issue_id,
-            &attachment.id,
-            &attachment.title,
-            &attachment.url,
-        );
-        match connector.download_attachment(&attachment.url, MAX_LINEAR_ATTACHMENT_DOWNLOAD_BYTES) {
-            Ok(bytes) => {
-                attachment.download = Some(LinearAttachmentDownload {
-                    status: "downloaded".to_string(),
-                    local_path: Some(local_path.to_string_lossy().replace('\\', "/")),
-                    error: None,
-                });
-                assets.push(HydratedAsset {
-                    path: local_path,
-                    bytes,
-                    media: None,
-                });
-            }
-            Err(error) => {
-                attachment.download = Some(LinearAttachmentDownload {
-                    status: if matches!(
-                        error,
-                        LocalityError::Guardrail(_) | LocalityError::Unsupported(_)
-                    ) {
-                        "skipped".to_string()
-                    } else {
-                        "failed".to_string()
-                    },
-                    local_path: None,
-                    error: Some(error.to_string()),
-                });
-            }
-        }
-    }
-    assets
-}
-
-fn is_http_url(url: &str) -> bool {
-    let lower = url.trim_start().to_ascii_lowercase();
-    lower.starts_with("http://") || lower.starts_with("https://")
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -319,6 +273,7 @@ mod tests {
         LinearApi, LinearAttachment, LinearComment, LinearIssue, LinearIssueContext,
         LinearIssueHistoryEntry, LinearIssuePage, LinearIssuePriority, LinearIssueState,
         LinearIssueUpdateInput, LinearLabel, LinearProject, LinearTeam, LinearUser,
+        attachment_local_path,
     };
 
     use super::*;

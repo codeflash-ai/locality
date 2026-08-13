@@ -1,8 +1,78 @@
 use std::path::{Path, PathBuf};
 
+use locality_core::{LocalityError, LocalityResult};
+
+use crate::dto::{LinearAttachmentDownload, LinearIssueContext};
+
+pub const DEFAULT_LINEAR_ATTACHMENT_DOWNLOAD_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_ATTACHMENT_FILENAME_LEN: usize = 240;
 const MAX_OPAQUE_COMPONENT_LEN: usize = 96;
 const MAX_EXTENSION_LEN: usize = 32;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinearAttachmentAsset {
+    pub issue_id: String,
+    pub attachment_id: String,
+    pub path: PathBuf,
+    pub bytes: Vec<u8>,
+}
+
+pub fn enrich_linear_attachment_downloads<F>(
+    context: &mut LinearIssueContext,
+    mut download: F,
+    max_bytes: u64,
+) -> Vec<LinearAttachmentAsset>
+where
+    F: FnMut(&str, u64) -> LocalityResult<Vec<u8>>,
+{
+    let mut assets = Vec::new();
+    for attachment in &mut context.attachments {
+        if !is_http_url(&attachment.url) {
+            attachment.download = Some(LinearAttachmentDownload {
+                status: "skipped".to_string(),
+                local_path: None,
+                error: Some("only HTTP(S) attachment URLs can be downloaded".to_string()),
+            });
+            continue;
+        }
+        let local_path = attachment_local_path(
+            &context.issue_id,
+            &attachment.id,
+            &attachment.title,
+            &attachment.url,
+        );
+        match download(&attachment.url, max_bytes) {
+            Ok(bytes) => {
+                attachment.download = Some(LinearAttachmentDownload {
+                    status: "downloaded".to_string(),
+                    local_path: Some(local_path.to_string_lossy().replace('\\', "/")),
+                    error: None,
+                });
+                assets.push(LinearAttachmentAsset {
+                    issue_id: context.issue_id.clone(),
+                    attachment_id: attachment.id.clone(),
+                    path: local_path,
+                    bytes,
+                });
+            }
+            Err(error) => {
+                attachment.download = Some(LinearAttachmentDownload {
+                    status: if matches!(
+                        error,
+                        LocalityError::Guardrail(_) | LocalityError::Unsupported(_)
+                    ) {
+                        "skipped".to_string()
+                    } else {
+                        "failed".to_string()
+                    },
+                    local_path: None,
+                    error: Some(error.to_string()),
+                });
+            }
+        }
+    }
+    assets
+}
 
 pub fn attachment_local_path(
     issue_id: &str,
@@ -31,6 +101,11 @@ pub fn attachment_local_path(
         .join("attachments")
         .join(bounded_opaque_id_component(issue_id))
         .join(format!("{stem}-{attachment_component}{extension}"))
+}
+
+fn is_http_url(url: &str) -> bool {
+    let lower = url.trim_start().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 fn filename_from_url(url: &str) -> Option<&str> {
