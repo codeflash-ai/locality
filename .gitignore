@@ -4,6 +4,8 @@
 /experiment/claude-locality-comparison/
 node_modules/
 dist/
+/experiment/runs/
+/experiment/runs-2/
 /.loc/
 /.tmp/
 /.worktrees/
