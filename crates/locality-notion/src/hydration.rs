@@ -29,23 +29,34 @@ pub fn fetch_page_native_bounded(
     page_id: &str,
     budget: &InitialHydrationBudget,
 ) -> InitialHydrationResult<NativeEntity> {
+    let bundle = fetch_page_bundle_bounded(api, page_id, budget)?;
+    let bundle_bytes = encoded_len(&bundle)?;
+    let remote_id = RemoteId::new(bundle.page.id.clone());
+    let kind = "notion_page".to_string();
+    budget.account_retained_bytes(remote_id.as_str().len() + kind.len())?;
+    let raw = encode_native_json_bounded(&bundle, budget)?;
+    budget.release_retained_bytes(bundle_bytes)?;
+    Ok(NativeEntity {
+        remote_id,
+        kind,
+        raw,
+    })
+}
+
+pub(crate) fn fetch_page_bundle_bounded(
+    api: &dyn NotionApi,
+    page_id: &str,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<NotionPageBundle> {
     let mut temporary = TemporaryRetainedBytes::new(budget);
     budget.visit_traversal_node(0)?;
     let page = api.retrieve_page_bounded(page_id, budget)?;
     validate_requested_identity(page_id, &page.id)?;
     temporary.reserve(encoded_len(&page)?)?;
     let blocks = fetch_block_trees_bounded(api, page_id, 1, budget, &mut temporary)?;
-    let remote_id = RemoteId::new(page.id.clone());
-    let kind = "notion_page".to_string();
-    budget.account_retained_bytes(remote_id.as_str().len() + kind.len())?;
     let bundle = NotionPageBundle { page, blocks };
-    temporary.replace(encoded_len(&bundle)?)?;
-    let raw = encode_native_json_bounded(&bundle, budget)?;
-    Ok(NativeEntity {
-        remote_id,
-        kind,
-        raw,
-    })
+    temporary.replace_and_commit(encoded_len(&bundle)?)?;
+    Ok(bundle)
 }
 
 /// Fetch and encode one database container and its declared data-source
@@ -55,6 +66,25 @@ pub fn fetch_database_native_bounded(
     database_id: &str,
     budget: &InitialHydrationBudget,
 ) -> InitialHydrationResult<NativeEntity> {
+    let bundle = fetch_database_bundle_bounded(api, database_id, budget)?;
+    let bundle_bytes = encoded_len(&bundle)?;
+    let remote_id = RemoteId::new(bundle.database.id.clone());
+    let kind = "notion_database".to_string();
+    budget.account_retained_bytes(remote_id.as_str().len() + kind.len())?;
+    let raw = encode_native_json_bounded(&bundle, budget)?;
+    budget.release_retained_bytes(bundle_bytes)?;
+    Ok(NativeEntity {
+        remote_id,
+        kind,
+        raw,
+    })
+}
+
+pub(crate) fn fetch_database_bundle_bounded(
+    api: &dyn NotionApi,
+    database_id: &str,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<NotionDatabaseBundle> {
     let mut temporary = TemporaryRetainedBytes::new(budget);
     budget.visit_traversal_node(0)?;
     let database = api.retrieve_database_bounded(database_id, budget)?;
@@ -86,20 +116,12 @@ pub fn fetch_database_native_bounded(
         temporary.reserve(encoded_len(&data_source)?)?;
         data_sources.push(data_source);
     }
-    let remote_id = RemoteId::new(database.id.clone());
-    let kind = "notion_database".to_string();
-    budget.account_retained_bytes(remote_id.as_str().len() + kind.len())?;
     let bundle = NotionDatabaseBundle {
         database,
         data_sources,
     };
-    temporary.replace(encoded_len(&bundle)?)?;
-    let raw = encode_native_json_bounded(&bundle, budget)?;
-    Ok(NativeEntity {
-        remote_id,
-        kind,
-        raw,
-    })
+    temporary.replace_and_commit(encoded_len(&bundle)?)?;
+    Ok(bundle)
 }
 
 /// Retrieve a data source's row inventory without assigning snapshot or
@@ -341,7 +363,7 @@ pub fn account_changes_bounded(
     budget.account_changes(change_count, retained_bytes)
 }
 
-fn encoded_len<T: Serialize>(value: &T) -> InitialHydrationResult<usize> {
+pub(crate) fn encoded_len<T: Serialize>(value: &T) -> InitialHydrationResult<usize> {
     struct Counter(usize);
     impl Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {

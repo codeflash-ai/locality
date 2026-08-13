@@ -238,6 +238,23 @@ The host must validate and reconcile the entire result before persisting
 fails, the previous checkpoint remains current so the connector can safely
 replay the batch.
 
+Notion initial hydration has an opt-in `NotionInitialHydrationSession` wrapper
+for hosts that need to drain a large explicit-root bootstrap without repeating
+provider inventory work. The session is created from a configured
+`NotionConnector`, a trusted SHA-256 source-connection identity, a page size,
+and `InitialHydrationLimits`. It owns one shared budget across inventory,
+fetch/media, render, and projection and implements `Connector` for use with the
+ordinary engine pipeline. A fresh session accepts only a bootstrap request with
+no checkpoint. Nonterminal checkpoints are random-nonce, connection, canonical
+root-set, inventory, and next-index bound; they are valid only on that live
+session and are rejected by the base connector. Only the terminal page returns
+the normal durable Notion checkpoint that later synchronization accepts. Hosts
+must publish that terminal checkpoint only with the completely validated
+aggregate. Dropping or failing a session requires a new session, nonce, and
+provider inventory. Every emitted fetch is also bound to the exact source kind
+and provider version observed by that inventory; a rename or edit that changes
+the provider version invalidates the session instead of mixing snapshots.
+
 Apply requests include the core `push_id`, mount ID, approved push plan, and deterministic operation IDs aligned with `plan.operations`. Connectors should use those operation IDs as source-side idempotency keys for block-level API calls when the source supports idempotent writes.
 
 Apply results include changed remote IDs plus operation-level journal effects. Created-block and created-entity effects must include the remote IDs assigned by the source, because reconcile and undo use those IDs to read back, materialize, and reverse appends and creates safely.
