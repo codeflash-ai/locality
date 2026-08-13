@@ -41,7 +41,12 @@ const PORTABLE_NATIVE_KIND: &str = "granola_meeting";
 pub struct GranolaConfig {
     pub api_key: String,
     pub updated_after: Option<String>,
-    pub execution_policy: ConnectorExecutionPolicy,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct GranolaConnectorConfig {
+    config: GranolaConfig,
+    execution_policy: ConnectorExecutionPolicy,
 }
 
 impl GranolaConfig {
@@ -49,7 +54,6 @@ impl GranolaConfig {
         Self {
             api_key: api_key.into(),
             updated_after: None,
-            execution_policy: ConnectorExecutionPolicy::Inline,
         }
     }
 
@@ -58,9 +62,33 @@ impl GranolaConfig {
         self
     }
 
-    pub fn with_execution_policy(mut self, execution_policy: ConnectorExecutionPolicy) -> Self {
-        self.execution_policy = execution_policy;
-        self
+    pub fn with_execution_policy(
+        self,
+        execution_policy: ConnectorExecutionPolicy,
+    ) -> GranolaConnectorConfig {
+        GranolaConnectorConfig {
+            config: self,
+            execution_policy,
+        }
+    }
+}
+
+impl From<GranolaConfig> for GranolaConnectorConfig {
+    fn from(config: GranolaConfig) -> Self {
+        Self {
+            config,
+            execution_policy: ConnectorExecutionPolicy::Inline,
+        }
+    }
+}
+
+impl GranolaConnectorConfig {
+    pub fn config(&self) -> &GranolaConfig {
+        &self.config
+    }
+
+    pub fn execution_policy(&self) -> ConnectorExecutionPolicy {
+        self.execution_policy
     }
 }
 
@@ -69,6 +97,14 @@ impl fmt::Debug for GranolaConfig {
         f.debug_struct("GranolaConfig")
             .field("api_key", &"<redacted>")
             .field("updated_after", &self.updated_after)
+            .finish()
+    }
+}
+
+impl fmt::Debug for GranolaConnectorConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GranolaConnectorConfig")
+            .field("config", &self.config)
             .field("execution_policy", &self.execution_policy)
             .finish()
     }
@@ -77,6 +113,7 @@ impl fmt::Debug for GranolaConfig {
 #[derive(Clone)]
 pub struct GranolaConnector {
     config: GranolaConfig,
+    execution_policy: ConnectorExecutionPolicy,
     api: Arc<dyn GranolaApi>,
 }
 
@@ -89,20 +126,41 @@ impl fmt::Debug for GranolaConnector {
 }
 
 impl GranolaConnector {
-    pub fn new(config: GranolaConfig) -> Self {
+    pub fn new(config: impl Into<GranolaConnectorConfig>) -> Self {
+        let config = config.into();
         let api = Arc::new(HttpGranolaApiClient::with_execution_policy(
-            config.api_key.clone(),
+            config.config.api_key.clone(),
             config.execution_policy,
         ));
-        Self::with_api(config, api)
+        Self {
+            config: config.config,
+            execution_policy: config.execution_policy,
+            api,
+        }
     }
 
     pub fn with_api(config: GranolaConfig, api: Arc<dyn GranolaApi>) -> Self {
-        Self { config, api }
+        Self::with_api_and_execution_policy(config, ConnectorExecutionPolicy::Inline, api)
+    }
+
+    pub fn with_api_and_execution_policy(
+        config: GranolaConfig,
+        execution_policy: ConnectorExecutionPolicy,
+        api: Arc<dyn GranolaApi>,
+    ) -> Self {
+        Self {
+            config,
+            execution_policy,
+            api,
+        }
     }
 
     pub fn config(&self) -> &GranolaConfig {
         &self.config
+    }
+
+    pub fn execution_policy(&self) -> ConnectorExecutionPolicy {
+        self.execution_policy
     }
 
     fn all_notes(&self, updated_after: Option<&str>) -> LocalityResult<Vec<GranolaNoteSummary>> {

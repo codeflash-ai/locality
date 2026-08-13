@@ -75,20 +75,48 @@ struct LinearPortableAttachmentAsset {
 #[derive(Clone, PartialEq, Eq)]
 pub struct LinearConfig {
     pub token: String,
-    pub execution_policy: ConnectorExecutionPolicy,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LinearConnectorConfig {
+    config: LinearConfig,
+    execution_policy: ConnectorExecutionPolicy,
 }
 
 impl LinearConfig {
     pub fn new(token: impl Into<String>) -> Self {
         Self {
             token: token.into(),
-            execution_policy: ConnectorExecutionPolicy::Inline,
         }
     }
 
-    pub fn with_execution_policy(mut self, execution_policy: ConnectorExecutionPolicy) -> Self {
-        self.execution_policy = execution_policy;
-        self
+    pub fn with_execution_policy(
+        self,
+        execution_policy: ConnectorExecutionPolicy,
+    ) -> LinearConnectorConfig {
+        LinearConnectorConfig {
+            config: self,
+            execution_policy,
+        }
+    }
+}
+
+impl From<LinearConfig> for LinearConnectorConfig {
+    fn from(config: LinearConfig) -> Self {
+        Self {
+            config,
+            execution_policy: ConnectorExecutionPolicy::Inline,
+        }
+    }
+}
+
+impl LinearConnectorConfig {
+    pub fn config(&self) -> &LinearConfig {
+        &self.config
+    }
+
+    pub fn execution_policy(&self) -> ConnectorExecutionPolicy {
+        self.execution_policy
     }
 }
 
@@ -96,6 +124,14 @@ impl fmt::Debug for LinearConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LinearConfig")
             .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Debug for LinearConnectorConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LinearConnectorConfig")
+            .field("config", &self.config)
             .field("execution_policy", &self.execution_policy)
             .finish()
     }
@@ -104,6 +140,7 @@ impl fmt::Debug for LinearConfig {
 #[derive(Clone)]
 pub struct LinearConnector {
     config: LinearConfig,
+    execution_policy: ConnectorExecutionPolicy,
     api: Arc<dyn LinearApi>,
 }
 
@@ -116,20 +153,41 @@ impl fmt::Debug for LinearConnector {
 }
 
 impl LinearConnector {
-    pub fn new(config: LinearConfig) -> Self {
+    pub fn new(config: impl Into<LinearConnectorConfig>) -> Self {
+        let config = config.into();
         let api = Arc::new(HttpLinearApiClient::with_execution_policy(
-            config.token.clone(),
+            config.config.token.clone(),
             config.execution_policy,
         ));
-        Self::with_api(config, api)
+        Self {
+            config: config.config,
+            execution_policy: config.execution_policy,
+            api,
+        }
     }
 
     pub fn with_api(config: LinearConfig, api: Arc<dyn LinearApi>) -> Self {
-        Self { config, api }
+        Self::with_api_and_execution_policy(config, ConnectorExecutionPolicy::Inline, api)
+    }
+
+    pub fn with_api_and_execution_policy(
+        config: LinearConfig,
+        execution_policy: ConnectorExecutionPolicy,
+        api: Arc<dyn LinearApi>,
+    ) -> Self {
+        Self {
+            config,
+            execution_policy,
+            api,
+        }
     }
 
     pub fn config(&self) -> &LinearConfig {
         &self.config
+    }
+
+    pub fn execution_policy(&self) -> ConnectorExecutionPolicy {
+        self.execution_policy
     }
 
     pub fn get_issue_context(&self, issue_id: &str) -> LocalityResult<LinearIssueContext> {
