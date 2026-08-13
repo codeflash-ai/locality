@@ -25,6 +25,7 @@ use locality_core::portable::{
 };
 use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::{LocalityError, LocalityResult};
+use serde::{Deserialize, Serialize};
 
 use crate::attachments::{
     DEFAULT_LINEAR_ATTACHMENT_DOWNLOAD_BYTES, enrich_linear_attachment_downloads,
@@ -48,12 +49,28 @@ const TEAM_REMOTE_ID_PREFIX: &str = "team:";
 const TEAM_ISSUES_REMOTE_ID_PREFIX: &str = "team-issues:";
 const TEAM_STATE_REMOTE_ID_PREFIX: &str = "team-state:";
 const LINEAR_CONTEXT_REMOTE_ID_PREFIX: &str = "linear-context:";
+const LINEAR_PORTABLE_NATIVE_KIND: &str = "linear_portable_issue";
 const LINEAR_CONTEXT_KINDS: &[LinearIssueContextKind] = &[
     LinearIssueContextKind::Comments,
     LinearIssueContextKind::Attachments,
     LinearIssueContextKind::PullRequests,
     LinearIssueContextKind::History,
 ];
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct LinearPortableNativeBundle {
+    bundle: LinearNativeBundle,
+    #[serde(default)]
+    attachment_assets: Vec<LinearPortableAttachmentAsset>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LinearPortableAttachmentAsset {
+    issue_id: String,
+    attachment_id: String,
+    logical_path: String,
+    bytes: Vec<u8>,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct LinearConfig {
@@ -324,17 +341,23 @@ impl Connector for LinearConnector {
         })?;
         let mut bundle = serde_json::from_slice::<LinearNativeBundle>(&native.raw)
             .map_err(|error| LocalityError::Io(format!("Linear native decode failed: {error}")))?;
+        let mut attachment_assets = Vec::new();
         if let Some(context) = &mut bundle.context
             && context.kind == LinearIssueContextKind::Attachments
         {
-            let _assets = enrich_linear_attachment_downloads(
+            attachment_assets = enrich_linear_attachment_downloads(
                 &mut context.context,
                 |url, max_bytes| self.download_attachment(url, max_bytes),
                 DEFAULT_LINEAR_ATTACHMENT_DOWNLOAD_BYTES,
-            );
-            native.raw = serde_json::to_vec(&bundle).map_err(|error| {
-                LocalityError::Io(format!("Linear native encode failed: {error}"))
-            })?;
+            )
+            .into_iter()
+            .map(|asset| LinearPortableAttachmentAsset {
+                issue_id: asset.issue_id,
+                attachment_id: asset.attachment_id,
+                logical_path: asset.path.to_string_lossy().replace('\\', "/"),
+                bytes: asset.bytes,
+            })
+            .collect();
         }
         let provider_version = if let Some(context) = &bundle.context {
             Some(crate::render::context_remote_version(
@@ -344,6 +367,12 @@ impl Connector for LinearConnector {
         } else {
             Some(remote_version(&bundle.issue))
         };
+        native.kind = LINEAR_PORTABLE_NATIVE_KIND.to_string();
+        native.raw = serde_json::to_vec(&LinearPortableNativeBundle {
+            bundle,
+            attachment_assets,
+        })
+        .map_err(|error| LocalityError::Io(format!("Linear native encode failed: {error}")))?;
         Ok(PortableFetchResult {
             native,
             provider_version,
@@ -364,8 +393,10 @@ impl Connector for LinearConnector {
         &self,
         request: &PortableRenderRequest,
     ) -> LocalityResult<PortableRenderResult> {
-        let bundle = serde_json::from_slice::<LinearNativeBundle>(&request.native.raw)
-            .map_err(|error| LocalityError::Io(format!("Linear native decode failed: {error}")))?;
+        let LinearPortableNativeBundle {
+            bundle,
+            attachment_assets,
+        } = portable_native_bundle(&request.native)?;
         let (document, canonical_key, projection_key, supported_actions) = if let Some(context) =
             &bundle.context
         {
@@ -411,19 +442,24 @@ impl Connector for LinearConnector {
             media_type: "text/markdown; charset=utf-8".to_string(),
             body: body.clone(),
         };
+        let mut projections = vec![PortableProjectionArtifact {
+            artifact: PortableContentArtifact {
+                artifact_key: projection_key,
+                media_type: "text/markdown; charset=utf-8".to_string(),
+                body,
+            },
+            logical_path: request.logical_path.clone(),
+            file_kind: ProjectionFileKind::Markdown,
+            format_version: request.format_version,
+            supported_actions,
+        }];
+        projections.extend(portable_attachment_projections(
+            attachment_assets,
+            request.format_version,
+        )?);
         Ok(PortableRenderResult {
             canonical: canonical.clone(),
-            projections: vec![PortableProjectionArtifact {
-                artifact: PortableContentArtifact {
-                    artifact_key: projection_key,
-                    media_type: "text/markdown; charset=utf-8".to_string(),
-                    body,
-                },
-                logical_path: request.logical_path.clone(),
-                file_kind: ProjectionFileKind::Markdown,
-                format_version: request.format_version,
-                supported_actions,
-            }],
+            projections,
             completeness: PortableCompleteness::complete(),
         })
     }
@@ -647,6 +683,65 @@ fn linear_context_artifact_key(
         "linear:context:{issue_id}:{}:{role}:v{format_version}",
         kind.as_str()
     ))
+}
+
+fn linear_attachment_artifact_key(
+    issue_id: &str,
+    attachment_id: &str,
+    role: &str,
+    format_version: u32,
+) -> PortableArtifactKey {
+    PortableArtifactKey::new(format!(
+        "linear:attachment:{issue_id}:{attachment_id}:{role}:v{format_version}"
+    ))
+}
+
+fn portable_native_bundle(native: &NativeEntity) -> LocalityResult<LinearPortableNativeBundle> {
+    if native.kind == LINEAR_PORTABLE_NATIVE_KIND {
+        return serde_json::from_slice::<LinearPortableNativeBundle>(&native.raw)
+            .map_err(|error| LocalityError::Io(format!("Linear native decode failed: {error}")));
+    }
+
+    serde_json::from_slice::<LinearNativeBundle>(&native.raw)
+        .map(|bundle| LinearPortableNativeBundle {
+            bundle,
+            attachment_assets: Vec::new(),
+        })
+        .map_err(|error| LocalityError::Io(format!("Linear native decode failed: {error}")))
+}
+
+fn portable_attachment_projections(
+    assets: Vec<LinearPortableAttachmentAsset>,
+    format_version: u32,
+) -> LocalityResult<Vec<PortableProjectionArtifact>> {
+    assets
+        .into_iter()
+        .map(|asset| {
+            let logical_path = LogicalPath::new(asset.logical_path.clone()).map_err(|error| {
+                LocalityError::InvalidState(format!(
+                    "Linear portable attachment path is invalid: {error}"
+                ))
+            })?;
+            Ok(PortableProjectionArtifact {
+                artifact: PortableContentArtifact {
+                    artifact_key: linear_attachment_artifact_key(
+                        &asset.issue_id,
+                        &asset.attachment_id,
+                        "binary",
+                        format_version,
+                    ),
+                    media_type: "application/octet-stream".to_string(),
+                    body: asset.bytes,
+                },
+                logical_path,
+                file_kind: ProjectionFileKind::Binary,
+                format_version,
+                supported_actions: [SourceAction::Read, SourceAction::DownloadAttachment]
+                    .into_iter()
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 fn update_for<'a>(
