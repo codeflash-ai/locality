@@ -68,6 +68,78 @@ batch observation.
 Hosts should use capabilities for scheduling and preflight decisions, not for
 bypassing authoritative push concurrency checks.
 
+## Initial-Hydration Budgets
+
+`locality_connector::hydration_budget` defines an additive, opt-in execution
+budget for initial hydration. A host constructs one `InitialHydrationBudget`
+per job and passes clones of that handle through every stage. A connector must
+not store it on a connector instance or in a process-global cache: clones share
+only the counters and deadline for that one job.
+
+The validated contract independently limits aggregate provider response bytes,
+provider calls and elapsed deadline, inventory items and encoded bytes,
+traversal nodes and depth, connector-native bytes, media assets and decoded
+bytes, rendered content bytes, projection and change counts, and shared
+retained bytes. Multi-dimensional reservations are atomic and use checked
+arithmetic. `Content-Length` is a preflight only; streamed chunks are still
+charged before extending a body buffer. Native JSON is charged from Serde's
+writer before extending its destination, so transformations such as media
+base64 expansion count their actual encoded size. Retained bytes describe live
+logical representations: temporary inventory and cursor encodings are reserved
+while live and released when dropped; a returned native entity retains its raw
+bytes plus identity and kind; and a render retains the canonical JSON encoding
+of the complete returned document, shadow, media metadata, or portable
+projection result. Rendered body bytes remain a separate content dimension and
+are not added to retained bytes a second time. Outputs whose exact size is not
+knowable before provider decoding or rendering are charged before return.
+
+Budget errors contain only a typed resource dimension. Provider response bodies,
+URLs, credentials, and transport messages are not retained. A rate limit keeps
+the provider and `Retry-After` duration as structured fields so the scheduler
+can park the job; the response message remains redacted. Limit and validation
+failures are permanent for that attempt, while rate limits and provider
+unavailability are retryable.
+
+`locality_notion::hydration` provides the first bounded primitives: page and
+database native fetch, recursive block traversal, hosted-media fetch, native
+JSON encoding, ordinary and portable render accounting, and change accounting.
+The production Notion HTTP client rejects oversized declared bodies before
+reading and charges chunked bodies as they stream. Its quota-gate admission,
+request send, and every response read share the same absolute job deadline; an
+expired gate waiter is removed rather than issuing a late request. A huge
+structured `Retry-After` remains intact for scheduling, while internal cooldown
+deadline arithmetic saturates instead of overflowing.
+
+The bounded hosted-media path is deliberately one GET with no redirect and no
+retry. It waits for the reusable transport mutex only within the absolute job
+deadline. Before provider admission, it atomically reserves one exclusive body
+allowance across decoded-media and retained-byte dimensions. Concurrent budget
+clones therefore cannot each allocate against the same remaining bytes. The
+reservation releases in full on error or unwind; success atomically keeps the
+actual body plus returned media-type bytes and releases unused capacity. The
+path counts the provider attempt and every consumed success-body chunk, does
+not consume failure bodies, and rechecks the deadline after transport and read
+waits. Redirects fail closed. Custom media fetchers must explicitly implement
+the bounded single-attempt hook, respect its pre-reserved maximum, and account
+consumed response chunks without charging media bytes again; its default fails
+closed. The public boundary rechecks the deadline and returned body length, so
+a custom fetcher cannot return a late or per-asset-oversized capture as success.
+
+Traversal depth and node capacity are preflighted before each child, data-source,
+or paginated row discovery request. Pagination cursors are retained before they
+enter cycle-detection storage and are released at the end of the operation.
+Existing `NotionApi`,
+`Connector::fetch_portable`, and render behavior remains unchanged unless a
+caller explicitly selects these bounded APIs.
+Custom `NotionApi` implementations fail closed on the bounded methods unless
+they explicitly implement the same accounting; there is no fallback to an
+unbounded provider call.
+
+These primitives deliberately do not claim snapshot authority, persist a
+checkpoint, or create a job session. The follow-up session workflow must own one
+budget from the first provider call through the final unpersisted projection,
+and must commit a checkpoint only after the complete bounded result validates.
+
 ## Batch Observation
 
 `Connector::observe_batch` is the mount-wide metadata discovery contract. A

@@ -7,6 +7,7 @@ use locality_connector::NativeEntity;
 use locality_core::model::{CanonicalDocument, RemoteId};
 use locality_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use locality_core::{LocalityError, LocalityResult};
+use serde::Serialize;
 
 use crate::dto::{
     BlockDto, BlockTreeDto, DateMentionDto, EquationBlockDto, FileBlockDto, LinkToPageBlockDto,
@@ -18,7 +19,7 @@ use crate::media::{
     validate_portable_external_media_url,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct NotionRenderedEntity {
     pub document: CanonicalDocument,
     pub shadow: ShadowDocument,

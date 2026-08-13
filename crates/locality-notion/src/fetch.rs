@@ -47,3 +47,7 @@ fn fetch_block_trees(api: &dyn NotionApi, block_id: &str) -> LocalityResult<Vec<
 fn should_fetch_children_for_render(kind: &str, has_children: bool) -> bool {
     has_children && !matches!(kind, "child_page" | "child_database")
 }
+
+pub(crate) fn should_fetch_children_for_bounded_hydration(kind: &str, has_children: bool) -> bool {
+    should_fetch_children_for_render(kind, has_children)
+}

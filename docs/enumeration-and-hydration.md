@@ -159,6 +159,24 @@ Hydration requests live in `crates/locality-core/src/hydration.rs`.
 - `HydrationReason::is_remote_fast_forward` groups `RemoteFastForward` and
   `LiveModeRemoteFastForward`.
 
+Initial-hydration hosts can opt into the job-scoped limits in
+`locality_connector::hydration_budget`. The current public prerequisite exposes
+bounded Notion client, traversal, native encoding, media, render, projection,
+and change-accounting primitives without changing any existing pull or daemon
+call path. It is not yet a session: a follow-up workflow must create exactly one
+budget per claimed job and carry it across all of those primitives. This avoids
+connector-global counters and ensures that exhausting a provider, traversal,
+media, output, or retained-memory dimension stops before the next corresponding
+request or known-size allocation, and before an unknown-size result can enter a
+retained aggregate. Provider-gate and media-mutex waits share the job's absolute
+deadline. Bounded hosted media makes exactly one non-redirecting GET with no
+retry, atomically owns its decoded/retained byte allowance before provider
+admission, and charges each consumed body chunk. Unused media capacity and
+failed or cancelled reservations are released. Temporary inventories and
+cursors are released from retained accounting when dropped; complete native
+identities, shadows, and portable projection representations remain charged
+while returned.
+
 ## Full Enumeration Triggers
 
 ### Explicit `loc pull` At A Mount Root
