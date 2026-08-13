@@ -11,6 +11,8 @@ const MAX_EXTENSION_LEN: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinearAttachmentAsset {
+    pub issue_id: String,
+    pub attachment_id: String,
     pub path: PathBuf,
     pub bytes: Vec<u8>,
 }
@@ -47,6 +49,8 @@ where
                     error: None,
                 });
                 assets.push(LinearAttachmentAsset {
+                    issue_id: context.issue_id.clone(),
+                    attachment_id: attachment.id.clone(),
                     path: local_path,
                     bytes,
                 });

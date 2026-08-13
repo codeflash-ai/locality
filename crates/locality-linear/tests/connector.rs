@@ -10,7 +10,7 @@ use locality_connector::{
 use locality_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
-use locality_core::portable::{LogicalPath, ProjectionFileKind, SourceConnectionId};
+use locality_core::portable::{LogicalPath, ProjectionFileKind, SourceAction, SourceConnectionId};
 use locality_core::push::RemotePrecondition;
 use locality_core::search::RAW_SEARCH_METADATA_KEY;
 use locality_linear::{
@@ -883,6 +883,26 @@ fn portable_fetch_enriches_linear_attachment_download_status() {
     assert!(attachments.contains("- local_path: .loc/linear/attachments/issue-1-69737375652d31/spec-attach-file-6174746163682d66696c65.pdf"));
     assert!(attachments.contains("- download_status: skipped"));
     assert!(attachments.contains("only HTTP(S) attachment URLs can be downloaded"));
+    let binary = rendered
+        .projections
+        .iter()
+        .find(|projection| projection.file_kind == ProjectionFileKind::Binary)
+        .expect("downloaded attachment binary projection");
+    assert_eq!(
+        binary.artifact.artifact_key.as_str(),
+        "linear:attachment:issue-1:attach-file:binary:v5"
+    );
+    assert_eq!(binary.artifact.media_type, "application/octet-stream");
+    assert_eq!(binary.artifact.body, b"pdf-bytes");
+    assert_eq!(
+        binary.logical_path.as_str(),
+        ".loc/linear/attachments/issue-1-69737375652d31/spec-attach-file-6174746163682d66696c65.pdf"
+    );
+    assert!(
+        binary
+            .supported_actions
+            .contains(&SourceAction::DownloadAttachment)
+    );
     assert_eq!(
         api.download_calls.lock().unwrap().as_slice(),
         &["https://files.linear.app/spec.pdf".to_string()]
