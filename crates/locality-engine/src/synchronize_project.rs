@@ -158,6 +158,32 @@ pub struct BootstrapAggregationLimits {
     pub max_total_content_bytes: u64,
 }
 
+/// Hard bounds for aggregating a paginated v2 synchronization.
+///
+/// The connector's `max_changes` bound is enforced independently on every
+/// dispatched request and response. These limits bound the aggregate work
+/// retained by the engine before a host persists any candidates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SynchronizationAggregationLimits {
+    pub max_checkpoints: usize,
+    pub max_total_changes: usize,
+    pub max_total_content_bytes: u64,
+}
+
+impl SynchronizationAggregationLimits {
+    fn validate(self) -> LocalityResult<Self> {
+        if self.max_checkpoints == 0
+            || self.max_total_changes == 0
+            || self.max_total_content_bytes == 0
+        {
+            return Err(sync_v2_aggregation_error(
+                "portable v2 synchronization aggregation limits must be nonzero",
+            ));
+        }
+        Ok(self)
+    }
+}
+
 impl BootstrapAggregationLimits {
     fn validate(self) -> LocalityResult<Self> {
         if self.max_checkpoints == 0
@@ -481,14 +507,45 @@ pub fn synchronize_and_project_portable_v2<C: Connector + ?Sized>(
     request: PortableSyncRequestV2,
     format_version: u32,
 ) -> LocalityResult<UnpersistedSynchronizationBatchV2> {
+    Ok(
+        synchronize_and_project_portable_v2_page(connector, request, format_version, false, None)?
+            .result,
+    )
+}
+
+struct ProjectedSynchronizationPageV2 {
+    result: UnpersistedSynchronizationBatchV2,
+    covered_root_remote_ids: Vec<RemoteId>,
+    has_checkpoint_continuation: bool,
+    has_exact_scope_coverage: bool,
+}
+
+fn synchronize_and_project_portable_v2_page<C: Connector + ?Sized>(
+    connector: &C,
+    request: PortableSyncRequestV2,
+    format_version: u32,
+    strip_connector_continuation: bool,
+    remaining_aggregate_changes: Option<usize>,
+) -> LocalityResult<ProjectedSynchronizationPageV2> {
     let source_connection_id = request.source_connection_id.clone();
     let scope = request.scope.clone();
     let mode = request.mode;
     let max_changes = request.max_changes;
-    let batch = dispatch_portable_sync_v2(connector, request)?;
+    let mut batch = dispatch_portable_sync_v2(connector, request)?;
     let has_exact_scope_coverage = batch.validate_for_request(&scope, max_changes)?;
+    let covered_root_remote_ids = batch.covered_root_remote_ids.clone();
+    let (has_checkpoint_continuation, preserved_connector_completeness) =
+        completeness_without_continuation(&batch.completeness);
+    if strip_connector_continuation {
+        batch.completeness = preserved_connector_completeness;
+    }
     let authority = batch.authority;
     validate_v2_batch_scope_provenance(&scope, &batch.changes)?;
+    if remaining_aggregate_changes.is_some_and(|remaining| batch.changes.len() > remaining) {
+        return Err(sync_v2_aggregation_error(
+            "portable v2 synchronization aggregation exceeded its change limit",
+        ));
+    }
     let batch = project_batch(
         connector,
         source_connection_id,
@@ -502,15 +559,306 @@ pub fn synchronize_and_project_portable_v2<C: Connector + ?Sized>(
     )?;
     let authorizes_omission = mode == PortableSyncMode::ReconcileScope
         && authority == PortableBatchAuthority::CompleteScopeSnapshot
+        && !has_checkpoint_continuation
         && batch.completeness.is_complete()
         && has_exact_scope_coverage;
-    Ok(UnpersistedSynchronizationBatchV2 {
-        batch,
-        scope,
-        mode,
-        authority,
-        authorizes_omission,
+    Ok(ProjectedSynchronizationPageV2 {
+        result: UnpersistedSynchronizationBatchV2 {
+            batch,
+            scope,
+            mode,
+            authority,
+            authorizes_omission,
+        },
+        covered_root_remote_ids,
+        has_checkpoint_continuation,
+        has_exact_scope_coverage,
     })
+}
+
+/// Run a bounded v2 synchronization through every continuation checkpoint.
+///
+/// Every request is revalidated through [`dispatch_portable_sync_v2`], with
+/// the original connection, scope, mode, hints, and per-response change bound
+/// preserved exactly. Only a continuation request advances the opaque
+/// checkpoint. Omission authority is derived once, after a terminal response,
+/// from the complete aggregate, exact accumulated and terminal root coverage,
+/// and the terminal response's authority.
+pub fn synchronize_and_project_portable_v2_to_completion<C: Connector + ?Sized>(
+    connector: &C,
+    request: PortableSyncRequestV2,
+    format_version: u32,
+    limits: SynchronizationAggregationLimits,
+) -> LocalityResult<UnpersistedSynchronizationBatchV2> {
+    let limits = limits.validate()?;
+    let expected_source_connection_id = request.source_connection_id.clone();
+    let expected_scope = request.scope.clone();
+    let expected_mode = request.mode;
+    let mut current_checkpoint = request.checkpoint.clone();
+    let mut seen_checkpoints = BTreeSet::from([checkpoint_identity(&current_checkpoint)]);
+    let mut aggregate = SynchronizationAggregateV2::new(expected_source_connection_id.clone());
+    let mut checkpoint_count = 0_usize;
+
+    loop {
+        if checkpoint_count >= limits.max_checkpoints {
+            return Err(sync_v2_aggregation_error(
+                "portable v2 synchronization aggregation exceeded its checkpoint limit",
+            ));
+        }
+        checkpoint_count += 1;
+
+        let mut page_request = request.clone();
+        page_request.checkpoint = current_checkpoint.clone();
+        let page = synchronize_and_project_portable_v2_page(
+            connector,
+            page_request,
+            format_version,
+            true,
+            Some(aggregate.remaining_changes(limits)),
+        )?;
+
+        if page.result.batch.source_connection_id != expected_source_connection_id
+            || page.result.scope != expected_scope
+            || page.result.mode != expected_mode
+        {
+            return Err(sync_v2_aggregation_error(
+                "portable v2 synchronization aggregation changed request identity",
+            ));
+        }
+
+        if page.has_checkpoint_continuation {
+            validate_sync_v2_continuation_checkpoint(
+                &current_checkpoint,
+                &page.result.batch.next_checkpoint,
+                &mut seen_checkpoints,
+            )?;
+        }
+
+        let next_checkpoint = page.result.batch.next_checkpoint.clone();
+        let terminal_authority = page.result.authority;
+        let terminal_has_exact_scope_coverage = page.has_exact_scope_coverage;
+        aggregate.push(page.result.batch, page.covered_root_remote_ids, limits)?;
+
+        if !page.has_checkpoint_continuation {
+            return Ok(aggregate.finish(
+                next_checkpoint,
+                expected_scope,
+                expected_mode,
+                terminal_authority,
+                terminal_has_exact_scope_coverage,
+            ));
+        }
+        current_checkpoint = next_checkpoint;
+    }
+}
+
+struct SynchronizationAggregateV2 {
+    source_connection_id: SourceConnectionId,
+    observed_changes: BTreeMap<RemoteId, PortableSourceChange>,
+    source_versions: BTreeMap<RemoteId, ImmutableSourceVersionCandidate>,
+    contents: BTreeMap<PortableArtifactKey, ImmutableContentCandidate>,
+    projections: BTreeMap<PortableArtifactKey, ImmutableProjectionCandidate>,
+    projection_paths: BTreeSet<String>,
+    covered_root_remote_ids: BTreeSet<RemoteId>,
+    completeness: PortableCompleteness,
+    total_changes: usize,
+    total_content_bytes: u64,
+}
+
+impl SynchronizationAggregateV2 {
+    fn new(source_connection_id: SourceConnectionId) -> Self {
+        Self {
+            source_connection_id,
+            observed_changes: BTreeMap::new(),
+            source_versions: BTreeMap::new(),
+            contents: BTreeMap::new(),
+            projections: BTreeMap::new(),
+            projection_paths: BTreeSet::new(),
+            covered_root_remote_ids: BTreeSet::new(),
+            completeness: PortableCompleteness::complete(),
+            total_changes: 0,
+            total_content_bytes: 0,
+        }
+    }
+
+    fn remaining_changes(&self, limits: SynchronizationAggregationLimits) -> usize {
+        limits.max_total_changes.saturating_sub(self.total_changes)
+    }
+
+    fn push(
+        &mut self,
+        page: UnpersistedSynchronizationBatch,
+        covered_root_remote_ids: Vec<RemoteId>,
+        limits: SynchronizationAggregationLimits,
+    ) -> LocalityResult<()> {
+        self.covered_root_remote_ids.extend(covered_root_remote_ids);
+        for source in &page.source_versions {
+            if self
+                .source_versions
+                .contains_key(&source.source_object.remote_id)
+            {
+                return Err(sync_v2_aggregation_error(
+                    "portable v2 synchronization aggregation repeated a source version",
+                ));
+            }
+        }
+        for change in &page.observed_changes {
+            if self
+                .observed_changes
+                .contains_key(&change.source_object.remote_id)
+            {
+                return Err(sync_v2_aggregation_error(
+                    "portable v2 synchronization aggregation repeated an observed source",
+                ));
+            }
+        }
+        for projection in &page.projections {
+            if self.projections.contains_key(&projection.artifact_key) {
+                return Err(sync_v2_aggregation_error(
+                    "portable v2 synchronization aggregation repeated a projection artifact",
+                ));
+            }
+            if self
+                .projection_paths
+                .contains(projection.logical_path.as_str())
+            {
+                return Err(sync_v2_aggregation_error(
+                    "portable v2 synchronization aggregation repeated a logical path",
+                ));
+            }
+        }
+        for content in &page.contents {
+            if self.contents.contains_key(&content.artifact_key) {
+                return Err(sync_v2_aggregation_error(
+                    "portable v2 synchronization aggregation repeated a content artifact",
+                ));
+            }
+        }
+
+        let total_changes = self
+            .total_changes
+            .checked_add(page.observed_changes.len())
+            .ok_or_else(|| {
+                sync_v2_aggregation_error(
+                    "portable v2 synchronization aggregation change count overflowed",
+                )
+            })?;
+        if total_changes > limits.max_total_changes {
+            return Err(sync_v2_aggregation_error(
+                "portable v2 synchronization aggregation exceeded its change limit",
+            ));
+        }
+        let page_content_bytes = page.contents.iter().try_fold(0_u64, |total, content| {
+            total.checked_add(content.byte_length).ok_or_else(|| {
+                sync_v2_aggregation_error(
+                    "portable v2 synchronization aggregation content bytes overflowed",
+                )
+            })
+        })?;
+        let total_content_bytes = self
+            .total_content_bytes
+            .checked_add(page_content_bytes)
+            .ok_or_else(|| {
+                sync_v2_aggregation_error(
+                    "portable v2 synchronization aggregation content bytes overflowed",
+                )
+            })?;
+        if total_content_bytes > limits.max_total_content_bytes {
+            return Err(sync_v2_aggregation_error(
+                "portable v2 synchronization aggregation exceeded its content byte limit",
+            ));
+        }
+
+        self.total_changes = total_changes;
+        self.total_content_bytes = total_content_bytes;
+        self.completeness.merge(page.completeness);
+        self.source_versions.extend(
+            page.source_versions
+                .into_iter()
+                .map(|source| (source.source_object.remote_id.clone(), source)),
+        );
+        self.observed_changes.extend(
+            page.observed_changes
+                .into_iter()
+                .map(|change| (change.source_object.remote_id.clone(), change)),
+        );
+        self.contents.extend(
+            page.contents
+                .into_iter()
+                .map(|content| (content.artifact_key.clone(), content)),
+        );
+        for projection in page.projections {
+            self.projection_paths
+                .insert(projection.logical_path.as_str().to_string());
+            self.projections
+                .insert(projection.artifact_key.clone(), projection);
+        }
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        next_checkpoint: locality_connector::PortableCheckpoint,
+        scope: PortableSourceScope,
+        mode: PortableSyncMode,
+        authority: PortableBatchAuthority,
+        terminal_has_exact_scope_coverage: bool,
+    ) -> UnpersistedSynchronizationBatchV2 {
+        let requested_roots = scope
+            .root_remote_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let publication_eligible = self.completeness.is_complete();
+        let authorizes_omission = mode == PortableSyncMode::ReconcileScope
+            && authority == PortableBatchAuthority::CompleteScopeSnapshot
+            && publication_eligible
+            && terminal_has_exact_scope_coverage
+            && self.covered_root_remote_ids == requested_roots;
+        UnpersistedSynchronizationBatchV2 {
+            batch: UnpersistedSynchronizationBatch {
+                source_connection_id: self.source_connection_id,
+                observed_changes: self.observed_changes.into_values().collect(),
+                source_versions: self.source_versions.into_values().collect(),
+                contents: self.contents.into_values().collect(),
+                projections: self.projections.into_values().collect(),
+                next_checkpoint,
+                completeness: self.completeness,
+                publication_eligible,
+            },
+            scope,
+            mode,
+            authority,
+            authorizes_omission,
+        }
+    }
+}
+
+fn validate_sync_v2_continuation_checkpoint(
+    current: &locality_connector::PortableCheckpoint,
+    next: &locality_connector::PortableCheckpoint,
+    seen: &mut BTreeSet<(u16, String)>,
+) -> LocalityResult<()> {
+    if next.opaque.is_empty() {
+        return Err(sync_v2_aggregation_error(
+            "portable v2 synchronization returned an empty next checkpoint",
+        ));
+    }
+    if current == next {
+        return Err(sync_v2_aggregation_error(
+            "portable v2 synchronization did not advance its checkpoint",
+        ));
+    }
+    if !seen.insert(checkpoint_identity(next)) {
+        return Err(sync_v2_aggregation_error(
+            "portable v2 synchronization formed a checkpoint cycle",
+        ));
+    }
+    Ok(())
+}
+
+fn sync_v2_aggregation_error(message: &'static str) -> LocalityError {
+    LocalityError::InvalidState(message.to_string())
 }
 
 fn validate_v2_batch_scope_provenance(

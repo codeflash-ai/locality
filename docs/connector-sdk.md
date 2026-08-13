@@ -108,6 +108,25 @@ every requested root; missing coverage never can. The v2 result's scope, mode,
 connector authority, completeness, and derived flag are private and available
 only through read-only accessors.
 
+Hosts that need to consume a checkpointed v2 result can use
+`synchronize_and_project_portable_v2_to_completion` with explicit aggregate
+checkpoint, change, and content-byte limits. The engine preserves the original
+connection, scope, mode, hints, and per-response `max_changes` across every
+validated dispatcher call; only a continuation request substitutes the next
+opaque checkpoint. Continuation checkpoints must be nonempty, advancing, and
+acyclic, while a terminal connector may legitimately return an empty or
+unchanged stateless checkpoint. Cross-page source, artifact, and path identity
+collisions fail closed; repeated covered roots are idempotent because terminal
+snapshot coverage repeats roots reported by intermediate pages. Continuation
+is pagination control flow, while every other connector, fetch, and render
+incompleteness remains in the aggregate. The aggregate change limit is checked
+after response validation but before fetch/render; content bytes are bounded
+after rendering. For requested roots A+B, an intermediate page may cover A and
+the terminal `CompleteScopeSnapshot` page must itself cover A+B. Omission is
+derived only after that terminal response, and requires both accumulated and
+terminal coverage to equal the requested roots; authority from an intermediate
+page is never carried forward.
+
 `dispatch_portable_sync_v2` is the validated trust boundary. It validates the
 request and then calls the connector's `sync_portable_v2_impl` hook. The default
 hook forwards legacy remote-ID hints to `sync_portable` and converts every
