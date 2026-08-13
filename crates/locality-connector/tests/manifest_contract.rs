@@ -186,7 +186,15 @@ fn hosted_connector_products_match_descriptive_registry() {
             .iter()
             .map(|product| product.provider_kind)
             .collect::<Vec<_>>(),
-        vec!["notion", "google-docs", "google-calendar", "gmail", "slack"]
+        vec![
+            "notion",
+            "google-docs",
+            "google-calendar",
+            "gmail",
+            "granola",
+            "linear",
+            "slack"
+        ]
     );
 
     for product in HOSTED_CONNECTOR_PRODUCTS {

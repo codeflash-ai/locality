@@ -40,6 +40,20 @@ pub const GMAIL_PRODUCT: HostedConnectorProduct = HostedConnectorProduct {
     content_plural: "labels",
 };
 
+pub const GRANOLA_PRODUCT: HostedConnectorProduct = HostedConnectorProduct {
+    provider_kind: "granola",
+    display_name: "Granola",
+    content_singular: "meeting",
+    content_plural: "meetings",
+};
+
+pub const LINEAR_PRODUCT: HostedConnectorProduct = HostedConnectorProduct {
+    provider_kind: "linear",
+    display_name: "Linear",
+    content_singular: "issue",
+    content_plural: "issues",
+};
+
 pub const SLACK_PRODUCT: HostedConnectorProduct = HostedConnectorProduct {
     provider_kind: "slack",
     display_name: "Slack",
@@ -52,6 +66,8 @@ pub const HOSTED_CONNECTOR_PRODUCTS: &[HostedConnectorProduct] = &[
     GOOGLE_DOCS_PRODUCT,
     GOOGLE_CALENDAR_PRODUCT,
     GMAIL_PRODUCT,
+    GRANOLA_PRODUCT,
+    LINEAR_PRODUCT,
     SLACK_PRODUCT,
 ];
 
@@ -60,4 +76,19 @@ pub fn hosted_connector_product(provider_kind: &str) -> Option<&'static HostedCo
     HOSTED_CONNECTOR_PRODUCTS
         .iter()
         .find(|product| product.provider_kind == provider_kind)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GRANOLA_PRODUCT, LINEAR_PRODUCT, hosted_connector_product};
+
+    #[test]
+    fn hosted_connector_product_finds_granola_metadata() {
+        assert_eq!(hosted_connector_product("granola"), Some(&GRANOLA_PRODUCT));
+    }
+
+    #[test]
+    fn hosted_connector_product_finds_linear_metadata() {
+        assert_eq!(hosted_connector_product("linear"), Some(&LINEAR_PRODUCT));
+    }
 }

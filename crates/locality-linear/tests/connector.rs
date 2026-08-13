@@ -3,11 +3,14 @@ use std::sync::{Arc, Mutex};
 
 use locality_connector::{
     ApplyPlanRequest, BatchObserveRequest, ChildContainer, Connector, ConnectorCheckpoint,
-    EnumerateRequest, ListChildrenRequest, ObserveRequest,
+    ConnectorExecutionPolicy, EnumerateRequest, ListChildrenRequest, ObserveRequest,
+    PortableBootstrapRequest, PortableCheckpoint, PortableFetchReason, PortableFetchRequest,
+    PortableRenderRequest, PortableSourceScope, PortableSyncRequest,
 };
 use locality_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
+use locality_core::portable::{LogicalPath, ProjectionFileKind, SourceConnectionId};
 use locality_core::push::RemotePrecondition;
 use locality_core::search::RAW_SEARCH_METADATA_KEY;
 use locality_linear::{
@@ -564,6 +567,211 @@ fn apply_rejects_linear_context_remote_ids_as_read_only() {
     assert!(api.updates.lock().unwrap().is_empty());
 }
 
+#[test]
+fn portable_bootstrap_returns_issue_and_context_document_changes() {
+    let api = Arc::new(FakeLinearApi::with_issues(vec![issue()]));
+    let connector = LinearConnector::with_api(LinearConfig::new("secret"), api);
+
+    let batch = connector
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("linear-connection"),
+            scope: PortableSourceScope::explicit_roots(Vec::<RemoteId>::new()),
+            checkpoint: None,
+            max_changes: 100,
+        })
+        .expect("portable bootstrap");
+
+    assert!(batch.completeness.is_complete());
+    assert_eq!(
+        batch
+            .changes
+            .iter()
+            .map(|change| (
+                change.source_object.remote_id.as_str().to_string(),
+                change.source_object.kind.clone(),
+                change
+                    .logical_path
+                    .as_ref()
+                    .map(|path| path.as_str().to_string()),
+                change.requires_fetch,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "linear-context:issue-1:attachments".to_string(),
+                EntityKind::Asset,
+                Some("Teams/Engineering/Issues/Todo/ENG-1 Improve sync/attachments.md".to_string()),
+                true,
+            ),
+            (
+                "linear-context:issue-1:comments".to_string(),
+                EntityKind::Asset,
+                Some("Teams/Engineering/Issues/Todo/ENG-1 Improve sync/comments.md".to_string()),
+                true,
+            ),
+            (
+                "linear-context:issue-1:history".to_string(),
+                EntityKind::Asset,
+                Some("Teams/Engineering/Issues/Todo/ENG-1 Improve sync/history.md".to_string()),
+                true,
+            ),
+            (
+                "issue-1".to_string(),
+                EntityKind::Page,
+                Some("Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md".to_string()),
+                true,
+            ),
+            (
+                "linear-context:issue-1:pull-requests".to_string(),
+                EntityKind::Asset,
+                Some(
+                    "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/pull-requests.md".to_string()
+                ),
+                true,
+            ),
+        ]
+    );
+}
+
+#[test]
+fn portable_sync_uses_updated_after_checkpoint_json_shape() {
+    let api = Arc::new(FakeLinearApi::with_issues(vec![issue()]));
+    let connector = LinearConnector::with_api(LinearConfig::new("secret"), api.clone());
+
+    let batch = connector
+        .sync_portable(PortableSyncRequest {
+            source_connection_id: SourceConnectionId::new("linear-connection"),
+            scope: PortableSourceScope::explicit_roots(Vec::<RemoteId>::new()),
+            checkpoint: PortableCheckpoint {
+                format_version: 1,
+                opaque: serde_json::json!({ "updated_after": "2026-07-14T00:00:00Z" }).to_string(),
+            },
+            hints: Vec::new(),
+            max_changes: 100,
+        })
+        .expect("portable sync");
+
+    assert!(batch.completeness.is_complete());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&batch.next_checkpoint.opaque)
+            .expect("checkpoint json"),
+        serde_json::json!({ "updated_after": "2026-07-15T12:00:00Z" })
+    );
+    assert_eq!(
+        api.list_calls.lock().unwrap().as_slice(),
+        &[(Some("2026-07-14T00:00:00Z".to_string()), None)]
+    );
+}
+
+#[test]
+fn portable_fetch_and_render_issue_page_and_context_sidecar() {
+    let api = Arc::new(FakeLinearApi::with_issues(vec![issue()]));
+    let connector = LinearConnector::with_api(LinearConfig::new("secret"), api);
+
+    let issue_fetch = connector
+        .fetch_portable(PortableFetchRequest {
+            source_connection_id: SourceConnectionId::new("linear-connection"),
+            remote_id: RemoteId::new("issue-1"),
+            reason: PortableFetchReason::Bootstrap,
+        })
+        .expect("portable issue fetch");
+    assert_eq!(
+        issue_fetch.provider_version.as_deref(),
+        Some("linear:issue-1:2026-07-15T12:00:00Z")
+    );
+    let issue_render = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("linear-connection"),
+            logical_path: LogicalPath::new(
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md",
+            )
+            .expect("issue logical path"),
+            native: issue_fetch.native,
+            format_version: 5,
+        })
+        .expect("portable issue render");
+    assert_eq!(
+        issue_render.canonical.artifact_key.as_str(),
+        "linear:issue:issue-1:canonical:v5"
+    );
+    assert_eq!(issue_render.projections.len(), 1);
+    assert_eq!(
+        issue_render.projections[0].artifact.artifact_key.as_str(),
+        "linear:issue:issue-1:page:v5"
+    );
+    assert_eq!(
+        issue_render.projections[0].logical_path.as_str(),
+        "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md"
+    );
+    assert_eq!(
+        issue_render.projections[0].file_kind,
+        ProjectionFileKind::Markdown
+    );
+    let issue_markdown =
+        String::from_utf8(issue_render.projections[0].artifact.body.clone()).expect("utf8");
+    assert!(issue_markdown.starts_with("---\nloc:\n  id: issue-1\n"));
+    assert!(issue_markdown.ends_with("Existing description.\n"));
+
+    let context_fetch = connector
+        .fetch_portable(PortableFetchRequest {
+            source_connection_id: SourceConnectionId::new("linear-connection"),
+            remote_id: RemoteId::new("linear-context:issue-1:comments"),
+            reason: PortableFetchReason::Bootstrap,
+        })
+        .expect("portable context fetch");
+    assert_eq!(
+        context_fetch.provider_version.as_deref(),
+        Some("linear-context:issue-1:comments:2026-07-15T12:00:00Z")
+    );
+    let context_render = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("linear-connection"),
+            logical_path: LogicalPath::new(
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/comments.md",
+            )
+            .expect("context logical path"),
+            native: context_fetch.native,
+            format_version: 5,
+        })
+        .expect("portable context render");
+    assert_eq!(
+        context_render.canonical.artifact_key.as_str(),
+        "linear:context:issue-1:comments:canonical:v5"
+    );
+    assert_eq!(
+        context_render.projections[0].artifact.artifact_key.as_str(),
+        "linear:context:issue-1:comments:markdown:v5"
+    );
+    assert_eq!(
+        context_render.projections[0].logical_path.as_str(),
+        "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/comments.md"
+    );
+    let comments =
+        String::from_utf8(context_render.projections[0].artifact.body.clone()).expect("utf8");
+    assert!(comments.starts_with("---\nloc:\n  id: \"linear-context:issue-1:comments\"\n"));
+    assert!(comments.contains("# Comments\n\n"));
+}
+
+#[test]
+fn portable_linear_config_supports_execution_policy_parity() {
+    let config = LinearConfig::new("secret")
+        .with_execution_policy(ConnectorExecutionPolicy::DeferProviderCooldown);
+    assert_eq!(
+        config.execution_policy,
+        ConnectorExecutionPolicy::DeferProviderCooldown
+    );
+
+    let connector = LinearConnector::with_api(
+        LinearConfig::new("secret"),
+        Arc::new(FakeLinearApi::with_issues(vec![issue()])),
+    );
+    let deferred = connector.with_execution_policy(ConnectorExecutionPolicy::DeferProviderCooldown);
+    assert_eq!(
+        deferred.config().execution_policy,
+        ConnectorExecutionPolicy::DeferProviderCooldown
+    );
+}
+
 fn entry_paths(entries: &[locality_core::model::TreeEntry]) -> Vec<String> {
     entries
         .iter()
@@ -575,6 +783,7 @@ fn entry_paths(entries: &[locality_core::model::TreeEntry]) -> Vec<String> {
 struct FakeLinearApi {
     issues: Mutex<Vec<LinearIssue>>,
     contexts: Mutex<BTreeMap<String, LinearIssueContext>>,
+    list_calls: Mutex<Vec<(Option<String>, Option<String>)>>,
     updates: Mutex<Vec<LinearIssueUpdateInput>>,
 }
 
@@ -587,6 +796,7 @@ impl FakeLinearApi {
         Self {
             issues: Mutex::new(issues),
             contexts: Mutex::new(contexts),
+            list_calls: Mutex::new(Vec::new()),
             updates: Mutex::new(Vec::new()),
         }
     }
@@ -596,9 +806,13 @@ impl LinearApi for FakeLinearApi {
     fn list_issues(
         &self,
         _cursor: Option<&str>,
-        _updated_after: Option<&str>,
+        updated_after: Option<&str>,
         team_id: Option<&str>,
     ) -> locality_core::LocalityResult<LinearIssuePage> {
+        self.list_calls.lock().unwrap().push((
+            updated_after.map(str::to_string),
+            team_id.map(str::to_string),
+        ));
         let issues = self
             .issues
             .lock()
