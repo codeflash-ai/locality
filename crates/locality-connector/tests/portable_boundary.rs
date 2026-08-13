@@ -1,14 +1,21 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, NativeEntity,
-    ParsedEntity, PortableBootstrapRequest, PortableEnumerateRequest, PortableFetchReason,
-    PortableFetchRequest, PortableSourceScope,
+    PORTABLE_SYNC_V2_MAX_CHANGES, PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES,
+    PORTABLE_SYNC_V2_MAX_HINTS, PORTABLE_SYNC_V2_MAX_ID_BYTES,
+    PORTABLE_SYNC_V2_MAX_PROVIDER_VERSION_BYTES, PORTABLE_SYNC_V2_MAX_SCOPE_ROOTS,
+    PORTABLE_SYNC_V2_MAX_SOURCE_KIND_BYTES, ParsedEntity, PortableBatchAuthority,
+    PortableBootstrapRequest, PortableChangeBatch, PortableChangeBatchV2, PortableCheckpoint,
+    PortableCompleteness, PortableEnumerateRequest, PortableFetchReason, PortableFetchRequest,
+    PortableSourceChange, PortableSourceScope, PortableSyncHint, PortableSyncHintV2,
+    PortableSyncMode, PortableSyncRequest, PortableSyncRequestV2,
 };
 use locality_core::LocalityResult;
-use locality_core::model::{CanonicalDocument, TreeEntry};
-use locality_core::portable::SourceConnectionId;
+use locality_core::model::{CanonicalDocument, EntityKind, TreeEntry};
+use locality_core::portable::{LogicalPath, SourceConnectionId, SourceObject};
+use serde_json::json;
 
 #[derive(Clone)]
 struct LegacyOnlyConnector;
@@ -103,5 +110,445 @@ fn legacy_connectors_compile_and_do_not_invent_portable_identity() {
     assert_eq!(
         error,
         locality_core::LocalityError::Unsupported("connector does not support portable fetch")
+    );
+}
+
+#[test]
+fn portable_batch_authority_defaults_to_incremental_and_rejects_unknown_values() {
+    let complete = PortableChangeBatchV2 {
+        changes: Vec::new(),
+        next_checkpoint: PortableCheckpoint {
+            format_version: 7,
+            opaque: r#"{"provider_cursor":"keep-opaque"}"#.to_string(),
+        },
+        completeness: PortableCompleteness::complete(),
+        covered_root_remote_ids: vec![locality_core::model::RemoteId::new("root-1")],
+        authority: PortableBatchAuthority::CompleteScopeSnapshot,
+    };
+    let serialized = serde_json::to_value(&complete).expect("portable batch JSON");
+    assert_eq!(
+        serialized.get("authority"),
+        Some(&json!("complete_scope_snapshot"))
+    );
+
+    let mut legacy = serialized.clone();
+    legacy
+        .as_object_mut()
+        .expect("portable batch object")
+        .remove("authority");
+    let legacy: PortableChangeBatchV2 =
+        serde_json::from_value(legacy).expect("v2 batch without authority");
+    assert_eq!(legacy.authority, PortableBatchAuthority::Incremental);
+    assert_eq!(
+        legacy.next_checkpoint.opaque,
+        r#"{"provider_cursor":"keep-opaque"}"#
+    );
+
+    let mut without_coverage = serialized.clone();
+    without_coverage
+        .as_object_mut()
+        .expect("portable batch object")
+        .remove("covered_root_remote_ids");
+    let without_coverage: PortableChangeBatchV2 =
+        serde_json::from_value(without_coverage).expect("v2 batch without coverage");
+    assert!(without_coverage.covered_root_remote_ids.is_empty());
+    assert!(
+        !without_coverage
+            .has_exact_scope_coverage(&PortableSourceScope::explicit_roots([
+                locality_core::model::RemoteId::new("root-1"),
+            ]))
+            .expect("missing coverage is non-authoritative")
+    );
+
+    let mut unknown = serialized;
+    unknown["authority"] = json!("future_authority");
+    assert!(serde_json::from_value::<PortableChangeBatchV2>(unknown).is_err());
+}
+
+#[test]
+fn legacy_portable_sync_wire_shape_remains_unchanged() {
+    let request = PortableSyncRequest {
+        source_connection_id: SourceConnectionId::new("source-1"),
+        scope: PortableSourceScope::explicit_roots([locality_core::model::RemoteId::new("root-1")]),
+        checkpoint: PortableCheckpoint {
+            format_version: 3,
+            opaque: "provider-owned-not-host-json".to_string(),
+        },
+        hints: vec![PortableSyncHint {
+            remote_id: locality_core::model::RemoteId::new("page-1"),
+        }],
+        max_changes: 50,
+    };
+    assert_eq!(
+        serde_json::to_value(&request).expect("legacy portable sync request JSON"),
+        json!({
+            "source_connection_id": "source-1",
+            "scope": { "root_remote_ids": ["root-1"] },
+            "checkpoint": {
+                "format_version": 3,
+                "opaque": "provider-owned-not-host-json"
+            },
+            "hints": [{ "remote_id": "page-1" }],
+            "max_changes": 50
+        })
+    );
+    let batch = PortableChangeBatch {
+        changes: Vec::new(),
+        next_checkpoint: request.checkpoint,
+        completeness: PortableCompleteness::complete(),
+    };
+    assert!(
+        serde_json::to_value(batch)
+            .expect("legacy portable batch JSON")
+            .get("authority")
+            .is_none()
+    );
+}
+
+#[test]
+fn portable_sync_v2_defaults_mode_and_prior_metadata_but_requires_owning_root() {
+    let v2_without_additive_fields = json!({
+        "source_connection_id": "source-1",
+        "scope": { "root_remote_ids": ["root-1"] },
+        "checkpoint": {
+            "format_version": 3,
+            "opaque": "provider-owned-not-host-json"
+        },
+        "hints": [{ "remote_id": "page-1" }],
+        "max_changes": 50
+    });
+    let request: PortableSyncRequestV2 = serde_json::from_value(v2_without_additive_fields)
+        .expect("v2 portable sync request with defaulted fields");
+    assert_eq!(request.mode, PortableSyncMode::HintsOnly);
+    assert_eq!(request.checkpoint.opaque, "provider-owned-not-host-json");
+    assert_eq!(request.hints.len(), 1);
+    assert_eq!(request.hints[0].provider_version, None);
+    assert_eq!(request.hints[0].logical_path, None);
+    assert_eq!(request.hints[0].source_kind, None);
+    assert_eq!(request.hints[0].owning_root_remote_id, None);
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(
+            "portable sync v2 hint must include an owning root".to_string()
+        ))
+    );
+    assert_eq!(
+        serde_json::to_value(&request.hints[0]).expect("portable sync hint JSON"),
+        json!({ "remote_id": "page-1" })
+    );
+
+    let rich_hint = PortableSyncHintV2 {
+        remote_id: locality_core::model::RemoteId::new("page-2"),
+        provider_version: Some("provider-version-2".to_string()),
+        logical_path: Some(LogicalPath::new("Roadmap/page.md").expect("logical path")),
+        source_kind: Some(EntityKind::Page),
+        owning_root_remote_id: Some(locality_core::model::RemoteId::new("root-1")),
+    };
+    assert_eq!(
+        serde_json::to_value(rich_hint).expect("rich portable sync hint JSON"),
+        json!({
+            "remote_id": "page-2",
+            "provider_version": "provider-version-2",
+            "logical_path": "Roadmap/page.md",
+            "source_kind": "page",
+            "owning_root_remote_id": "root-1"
+        })
+    );
+
+    let mut unknown = serde_json::to_value(request).expect("portable sync request JSON");
+    unknown["mode"] = json!("future_mode");
+    assert!(serde_json::from_value::<PortableSyncRequestV2>(unknown).is_err());
+}
+
+fn valid_v2_request(hints: Vec<PortableSyncHintV2>) -> PortableSyncRequestV2 {
+    PortableSyncRequestV2 {
+        source_connection_id: SourceConnectionId::new("source-1"),
+        scope: PortableSourceScope::explicit_roots([locality_core::model::RemoteId::new("root-1")]),
+        checkpoint: PortableCheckpoint {
+            format_version: 1,
+            opaque: "checkpoint".to_string(),
+        },
+        mode: PortableSyncMode::HintsOnly,
+        hints,
+        max_changes: 100,
+    }
+}
+
+fn valid_v2_hint(remote_id: impl Into<String>) -> PortableSyncHintV2 {
+    PortableSyncHintV2 {
+        remote_id: locality_core::model::RemoteId::new(remote_id),
+        provider_version: None,
+        logical_path: None,
+        source_kind: None,
+        owning_root_remote_id: Some(locality_core::model::RemoteId::new("root-1")),
+    }
+}
+
+#[test]
+fn portable_sync_v2_enforces_exact_metadata_bounds() {
+    let hints = (0..PORTABLE_SYNC_V2_MAX_HINTS)
+        .map(|index| valid_v2_hint(format!("page-{index}")))
+        .collect::<Vec<_>>();
+    let mut request = valid_v2_request(hints);
+    request.validate().expect("exact hint ceiling");
+    request.hints.push(valid_v2_hint("one-too-many"));
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 has {} hints; maximum is {}",
+            PORTABLE_SYNC_V2_MAX_HINTS + 1,
+            PORTABLE_SYNC_V2_MAX_HINTS
+        )))
+    );
+
+    let mut request = valid_v2_request(vec![valid_v2_hint(
+        "a".repeat(PORTABLE_SYNC_V2_MAX_ID_BYTES),
+    )]);
+    request.validate().expect("exact ID ceiling");
+    request.hints[0].remote_id =
+        locality_core::model::RemoteId::new("a".repeat(PORTABLE_SYNC_V2_MAX_ID_BYTES + 1));
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 hint remote ID must contain 1..={} UTF-8 bytes",
+            PORTABLE_SYNC_V2_MAX_ID_BYTES
+        )))
+    );
+
+    request = valid_v2_request(vec![valid_v2_hint("page-1")]);
+    request.hints[0].provider_version =
+        Some("v".repeat(PORTABLE_SYNC_V2_MAX_PROVIDER_VERSION_BYTES));
+    request.validate().expect("exact provider-version ceiling");
+    request.hints[0].provider_version =
+        Some("v".repeat(PORTABLE_SYNC_V2_MAX_PROVIDER_VERSION_BYTES + 1));
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 provider version exceeds {} UTF-8 bytes",
+            PORTABLE_SYNC_V2_MAX_PROVIDER_VERSION_BYTES
+        )))
+    );
+
+    request = valid_v2_request(vec![valid_v2_hint("page-1")]);
+    request.hints[0].source_kind = Some(EntityKind::Unknown(
+        "k".repeat(PORTABLE_SYNC_V2_MAX_SOURCE_KIND_BYTES),
+    ));
+    request.validate().expect("exact source-kind ceiling");
+    request.hints[0].source_kind = Some(EntityKind::Unknown(
+        "k".repeat(PORTABLE_SYNC_V2_MAX_SOURCE_KIND_BYTES + 1),
+    ));
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 source kind exceeds {} UTF-8 bytes",
+            PORTABLE_SYNC_V2_MAX_SOURCE_KIND_BYTES
+        )))
+    );
+
+    request = valid_v2_request(Vec::new());
+    request.checkpoint.opaque = "c".repeat(PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES);
+    request.validate().expect("exact checkpoint ceiling");
+    request.checkpoint.opaque = "c".repeat(PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES + 1);
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 checkpoint is {} UTF-8 bytes; maximum is {}",
+            PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES + 1,
+            PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES
+        )))
+    );
+}
+
+#[test]
+fn portable_sync_v2_bounds_scope_and_provider_work_before_dispatch() {
+    let mut request = valid_v2_request(Vec::new());
+    request.scope.root_remote_ids.clear();
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(
+            "portable sync v2 scope must contain at least one root".to_string()
+        ))
+    );
+
+    request = valid_v2_request(Vec::new());
+    request.scope.root_remote_ids = (0..PORTABLE_SYNC_V2_MAX_SCOPE_ROOTS)
+        .map(|index| locality_core::model::RemoteId::new(format!("root-{index}")))
+        .collect();
+    request.validate().expect("exact scope-root ceiling");
+    request
+        .scope
+        .root_remote_ids
+        .push(locality_core::model::RemoteId::new("one-too-many"));
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 has {} scope roots; maximum is {}",
+            PORTABLE_SYNC_V2_MAX_SCOPE_ROOTS + 1,
+            PORTABLE_SYNC_V2_MAX_SCOPE_ROOTS
+        )))
+    );
+
+    request = valid_v2_request(Vec::new());
+    request.max_changes = PORTABLE_SYNC_V2_MAX_CHANGES;
+    request.validate().expect("exact max_changes ceiling");
+    request.max_changes = 0;
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 max_changes must be in 1..={}",
+            PORTABLE_SYNC_V2_MAX_CHANGES
+        )))
+    );
+    request.max_changes = PORTABLE_SYNC_V2_MAX_CHANGES + 1;
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 max_changes must be in 1..={}",
+            PORTABLE_SYNC_V2_MAX_CHANGES
+        )))
+    );
+}
+
+#[test]
+fn portable_sync_v2_bounds_explicit_response_coverage() {
+    let scope = PortableSourceScope::explicit_roots(
+        (0..PORTABLE_SYNC_V2_MAX_SCOPE_ROOTS)
+            .map(|index| locality_core::model::RemoteId::new(format!("root-{index}"))),
+    );
+    let mut batch = PortableChangeBatchV2 {
+        changes: Vec::new(),
+        next_checkpoint: PortableCheckpoint {
+            format_version: 1,
+            opaque: "covered".to_string(),
+        },
+        completeness: PortableCompleteness::complete(),
+        covered_root_remote_ids: scope.root_remote_ids.clone(),
+        authority: PortableBatchAuthority::CompleteScopeSnapshot,
+    };
+    assert!(
+        batch
+            .has_exact_scope_coverage(&scope)
+            .expect("exact response coverage ceiling")
+    );
+    batch
+        .covered_root_remote_ids
+        .push(locality_core::model::RemoteId::new("one-too-many"));
+    assert_eq!(
+        batch.has_exact_scope_coverage(&scope),
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 batch covers {} scope roots; maximum is {}",
+            PORTABLE_SYNC_V2_MAX_SCOPE_ROOTS + 1,
+            PORTABLE_SYNC_V2_MAX_SCOPE_ROOTS
+        )))
+    );
+
+    batch.covered_root_remote_ids = vec![locality_core::model::RemoteId::new("")];
+    assert_eq!(
+        batch.has_exact_scope_coverage(&scope),
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 covered root remote ID must contain 1..={} UTF-8 bytes",
+            PORTABLE_SYNC_V2_MAX_ID_BYTES
+        )))
+    );
+    batch.covered_root_remote_ids = vec![locality_core::model::RemoteId::new(
+        "r".repeat(PORTABLE_SYNC_V2_MAX_ID_BYTES + 1),
+    )];
+    assert_eq!(
+        batch.has_exact_scope_coverage(&scope),
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 covered root remote ID must contain 1..={} UTF-8 bytes",
+            PORTABLE_SYNC_V2_MAX_ID_BYTES
+        )))
+    );
+}
+
+#[test]
+fn portable_sync_v2_bounds_response_changes_at_global_ceiling() {
+    let scope =
+        PortableSourceScope::explicit_roots([locality_core::model::RemoteId::new("root-1")]);
+    let change = PortableSourceChange {
+        source_object: SourceObject {
+            source_connection_id: SourceConnectionId::new("source-1"),
+            remote_id: locality_core::model::RemoteId::new("page-1"),
+            kind: EntityKind::Page,
+            edges: Vec::new(),
+            opaque_version: None,
+            deleted: false,
+            connector_metadata: BTreeMap::new(),
+            acl_observations: Vec::new(),
+            discovered_at: None,
+            observed_at: None,
+        },
+        logical_path: None,
+        requires_fetch: false,
+    };
+    let mut batch = PortableChangeBatchV2 {
+        changes: vec![change.clone(); PORTABLE_SYNC_V2_MAX_CHANGES as usize],
+        next_checkpoint: PortableCheckpoint {
+            format_version: 1,
+            opaque: "c".repeat(PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES),
+        },
+        completeness: PortableCompleteness::complete(),
+        covered_root_remote_ids: scope.root_remote_ids.clone(),
+        authority: PortableBatchAuthority::Incremental,
+    };
+    assert!(
+        batch
+            .validate_for_request(&scope, PORTABLE_SYNC_V2_MAX_CHANGES)
+            .expect("response exactly at global change and checkpoint ceilings")
+    );
+    batch.changes.push(change);
+    assert_eq!(
+        batch.validate_for_request(&scope, PORTABLE_SYNC_V2_MAX_CHANGES),
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 batch has {} changes; request maximum is {}",
+            PORTABLE_SYNC_V2_MAX_CHANGES + 1,
+            PORTABLE_SYNC_V2_MAX_CHANGES
+        )))
+    );
+}
+
+#[test]
+fn portable_sync_v2_rejects_duplicate_ids_and_out_of_scope_owners() {
+    let request = valid_v2_request(vec![valid_v2_hint("page-1"), valid_v2_hint("page-1")]);
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(
+            "portable sync v2 contains duplicate hint remote IDs".to_string()
+        ))
+    );
+
+    let mut request = valid_v2_request(vec![valid_v2_hint("page-1")]);
+    request.hints[0].owning_root_remote_id = None;
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(
+            "portable sync v2 hint must include an owning root".to_string()
+        ))
+    );
+
+    let mut request = valid_v2_request(Vec::new());
+    let duplicate_root = request
+        .scope
+        .root_remote_ids
+        .first()
+        .expect("fixture scope root")
+        .clone();
+    request.scope.root_remote_ids.push(duplicate_root);
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(
+            "portable sync v2 contains duplicate scope root remote IDs".to_string()
+        ))
+    );
+
+    let mut request = valid_v2_request(vec![valid_v2_hint("page-1")]);
+    request.hints[0].owning_root_remote_id =
+        Some(locality_core::model::RemoteId::new("other-root"));
+    assert_eq!(
+        request.validate(),
+        Err(locality_core::LocalityError::InvalidState(
+            "portable sync v2 hint owning root is outside the request scope".to_string()
+        ))
     );
 }
