@@ -553,6 +553,23 @@ fn linear_descriptor_comes_from_registry_and_uses_api_key_setup() {
 }
 
 #[test]
+fn granola_and_linear_source_descriptors_remain_api_key_without_oauth() {
+    let granola = source_descriptor(GRANOLA_CONNECTOR_ID);
+    assert!(!granola.supports_oauth());
+    assert_eq!(
+        granola.connect_command(),
+        Some("loc connect granola --api-key-stdin")
+    );
+
+    let linear = source_descriptor(LINEAR_CONNECTOR_ID);
+    assert!(!linear.supports_oauth());
+    assert_eq!(
+        linear.connect_command(),
+        Some("loc connect linear --api-key-stdin")
+    );
+}
+
+#[test]
 fn source_descriptors_declare_canonical_title_rename_policy() {
     for connector in [
         "notion",
