@@ -294,6 +294,141 @@ fn data_source_and_database_hints_emit_one_composite_database_change() {
 }
 
 #[test]
+fn data_source_first_uses_later_database_hint_when_its_path_is_missing() {
+    let database = DatabaseDto {
+        id: DATABASE.to_string(),
+        parent: Some(page_parent(ROOT_A)),
+        last_edited_time: Some("db-v1".to_string()),
+        data_sources: vec![DataSourceSummaryDto {
+            id: DATA_SOURCE.to_string(),
+            name: Some("Tasks".to_string()),
+        }],
+        ..Default::default()
+    };
+    let data_source = DataSourceDto {
+        id: DATA_SOURCE.to_string(),
+        parent: Some(database_parent(DATABASE)),
+        last_edited_time: Some("ds-v1".to_string()),
+        ..Default::default()
+    };
+    let provider_version = database_bundle_provider_version_token(&NotionDatabaseBundle {
+        database: database.clone(),
+        data_sources: vec![data_source.clone()],
+    })
+    .expect("database provider token");
+    let api = Arc::new(
+        RecordingApi::default()
+            .with_database(database)
+            .with_data_source(data_source),
+    );
+    let connector = connector(api.clone(), [ROOT_A]);
+    let mut data_source_hint = hint(
+        DATA_SOURCE,
+        Some("data-source-prior"),
+        "Unused/Schema/_schema.yaml",
+        EntityKind::Unknown("data_source".to_string()),
+        ROOT_A,
+    );
+    data_source_hint.logical_path = None;
+    let batch = dispatch_portable_sync_v2(
+        &connector,
+        request(
+            [ROOT_A],
+            terminal_v1_checkpoint(ROOT_A),
+            vec![
+                data_source_hint,
+                hint(
+                    DATABASE,
+                    Some(&provider_version),
+                    "Root/Canonical DB/_schema.yaml",
+                    EntityKind::Database,
+                    ROOT_A,
+                ),
+            ],
+            8,
+        ),
+    )
+    .expect("data-source-first coalescing");
+    assert_eq!(batch.changes.len(), 1);
+    assert_eq!(
+        batch.changes[0]
+            .logical_path
+            .as_ref()
+            .map(LogicalPath::as_str),
+        Some("Root/Canonical DB/_schema.yaml")
+    );
+    assert_eq!(
+        batch.changes[0].source_object.opaque_version.as_deref(),
+        Some(provider_version.as_str())
+    );
+    assert_eq!(
+        api.calls(),
+        vec![
+            format!("data_source:{DATA_SOURCE}"),
+            format!("database:{DATABASE}")
+        ]
+    );
+}
+
+#[test]
+fn data_source_first_archived_database_uses_later_database_path_and_prior_root() {
+    let mut database = DatabaseDto {
+        id: DATABASE.to_string(),
+        parent: Some(page_parent(ROOT_A)),
+        last_edited_time: Some("archived-v2".to_string()),
+        ..Default::default()
+    };
+    database.archived = true;
+    let data_source = DataSourceDto {
+        id: DATA_SOURCE.to_string(),
+        parent: Some(database_parent(DATABASE)),
+        ..Default::default()
+    };
+    let api = Arc::new(
+        RecordingApi::default()
+            .with_database(database)
+            .with_data_source(data_source),
+    );
+    let connector = connector(api, [ROOT_A, ROOT_B]);
+    let batch = dispatch_portable_sync_v2(
+        &connector,
+        request(
+            [ROOT_A_EXACT, ROOT_B_EXACT],
+            terminal_v2_checkpoint([ROOT_A_EXACT, ROOT_B_EXACT]),
+            vec![
+                hint(
+                    DATA_SOURCE,
+                    Some("data-source-prior"),
+                    "Wrong Root/Wrong DB/_schema.yaml",
+                    EntityKind::Unknown("data_source".to_string()),
+                    ROOT_B_EXACT,
+                ),
+                hint(
+                    DATABASE,
+                    Some("database-prior"),
+                    "Right Root/Right DB/_schema.yaml",
+                    EntityKind::Database,
+                    ROOT_A_EXACT,
+                ),
+            ],
+            8,
+        ),
+    )
+    .expect("archived database coalescing");
+    assert_eq!(batch.changes.len(), 1);
+    let change = &batch.changes[0];
+    assert!(change.source_object.deleted);
+    assert_eq!(
+        change.logical_path.as_ref().map(LogicalPath::as_str),
+        Some("Right Root/Right DB/_schema.yaml")
+    );
+    assert_eq!(
+        portable_scope_root_remote_id(&change.source_object).expect("database prior root"),
+        Some(&RemoteId::new(ROOT_A_EXACT))
+    );
+}
+
+#[test]
 fn maximum_database_fanout_roundtrips_a_publicly_valid_provider_token() {
     let data_sources = (0..100)
         .map(|index| DataSourceDto {

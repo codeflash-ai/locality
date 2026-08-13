@@ -672,9 +672,10 @@ fn process_sync_v2_database_hint(
     if first_index != hint_index {
         return Ok(None);
     }
+    let database_hint = preferred_database_hint(&request.hints, &database_id)?.unwrap_or(hint);
 
     let database = metadata.database(&database_id)?;
-    let prior_root = exact_hint_root(hint, roots)?;
+    let prior_root = exact_hint_root(database_hint, roots)?;
     if database.archived || database.in_trash {
         return Ok(Some(sync_v2_change(
             &request.source_connection_id,
@@ -683,7 +684,7 @@ fn process_sync_v2_database_hint(
                 kind: EntityKind::Database,
                 owning_root: prior_root,
                 opaque_version: database.last_edited_time,
-                logical_path: hint.logical_path.clone(),
+                logical_path: database_hint.logical_path.clone(),
                 deleted: true,
                 title: None,
             },
@@ -701,7 +702,7 @@ fn process_sync_v2_database_hint(
                         kind: EntityKind::Database,
                         owning_root: prior_root,
                         opaque_version: database.last_edited_time,
-                        logical_path: hint.logical_path.clone(),
+                        logical_path: database_hint.logical_path.clone(),
                         deleted: true,
                         title: None,
                     },
@@ -714,12 +715,12 @@ fn process_sync_v2_database_hint(
     let bundle = metadata.database_bundle(database)?;
     let provider_version = database_bundle_provider_version_token(&bundle)?;
     if !triggered_by_data_source
-        && hint.provider_version.as_deref() == Some(provider_version.as_str())
+        && database_hint.provider_version.as_deref() == Some(provider_version.as_str())
         && prior_root == current_root
     {
         return Ok(None);
     }
-    let logical_path = required_hint_path(hint, "database")?;
+    let logical_path = required_hint_path(database_hint, "database")?;
     let title = database_title(&bundle.database).unwrap_or_else(|| "Untitled database".to_string());
     Ok(Some(sync_v2_change(
         &request.source_connection_id,
@@ -733,6 +734,21 @@ fn process_sync_v2_database_hint(
             title: Some(title),
         },
     )))
+}
+
+fn preferred_database_hint<'a>(
+    hints: &'a [PortableSyncHintV2],
+    database_id: &str,
+) -> LocalityResult<Option<&'a PortableSyncHintV2>> {
+    let canonical_database_id = normalize_notion_id(database_id);
+    for hint in hints {
+        if sync_v2_hint_kind(hint)? == SyncV2HintKind::Database
+            && normalize_notion_id(hint.remote_id.as_str()) == canonical_database_id
+        {
+            return Ok(Some(hint));
+        }
+    }
+    Ok(None)
 }
 
 fn database_has_data_source_hint(
