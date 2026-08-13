@@ -41,6 +41,7 @@ const PORTABLE_NATIVE_KIND: &str = "granola_meeting";
 pub struct GranolaConfig {
     pub api_key: String,
     pub updated_after: Option<String>,
+    pub execution_policy: ConnectorExecutionPolicy,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -54,6 +55,7 @@ impl GranolaConfig {
         Self {
             api_key: api_key.into(),
             updated_after: None,
+            execution_policy: ConnectorExecutionPolicy::Inline,
         }
     }
 
@@ -62,22 +64,18 @@ impl GranolaConfig {
         self
     }
 
-    pub fn with_execution_policy(
-        self,
-        execution_policy: ConnectorExecutionPolicy,
-    ) -> GranolaConnectorConfig {
-        GranolaConnectorConfig {
-            config: self,
-            execution_policy,
-        }
+    pub fn with_execution_policy(mut self, execution_policy: ConnectorExecutionPolicy) -> Self {
+        self.execution_policy = execution_policy;
+        self
     }
 }
 
 impl From<GranolaConfig> for GranolaConnectorConfig {
     fn from(config: GranolaConfig) -> Self {
+        let execution_policy = config.execution_policy;
         Self {
             config,
-            execution_policy: ConnectorExecutionPolicy::Inline,
+            execution_policy,
         }
     }
 }
@@ -97,6 +95,7 @@ impl fmt::Debug for GranolaConfig {
         f.debug_struct("GranolaConfig")
             .field("api_key", &"<redacted>")
             .field("updated_after", &self.updated_after)
+            .field("execution_policy", &self.execution_policy)
             .finish()
     }
 }
