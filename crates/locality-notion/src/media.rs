@@ -9,10 +9,13 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use locality_connector::hydration_budget::{
+    HydrationResource, InitialHydrationBudget, InitialHydrationError, InitialHydrationResult,
+};
 use locality_core::path_projection::page_container_path;
 use locality_core::{LocalityError, LocalityResult};
 use reqwest::StatusCode;
@@ -101,6 +104,35 @@ pub trait PortableMediaCaptureFetcher: Send + Sync {
             Err(_) => HostedMediaCaptureOutcome::Unavailable,
         }
     }
+
+    /// Deadline-aware hook used by one job-scoped bounded hydration attempt.
+    /// Existing injected fetchers remain compatible; the production fetcher
+    /// overrides this hook and applies the smaller job deadline to retries and
+    /// every redirected request.
+    fn fetch_outcome_with_deadline(
+        &self,
+        hosted_url: &str,
+        max_bytes: usize,
+        _deadline: Duration,
+    ) -> HostedMediaCaptureOutcome {
+        self.fetch_outcome(hosted_url, max_bytes)
+    }
+
+    /// Single-attempt media hook for job-scoped hydration. Implementations
+    /// must make at most one GET, must not follow redirects or retry, and must
+    /// account every consumed response chunk against `budget`. `max_bytes` is
+    /// an exclusive decoded-media/retained allowance already owned by this
+    /// fetch, so implementations must not charge those dimensions again. The
+    /// default fails closed so an existing unbounded fetcher cannot bypass the
+    /// contract.
+    fn fetch_bounded(
+        &self,
+        _hosted_url: &str,
+        _max_bytes: usize,
+        _budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<PortableMediaCapture> {
+        Err(InitialHydrationError::ProviderResponseInvalid)
+    }
 }
 
 #[derive(Default)]
@@ -140,6 +172,70 @@ impl PortableMediaCaptureFetcher for SecurePortableMediaCaptureFetcher {
                 .expect("portable media HTTP client was initialized above"),
             hosted_url,
             max_bytes,
+        )
+    }
+
+    fn fetch_outcome_with_deadline(
+        &self,
+        hosted_url: &str,
+        max_bytes: usize,
+        deadline: Duration,
+    ) -> HostedMediaCaptureOutcome {
+        let Ok(mut transport) = self.transport.lock() else {
+            return HostedMediaCaptureOutcome::Unavailable;
+        };
+        if transport.is_none() {
+            let Ok(client) = ReqwestPortableMediaTransport::new() else {
+                return HostedMediaCaptureOutcome::Unavailable;
+            };
+            *transport = Some(client);
+        }
+        fetch_hosted_media_outcome_with_policy(
+            transport
+                .as_ref()
+                .expect("portable media HTTP client was initialized above"),
+            hosted_url,
+            max_bytes,
+            deadline,
+            MEDIA_FETCH_RETRY_DELAY,
+        )
+    }
+
+    fn fetch_bounded(
+        &self,
+        hosted_url: &str,
+        max_bytes: usize,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<PortableMediaCapture> {
+        let mut transport = loop {
+            budget.check_deadline()?;
+            match self.transport.try_lock() {
+                Ok(transport) => break transport,
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(InitialHydrationError::ProviderUnavailable);
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let wait = budget
+                        .remaining_provider_time()?
+                        .min(Duration::from_millis(1));
+                    thread::sleep(wait);
+                    budget.check_deadline()?;
+                }
+            }
+        };
+        if transport.is_none() {
+            let client = ReqwestPortableMediaTransport::new()
+                .map_err(InitialHydrationError::from_connector_error)?;
+            budget.check_deadline()?;
+            *transport = Some(client);
+        }
+        fetch_hosted_media_bounded_once_with_transport(
+            transport
+                .as_ref()
+                .expect("portable media HTTP client was initialized above"),
+            hosted_url,
+            max_bytes,
+            budget,
         )
     }
 }
@@ -228,6 +324,91 @@ impl PortableMediaHttpTransport for ReqwestPortableMediaTransport {
             body: Box::new(response),
         })
     }
+}
+
+fn fetch_hosted_media_bounded_once_with_transport(
+    transport: &dyn PortableMediaHttpTransport,
+    hosted_url: &str,
+    max_bytes: usize,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<PortableMediaCapture> {
+    let url = validate_portable_hosted_media_url(hosted_url)
+        .map_err(InitialHydrationError::from_connector_error)?;
+    let timeout = budget.remaining_provider_time()?;
+    let response = transport.get(url.as_str(), timeout);
+    budget.check_deadline()?;
+    let mut response = response.map_err(InitialHydrationError::from_connector_error)?;
+
+    if response.status.is_redirection() {
+        return Err(InitialHydrationError::ProviderResponseInvalid);
+    }
+    if !response.status.is_success() {
+        return Err(InitialHydrationError::ProviderUnavailable);
+    }
+    if response
+        .content_encoding
+        .as_deref()
+        .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+    {
+        return Err(InitialHydrationError::ProviderResponseInvalid);
+    }
+    if let Some(length) = response.content_length {
+        budget.preflight_response_length(length)?;
+        if length > max_bytes as u64 {
+            return Err(InitialHydrationError::LimitExceeded {
+                resource: HydrationResource::MediaDecodedBytes,
+            });
+        }
+    }
+
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(0)
+            .min(max_bytes),
+    );
+    let mut buffer = [0_u8; PORTABLE_MEDIA_READ_BUFFER_BYTES];
+    loop {
+        budget.check_deadline()?;
+        let read = match response.body.read(&mut buffer) {
+            Ok(read) => read,
+            Err(_) => {
+                budget.check_deadline()?;
+                return Err(InitialHydrationError::ProviderUnavailable);
+            }
+        };
+        let chunk_result = if read > 0 {
+            budget.account_response_chunk(read)
+        } else {
+            Ok(())
+        };
+        let deadline_result = budget.check_deadline();
+        deadline_result?;
+        chunk_result?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) > max_bytes {
+            return Err(InitialHydrationError::LimitExceeded {
+                resource: HydrationResource::MediaDecodedBytes,
+            });
+        }
+        bytes
+            .try_reserve(read)
+            .map_err(|_| InitialHydrationError::ProviderUnavailable)?;
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    if response
+        .content_length
+        .is_some_and(|length| length != bytes.len() as u64)
+    {
+        return Err(InitialHydrationError::ProviderUnavailable);
+    }
+    Ok(PortableMediaCapture {
+        bytes,
+        media_type: sanitize_portable_media_type(response.content_type.as_deref()),
+    })
 }
 
 #[cfg(test)]
@@ -673,7 +854,7 @@ pub(crate) fn sanitize_portable_media_type(value: Option<&str>) -> String {
         .to_ascii_lowercase()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MediaAsset {
     pub block_id: String,
     pub kind: String,
@@ -1271,11 +1452,15 @@ mod tests {
     use super::{
         HostedMediaCaptureOutcome, HostedMediaRetryClock, MediaAsset,
         PORTABLE_MEDIA_READ_BUFFER_BYTES, PortableMediaCapture, PortableMediaCaptureFetcher,
-        PortableMediaHttpResponse, PortableMediaHttpTransport,
-        fetch_hosted_media_outcome_with_clock, fetch_hosted_media_outcome_with_policy,
-        fetch_hosted_media_outcome_with_transport, fetch_portable_media_with_transport,
-        local_media_href, media_local_path, portable_media_expired, replace_media_manifest,
-        resolve_media_href, sanitize_portable_hosted_media_url, validate_portable_hosted_media_url,
+        PortableMediaHttpResponse, PortableMediaHttpTransport, SecurePortableMediaCaptureFetcher,
+        fetch_hosted_media_bounded_once_with_transport, fetch_hosted_media_outcome_with_clock,
+        fetch_hosted_media_outcome_with_policy, fetch_hosted_media_outcome_with_transport,
+        fetch_portable_media_with_transport, local_media_href, media_local_path,
+        portable_media_expired, replace_media_manifest, resolve_media_href,
+        sanitize_portable_hosted_media_url, validate_portable_hosted_media_url,
+    };
+    use locality_connector::hydration_budget::{
+        HydrationResource, InitialHydrationBudget, InitialHydrationError, InitialHydrationLimits,
     };
     use reqwest::StatusCode;
     use std::collections::VecDeque;
@@ -1828,6 +2013,124 @@ mod tests {
     fn scripted_read_error_response(mut response: ScriptedResponse) -> ScriptedResponse {
         response.read_error = true;
         response
+    }
+
+    fn hydration_limits(response_bytes: u64) -> InitialHydrationLimits {
+        InitialHydrationLimits {
+            max_response_body_bytes: response_bytes,
+            max_provider_calls: 10,
+            provider_deadline_ms: 60_000,
+            max_inventory_items: 10,
+            max_inventory_encoded_bytes: 10,
+            max_traversal_nodes: 10,
+            max_traversal_depth: 10,
+            max_native_bytes: 10,
+            max_media_assets: 10,
+            max_media_decoded_bytes: 10,
+            max_rendered_content_bytes: 10,
+            max_projections: 10,
+            max_changes: 10,
+            max_retained_bytes: 10,
+        }
+    }
+
+    #[test]
+    fn bounded_media_is_one_get_without_redirect_or_retry() {
+        let redirect = ScriptedPortableMediaTransport::new([
+            scripted_response(
+                StatusCode::FOUND,
+                Some("https://secure.notion-static.com/next"),
+                None,
+                Some(0),
+                None,
+                Vec::new(),
+            ),
+            scripted_response(StatusCode::OK, None, None, Some(1), None, vec![1]),
+        ]);
+        let budget = InitialHydrationBudget::new(hydration_limits(10)).unwrap();
+        budget.reserve_provider_call().unwrap();
+        assert_eq!(
+            fetch_hosted_media_bounded_once_with_transport(
+                &redirect,
+                "https://secure.notion-static.com/asset",
+                10,
+                &budget,
+            ),
+            Err(InitialHydrationError::ProviderResponseInvalid)
+        );
+        assert_eq!(redirect.requests().len(), 1);
+
+        let transient = ScriptedPortableMediaTransport::new([
+            scripted_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                None,
+                None,
+                Some(0),
+                None,
+                Vec::new(),
+            ),
+            scripted_response(StatusCode::OK, None, None, Some(1), None, vec![1]),
+        ]);
+        let budget = InitialHydrationBudget::new(hydration_limits(10)).unwrap();
+        budget.reserve_provider_call().unwrap();
+        assert_eq!(
+            fetch_hosted_media_bounded_once_with_transport(
+                &transient,
+                "https://secure.notion-static.com/asset",
+                10,
+                &budget,
+            ),
+            Err(InitialHydrationError::ProviderUnavailable)
+        );
+        assert_eq!(transient.requests().len(), 1);
+    }
+
+    #[test]
+    fn bounded_media_counts_streamed_body_at_cap_and_cap_plus_one() {
+        for (cap, succeeds) in [(3_u64, true), (2_u64, false)] {
+            let transport = ScriptedPortableMediaTransport::new([scripted_response(
+                StatusCode::OK,
+                None,
+                None,
+                None,
+                Some("image/png"),
+                vec![1, 2, 3],
+            )]);
+            let budget = InitialHydrationBudget::new(hydration_limits(cap)).unwrap();
+            budget.reserve_provider_call().unwrap();
+            let result = fetch_hosted_media_bounded_once_with_transport(
+                &transport,
+                "https://secure.notion-static.com/asset",
+                10,
+                &budget,
+            );
+            if succeeds {
+                assert_eq!(result.unwrap().bytes, vec![1, 2, 3]);
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    InitialHydrationError::LimitExceeded {
+                        resource: HydrationResource::ResponseBodyBytes
+                    }
+                );
+            }
+            assert_eq!(transport.requests().len(), 1);
+        }
+    }
+
+    #[test]
+    fn bounded_media_mutex_admission_honors_the_job_deadline() {
+        let fetcher = SecurePortableMediaCaptureFetcher::default();
+        let _held = fetcher.transport.lock().unwrap();
+        let mut limits = hydration_limits(10);
+        limits.provider_deadline_ms = 1;
+        let budget = InitialHydrationBudget::new(limits).unwrap();
+        assert_eq!(
+            fetcher.fetch_bounded("https://secure.notion-static.com/asset", 10, &budget,),
+            Err(InitialHydrationError::LimitExceeded {
+                resource: HydrationResource::ProviderDeadline
+            })
+        );
     }
 
     struct TrackingReader {

@@ -121,7 +121,17 @@ impl ConnectorNetworkGate {
     }
 
     pub fn acquire(&self) -> NetworkPermit {
-        self.orchestrator.acquire(&self.config)
+        self.orchestrator
+            .acquire(&self.config, None)
+            .expect("unbounded network admission does not time out")
+    }
+
+    /// Wait for fair admission for at most `max_wait`.
+    ///
+    /// A timed-out waiter is removed from the scope rotation before this
+    /// returns, so an expired hydration job cannot leave phantom pressure.
+    pub fn acquire_for(&self, max_wait: Duration) -> Option<NetworkPermit> {
+        self.orchestrator.acquire(&self.config, Some(max_wait))
     }
 
     pub fn record_cooldown(&self, delay: Duration) {
@@ -245,7 +255,11 @@ impl NetworkOrchestrator {
             .or_insert_with(|| ScopeState::new(config));
     }
 
-    fn acquire(&self, config: &ConnectorNetworkConfig) -> NetworkPermit {
+    fn acquire(
+        &self,
+        config: &ConnectorNetworkConfig,
+        max_wait: Option<Duration>,
+    ) -> Option<NetworkPermit> {
         let started = Instant::now();
         let scope = config.quota_scope.clone();
         let mut state = self.inner.state.lock().expect("network orchestrator lock");
@@ -259,6 +273,11 @@ impl NetworkOrchestrator {
         }
 
         loop {
+            if max_wait.is_some_and(|limit| started.elapsed() >= limit) {
+                cancel_waiter(&mut state, &scope);
+                self.inner.changed.notify_all();
+                return None;
+            }
             let now = Instant::now();
             for scope_state in state.scopes.values_mut() {
                 scope_state.refill(now);
@@ -291,20 +310,27 @@ impl NetworkOrchestrator {
                 }
                 state.in_flight = state.in_flight.saturating_add(1);
                 self.inner.changed.notify_all();
-                return NetworkPermit {
+                return Some(NetworkPermit {
                     inner: Arc::clone(&self.inner),
                     scope,
                     waited: started.elapsed(),
-                };
+                });
             }
 
-            let delay = state
+            let mut delay = state
                 .scopes
                 .get(&scope)
                 .expect("registered scope")
                 .next_ready_delay(now)
-                .min(FAIRNESS_RECHECK_INTERVAL)
-                .max(Duration::from_millis(1));
+                .min(FAIRNESS_RECHECK_INTERVAL);
+            if let Some(limit) = max_wait {
+                delay = delay.min(limit.saturating_sub(started.elapsed()));
+            }
+            if delay.is_zero() {
+                cancel_waiter(&mut state, &scope);
+                self.inner.changed.notify_all();
+                return None;
+            }
             let (next_state, _) = self
                 .inner
                 .changed
@@ -319,14 +345,15 @@ impl NetworkOrchestrator {
         let Some(scope_state) = state.scopes.get_mut(scope) else {
             return;
         };
-        let until = Instant::now() + delay;
+        let now = Instant::now();
+        let until = saturating_instant_add(now, delay);
         scope_state.cooldown_until = Some(
             scope_state
                 .cooldown_until
                 .map_or(until, |current| current.max(until)),
         );
         scope_state.tokens = 0.0;
-        scope_state.last_refill = Instant::now();
+        scope_state.last_refill = now;
         self.inner.changed.notify_all();
     }
 
@@ -350,6 +377,40 @@ impl NetworkOrchestrator {
             global_max_in_flight: self.inner.max_in_flight,
         }
     }
+}
+
+fn cancel_waiter(state: &mut NetworkOrchestratorState, scope: &str) {
+    let Some(scope_state) = state.scopes.get_mut(scope) else {
+        return;
+    };
+    scope_state.waiting = scope_state.waiting.saturating_sub(1);
+    if scope_state.waiting == 0 {
+        state.rotation.retain(|candidate| candidate != scope);
+    }
+}
+
+fn saturating_instant_add(base: Instant, duration: Duration) -> Instant {
+    if let Some(until) = base.checked_add(duration) {
+        return until;
+    }
+
+    let mut low = 0_u128;
+    let mut high = duration.as_nanos();
+    while low < high {
+        let midpoint = low + (high - low).div_ceil(2);
+        if base.checked_add(duration_from_nanos(midpoint)).is_some() {
+            low = midpoint;
+        } else {
+            high = midpoint - 1;
+        }
+    }
+    base.checked_add(duration_from_nanos(low)).unwrap_or(base)
+}
+
+fn duration_from_nanos(nanos: u128) -> Duration {
+    let seconds = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
+    let subsecond_nanos = (nanos % 1_000_000_000) as u32;
+    Duration::new(seconds, subsecond_nanos)
 }
 
 #[derive(Debug)]
@@ -391,6 +452,7 @@ mod tests {
 
     use super::{
         ConnectorNetworkConfig, ConnectorNetworkGate, NetworkOrchestrator, RetryConfig, ScopeState,
+        saturating_instant_add,
     };
     use std::time::{Duration, Instant};
 
@@ -502,6 +564,37 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(40));
         let limited_permit = limited.acquire();
         assert!(limited_permit.waited() >= Duration::from_millis(40));
+    }
+
+    #[test]
+    fn timed_admission_cancels_an_expired_waiter() {
+        let orchestrator = NetworkOrchestrator::new(1);
+        let gate = ConnectorNetworkGate::new(
+            orchestrator,
+            ConnectorNetworkConfig::new("bounded", 100.0, 1.0),
+        );
+        gate.record_cooldown(Duration::from_secs(1));
+
+        let started = Instant::now();
+        assert!(gate.acquire_for(Duration::from_millis(5)).is_none());
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(gate.status().waiting, 0);
+    }
+
+    #[test]
+    fn enormous_cooldown_saturates_instant_arithmetic() {
+        let now = Instant::now();
+        let until = saturating_instant_add(now, Duration::MAX);
+        assert!(until >= now);
+
+        let orchestrator = NetworkOrchestrator::new(1);
+        let gate = ConnectorNetworkGate::new(
+            orchestrator,
+            ConnectorNetworkConfig::new("bounded-huge", 100.0, 1.0),
+        );
+        gate.record_cooldown(Duration::MAX);
+        assert!(gate.acquire_for(Duration::from_millis(1)).is_none());
+        assert_eq!(gate.status().waiting, 0);
     }
 
     #[test]

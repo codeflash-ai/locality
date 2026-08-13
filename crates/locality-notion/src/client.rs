@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use locality_connector::hydration_budget::{
+    HydrationResource, InitialHydrationBudget, InitialHydrationError, InitialHydrationResult,
+};
 use locality_connector::network::{
     ConnectorNetworkConfig, ConnectorNetworkGate, NetworkPermit, RetryConfig,
 };
@@ -188,6 +191,59 @@ pub trait NotionApi: std::fmt::Debug + Send + Sync {
     ) -> LocalityResult<String> {
         let _ = (filename, content_type, bytes);
         Err(LocalityError::NotImplemented("upload Notion file"))
+    }
+
+    /// Budgeted read primitives for initial hydration. The defaults keep test
+    /// and third-party implementations source-compatible. The HTTP client
+    /// overrides them so response bytes are bounded while streaming.
+    fn retrieve_page_bounded(
+        &self,
+        _page_id: &str,
+        _budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<PageDto> {
+        Err(InitialHydrationError::ProviderResponseInvalid)
+    }
+
+    fn retrieve_database_bounded(
+        &self,
+        _database_id: &str,
+        _budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<DatabaseDto> {
+        Err(InitialHydrationError::ProviderResponseInvalid)
+    }
+
+    fn retrieve_data_source_bounded(
+        &self,
+        _data_source_id: &str,
+        _budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<DataSourceDto> {
+        Err(InitialHydrationError::ProviderResponseInvalid)
+    }
+
+    fn retrieve_block_bounded(
+        &self,
+        _block_id: &str,
+        _budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<BlockDto> {
+        Err(InitialHydrationError::ProviderResponseInvalid)
+    }
+
+    fn retrieve_block_children_bounded(
+        &self,
+        _block_id: &str,
+        _start_cursor: Option<&str>,
+        _budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<BlockListDto> {
+        Err(InitialHydrationError::ProviderResponseInvalid)
+    }
+
+    fn query_data_source_bounded(
+        &self,
+        _data_source_id: &str,
+        _start_cursor: Option<&str>,
+        _budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<PageListDto> {
+        Err(InitialHydrationError::ProviderResponseInvalid)
     }
 }
 
@@ -675,6 +731,144 @@ impl HttpNotionApi {
         ))
     }
 
+    fn get_json_bounded<T>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        interpretation: NotionResponseInterpretation,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        let token = self
+            .token()
+            .map_err(InitialHydrationError::from_connector_error)?;
+        let url = format!(
+            "{}/{}",
+            DEFAULT_NOTION_API_BASE_URL,
+            path.trim_start_matches('/')
+        );
+        self.get_json_url_bounded(path, query, interpretation, budget, move || {
+            self.client
+                .get(&url)
+                .bearer_auth(&token)
+                .header("Notion-Version", DEFAULT_NOTION_VERSION)
+        })
+    }
+
+    fn get_json_url_bounded<T>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        interpretation: NotionResponseInterpretation,
+        budget: &InitialHydrationBudget,
+        build_request: impl FnMut() -> reqwest::blocking::RequestBuilder,
+    ) -> InitialHydrationResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.send_request_url_bounded("GET", path, query, interpretation, budget, build_request)
+    }
+
+    fn post_read_json_bounded<T>(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        let token = self
+            .token()
+            .map_err(InitialHydrationError::from_connector_error)?;
+        let url = format!(
+            "{}/{}",
+            DEFAULT_NOTION_API_BASE_URL,
+            path.trim_start_matches('/')
+        );
+        self.send_request_url_bounded(
+            "POST",
+            path,
+            &[],
+            NotionResponseInterpretation::Default,
+            budget,
+            move || {
+                self.client
+                    .post(&url)
+                    .bearer_auth(&token)
+                    .header("Notion-Version", DEFAULT_NOTION_VERSION)
+                    .json(&body)
+            },
+        )
+    }
+
+    fn send_request_url_bounded<T>(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(&str, String)],
+        interpretation: NotionResponseInterpretation,
+        budget: &InitialHydrationBudget,
+        mut build_request: impl FnMut() -> reqwest::blocking::RequestBuilder,
+    ) -> InitialHydrationResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        if budget.remaining(HydrationResource::ResponseBodyBytes)? == 0 {
+            return Err(InitialHydrationError::LimitExceeded {
+                resource: HydrationResource::ResponseBodyBytes,
+            });
+        }
+        budget.reserve_provider_call()?;
+        let (_network_permit, waited_for_token) = acquire_notion_request_token_bounded(budget)?;
+        budget.check_deadline()?;
+        let timeout = budget.remaining_provider_time()?;
+        let request_debug_id = start_notion_request_debug(method, path, 0, waited_for_token);
+        let mut request = build_request().timeout(timeout);
+        for (key, value) in query {
+            request = request.query(&[(*key, value.as_str())]);
+        }
+        let response = request.send();
+        if let Err(error) = budget.check_deadline() {
+            finish_notion_request_debug(request_debug_id, "job deadline");
+            return Err(error);
+        }
+        let response = response.map_err(|_| {
+            finish_notion_request_debug(request_debug_id, "transport error");
+            InitialHydrationError::ProviderUnavailable
+        })?;
+        let status = response.status();
+        let retry_after = retry_after_header(response.headers());
+        finish_notion_request_debug(request_debug_id, format!("HTTP {status}"));
+        if is_notion_rate_limited(status) {
+            let error = bounded_rate_limit_error(retry_after);
+            let delay = error
+                .retry_after()
+                .expect("bounded Notion rate limit carries Retry-After");
+            record_notion_rate_limit(0, Some(delay));
+            return Err(error);
+        }
+        let body = read_bounded_response(response, budget)?;
+        if status.is_success() {
+            return serde_json::from_slice(&body)
+                .map_err(|_| InitialHydrationError::ProviderResponseInvalid);
+        }
+        if interpretation == NotionResponseInterpretation::PageLookup
+            && notion_page_lookup_reports_database(status, std::str::from_utf8(&body).unwrap_or(""))
+        {
+            return Err(InitialHydrationError::ProviderNotFound);
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Err(InitialHydrationError::ProviderNotFound);
+        }
+        if status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT {
+            return Err(InitialHydrationError::ProviderUnavailable);
+        }
+        Err(InitialHydrationError::ProviderResponseInvalid)
+    }
+
     fn token(&self) -> LocalityResult<String> {
         if let Some(token) = &self.config.token {
             return Ok(token.clone());
@@ -688,6 +882,13 @@ impl HttpNotionApi {
                     self.config.token_key
                 ))
             })
+    }
+}
+
+fn bounded_rate_limit_error(retry_after: Option<Duration>) -> InitialHydrationError {
+    InitialHydrationError::ProviderRateLimited {
+        provider: "notion".to_string(),
+        retry_after: retry_after.unwrap_or_else(|| rate_limit_backoff(0)),
     }
 }
 
@@ -732,6 +933,21 @@ fn acquire_notion_request_token() -> (NetworkPermit, Duration) {
     record_notion_token_wait_end(recorded_wait);
     let waited = permit.waited();
     (permit, waited)
+}
+
+fn acquire_notion_request_token_bounded(
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<(NetworkPermit, Duration)> {
+    let remaining = budget.remaining_provider_time()?;
+    let recorded_wait = record_notion_token_wait_start();
+    let permit = notion_network_gate().acquire_for(remaining);
+    record_notion_token_wait_end(recorded_wait);
+    let permit = permit.ok_or(InitialHydrationError::LimitExceeded {
+        resource: HydrationResource::ProviderDeadline,
+    })?;
+    budget.check_deadline()?;
+    let waited = permit.waited();
+    Ok((permit, waited))
 }
 
 fn record_notion_rate_limit(attempt: usize, retry_after: Option<Duration>) {
@@ -946,6 +1162,166 @@ impl NotionApi for HttpNotionApi {
     ) -> LocalityResult<String> {
         self.upload_file_bytes(filename, content_type, bytes)
     }
+
+    fn retrieve_page_bounded(
+        &self,
+        page_id: &str,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<PageDto> {
+        self.get_json_bounded(
+            &format!("/v1/pages/{page_id}"),
+            &[],
+            NotionResponseInterpretation::PageLookup,
+            budget,
+        )
+    }
+
+    fn retrieve_database_bounded(
+        &self,
+        database_id: &str,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<DatabaseDto> {
+        self.get_json_bounded(
+            &format!("/v1/databases/{database_id}"),
+            &[],
+            NotionResponseInterpretation::Default,
+            budget,
+        )
+    }
+
+    fn retrieve_data_source_bounded(
+        &self,
+        data_source_id: &str,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<DataSourceDto> {
+        self.get_json_bounded(
+            &format!("/v1/data_sources/{data_source_id}"),
+            &[],
+            NotionResponseInterpretation::Default,
+            budget,
+        )
+    }
+
+    fn retrieve_block_bounded(
+        &self,
+        block_id: &str,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<BlockDto> {
+        self.get_json_bounded(
+            &format!("/v1/blocks/{block_id}"),
+            &[],
+            NotionResponseInterpretation::Default,
+            budget,
+        )
+    }
+
+    fn retrieve_block_children_bounded(
+        &self,
+        block_id: &str,
+        start_cursor: Option<&str>,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<BlockListDto> {
+        let page_size = bounded_inventory_page_size(budget)?;
+        let mut query = vec![("page_size", page_size.to_string())];
+        if let Some(start_cursor) = start_cursor {
+            query.push(("start_cursor", start_cursor.to_string()));
+        }
+        self.get_json_bounded(
+            &format!("/v1/blocks/{block_id}/children"),
+            &query,
+            NotionResponseInterpretation::Default,
+            budget,
+        )
+    }
+
+    fn query_data_source_bounded(
+        &self,
+        data_source_id: &str,
+        start_cursor: Option<&str>,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<PageListDto> {
+        let page_size = bounded_inventory_page_size(budget)?;
+        let mut body = json!({ "page_size": page_size });
+        if let Some(start_cursor) = start_cursor {
+            body["start_cursor"] = json!(start_cursor);
+        }
+        self.post_read_json_bounded(
+            &format!("/v1/data_sources/{data_source_id}/query"),
+            body,
+            budget,
+        )
+    }
+}
+
+fn bounded_inventory_page_size(budget: &InitialHydrationBudget) -> InitialHydrationResult<usize> {
+    let remaining_items = budget.remaining(HydrationResource::InventoryItems)?;
+    let remaining_encoded = budget.remaining(HydrationResource::InventoryEncodedBytes)?;
+    let remaining_nodes = budget.remaining(HydrationResource::TraversalNodes)?;
+    let remaining_retained = budget.remaining(HydrationResource::RetainedBytes)?;
+    if remaining_encoded == 0 || remaining_retained == 0 {
+        return Err(InitialHydrationError::LimitExceeded {
+            resource: if remaining_encoded == 0 {
+                HydrationResource::InventoryEncodedBytes
+            } else {
+                HydrationResource::RetainedBytes
+            },
+        });
+    }
+    let page_size = remaining_items.min(remaining_nodes).min(100);
+    if page_size == 0 {
+        return Err(InitialHydrationError::LimitExceeded {
+            resource: if remaining_items == 0 {
+                HydrationResource::InventoryItems
+            } else {
+                HydrationResource::TraversalNodes
+            },
+        });
+    }
+    usize::try_from(page_size).map_err(|_| InitialHydrationError::ProviderResponseInvalid)
+}
+
+fn read_bounded_response(
+    response: reqwest::blocking::Response,
+    budget: &InitialHydrationBudget,
+) -> InitialHydrationResult<Vec<u8>> {
+    use std::io::Read;
+
+    if let Some(content_length) = response.content_length() {
+        budget.preflight_response_length(content_length)?;
+    }
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(64 * 1024);
+    let mut response = response;
+    let mut body = Vec::with_capacity(capacity);
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        budget.check_deadline()?;
+        let read = match response.read(&mut buffer) {
+            Ok(read) => read,
+            Err(_) => {
+                budget.check_deadline()?;
+                return Err(InitialHydrationError::ProviderUnavailable);
+            }
+        };
+        let chunk_result = if read > 0 {
+            budget.account_response_chunk(read)
+        } else {
+            Ok(())
+        };
+        let deadline_result = budget.check_deadline();
+        deadline_result?;
+        chunk_result?;
+        if read == 0 {
+            break;
+        }
+        body.try_reserve(read)
+            .map_err(|_| InitialHydrationError::ProviderUnavailable)?;
+        body.extend_from_slice(&buffer[..read]);
+    }
+    Ok(body)
 }
 
 fn data_source_search_body(start_cursor: Option<&str>, page_size: usize) -> Value {
@@ -987,11 +1363,15 @@ fn unique_database_ids(data_sources: &[DataSourceDto], max_results: usize) -> Ve
 #[cfg(test)]
 mod tests {
     use super::{
-        HttpNotionApi, NotionResponseInterpretation, NotionRetryClass, data_source_search_body,
-        notion_http_client_builder, notion_network_config, notion_page_lookup_reports_database,
-        rate_limit_backoff, retry_after_header, unique_database_ids,
+        HttpNotionApi, NotionResponseInterpretation, NotionRetryClass, bounded_rate_limit_error,
+        data_source_search_body, notion_http_client_builder, notion_network_config,
+        notion_page_lookup_reports_database, rate_limit_backoff, read_bounded_response,
+        retry_after_header, unique_database_ids,
     };
     use crate::dto::{DataSourceDto, ParentDto};
+    use locality_connector::hydration_budget::{
+        HydrationResource, InitialHydrationBudget, InitialHydrationError, InitialHydrationLimits,
+    };
     use locality_core::LocalityError;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use serde_json::Value;
@@ -1047,6 +1427,117 @@ mod tests {
         headers.insert(RETRY_AFTER, HeaderValue::from_static("3"));
 
         assert_eq!(retry_after_header(&headers), Some(Duration::from_secs(3)));
+    }
+
+    fn hydration_limits(response_bytes: u64) -> InitialHydrationLimits {
+        InitialHydrationLimits {
+            max_response_body_bytes: response_bytes,
+            max_provider_calls: 4,
+            provider_deadline_ms: 5_000,
+            max_inventory_items: 100,
+            max_inventory_encoded_bytes: 1024 * 1024,
+            max_traversal_nodes: 100,
+            max_traversal_depth: 32,
+            max_native_bytes: 1024 * 1024,
+            max_media_assets: 10,
+            max_media_decoded_bytes: 1024 * 1024,
+            max_rendered_content_bytes: 1024 * 1024,
+            max_projections: 100,
+            max_changes: 100,
+            max_retained_bytes: 4 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn bounded_json_rejects_oversized_content_length_before_body_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let url = format!("http://{}/bounded", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            read_http_request_headers(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write headers");
+            stream.write_all(br#"{"ok":true}"#).expect("write body");
+        });
+        let api = HttpNotionApi {
+            config: crate::NotionConfig::default(),
+            client: notion_http_client_builder()
+                .timeout(Duration::from_millis(500))
+                .build()
+                .expect("build client"),
+        };
+        let budget = InitialHydrationBudget::new(hydration_limits(11)).unwrap();
+        let response = api.client.get(&url).send().expect("receive response");
+        let error = read_bounded_response(response, &budget).unwrap_err();
+        server.join().expect("join server");
+        assert_eq!(
+            error,
+            InitialHydrationError::LimitExceeded {
+                resource: HydrationResource::ResponseBodyBytes
+            }
+        );
+        assert_eq!(
+            budget.remaining(HydrationResource::ResponseBodyBytes),
+            Ok(11),
+            "Content-Length preflight must not partially account a rejected body"
+        );
+    }
+
+    #[test]
+    fn bounded_json_counts_chunked_body_at_cap_and_rejects_cap_plus_one() {
+        for (cap, succeeds) in [(11_u64, true), (10_u64, false)] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+            let url = format!("http://{}/chunked", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                read_http_request_headers(&mut stream);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\n{\"ok\":\r\n5\r\ntrue}\r\n0\r\n\r\n",
+                    )
+                    .expect("write chunked response");
+            });
+            let api = HttpNotionApi {
+                config: crate::NotionConfig::default(),
+                client: notion_http_client_builder()
+                    .timeout(Duration::from_millis(500))
+                    .build()
+                    .expect("build client"),
+            };
+            let budget = InitialHydrationBudget::new(hydration_limits(cap)).unwrap();
+            let response = api.client.get(&url).send().expect("receive response");
+            let result = read_bounded_response(response, &budget).and_then(|body| {
+                serde_json::from_slice::<Value>(&body)
+                    .map_err(|_| InitialHydrationError::ProviderResponseInvalid)
+            });
+            server.join().expect("join server");
+            if succeeds {
+                assert_eq!(result.unwrap()["ok"], Value::Bool(true));
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    InitialHydrationError::LimitExceeded {
+                        resource: HydrationResource::ResponseBodyBytes
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_rate_limit_preserves_retry_after_without_response_body() {
+        let error = bounded_rate_limit_error(Some(Duration::MAX));
+        assert_eq!(error.retry_after(), Some(Duration::MAX));
+        assert_eq!(
+            format!("{error:?}"),
+            format!(
+                "ProviderRateLimited {{ provider: \"notion\", retry_after: {:?} }}",
+                Duration::MAX
+            )
+        );
     }
 
     #[test]

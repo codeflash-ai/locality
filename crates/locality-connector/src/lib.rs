@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 pub mod conformance;
+pub mod hydration_budget;
 pub mod manifest;
 pub mod network;
 pub mod oauth_broker;

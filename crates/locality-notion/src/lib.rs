@@ -9,6 +9,7 @@ pub mod database;
 pub mod database_create;
 pub mod dto;
 pub mod fetch;
+pub mod hydration;
 pub mod mapping;
 pub mod markdown_table;
 pub mod media;
@@ -23,6 +24,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
+use locality_connector::hydration_budget::{InitialHydrationBudget, InitialHydrationResult};
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorExecutionPolicy, ConnectorKind, EnumerateRequest, FetchRequest,
@@ -217,6 +219,71 @@ impl NotionConnector {
 
     pub fn portable_media_capture_policy(&self) -> PortableMediaCapturePolicy {
         self.portable_media_capture_policy
+    }
+
+    /// Opt-in initial-hydration page fetch. The caller owns the job-scoped
+    /// budget and must reuse it for every later media/render/projection stage.
+    pub fn fetch_page_native_bounded(
+        &self,
+        page_id: &RemoteId,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<NativeEntity> {
+        hydration::fetch_page_native_bounded(self.api.as_ref(), page_id.as_str(), budget)
+    }
+
+    /// Opt-in initial-hydration database/schema fetch.
+    pub fn fetch_database_native_bounded(
+        &self,
+        database_id: &RemoteId,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<NativeEntity> {
+        hydration::fetch_database_native_bounded(self.api.as_ref(), database_id.as_str(), budget)
+    }
+
+    /// Bounded row inventory only; the caller must not infer deletion from
+    /// omissions or assign snapshot authority to this result.
+    pub fn query_data_source_rows_bounded(
+        &self,
+        data_source_id: &RemoteId,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<Vec<dto::PageDto>> {
+        hydration::query_data_source_rows_bounded(
+            self.api.as_ref(),
+            data_source_id.as_str(),
+            budget,
+        )
+    }
+
+    /// Fetch one hosted asset under the connector's configured transport and
+    /// the caller's shared initial-hydration budget.
+    pub fn fetch_portable_media_bounded(
+        &self,
+        hosted_url: &str,
+        per_asset_max_bytes: usize,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<media::PortableMediaCapture> {
+        let default_fetcher = default_portable_media_fetcher();
+        let fetcher = self
+            .portable_media_fetcher
+            .as_deref()
+            .unwrap_or(default_fetcher.as_ref());
+        hydration::fetch_media_bounded(fetcher, hosted_url, per_asset_max_bytes, budget)
+    }
+
+    pub fn render_native_entity_bounded(
+        &self,
+        entity: &NativeEntity,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<NotionRenderedEntity> {
+        hydration::render_native_entity_bounded(entity, budget)
+    }
+
+    pub fn render_portable_bounded(
+        &self,
+        request: &PortableRenderRequest,
+        budget: &InitialHydrationBudget,
+    ) -> InitialHydrationResult<PortableRenderResult> {
+        hydration::render_portable_bounded(request, budget)
     }
 
     pub fn render_native_entity(
