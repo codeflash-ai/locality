@@ -18,8 +18,9 @@ use locality_core::portable::{
     LogicalPath, ProjectionFileKind, SourceAction, SourceConnectionId, SourceEdge, SourceObject,
 };
 use locality_engine::synchronize_project::{
-    BootstrapAggregationLimits, bootstrap_and_project, bootstrap_and_project_to_completion,
-    synchronize_and_project_portable, synchronize_and_project_portable_v2,
+    BootstrapAggregationLimits, SynchronizationAggregationLimits, bootstrap_and_project,
+    bootstrap_and_project_to_completion, synchronize_and_project_portable,
+    synchronize_and_project_portable_v2, synchronize_and_project_portable_v2_to_completion,
 };
 
 #[derive(Clone)]
@@ -325,6 +326,215 @@ impl Connector for V2FixtureConnector {
         request: &PortableRenderRequest,
     ) -> LocalityResult<PortableRenderResult> {
         FixtureConnector::complete().render_portable(request)
+    }
+
+    fn fetch(&self, _request: FetchRequest) -> LocalityResult<NativeEntity> {
+        unreachable!("portable engine uses fetch_portable")
+    }
+
+    fn render(&self, _entity: &NativeEntity) -> LocalityResult<CanonicalDocument> {
+        unreachable!("portable engine uses render_portable")
+    }
+
+    fn parse(&self, _document: &CanonicalDocument) -> LocalityResult<ParsedEntity> {
+        unreachable!("not used")
+    }
+
+    fn check_concurrency(&self, _request: ApplyPlanRequest<'_>) -> LocalityResult<()> {
+        unreachable!("not used")
+    }
+
+    fn apply(&self, _request: ApplyPlanRequest<'_>) -> LocalityResult<ApplyPlanResult> {
+        unreachable!("not used")
+    }
+
+    fn apply_undo(&self, _request: ApplyUndoRequest<'_>) -> LocalityResult<ApplyUndoResult> {
+        unreachable!("not used")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum V2PagedFault {
+    None,
+    TerminalIncremental,
+    SubsetCoverage,
+    DuplicateCoverage,
+    ForeignCoverage,
+    DuplicateSource,
+    DuplicateArtifact,
+    RepeatedCheckpoint,
+    CheckpointCycle,
+    TerminalRepeatedCheckpoint,
+    TerminalEmptyCheckpoint,
+    ResponseOverflow,
+    IncompleteFetch,
+    IncompleteRender,
+}
+
+struct V2PagedConnector {
+    fault: V2PagedFault,
+    requests: Mutex<Vec<PortableSyncRequestV2>>,
+    fetches: AtomicUsize,
+}
+
+impl V2PagedConnector {
+    fn new(fault: V2PagedFault) -> Self {
+        Self {
+            fault,
+            requests: Mutex::new(Vec::new()),
+            fetches: AtomicUsize::new(0),
+        }
+    }
+
+    fn requests(&self) -> Vec<PortableSyncRequestV2> {
+        self.requests.lock().expect("requests lock").clone()
+    }
+}
+
+impl Connector for V2PagedConnector {
+    fn kind(&self) -> ConnectorKind {
+        ConnectorKind("v2-paged-fixture")
+    }
+
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::read_only()
+    }
+
+    fn supported_push_operations(&self) -> BTreeSet<locality_core::planner::PushOperationKind> {
+        BTreeSet::new()
+    }
+
+    fn enumerate(&self, _request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>> {
+        Ok(Vec::new())
+    }
+
+    fn sync_portable_v2_impl(
+        &self,
+        request: PortableSyncRequestV2,
+    ) -> LocalityResult<PortableChangeBatchV2> {
+        self.requests
+            .lock()
+            .expect("requests lock")
+            .push(request.clone());
+        let page = match request.checkpoint.opaque.as_str() {
+            "start" => 0,
+            "cp-a" => 1,
+            "cp-b" if self.fault == V2PagedFault::CheckpointCycle => 2,
+            _ => {
+                return Err(locality_core::LocalityError::InvalidState(
+                    "fixture checkpoint is invalid".to_string(),
+                ));
+            }
+        };
+
+        let (remote_id, path, owning_root) = match page {
+            0 => ("page-a", "A/page.md", "root-a"),
+            1 if self.fault == V2PagedFault::DuplicateSource => {
+                ("page-a", "A-again/page.md", "root-b")
+            }
+            1 => ("page-b", "B/page.md", "root-b"),
+            _ => ("page-c", "C/page.md", "root-b"),
+        };
+        let mut changes = vec![v2_paged_change(
+            &request.source_connection_id,
+            remote_id,
+            path,
+            owning_root,
+        )];
+        if self.fault == V2PagedFault::ResponseOverflow && page == 0 {
+            changes.push(v2_paged_change(
+                &request.source_connection_id,
+                "page-extra",
+                "Extra/page.md",
+                "root-a",
+            ));
+        }
+
+        let (next_checkpoint, completeness) = match (self.fault, page) {
+            (V2PagedFault::RepeatedCheckpoint, 0) => (
+                "start",
+                PortableCompleteness::incomplete(PortableIncompleteReason::CheckpointContinuation),
+            ),
+            (V2PagedFault::CheckpointCycle, 0) => (
+                "cp-a",
+                PortableCompleteness::incomplete(PortableIncompleteReason::CheckpointContinuation),
+            ),
+            (V2PagedFault::CheckpointCycle, 1) => (
+                "cp-b",
+                PortableCompleteness::incomplete(PortableIncompleteReason::CheckpointContinuation),
+            ),
+            (V2PagedFault::CheckpointCycle, _) => (
+                "cp-a",
+                PortableCompleteness::incomplete(PortableIncompleteReason::CheckpointContinuation),
+            ),
+            (V2PagedFault::TerminalRepeatedCheckpoint, 1) => {
+                ("cp-a", PortableCompleteness::complete())
+            }
+            (V2PagedFault::TerminalEmptyCheckpoint, 1) => ("", PortableCompleteness::complete()),
+            (_, 0) => (
+                "cp-a",
+                PortableCompleteness::incomplete(PortableIncompleteReason::CheckpointContinuation),
+            ),
+            (_, _) => ("done", PortableCompleteness::complete()),
+        };
+
+        let covered_root_remote_ids = match (self.fault, page) {
+            (V2PagedFault::SubsetCoverage, 1) => vec![RemoteId::new("root-b")],
+            (V2PagedFault::DuplicateCoverage, 0) => {
+                vec![RemoteId::new("root-a"), RemoteId::new("root-a")]
+            }
+            (V2PagedFault::ForeignCoverage, 0) => vec![RemoteId::new("foreign-root")],
+            (_, 0) => vec![RemoteId::new("root-a")],
+            (_, 1) => vec![RemoteId::new("root-a"), RemoteId::new("root-b")],
+            _ => Vec::new(),
+        };
+        let authority = if page == 0 || self.fault != V2PagedFault::TerminalIncremental {
+            PortableBatchAuthority::CompleteScopeSnapshot
+        } else {
+            PortableBatchAuthority::Incremental
+        };
+
+        Ok(PortableChangeBatchV2 {
+            changes,
+            next_checkpoint: PortableCheckpoint {
+                format_version: 1,
+                opaque: next_checkpoint.to_string(),
+            },
+            completeness,
+            covered_root_remote_ids,
+            authority,
+        })
+    }
+
+    fn fetch_portable(&self, request: PortableFetchRequest) -> LocalityResult<PortableFetchResult> {
+        self.fetches.fetch_add(1, Ordering::SeqCst);
+        let mut result = FixtureConnector::complete().fetch_portable(request)?;
+        if self.fault == V2PagedFault::IncompleteFetch {
+            result.completeness =
+                PortableCompleteness::incomplete(PortableIncompleteReason::ConnectorLimitation {
+                    code: "fetch_gap".to_string(),
+                    remote_id: None,
+                });
+        }
+        Ok(result)
+    }
+
+    fn render_portable(
+        &self,
+        request: &PortableRenderRequest,
+    ) -> LocalityResult<PortableRenderResult> {
+        let mut result = FixtureConnector::complete().render_portable(request)?;
+        if self.fault == V2PagedFault::DuplicateArtifact {
+            result.canonical.artifact_key = PortableArtifactKey::new("v2:shared:canonical:v1");
+        }
+        if self.fault == V2PagedFault::IncompleteRender {
+            result.completeness =
+                PortableCompleteness::incomplete(PortableIncompleteReason::ConnectorLimitation {
+                    code: "render_gap".to_string(),
+                    remote_id: None,
+                });
+        }
+        Ok(result)
     }
 
     fn fetch(&self, _request: FetchRequest) -> LocalityResult<NativeEntity> {
@@ -893,6 +1103,275 @@ fn v2_validation_rejects_invalid_hints_before_connector_dispatch() {
 }
 
 #[test]
+fn paginated_v2_allows_repeated_coverage_with_an_exact_terminal_snapshot() {
+    let connector = V2PagedConnector::new(V2PagedFault::None);
+    let request = v2_paged_request(1);
+    let aggregate = synchronize_and_project_portable_v2_to_completion(
+        &connector,
+        request.clone(),
+        1,
+        generous_sync_v2_aggregation_limits(),
+    )
+    .expect("multi-root v2 aggregate");
+
+    assert_eq!(aggregate.scope(), &request.scope);
+    assert_eq!(aggregate.mode(), request.mode);
+    assert_eq!(
+        aggregate.authority(),
+        PortableBatchAuthority::CompleteScopeSnapshot
+    );
+    assert!(aggregate.authorizes_omission());
+    assert!(aggregate.batch().is_publication_eligible());
+    assert_eq!(aggregate.batch().next_checkpoint.opaque, "done");
+    assert_eq!(
+        aggregate
+            .batch()
+            .observed_changes
+            .iter()
+            .map(|change| change.source_object.remote_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["page-a", "page-b"]
+    );
+
+    let requests = connector.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], request);
+    let mut second_request = request.clone();
+    second_request.checkpoint.opaque = "cp-a".to_string();
+    assert_eq!(requests[1], second_request);
+}
+
+#[test]
+fn paginated_v2_uses_only_terminal_authority_and_complete_aggregate_coverage() {
+    let terminal_incremental = V2PagedConnector::new(V2PagedFault::TerminalIncremental);
+    let aggregate = synchronize_and_project_portable_v2_to_completion(
+        &terminal_incremental,
+        v2_paged_request(1),
+        1,
+        generous_sync_v2_aggregation_limits(),
+    )
+    .expect("terminal incremental aggregate");
+    assert_eq!(aggregate.authority(), PortableBatchAuthority::Incremental);
+    assert!(aggregate.batch().is_publication_eligible());
+    assert!(!aggregate.authorizes_omission());
+
+    let subset = V2PagedConnector::new(V2PagedFault::SubsetCoverage);
+    let aggregate = synchronize_and_project_portable_v2_to_completion(
+        &subset,
+        v2_paged_request(1),
+        1,
+        generous_sync_v2_aggregation_limits(),
+    )
+    .expect("subset coverage remains inspectable");
+    assert_eq!(
+        aggregate.authority(),
+        PortableBatchAuthority::CompleteScopeSnapshot
+    );
+    assert!(aggregate.batch().is_publication_eligible());
+    assert!(!aggregate.authorizes_omission());
+}
+
+#[test]
+fn paginated_v2_rejects_duplicate_and_foreign_coverage_before_fetch() {
+    for fault in [
+        V2PagedFault::DuplicateCoverage,
+        V2PagedFault::ForeignCoverage,
+    ] {
+        let connector = V2PagedConnector::new(fault);
+        synchronize_and_project_portable_v2_to_completion(
+            &connector,
+            v2_paged_request(1),
+            1,
+            generous_sync_v2_aggregation_limits(),
+        )
+        .expect_err("invalid coverage must fail");
+        assert_eq!(connector.requests().len(), 1, "{fault:?}");
+        assert_eq!(connector.fetches.load(Ordering::SeqCst), 0, "{fault:?}");
+    }
+}
+
+#[test]
+fn paginated_v2_rejects_checkpoint_replay_and_cycles() {
+    for (fault, expected) in [
+        (V2PagedFault::RepeatedCheckpoint, "did not advance"),
+        (V2PagedFault::CheckpointCycle, "checkpoint cycle"),
+    ] {
+        let connector = V2PagedConnector::new(fault);
+        let error = synchronize_and_project_portable_v2_to_completion(
+            &connector,
+            v2_paged_request(1),
+            1,
+            generous_sync_v2_aggregation_limits(),
+        )
+        .expect_err("unsafe checkpoint progression must fail");
+        assert!(error.to_string().contains(expected), "{fault:?}: {error}");
+    }
+}
+
+#[test]
+fn paginated_v2_accepts_stateless_terminal_checkpoints() {
+    for (fault, expected_checkpoint) in [
+        (V2PagedFault::TerminalRepeatedCheckpoint, "cp-a"),
+        (V2PagedFault::TerminalEmptyCheckpoint, ""),
+    ] {
+        let connector = V2PagedConnector::new(fault);
+        let aggregate = synchronize_and_project_portable_v2_to_completion(
+            &connector,
+            v2_paged_request(1),
+            1,
+            generous_sync_v2_aggregation_limits(),
+        )
+        .expect("terminal checkpoint need not advance");
+        assert_eq!(
+            aggregate.batch().next_checkpoint.opaque,
+            expected_checkpoint,
+            "{fault:?}"
+        );
+        assert!(aggregate.authorizes_omission(), "{fault:?}");
+    }
+}
+
+#[test]
+fn paginated_v2_rejects_cross_page_source_and_artifact_collisions() {
+    for (fault, expected) in [
+        (V2PagedFault::DuplicateSource, "repeated a source version"),
+        (
+            V2PagedFault::DuplicateArtifact,
+            "repeated a content artifact",
+        ),
+    ] {
+        let connector = V2PagedConnector::new(fault);
+        let error = synchronize_and_project_portable_v2_to_completion(
+            &connector,
+            v2_paged_request(1),
+            1,
+            generous_sync_v2_aggregation_limits(),
+        )
+        .expect_err("cross-page identity collision must fail");
+        assert!(error.to_string().contains(expected), "{fault:?}: {error}");
+    }
+}
+
+#[test]
+fn paginated_v2_aggregate_limits_are_nonzero_and_enforced() {
+    for limits in [
+        SynchronizationAggregationLimits {
+            max_checkpoints: 0,
+            ..generous_sync_v2_aggregation_limits()
+        },
+        SynchronizationAggregationLimits {
+            max_total_changes: 0,
+            ..generous_sync_v2_aggregation_limits()
+        },
+        SynchronizationAggregationLimits {
+            max_total_content_bytes: 0,
+            ..generous_sync_v2_aggregation_limits()
+        },
+    ] {
+        let connector = V2PagedConnector::new(V2PagedFault::None);
+        let error = synchronize_and_project_portable_v2_to_completion(
+            &connector,
+            v2_paged_request(1),
+            1,
+            limits,
+        )
+        .expect_err("zero aggregate bound must fail");
+        assert!(error.to_string().contains("limits must be nonzero"));
+        assert!(connector.requests().is_empty());
+    }
+
+    for (limits, expected) in [
+        (
+            SynchronizationAggregationLimits {
+                max_checkpoints: 1,
+                ..generous_sync_v2_aggregation_limits()
+            },
+            "checkpoint limit",
+        ),
+        (
+            SynchronizationAggregationLimits {
+                max_total_changes: 1,
+                ..generous_sync_v2_aggregation_limits()
+            },
+            "change limit",
+        ),
+        (
+            SynchronizationAggregationLimits {
+                max_total_content_bytes: 1,
+                ..generous_sync_v2_aggregation_limits()
+            },
+            "content byte limit",
+        ),
+    ] {
+        let connector = V2PagedConnector::new(V2PagedFault::None);
+        let error = synchronize_and_project_portable_v2_to_completion(
+            &connector,
+            v2_paged_request(1),
+            1,
+            limits,
+        )
+        .expect_err("aggregate bound must fail");
+        assert!(error.to_string().contains(expected), "{error}");
+        if expected == "change limit" {
+            assert_eq!(connector.requests().len(), 2);
+            assert_eq!(connector.fetches.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[test]
+fn paginated_v2_merges_fetch_and_render_incompleteness() {
+    for (fault, expected_code) in [
+        (V2PagedFault::IncompleteFetch, "fetch_gap"),
+        (V2PagedFault::IncompleteRender, "render_gap"),
+    ] {
+        let connector = V2PagedConnector::new(fault);
+        let aggregate = synchronize_and_project_portable_v2_to_completion(
+            &connector,
+            v2_paged_request(1),
+            1,
+            generous_sync_v2_aggregation_limits(),
+        )
+        .expect("incomplete aggregate remains inspectable");
+        assert!(!aggregate.batch().is_publication_eligible(), "{fault:?}");
+        assert!(!aggregate.authorizes_omission(), "{fault:?}");
+        assert_eq!(
+            aggregate.batch().completeness.incomplete_reasons(),
+            [PortableIncompleteReason::ConnectorLimitation {
+                code: expected_code.to_string(),
+                remote_id: None,
+            }]
+        );
+    }
+}
+
+#[test]
+fn paginated_v2_rejects_zero_work_and_oversized_responses_before_fetch() {
+    let zero_work = V2PagedConnector::new(V2PagedFault::None);
+    let error = synchronize_and_project_portable_v2_to_completion(
+        &zero_work,
+        v2_paged_request(0),
+        1,
+        generous_sync_v2_aggregation_limits(),
+    )
+    .expect_err("zero max_changes must fail validation");
+    assert!(error.to_string().contains("max_changes must be in 1..="));
+    assert!(zero_work.requests().is_empty());
+    assert_eq!(zero_work.fetches.load(Ordering::SeqCst), 0);
+
+    let overflow = V2PagedConnector::new(V2PagedFault::ResponseOverflow);
+    synchronize_and_project_portable_v2_to_completion(
+        &overflow,
+        v2_paged_request(1),
+        1,
+        generous_sync_v2_aggregation_limits(),
+    )
+    .expect_err("response over per-request bound must fail");
+    assert_eq!(overflow.requests().len(), 1);
+    assert_eq!(overflow.fetches.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn conflicting_artifact_keys_fail_the_whole_batch() {
     let connector = FixtureConnector {
         incomplete: false,
@@ -1188,6 +1667,48 @@ fn generous_aggregation_limits() -> BootstrapAggregationLimits {
         max_total_changes: 100,
         max_total_content_bytes: 1_000_000,
     }
+}
+
+fn v2_paged_request(max_changes: u32) -> PortableSyncRequestV2 {
+    PortableSyncRequestV2 {
+        source_connection_id: SourceConnectionId::new("v2-paged-source"),
+        scope: locality_connector::PortableSourceScope::explicit_roots([
+            RemoteId::new("root-a"),
+            RemoteId::new("root-b"),
+        ]),
+        checkpoint: PortableCheckpoint {
+            format_version: 1,
+            opaque: "start".to_string(),
+        },
+        mode: PortableSyncMode::ReconcileScope,
+        hints: vec![PortableSyncHintV2 {
+            remote_id: RemoteId::new("prior-a"),
+            provider_version: Some("v0".to_string()),
+            logical_path: Some(LogicalPath::new("Prior/page.md").expect("logical path")),
+            source_kind: Some(EntityKind::Page),
+            owning_root_remote_id: Some(RemoteId::new("root-a")),
+        }],
+        max_changes,
+    }
+}
+
+fn generous_sync_v2_aggregation_limits() -> SynchronizationAggregationLimits {
+    SynchronizationAggregationLimits {
+        max_checkpoints: 10,
+        max_total_changes: 100,
+        max_total_content_bytes: 1_000_000,
+    }
+}
+
+fn v2_paged_change(
+    source_connection_id: &SourceConnectionId,
+    remote_id: &str,
+    path: &str,
+    owning_root: &str,
+) -> PortableSourceChange {
+    let mut change = change(source_connection_id, remote_id, path);
+    change.source_object.edges[0].target_remote_id = RemoteId::new(owning_root);
+    change
 }
 
 fn paged_change(
