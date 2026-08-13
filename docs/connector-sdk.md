@@ -100,8 +100,9 @@ batch explicitly lists
 `covered_root_remote_ids`; omission requires that validated, unique set to equal
 the exact requested root set. The engine preserves that requested scope,
 rejects every returned change or tombstone with missing or foreign owning-root
-provenance, and derives the omission flag only after coverage and projection
-validation. A batch covering only A for a request of A+B is non-authoritative.
+provenance, and derives the omission flag only after bounded response, coverage,
+and projection validation. A batch covering only A for a request of A+B is
+non-authoritative.
 An empty change result can authorize omission only when it explicitly covers
 every requested root; missing coverage never can. The v2 result's scope, mode,
 connector authority, completeness, and derived flag are private and available
@@ -135,8 +136,11 @@ checkpoints are at most 65,536 UTF-8 bytes. Logical paths retain the portable
 core's 1,024-byte ceiling. Duplicate scope-root or hint remote IDs and missing
 or out-of-scope hint owning roots are rejected. Response coverage uses the same
 256-root and 1,024-byte ID ceilings; duplicate or foreign covered roots are
-rejected. Checkpoint bytes remain connector-owned and opaque: hosts bound,
-persist, and return them without parsing their contents.
+rejected. A response may contain no more changes than the original request's
+`max_changes` and its next opaque checkpoint has the same 65,536-byte ceiling;
+both are checked before fetch, render, or any host persistence. Checkpoint bytes
+remain connector-owned and opaque: hosts bound, persist, and return them
+without parsing their contents.
 
 The host must validate and reconcile the entire result before persisting
 `next_checkpoint`. If validation, store mutation, or projection reconciliation

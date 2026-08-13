@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
@@ -9,12 +9,12 @@ use locality_connector::{
     PORTABLE_SYNC_V2_MAX_SOURCE_KIND_BYTES, ParsedEntity, PortableBatchAuthority,
     PortableBootstrapRequest, PortableChangeBatch, PortableChangeBatchV2, PortableCheckpoint,
     PortableCompleteness, PortableEnumerateRequest, PortableFetchReason, PortableFetchRequest,
-    PortableSourceScope, PortableSyncHint, PortableSyncHintV2, PortableSyncMode,
-    PortableSyncRequest, PortableSyncRequestV2,
+    PortableSourceChange, PortableSourceScope, PortableSyncHint, PortableSyncHintV2,
+    PortableSyncMode, PortableSyncRequest, PortableSyncRequestV2,
 };
 use locality_core::LocalityResult;
 use locality_core::model::{CanonicalDocument, EntityKind, TreeEntry};
-use locality_core::portable::{LogicalPath, SourceConnectionId};
+use locality_core::portable::{LogicalPath, SourceConnectionId, SourceObject};
 use serde_json::json;
 
 #[derive(Clone)]
@@ -458,6 +458,52 @@ fn portable_sync_v2_bounds_explicit_response_coverage() {
         Err(locality_core::LocalityError::InvalidState(format!(
             "portable sync v2 covered root remote ID must contain 1..={} UTF-8 bytes",
             PORTABLE_SYNC_V2_MAX_ID_BYTES
+        )))
+    );
+}
+
+#[test]
+fn portable_sync_v2_bounds_response_changes_at_global_ceiling() {
+    let scope =
+        PortableSourceScope::explicit_roots([locality_core::model::RemoteId::new("root-1")]);
+    let change = PortableSourceChange {
+        source_object: SourceObject {
+            source_connection_id: SourceConnectionId::new("source-1"),
+            remote_id: locality_core::model::RemoteId::new("page-1"),
+            kind: EntityKind::Page,
+            edges: Vec::new(),
+            opaque_version: None,
+            deleted: false,
+            connector_metadata: BTreeMap::new(),
+            acl_observations: Vec::new(),
+            discovered_at: None,
+            observed_at: None,
+        },
+        logical_path: None,
+        requires_fetch: false,
+    };
+    let mut batch = PortableChangeBatchV2 {
+        changes: vec![change.clone(); PORTABLE_SYNC_V2_MAX_CHANGES as usize],
+        next_checkpoint: PortableCheckpoint {
+            format_version: 1,
+            opaque: "c".repeat(PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES),
+        },
+        completeness: PortableCompleteness::complete(),
+        covered_root_remote_ids: scope.root_remote_ids.clone(),
+        authority: PortableBatchAuthority::Incremental,
+    };
+    assert!(
+        batch
+            .validate_for_request(&scope, PORTABLE_SYNC_V2_MAX_CHANGES)
+            .expect("response exactly at global change and checkpoint ceilings")
+    );
+    batch.changes.push(change);
+    assert_eq!(
+        batch.validate_for_request(&scope, PORTABLE_SYNC_V2_MAX_CHANGES),
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 batch has {} changes; request maximum is {}",
+            PORTABLE_SYNC_V2_MAX_CHANGES + 1,
+            PORTABLE_SYNC_V2_MAX_CHANGES
         )))
     );
 }

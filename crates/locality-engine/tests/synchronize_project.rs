@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, NativeEntity,
-    PORTABLE_SCOPE_ROOT_RELATIONSHIP, ParsedEntity, PortableArtifactKey, PortableBatchAuthority,
-    PortableBootstrapRequest, PortableChangeBatch, PortableChangeBatchV2, PortableCheckpoint,
-    PortableCompleteness, PortableContentArtifact, PortableFetchRequest, PortableFetchResult,
-    PortableIncompleteReason, PortableProjectionArtifact, PortableRenderRequest,
-    PortableRenderResult, PortableSourceChange, PortableSyncHintV2, PortableSyncMode,
-    PortableSyncRequest, PortableSyncRequestV2,
+    PORTABLE_SCOPE_ROOT_RELATIONSHIP, PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES, ParsedEntity,
+    PortableArtifactKey, PortableBatchAuthority, PortableBootstrapRequest, PortableChangeBatch,
+    PortableChangeBatchV2, PortableCheckpoint, PortableCompleteness, PortableContentArtifact,
+    PortableFetchRequest, PortableFetchResult, PortableIncompleteReason,
+    PortableProjectionArtifact, PortableRenderRequest, PortableRenderResult, PortableSourceChange,
+    PortableSyncHintV2, PortableSyncMode, PortableSyncRequest, PortableSyncRequestV2,
 };
 use locality_core::LocalityResult;
 use locality_core::model::{CanonicalDocument, EntityKind, RemoteId, TreeEntry};
@@ -175,7 +175,10 @@ struct V2FixtureConnector {
     complete: bool,
     provenance: V2FixtureProvenance,
     coverage: V2FixtureCoverage,
+    change_count: usize,
+    checkpoint_bytes: usize,
     dispatches: AtomicUsize,
+    fetches: AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -204,7 +207,10 @@ impl V2FixtureConnector {
             complete,
             provenance: V2FixtureProvenance::InScope,
             coverage: V2FixtureCoverage::Exact,
+            change_count: 1,
+            checkpoint_bytes: "v2-ready".len(),
             dispatches: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
         }
     }
 
@@ -215,6 +221,16 @@ impl V2FixtureConnector {
 
     fn with_coverage(mut self, coverage: V2FixtureCoverage) -> Self {
         self.coverage = coverage;
+        self
+    }
+
+    fn with_change_count(mut self, change_count: usize) -> Self {
+        self.change_count = change_count;
+        self
+    }
+
+    fn with_checkpoint_bytes(mut self, checkpoint_bytes: usize) -> Self {
+        self.checkpoint_bytes = checkpoint_bytes;
         self
     }
 }
@@ -245,7 +261,15 @@ impl Connector for V2FixtureConnector {
         let mut foreign = change(&request.source_connection_id, "page-b", "B/page.md");
         foreign.source_object.edges[0].target_remote_id = RemoteId::new("foreign-root");
         let changes = match self.provenance {
-            V2FixtureProvenance::InScope => vec![in_scope],
+            V2FixtureProvenance::InScope => (0..self.change_count)
+                .map(|index| {
+                    change(
+                        &request.source_connection_id,
+                        &format!("page-{index}"),
+                        &format!("Page-{index}/page.md"),
+                    )
+                })
+                .collect(),
             V2FixtureProvenance::Missing => {
                 in_scope.source_object.edges.clear();
                 vec![in_scope]
@@ -279,7 +303,7 @@ impl Connector for V2FixtureConnector {
             changes,
             next_checkpoint: PortableCheckpoint {
                 format_version: 1,
-                opaque: "v2-ready".to_string(),
+                opaque: "c".repeat(self.checkpoint_bytes),
             },
             completeness: if self.complete {
                 PortableCompleteness::complete()
@@ -292,6 +316,7 @@ impl Connector for V2FixtureConnector {
     }
 
     fn fetch_portable(&self, request: PortableFetchRequest) -> LocalityResult<PortableFetchResult> {
+        self.fetches.fetch_add(1, Ordering::SeqCst);
         FixtureConnector::complete().fetch_portable(request)
     }
 
@@ -792,6 +817,47 @@ fn v2_coverage_must_exactly_equal_the_requested_scope() {
             locality_core::LocalityError::InvalidState(expected.to_string())
         );
     }
+}
+
+#[test]
+fn v2_response_bounds_fail_before_projection() {
+    let connector = V2FixtureConnector::new(PortableBatchAuthority::Incremental, true)
+        .with_change_count(1)
+        .with_checkpoint_bytes(PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES);
+    let mut request = v2_request(PortableSyncMode::HintsOnly);
+    request.max_changes = 1;
+    synchronize_and_project_portable_v2(&connector, request, 1)
+        .expect("response exactly at change and checkpoint limits");
+    assert_eq!(connector.fetches.load(Ordering::SeqCst), 1);
+
+    let connector =
+        V2FixtureConnector::new(PortableBatchAuthority::Incremental, true).with_change_count(2);
+    let mut request = v2_request(PortableSyncMode::HintsOnly);
+    request.max_changes = 1;
+    let error = synchronize_and_project_portable_v2(&connector, request, 1)
+        .expect_err("response above request change limit");
+    assert_eq!(
+        error,
+        locality_core::LocalityError::InvalidState(
+            "portable sync v2 batch has 2 changes; request maximum is 1".to_string()
+        )
+    );
+    assert_eq!(connector.fetches.load(Ordering::SeqCst), 0);
+
+    let connector = V2FixtureConnector::new(PortableBatchAuthority::Incremental, true)
+        .with_checkpoint_bytes(PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES + 1);
+    let error =
+        synchronize_and_project_portable_v2(&connector, v2_request(PortableSyncMode::HintsOnly), 1)
+            .expect_err("response above checkpoint limit");
+    assert_eq!(
+        error,
+        locality_core::LocalityError::InvalidState(format!(
+            "portable sync v2 response checkpoint is {} UTF-8 bytes; maximum is {}",
+            PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES + 1,
+            PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES
+        ))
+    );
+    assert_eq!(connector.fetches.load(Ordering::SeqCst), 0);
 }
 
 #[test]

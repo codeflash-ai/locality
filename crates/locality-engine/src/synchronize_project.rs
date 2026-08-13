@@ -484,9 +484,10 @@ pub fn synchronize_and_project_portable_v2<C: Connector + ?Sized>(
     let source_connection_id = request.source_connection_id.clone();
     let scope = request.scope.clone();
     let mode = request.mode;
+    let max_changes = request.max_changes;
     let batch = dispatch_portable_sync_v2(connector, request)?;
+    let has_exact_scope_coverage = batch.validate_for_request(&scope, max_changes)?;
     let authority = batch.authority;
-    let has_exact_scope_coverage = batch.has_exact_scope_coverage(&scope)?;
     validate_v2_batch_scope_provenance(&scope, &batch.changes)?;
     let batch = project_batch(
         connector,

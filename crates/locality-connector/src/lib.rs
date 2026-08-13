@@ -298,6 +298,36 @@ impl From<PortableChangeBatch> for PortableChangeBatchV2 {
 }
 
 impl PortableChangeBatchV2 {
+    /// Validate bounded response fields against the original request and
+    /// report whether covered roots exactly equal the requested scope.
+    pub fn validate_for_request(
+        &self,
+        scope: &PortableSourceScope,
+        max_changes: u32,
+    ) -> LocalityResult<bool> {
+        if max_changes == 0 || max_changes > PORTABLE_SYNC_V2_MAX_CHANGES {
+            return Err(locality_core::LocalityError::InvalidState(format!(
+                "portable sync v2 max_changes must be in 1..={}",
+                PORTABLE_SYNC_V2_MAX_CHANGES
+            )));
+        }
+        if self.changes.len() > max_changes as usize {
+            return Err(locality_core::LocalityError::InvalidState(format!(
+                "portable sync v2 batch has {} changes; request maximum is {}",
+                self.changes.len(),
+                max_changes
+            )));
+        }
+        if self.next_checkpoint.opaque.len() > PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES {
+            return Err(locality_core::LocalityError::InvalidState(format!(
+                "portable sync v2 response checkpoint is {} UTF-8 bytes; maximum is {}",
+                self.next_checkpoint.opaque.len(),
+                PORTABLE_SYNC_V2_MAX_CHECKPOINT_BYTES
+            )));
+        }
+        self.has_exact_scope_coverage(scope)
+    }
+
     /// Validate response coverage and report whether it exactly equals the
     /// requested scope. A strict subset is valid but non-authoritative.
     pub fn has_exact_scope_coverage(&self, scope: &PortableSourceScope) -> LocalityResult<bool> {
