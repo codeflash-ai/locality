@@ -26,6 +26,9 @@ use locality_core::portable::{
 use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::{LocalityError, LocalityResult};
 
+use crate::attachments::{
+    DEFAULT_LINEAR_ATTACHMENT_DOWNLOAD_BYTES, enrich_linear_attachment_downloads,
+};
 use crate::client::{HttpLinearApiClient, LinearApi};
 use crate::dto::{
     LinearIssue, LinearIssueContext, LinearIssueContextKind, LinearIssueState,
@@ -316,11 +319,23 @@ impl Connector for LinearConnector {
     }
 
     fn fetch_portable(&self, request: PortableFetchRequest) -> LocalityResult<PortableFetchResult> {
-        let native = self.fetch(FetchRequest {
+        let mut native = self.fetch(FetchRequest {
             remote_id: request.remote_id,
         })?;
-        let bundle = serde_json::from_slice::<LinearNativeBundle>(&native.raw)
+        let mut bundle = serde_json::from_slice::<LinearNativeBundle>(&native.raw)
             .map_err(|error| LocalityError::Io(format!("Linear native decode failed: {error}")))?;
+        if let Some(context) = &mut bundle.context
+            && context.kind == LinearIssueContextKind::Attachments
+        {
+            let _assets = enrich_linear_attachment_downloads(
+                &mut context.context,
+                |url, max_bytes| self.download_attachment(url, max_bytes),
+                DEFAULT_LINEAR_ATTACHMENT_DOWNLOAD_BYTES,
+            );
+            native.raw = serde_json::to_vec(&bundle).map_err(|error| {
+                LocalityError::Io(format!("Linear native encode failed: {error}"))
+            })?;
+        }
         let provider_version = if let Some(context) = &bundle.context {
             Some(crate::render::context_remote_version(
                 &context.context,
