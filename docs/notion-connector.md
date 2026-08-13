@@ -280,16 +280,18 @@ Legacy `with_root_page_id` synchronization keeps its v1 checkpoint format;
 `HintsOnly` is a bounded metadata path. It retrieves only hinted page,
 database, or data-source metadata plus the parent metadata needed to prove
 ownership. It never searches, inventories a root, lists block children, or
-queries a data source. Page hints always produce an upsert when still owned,
-even when `last_edited_time` equals the supplied version, because Notion block
-metadata has no reliable independent edit timestamp. Database versions hash
-canonical V1 material containing the database ID/edit time and every declared
-data-source ID/edit time into a fixed-size `notion-db-v1:sha256:...` token;
-data-source hints therefore refresh and deduplicate to their parent database
-without exceeding the public provider-version bound. When a batch contains both
-forms, the direct database hint supplies the prior path, provider version, and
-owning root regardless of hint order; data-source metadata supplies only the
-refresh trigger and parent-database identity.
+queries a data source. A page hint whose supplied and current
+`last_edited_time` versions are both present and equal produces no change when
+its exact owning root is also unchanged, avoiding hydration and render work.
+Version changes, unknown versions, and owning-root changes still produce an
+upsert. Database versions hash canonical V1 material containing the database
+ID/edit time and every declared data-source ID/edit time into a fixed-size
+`notion-db-v1:sha256:...` token; data-source hints therefore refresh and
+deduplicate to their parent database without exceeding the public
+provider-version bound. When a batch contains both forms, the direct database
+hint supplies the prior path, provider version, and owning root regardless of
+hint order; data-source metadata supplies only the refresh trigger and
+parent-database identity.
 
 Ordinary updates retain the host-supplied logical path. Bounded ancestry can
 prove an owning-root change, but this metadata path does not claim exact rename

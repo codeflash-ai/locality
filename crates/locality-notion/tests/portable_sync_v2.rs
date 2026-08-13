@@ -27,6 +27,7 @@ const ROOT_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 const ROOT_B_EXACT: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 const PAGE_1: &str = "11111111-1111-1111-1111-111111111111";
 const PAGE_2: &str = "22222222-2222-2222-2222-222222222222";
+const PAGE_3: &str = "33333333-3333-3333-3333-333333333333";
 const DATABASE: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
 const DATA_SOURCE: &str = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
 
@@ -158,7 +159,7 @@ impl NotionApi for RecordingApi {
 }
 
 #[test]
-fn hints_only_preserves_exact_root_and_upserts_page_with_same_timestamp() {
+fn unchanged_page_hint_is_noop_without_scheduling_fetch() {
     let timestamp = "2026-08-13T01:02:03.000Z";
     let api =
         Arc::new(RecordingApi::default().with_page(page(PAGE_1, page_parent(ROOT_A), timestamp)));
@@ -179,18 +180,7 @@ fn hints_only_preserves_exact_root_and_upserts_page_with_same_timestamp() {
     let batch = dispatch_portable_sync_v2(&connector, request).expect("hints-only batch");
     assert_eq!(batch.authority, PortableBatchAuthority::Incremental);
     assert!(batch.covered_root_remote_ids.is_empty());
-    assert_eq!(batch.changes.len(), 1);
-    let change = &batch.changes[0];
-    assert!(!change.source_object.deleted);
-    assert!(change.requires_fetch);
-    assert_eq!(
-        change.logical_path.as_ref().map(LogicalPath::as_str),
-        Some("Prior Exact/Child/page.md")
-    );
-    assert_eq!(
-        portable_scope_root_remote_id(&change.source_object).expect("root edge"),
-        Some(&RemoteId::new(ROOT_A_EXACT))
-    );
+    assert!(batch.changes.is_empty());
     assert_eq!(batch.next_checkpoint.format_version, 3);
     let checkpoint: serde_json::Value =
         serde_json::from_str(&batch.next_checkpoint.opaque).expect("v3 checkpoint");
@@ -200,6 +190,52 @@ fn hints_only_preserves_exact_root_and_upserts_page_with_same_timestamp() {
         json!([canonical(ROOT_A)])
     );
     assert_eq!(api.calls(), vec![format!("page:{PAGE_1}")]);
+}
+
+#[test]
+fn changed_page_version_and_unknown_prior_version_still_upsert() {
+    let api = Arc::new(
+        RecordingApi::default()
+            .with_page(page(PAGE_1, page_parent(ROOT_A), "v2"))
+            .with_page(page(PAGE_2, page_parent(ROOT_A), "v2")),
+    );
+    let connector = connector(api.clone(), [ROOT_A]);
+    let batch = dispatch_portable_sync_v2(
+        &connector,
+        request(
+            [ROOT_A_EXACT],
+            terminal_v1_checkpoint(ROOT_A_EXACT),
+            vec![
+                hint(
+                    PAGE_1,
+                    Some("v1"),
+                    "Prior Exact/Changed/page.md",
+                    EntityKind::Page,
+                    ROOT_A_EXACT,
+                ),
+                hint(
+                    PAGE_2,
+                    None,
+                    "Prior Exact/Unknown/page.md",
+                    EntityKind::Page,
+                    ROOT_A_EXACT,
+                ),
+            ],
+            8,
+        ),
+    )
+    .expect("page upsert batch");
+
+    assert_eq!(batch.changes.len(), 2);
+    assert!(batch.changes.iter().all(|change| {
+        !change.source_object.deleted
+            && change.requires_fetch
+            && change.source_object.opaque_version.as_deref() == Some("v2")
+    }));
+    assert_eq!(
+        api.calls(),
+        vec![format!("page:{PAGE_1}"), format!("page:{PAGE_2}")]
+    );
 }
 
 #[test]
@@ -523,12 +559,15 @@ fn maximum_database_fanout_roundtrips_a_publicly_valid_provider_token() {
 
 #[test]
 fn direct_archives_and_proven_outside_moves_are_tombstones() {
-    let mut archived = page(PAGE_1, malformed_parent(), "v2");
+    let mut archived = page(PAGE_1, malformed_parent(), "v1");
     archived.archived = true;
-    let moved_outside = page(PAGE_2, workspace_parent(), "v3");
+    let mut trashed = page(PAGE_2, malformed_parent(), "v2");
+    trashed.in_trash = true;
+    let moved_outside = page(PAGE_3, workspace_parent(), "v3");
     let api = Arc::new(
         RecordingApi::default()
             .with_page(archived)
+            .with_page(trashed)
             .with_page(moved_outside),
     );
     let connector = connector(api, [ROOT_A]);
@@ -548,6 +587,13 @@ fn direct_archives_and_proven_outside_moves_are_tombstones() {
                 hint(
                     PAGE_2,
                     Some("v2"),
+                    "Root/Trashed/page.md",
+                    EntityKind::Page,
+                    ROOT_A,
+                ),
+                hint(
+                    PAGE_3,
+                    Some("v3"),
                     "Root/Moved/page.md",
                     EntityKind::Page,
                     ROOT_A,
@@ -557,7 +603,7 @@ fn direct_archives_and_proven_outside_moves_are_tombstones() {
         ),
     )
     .expect("tombstone batch");
-    assert_eq!(batch.changes.len(), 2);
+    assert_eq!(batch.changes.len(), 3);
     assert!(
         batch
             .changes
@@ -568,7 +614,7 @@ fn direct_archives_and_proven_outside_moves_are_tombstones() {
 
 #[test]
 fn move_between_requested_roots_is_one_rehomed_upsert() {
-    let api = Arc::new(RecordingApi::default().with_page(page(PAGE_1, page_parent(ROOT_B), "v2")));
+    let api = Arc::new(RecordingApi::default().with_page(page(PAGE_1, page_parent(ROOT_B), "v1")));
     let connector = connector(api, [ROOT_A, ROOT_B]);
     let batch = dispatch_portable_sync_v2(
         &connector,
@@ -670,7 +716,7 @@ fn not_found_rate_limit_and_malformed_ancestry_fail_without_tombstones() {
         assert_eq!(result.expect_err("metadata error must propagate"), error);
     }
 
-    let api = Arc::new(RecordingApi::default().with_page(page(PAGE_1, malformed_parent(), "v2")));
+    let api = Arc::new(RecordingApi::default().with_page(page(PAGE_1, malformed_parent(), "v1")));
     let connector = connector(api, [ROOT_A]);
     let error = dispatch_portable_sync_v2(
         &connector,

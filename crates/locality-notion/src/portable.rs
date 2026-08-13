@@ -616,6 +616,14 @@ fn process_sync_v2_page(
 
     match resolve_sync_v2_ancestry(metadata, &page.id, page.parent.as_ref(), roots)? {
         SyncV2Ancestry::Owned(current_root) => {
+            if hint
+                .provider_version
+                .as_deref()
+                .is_some_and(|prior| page.last_edited_time.as_deref() == Some(prior))
+                && prior_root == current_root
+            {
+                return Ok(None);
+            }
             let logical_path = required_hint_path(hint, "page")?;
             let title = page_title(&page);
             Ok(Some(sync_v2_change(
