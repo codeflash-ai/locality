@@ -911,10 +911,12 @@ fn portable_fetch_enriches_linear_attachment_download_status() {
 
 #[test]
 fn portable_linear_config_supports_execution_policy_parity() {
-    let config = LinearConfig::new("secret")
-        .with_execution_policy(ConnectorExecutionPolicy::DeferProviderCooldown);
+    let connector = LinearConnector::new(
+        LinearConfig::new("secret")
+            .with_execution_policy(ConnectorExecutionPolicy::DeferProviderCooldown),
+    );
     assert_eq!(
-        config.execution_policy,
+        connector.execution_policy(),
         ConnectorExecutionPolicy::DeferProviderCooldown
     );
 
@@ -924,7 +926,7 @@ fn portable_linear_config_supports_execution_policy_parity() {
     );
     let deferred = connector.with_execution_policy(ConnectorExecutionPolicy::DeferProviderCooldown);
     assert_eq!(
-        deferred.config().execution_policy,
+        deferred.execution_policy(),
         ConnectorExecutionPolicy::DeferProviderCooldown
     );
 }

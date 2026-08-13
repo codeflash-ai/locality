@@ -9,7 +9,7 @@ pub use attachments::{
     enrich_linear_attachment_downloads,
 };
 pub use client::{DEFAULT_LINEAR_GRAPHQL_URL, HttpLinearApiClient, LinearApi};
-pub use connector::{LINEAR_CONNECTOR_ID, LinearConfig, LinearConnector};
+pub use connector::{LINEAR_CONNECTOR_ID, LinearConfig, LinearConnector, LinearConnectorConfig};
 pub use dto::*;
 pub use render::{
     LinearNativeBundle, LinearNativeContextBundle, context_remote_version,
