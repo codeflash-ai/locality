@@ -264,14 +264,55 @@ are projected together by the same root allocator and recursive traversal as
 the desktop workspace view, including title collision suffixes. The configured
 and requested root sets must match exactly; empty, duplicate, overlapping, or
 ambiguous roots fail closed. Every set-mode source change carries exactly one
-`SourceObject.edges` entry with relationship `locality_scope_root` and the
-canonical owning root as its target, including a self-edge for each root.
+`SourceObject.edges` entry with relationship `locality_scope_root`. Recursive
+bootstrap uses the canonical owning root; portable V2 hint synchronization uses
+the exact root spelling from the request scope so host scope comparison remains
+byte-exact. Canonicalized IDs are used only for Notion identity comparison.
 Consumers decode it with `portable_scope_root_remote_id`; mixed or multiple
 owning-root edges fail closed.
 Notion does not expose reliable teamspace/private membership here, so Locality
 does not infer it. Database and media coverage remains explicitly incomplete.
 Legacy `with_root_page_id` synchronization keeps its v1 checkpoint format;
 `with_root_ids` uses component-versioned v2 root-set checkpoints.
+
+### Portable V2 hint synchronization
+
+`HintsOnly` is a bounded metadata path. It retrieves only hinted page,
+database, or data-source metadata plus the parent metadata needed to prove
+ownership. It never searches, inventories a root, lists block children, or
+queries a data source. Page hints always produce an upsert when still owned,
+even when `last_edited_time` equals the supplied version, because Notion block
+metadata has no reliable independent edit timestamp. Database versions hash
+canonical V1 material containing the database ID/edit time and every declared
+data-source ID/edit time into a fixed-size `notion-db-v1:sha256:...` token;
+data-source hints therefore refresh and deduplicate to their parent database
+without exceeding the public provider-version bound. When a batch contains both
+forms, the direct database hint supplies the prior path, provider version, and
+owning root regardless of hint order; data-source metadata supplies only the
+refresh trigger and parent-database identity.
+
+Ordinary updates retain the host-supplied logical path. Bounded ancestry can
+prove an owning-root change, but this metadata path does not claim exact rename
+repair or run sibling collision allocation. A move between requested roots is
+one upsert with the new exact owning-root edge, never a tombstone plus upsert.
+The connector emits a tombstone only for direct `archived`/`in_trash` metadata
+or ancestry that positively reaches exact, noncontradictory workspace parent
+metadata (`type: workspace` and `workspace: true`) outside the prior root.
+Not-found or inaccessible metadata, malformed parents, cycles, depth
+exhaustion, data-source disappearance, and rate limits fail the batch without a
+new checkpoint.
+
+The connector-specific ceilings are 32 hints per request/batch, 32 ancestry
+hops, 100 unique declared data sources and 32 equivalent duplicate summaries
+per database, and 16 KiB of checkpoint JSON. `max_changes` can lower the output
+page size further. V3 hint checkpoints bind the component version, synchronize
+operation, mode, source connection, exact and canonical root sets, the complete
+semantic hint digest, hint count, next index, and completion. Only terminal V1
+or V2 checkpoints migrate into this path; nonterminal legacy checkpoints,
+future versions, changed continuation inputs, and invalid/replayed progress
+shapes fail closed. `HintsOnly` always returns incremental authority and no
+covered roots. `ReconcileScope` currently retains the legacy incremental
+adapter and likewise claims no omission authority or root coverage.
 
 Each Notion page is a directory. The page body lives in `page.md`; sibling entries in the same directory are child Notion content:
 

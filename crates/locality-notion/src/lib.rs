@@ -27,8 +27,9 @@ use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorExecutionPolicy, ConnectorKind, EnumerateRequest, FetchRequest,
     ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
-    PortableBootstrapRequest, PortableChangeBatch, PortableFetchRequest, PortableFetchResult,
-    PortableRenderRequest, PortableRenderResult, PortableSyncRequest,
+    PortableBootstrapRequest, PortableChangeBatch, PortableChangeBatchV2, PortableFetchRequest,
+    PortableFetchResult, PortableRenderRequest, PortableRenderResult, PortableSyncHint,
+    PortableSyncMode, PortableSyncRequest, PortableSyncRequestV2,
 };
 use locality_core::freshness::RemoteObservation;
 use locality_core::model::{CanonicalDocument, RemoteId, TreeEntry};
@@ -385,6 +386,43 @@ impl Connector for NotionConnector {
             self.explicit_root_set,
             request,
         )
+    }
+
+    fn sync_portable_v2_impl(
+        &self,
+        request: PortableSyncRequestV2,
+    ) -> LocalityResult<PortableChangeBatchV2> {
+        if request.mode == PortableSyncMode::HintsOnly {
+            return portable::synchronize_v2_hints(
+                self.api.as_ref(),
+                &self.explicit_root_page_ids,
+                request,
+            );
+        }
+
+        // ReconcileScope intentionally retains the compatibility adapter for
+        // now: legacy incremental behavior, with no omission authority or root
+        // coverage claim. A future exhaustive implementation can replace this
+        // branch without weakening HintsOnly's bounded metadata path.
+        portable::synchronize(
+            self.api.as_ref(),
+            &self.explicit_root_page_ids,
+            self.explicit_root_set,
+            PortableSyncRequest {
+                source_connection_id: request.source_connection_id,
+                scope: request.scope,
+                checkpoint: request.checkpoint,
+                hints: request
+                    .hints
+                    .into_iter()
+                    .map(|hint| PortableSyncHint {
+                        remote_id: hint.remote_id,
+                    })
+                    .collect(),
+                max_changes: request.max_changes,
+            },
+        )
+        .map(Into::into)
     }
 
     fn fetch_portable(&self, request: PortableFetchRequest) -> LocalityResult<PortableFetchResult> {

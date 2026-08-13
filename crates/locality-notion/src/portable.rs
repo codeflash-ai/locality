@@ -8,11 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use locality_connector::{
-    NativeEntity, PORTABLE_SCOPE_ROOT_RELATIONSHIP, PortableArtifactKey, PortableBootstrapRequest,
-    PortableChangeBatch, PortableCheckpoint, PortableCompleteness, PortableContentArtifact,
-    PortableFetchRequest, PortableFetchResult, PortableIncompleteReason,
-    PortableProjectionArtifact, PortableRenderRequest, PortableRenderResult, PortableSourceChange,
-    PortableSyncRequest,
+    NativeEntity, PORTABLE_SCOPE_ROOT_RELATIONSHIP, PortableArtifactKey, PortableBatchAuthority,
+    PortableBootstrapRequest, PortableChangeBatch, PortableChangeBatchV2, PortableCheckpoint,
+    PortableCompleteness, PortableContentArtifact, PortableFetchRequest, PortableFetchResult,
+    PortableIncompleteReason, PortableProjectionArtifact, PortableRenderRequest,
+    PortableRenderResult, PortableSourceChange, PortableSyncHintV2, PortableSyncMode,
+    PortableSyncRequest, PortableSyncRequestV2,
 };
 use locality_core::canonical::render_canonical_markdown;
 use locality_core::model::{EntityKind, MountId, RemoteId};
@@ -25,11 +26,13 @@ use sha2::{Digest, Sha256};
 
 use crate::client::NotionApi;
 use crate::database::{
-    database_bundle_provider_version, fetch_database_bundle, render_database_bundle_schema,
+    database_bundle_from_metadata_bounded, database_bundle_provider_version_token,
+    fetch_database_bundle, render_database_bundle_schema,
 };
 use crate::dto::{
-    BlockDto, BlockTreeDto, FileBlockDto, NotionDatabaseBundle, NotionPageBundle,
-    NotionPortableCapturedMediaV1, NotionPortableIncompleteMediaV1, NotionPortablePageBundleV1,
+    BlockDto, BlockTreeDto, DataSourceDto, DatabaseDto, FileBlockDto, NotionDatabaseBundle,
+    NotionPageBundle, NotionPortableCapturedMediaV1, NotionPortableIncompleteMediaV1,
+    NotionPortablePageBundleV1, PageDto, ParentDto,
 };
 use crate::fetch::fetch_known_page_bundle;
 use crate::media::{
@@ -39,13 +42,22 @@ use crate::media::{
     sanitize_portable_hosted_media_url, sanitize_portable_media_type,
     validate_portable_external_media_url,
 };
-use crate::projection::enumerate_explicit_root_trees;
-use crate::render::{RenderOptions, render_native_entity, render_native_entity_with_options};
+use crate::projection::{database_title, enumerate_explicit_root_trees};
+use crate::render::{
+    RenderOptions, page_title, render_native_entity, render_native_entity_with_options,
+};
 
 const LEGACY_CHECKPOINT_FORMAT_VERSION: u16 = 1;
 const CHECKPOINT_FORMAT_VERSION: u16 = 2;
 const CHECKPOINT_COMPONENT_VERSION: u16 = 2;
+const SYNC_V2_CHECKPOINT_FORMAT_VERSION: u16 = 3;
+const SYNC_V2_CHECKPOINT_COMPONENT_VERSION: u16 = 3;
 const MAX_EXPLICIT_ROOTS: usize = 16;
+const SYNC_V2_MAX_HINTS: usize = 32;
+const SYNC_V2_MAX_ANCESTRY_DEPTH: usize = 32;
+const SYNC_V2_MAX_DATA_SOURCES_PER_DATABASE: usize = 100;
+const SYNC_V2_MAX_EQUIVALENT_DATA_SOURCE_DUPLICATES: usize = 32;
+const SYNC_V2_MAX_CHECKPOINT_BYTES: usize = 16 * 1024;
 const PORTABLE_FORMAT_VERSION: u32 = 1;
 const PORTABLE_MEDIA_NATIVE_FORMAT_VERSION: u16 = 1;
 const PORTABLE_MEDIA_NATIVE_KIND: &str = "notion_page_portable_media_v1";
@@ -79,6 +91,20 @@ struct NotionCheckpoint {
     complete: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct NotionSyncCheckpointV3 {
+    component_version: u16,
+    operation: CheckpointOperation,
+    mode: PortableSyncMode,
+    source_connection_sha256: String,
+    exact_root_remote_ids: Vec<String>,
+    canonical_root_remote_ids: Vec<String>,
+    semantic_hint_sha256: String,
+    hint_count: u32,
+    next_index: u32,
+    complete: bool,
+}
+
 enum DecodedCheckpoint {
     Legacy(LegacyNotionCheckpoint),
     Current(NotionCheckpoint),
@@ -89,6 +115,13 @@ struct CanonicalRootSet {
     roots: Vec<RemoteId>,
     normalized_ids: Vec<String>,
     identity: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SyncV2RootSet {
+    exact_ids: Vec<String>,
+    canonical_ids: Vec<String>,
+    exact_by_canonical: BTreeMap<String, RemoteId>,
 }
 
 pub(crate) fn bootstrap(
@@ -190,6 +223,857 @@ pub(crate) fn synchronize(
     )
 }
 
+pub(crate) fn synchronize_v2_hints(
+    api: &dyn NotionApi,
+    configured_roots: &[RemoteId],
+    request: PortableSyncRequestV2,
+) -> LocalityResult<PortableChangeBatchV2> {
+    if request.hints.len() > SYNC_V2_MAX_HINTS {
+        return Err(LocalityError::InvalidState(format!(
+            "Notion portable hints-only sync has {} hints; maximum is {SYNC_V2_MAX_HINTS}",
+            request.hints.len()
+        )));
+    }
+    if request.checkpoint.opaque.len() > SYNC_V2_MAX_CHECKPOINT_BYTES {
+        return Err(LocalityError::InvalidState(format!(
+            "Notion portable hints-only checkpoint is {} UTF-8 bytes; maximum is {SYNC_V2_MAX_CHECKPOINT_BYTES}",
+            request.checkpoint.opaque.len()
+        )));
+    }
+
+    let roots = validate_sync_v2_roots(configured_roots, &request.scope.root_remote_ids)?;
+    let mut canonical_hint_ids = BTreeSet::new();
+    for hint in &request.hints {
+        let canonical = normalize_notion_id(hint.remote_id.as_str());
+        if canonical.is_empty() || !canonical_hint_ids.insert(canonical) {
+            return Err(LocalityError::InvalidState(
+                "Notion portable hints-only sync contains an empty or canonically duplicate hint ID"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let semantic_hint_sha256 = semantic_hint_sha256(&request.hints);
+    let source_connection_sha256 = sha256_field(request.source_connection_id.as_str());
+    let mut next_index = sync_v2_start_index(
+        &request,
+        &roots,
+        &source_connection_sha256,
+        &semantic_hint_sha256,
+    )?;
+    let mut changes = Vec::new();
+    let mut metadata = SyncV2Metadata::new(api);
+    while next_index < request.hints.len() && changes.len() < request.max_changes as usize {
+        if let Some(change) = process_sync_v2_hint(&mut metadata, &request, &roots, next_index)? {
+            changes.push(change);
+        }
+        next_index += 1;
+    }
+
+    let complete = next_index == request.hints.len();
+    let mut completeness = PortableCompleteness::complete();
+    if !complete {
+        completeness.merge(PortableCompleteness::incomplete(
+            PortableIncompleteReason::CheckpointContinuation,
+        ));
+    }
+    let hint_count = u32::try_from(request.hints.len()).map_err(|_| {
+        LocalityError::InvalidState(
+            "Notion portable hints-only hint count is too large to checkpoint".to_string(),
+        )
+    })?;
+    let checkpoint_index = u32::try_from(next_index).map_err(|_| {
+        LocalityError::InvalidState(
+            "Notion portable hints-only next index is too large to checkpoint".to_string(),
+        )
+    })?;
+    let next_checkpoint = encode_sync_v2_checkpoint(&NotionSyncCheckpointV3 {
+        component_version: SYNC_V2_CHECKPOINT_COMPONENT_VERSION,
+        operation: CheckpointOperation::Synchronize,
+        mode: request.mode,
+        source_connection_sha256,
+        exact_root_remote_ids: roots.exact_ids.clone(),
+        canonical_root_remote_ids: roots.canonical_ids.clone(),
+        semantic_hint_sha256,
+        hint_count,
+        next_index: checkpoint_index,
+        complete,
+    })?;
+
+    Ok(PortableChangeBatchV2 {
+        changes,
+        next_checkpoint,
+        completeness,
+        covered_root_remote_ids: Vec::new(),
+        authority: PortableBatchAuthority::Incremental,
+    })
+}
+
+fn validate_sync_v2_roots(
+    configured_roots: &[RemoteId],
+    requested_roots: &[RemoteId],
+) -> LocalityResult<SyncV2RootSet> {
+    if configured_roots.is_empty() {
+        return Err(LocalityError::Unsupported(
+            "Notion portable synchronization requires a configured explicit root set",
+        ));
+    }
+    let configured = canonical_root_set(configured_roots)?;
+    let requested = canonical_root_set(requested_roots)?;
+    if configured.normalized_ids != requested.normalized_ids {
+        return Err(LocalityError::InvalidState(
+            "Notion portable scope must exactly match the configured explicit root set".to_string(),
+        ));
+    }
+
+    let exact_by_canonical = requested_roots
+        .iter()
+        .map(|root| (normalize_notion_id(root.as_str()), root.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let exact_ids = requested
+        .normalized_ids
+        .iter()
+        .map(|canonical| {
+            exact_by_canonical
+                .get(canonical)
+                .expect("validated requested canonical root")
+                .as_str()
+                .to_string()
+        })
+        .collect();
+    Ok(SyncV2RootSet {
+        exact_ids,
+        canonical_ids: requested.normalized_ids,
+        exact_by_canonical,
+    })
+}
+
+fn sync_v2_start_index(
+    request: &PortableSyncRequestV2,
+    roots: &SyncV2RootSet,
+    source_connection_sha256: &str,
+    semantic_hint_sha256: &str,
+) -> LocalityResult<usize> {
+    match request.checkpoint.format_version {
+        LEGACY_CHECKPOINT_FORMAT_VERSION => {
+            let checkpoint: LegacyNotionCheckpoint =
+                serde_json::from_str(&request.checkpoint.opaque).map_err(|_| {
+                    LocalityError::InvalidState(
+                        "Notion portable hints-only legacy checkpoint is invalid".to_string(),
+                    )
+                })?;
+            if !checkpoint.complete
+                || roots.canonical_ids.len() != 1
+                || normalize_notion_id(&checkpoint.root_remote_id) != roots.canonical_ids[0]
+            {
+                return Err(LocalityError::InvalidState(
+                    "Notion portable hints-only sync accepts only a terminal matching legacy checkpoint"
+                        .to_string(),
+                ));
+            }
+            Ok(0)
+        }
+        CHECKPOINT_FORMAT_VERSION => {
+            let checkpoint: NotionCheckpoint = serde_json::from_str(&request.checkpoint.opaque)
+                .map_err(|_| {
+                    LocalityError::InvalidState(
+                        "Notion portable hints-only root-set checkpoint is invalid".to_string(),
+                    )
+                })?;
+            if checkpoint.component_version > CHECKPOINT_COMPONENT_VERSION {
+                return Err(LocalityError::InvalidState(format!(
+                    "Notion portable checkpoint component version {} requires an update",
+                    checkpoint.component_version
+                )));
+            }
+            if !checkpoint.complete
+                || checkpoint.component_version != CHECKPOINT_COMPONENT_VERSION
+                || checkpoint.root_remote_ids != roots.canonical_ids
+                || checkpoint.root_set_sha256 != canonical_root_identity(&roots.canonical_ids)
+            {
+                return Err(LocalityError::InvalidState(
+                    "Notion portable hints-only sync accepts only a terminal matching root-set checkpoint"
+                        .to_string(),
+                ));
+            }
+            Ok(0)
+        }
+        SYNC_V2_CHECKPOINT_FORMAT_VERSION => {
+            let checkpoint: NotionSyncCheckpointV3 =
+                serde_json::from_str(&request.checkpoint.opaque).map_err(|_| {
+                    LocalityError::InvalidState(
+                        "Notion portable hints-only checkpoint v3 is invalid".to_string(),
+                    )
+                })?;
+            if checkpoint.component_version > SYNC_V2_CHECKPOINT_COMPONENT_VERSION {
+                return Err(LocalityError::InvalidState(format!(
+                    "Notion portable hints-only checkpoint component version {} requires an update",
+                    checkpoint.component_version
+                )));
+            }
+            validate_sync_v2_checkpoint_shape(&checkpoint)?;
+            if checkpoint.component_version != SYNC_V2_CHECKPOINT_COMPONENT_VERSION
+                || checkpoint.operation != CheckpointOperation::Synchronize
+                || checkpoint.mode != request.mode
+                || checkpoint.source_connection_sha256 != source_connection_sha256
+                || checkpoint.exact_root_remote_ids != roots.exact_ids
+                || checkpoint.canonical_root_remote_ids != roots.canonical_ids
+            {
+                return Err(LocalityError::InvalidState(
+                    "Notion portable hints-only checkpoint does not match the current connection, mode, or exact root set"
+                        .to_string(),
+                ));
+            }
+            if checkpoint.complete {
+                return Ok(0);
+            }
+            if checkpoint.semantic_hint_sha256 != semantic_hint_sha256
+                || checkpoint.hint_count as usize != request.hints.len()
+            {
+                return Err(LocalityError::InvalidState(
+                    "Notion portable hints-only continuation does not match the original semantic hints"
+                        .to_string(),
+                ));
+            }
+            usize::try_from(checkpoint.next_index).map_err(|_| {
+                LocalityError::InvalidState(
+                    "Notion portable hints-only checkpoint index is too large for this host"
+                        .to_string(),
+                )
+            })
+        }
+        version => Err(LocalityError::InvalidState(format!(
+            "Notion portable hints-only checkpoint version {version} requires an update (supported: {LEGACY_CHECKPOINT_FORMAT_VERSION}, {CHECKPOINT_FORMAT_VERSION}, {SYNC_V2_CHECKPOINT_FORMAT_VERSION})"
+        ))),
+    }
+}
+
+fn validate_sync_v2_checkpoint_shape(checkpoint: &NotionSyncCheckpointV3) -> LocalityResult<()> {
+    let structurally_complete =
+        checkpoint.complete && checkpoint.next_index == checkpoint.hint_count;
+    let structurally_incomplete = !checkpoint.complete
+        && checkpoint.next_index > 0
+        && checkpoint.next_index < checkpoint.hint_count;
+    if !structurally_complete && !structurally_incomplete {
+        return Err(LocalityError::InvalidState(
+            "Notion portable hints-only checkpoint contains a replay, cycle, or invalid progress index"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn encode_sync_v2_checkpoint(
+    checkpoint: &NotionSyncCheckpointV3,
+) -> LocalityResult<PortableCheckpoint> {
+    let opaque = serde_json::to_string(checkpoint).map_err(|error| {
+        LocalityError::Io(format!(
+            "Notion portable hints-only checkpoint encode failed: {error}"
+        ))
+    })?;
+    if opaque.len() > SYNC_V2_MAX_CHECKPOINT_BYTES {
+        return Err(LocalityError::InvalidState(format!(
+            "Notion portable hints-only response checkpoint exceeds {SYNC_V2_MAX_CHECKPOINT_BYTES} UTF-8 bytes"
+        )));
+    }
+    Ok(PortableCheckpoint {
+        format_version: SYNC_V2_CHECKPOINT_FORMAT_VERSION,
+        opaque,
+    })
+}
+
+fn semantic_hint_sha256(hints: &[PortableSyncHintV2]) -> String {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, "notion-portable-sync-hints-v3");
+    for hint in hints {
+        hash_field(&mut hasher, hint.remote_id.as_str());
+        hash_field(&mut hasher, &normalize_notion_id(hint.remote_id.as_str()));
+        hash_optional_field(&mut hasher, hint.provider_version.as_deref());
+        hash_optional_field(
+            &mut hasher,
+            hint.logical_path.as_ref().map(LogicalPath::as_str),
+        );
+        let source_kind = hint
+            .source_kind
+            .as_ref()
+            .map(source_kind)
+            .unwrap_or_default();
+        hash_optional_field(
+            &mut hasher,
+            hint.source_kind.as_ref().map(|_| source_kind.as_str()),
+        );
+        hash_optional_field(
+            &mut hasher,
+            hint.owning_root_remote_id.as_ref().map(RemoteId::as_str),
+        );
+        hash_optional_field(
+            &mut hasher,
+            hint.owning_root_remote_id
+                .as_ref()
+                .map(|root| normalize_notion_id(root.as_str()))
+                .as_deref(),
+        );
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn hash_optional_field(hasher: &mut Sha256, value: Option<&str>) {
+    hash_field(hasher, if value.is_some() { "some" } else { "none" });
+    if let Some(value) = value {
+        hash_field(hasher, value);
+    }
+}
+
+fn sha256_field(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, value);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn canonical_root_identity(canonical_ids: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for root in canonical_ids {
+        hash_field(&mut hasher, root);
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncV2HintKind {
+    Page,
+    Database,
+    DataSource,
+}
+
+fn sync_v2_hint_kind(hint: &PortableSyncHintV2) -> LocalityResult<SyncV2HintKind> {
+    match hint.source_kind.as_ref() {
+        Some(EntityKind::Page) => Ok(SyncV2HintKind::Page),
+        Some(EntityKind::Database) => Ok(SyncV2HintKind::Database),
+        Some(EntityKind::Unknown(kind))
+            if matches!(
+                kind.to_ascii_lowercase().replace('-', "_").as_str(),
+                "data_source" | "notion_data_source"
+            ) =>
+        {
+            Ok(SyncV2HintKind::DataSource)
+        }
+        None if hint
+            .logical_path
+            .as_ref()
+            .is_some_and(|path| path.as_str().ends_with("/_schema.yaml")) =>
+        {
+            Ok(SyncV2HintKind::Database)
+        }
+        None => Ok(SyncV2HintKind::Page),
+        _ => Err(LocalityError::InvalidState(format!(
+            "Notion portable hints-only sync does not support source kind `{}`",
+            hint.source_kind
+                .as_ref()
+                .map(source_kind)
+                .unwrap_or_else(|| "missing".to_string())
+        ))),
+    }
+}
+
+fn process_sync_v2_hint(
+    metadata: &mut SyncV2Metadata<'_>,
+    request: &PortableSyncRequestV2,
+    roots: &SyncV2RootSet,
+    hint_index: usize,
+) -> LocalityResult<Option<PortableSourceChange>> {
+    let hint = &request.hints[hint_index];
+    match sync_v2_hint_kind(hint)? {
+        SyncV2HintKind::Page => process_sync_v2_page(metadata, request, roots, hint),
+        SyncV2HintKind::Database | SyncV2HintKind::DataSource => {
+            process_sync_v2_database_hint(metadata, request, roots, hint_index)
+        }
+    }
+}
+
+fn process_sync_v2_page(
+    metadata: &mut SyncV2Metadata<'_>,
+    request: &PortableSyncRequestV2,
+    roots: &SyncV2RootSet,
+    hint: &PortableSyncHintV2,
+) -> LocalityResult<Option<PortableSourceChange>> {
+    let page = metadata.page(hint.remote_id.as_str())?;
+    let prior_root = exact_hint_root(hint, roots)?;
+    if page.archived || page.in_trash {
+        return Ok(Some(sync_v2_change(
+            &request.source_connection_id,
+            SyncV2ChangeInput {
+                remote_id: RemoteId::new(page.id),
+                kind: EntityKind::Page,
+                owning_root: prior_root,
+                opaque_version: page.last_edited_time,
+                logical_path: hint.logical_path.clone(),
+                deleted: true,
+                title: None,
+            },
+        )));
+    }
+
+    match resolve_sync_v2_ancestry(metadata, &page.id, page.parent.as_ref(), roots)? {
+        SyncV2Ancestry::Owned(current_root) => {
+            let logical_path = required_hint_path(hint, "page")?;
+            let title = page_title(&page);
+            Ok(Some(sync_v2_change(
+                &request.source_connection_id,
+                SyncV2ChangeInput {
+                    remote_id: RemoteId::new(page.id),
+                    kind: EntityKind::Page,
+                    owning_root: current_root,
+                    opaque_version: page.last_edited_time,
+                    logical_path: Some(logical_path),
+                    deleted: false,
+                    title: Some(title),
+                },
+            )))
+        }
+        SyncV2Ancestry::OutsideRequestedRoots => Ok(Some(sync_v2_change(
+            &request.source_connection_id,
+            SyncV2ChangeInput {
+                remote_id: RemoteId::new(page.id),
+                kind: EntityKind::Page,
+                owning_root: prior_root,
+                opaque_version: page.last_edited_time,
+                logical_path: hint.logical_path.clone(),
+                deleted: true,
+                title: None,
+            },
+        ))),
+    }
+}
+
+fn process_sync_v2_database_hint(
+    metadata: &mut SyncV2Metadata<'_>,
+    request: &PortableSyncRequestV2,
+    roots: &SyncV2RootSet,
+    hint_index: usize,
+) -> LocalityResult<Option<PortableSourceChange>> {
+    let hint = &request.hints[hint_index];
+    let (database_id, triggered_by_data_source) = match sync_v2_hint_kind(hint)? {
+        SyncV2HintKind::Database => (hint.remote_id.as_str().to_string(), false),
+        SyncV2HintKind::DataSource => {
+            let data_source = metadata.data_source(hint.remote_id.as_str())?;
+            let parent = parse_parent(data_source.parent.as_ref(), "data source")?;
+            let SyncV2Parent::Database(database_id) = parent else {
+                return Err(LocalityError::InvalidState(format!(
+                    "Notion data source `{}` does not expose a direct database parent",
+                    data_source.id
+                )));
+            };
+            (database_id, true)
+        }
+        SyncV2HintKind::Page => unreachable!("database hint classification"),
+    };
+
+    let first_index = first_hint_for_database(metadata, &request.hints, &database_id, hint_index)?;
+    if first_index != hint_index {
+        return Ok(None);
+    }
+    let database_hint = preferred_database_hint(&request.hints, &database_id)?.unwrap_or(hint);
+
+    let database = metadata.database(&database_id)?;
+    let prior_root = exact_hint_root(database_hint, roots)?;
+    if database.archived || database.in_trash {
+        return Ok(Some(sync_v2_change(
+            &request.source_connection_id,
+            SyncV2ChangeInput {
+                remote_id: RemoteId::new(database.id),
+                kind: EntityKind::Database,
+                owning_root: prior_root,
+                opaque_version: database.last_edited_time,
+                logical_path: database_hint.logical_path.clone(),
+                deleted: true,
+                title: None,
+            },
+        )));
+    }
+
+    let current_root =
+        match resolve_sync_v2_ancestry(metadata, &database.id, database.parent.as_ref(), roots)? {
+            SyncV2Ancestry::Owned(root) => root,
+            SyncV2Ancestry::OutsideRequestedRoots => {
+                return Ok(Some(sync_v2_change(
+                    &request.source_connection_id,
+                    SyncV2ChangeInput {
+                        remote_id: RemoteId::new(database.id),
+                        kind: EntityKind::Database,
+                        owning_root: prior_root,
+                        opaque_version: database.last_edited_time,
+                        logical_path: database_hint.logical_path.clone(),
+                        deleted: true,
+                        title: None,
+                    },
+                )));
+            }
+        };
+
+    let triggered_by_data_source = triggered_by_data_source
+        || database_has_data_source_hint(metadata, &request.hints, &database.id)?;
+    let bundle = metadata.database_bundle(database)?;
+    let provider_version = database_bundle_provider_version_token(&bundle)?;
+    if !triggered_by_data_source
+        && database_hint.provider_version.as_deref() == Some(provider_version.as_str())
+        && prior_root == current_root
+    {
+        return Ok(None);
+    }
+    let logical_path = required_hint_path(database_hint, "database")?;
+    let title = database_title(&bundle.database).unwrap_or_else(|| "Untitled database".to_string());
+    Ok(Some(sync_v2_change(
+        &request.source_connection_id,
+        SyncV2ChangeInput {
+            remote_id: RemoteId::new(bundle.database.id),
+            kind: EntityKind::Database,
+            owning_root: current_root,
+            opaque_version: Some(provider_version),
+            logical_path: Some(logical_path),
+            deleted: false,
+            title: Some(title),
+        },
+    )))
+}
+
+fn preferred_database_hint<'a>(
+    hints: &'a [PortableSyncHintV2],
+    database_id: &str,
+) -> LocalityResult<Option<&'a PortableSyncHintV2>> {
+    let canonical_database_id = normalize_notion_id(database_id);
+    for hint in hints {
+        if sync_v2_hint_kind(hint)? == SyncV2HintKind::Database
+            && normalize_notion_id(hint.remote_id.as_str()) == canonical_database_id
+        {
+            return Ok(Some(hint));
+        }
+    }
+    Ok(None)
+}
+
+fn database_has_data_source_hint(
+    metadata: &mut SyncV2Metadata<'_>,
+    hints: &[PortableSyncHintV2],
+    database_id: &str,
+) -> LocalityResult<bool> {
+    let canonical_database_id = normalize_notion_id(database_id);
+    for hint in hints {
+        if sync_v2_hint_kind(hint)? != SyncV2HintKind::DataSource {
+            continue;
+        }
+        let data_source = metadata.data_source(hint.remote_id.as_str())?;
+        let parent = parse_parent(data_source.parent.as_ref(), "data source")?;
+        let SyncV2Parent::Database(parent_database_id) = parent else {
+            return Err(LocalityError::InvalidState(format!(
+                "Notion data source `{}` does not expose a direct database parent",
+                data_source.id
+            )));
+        };
+        if normalize_notion_id(&parent_database_id) == canonical_database_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn first_hint_for_database(
+    metadata: &mut SyncV2Metadata<'_>,
+    hints: &[PortableSyncHintV2],
+    database_id: &str,
+    through_index: usize,
+) -> LocalityResult<usize> {
+    let canonical_database_id = normalize_notion_id(database_id);
+    for (index, hint) in hints.iter().enumerate().take(through_index + 1) {
+        match sync_v2_hint_kind(hint)? {
+            SyncV2HintKind::Database
+                if normalize_notion_id(hint.remote_id.as_str()) == canonical_database_id =>
+            {
+                return Ok(index);
+            }
+            SyncV2HintKind::DataSource => {
+                let data_source = metadata.data_source(hint.remote_id.as_str())?;
+                let parent = parse_parent(data_source.parent.as_ref(), "data source")?;
+                if let SyncV2Parent::Database(parent_database_id) = parent
+                    && normalize_notion_id(&parent_database_id) == canonical_database_id
+                {
+                    return Ok(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(LocalityError::InvalidState(
+        "Notion portable hints-only database deduplication lost its current hint".to_string(),
+    ))
+}
+
+fn required_hint_path(hint: &PortableSyncHintV2, source_kind: &str) -> LocalityResult<LogicalPath> {
+    hint.logical_path.clone().ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "Notion portable hints-only {source_kind} upsert requires the supplied prior logical path"
+        ))
+    })
+}
+
+fn exact_hint_root(hint: &PortableSyncHintV2, roots: &SyncV2RootSet) -> LocalityResult<RemoteId> {
+    let hint_root = hint.owning_root_remote_id.as_ref().ok_or_else(|| {
+        LocalityError::InvalidState(
+            "Notion portable hints-only hint is missing its owning root".to_string(),
+        )
+    })?;
+    roots
+        .exact_by_canonical
+        .get(&normalize_notion_id(hint_root.as_str()))
+        .cloned()
+        .ok_or_else(|| {
+            LocalityError::InvalidState(
+                "Notion portable hints-only hint owning root is outside the requested root set"
+                    .to_string(),
+            )
+        })
+}
+
+struct SyncV2ChangeInput {
+    remote_id: RemoteId,
+    kind: EntityKind,
+    owning_root: RemoteId,
+    opaque_version: Option<String>,
+    logical_path: Option<LogicalPath>,
+    deleted: bool,
+    title: Option<String>,
+}
+
+fn sync_v2_change(
+    source_connection_id: &locality_core::portable::SourceConnectionId,
+    input: SyncV2ChangeInput,
+) -> PortableSourceChange {
+    let connector_metadata = input
+        .title
+        .map(|title| BTreeMap::from([("title".to_string(), title)]))
+        .unwrap_or_default();
+    PortableSourceChange {
+        source_object: SourceObject {
+            source_connection_id: source_connection_id.clone(),
+            remote_id: input.remote_id,
+            kind: input.kind,
+            edges: vec![SourceEdge {
+                relationship: PORTABLE_SCOPE_ROOT_RELATIONSHIP.to_string(),
+                target_remote_id: input.owning_root,
+            }],
+            opaque_version: input.opaque_version,
+            deleted: input.deleted,
+            connector_metadata,
+            acl_observations: Vec::new(),
+            discovered_at: None,
+            observed_at: None,
+        },
+        logical_path: input.logical_path,
+        requires_fetch: !input.deleted,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SyncV2Ancestry {
+    Owned(RemoteId),
+    OutsideRequestedRoots,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SyncV2Parent {
+    Workspace,
+    Page(String),
+    Database(String),
+    DataSource(String),
+    Block(String),
+}
+
+fn resolve_sync_v2_ancestry(
+    metadata: &mut SyncV2Metadata<'_>,
+    object_id: &str,
+    parent: Option<&ParentDto>,
+    roots: &SyncV2RootSet,
+) -> LocalityResult<SyncV2Ancestry> {
+    let object_canonical = normalize_notion_id(object_id);
+    if let Some(root) = roots.exact_by_canonical.get(&object_canonical) {
+        return Ok(SyncV2Ancestry::Owned(root.clone()));
+    }
+    let mut seen = BTreeSet::from([object_canonical]);
+    let mut current_parent = parse_parent(parent, "hinted object")?;
+    for _ in 0..SYNC_V2_MAX_ANCESTRY_DEPTH {
+        if current_parent == SyncV2Parent::Workspace {
+            return Ok(SyncV2Ancestry::OutsideRequestedRoots);
+        }
+        let parent_id = match &current_parent {
+            SyncV2Parent::Page(id)
+            | SyncV2Parent::Database(id)
+            | SyncV2Parent::DataSource(id)
+            | SyncV2Parent::Block(id) => id,
+            SyncV2Parent::Workspace => unreachable!("handled workspace parent"),
+        };
+        let canonical_parent = normalize_notion_id(parent_id);
+        if let Some(root) = roots.exact_by_canonical.get(&canonical_parent) {
+            return Ok(SyncV2Ancestry::Owned(root.clone()));
+        }
+        if canonical_parent.is_empty() || !seen.insert(canonical_parent) {
+            return Err(LocalityError::InvalidState(
+                "Notion portable hints-only ancestry contains a malformed identity or cycle"
+                    .to_string(),
+            ));
+        }
+        current_parent = match current_parent {
+            SyncV2Parent::Page(id) => {
+                let page = metadata.page(&id)?;
+                parse_parent(page.parent.as_ref(), "page ancestor")?
+            }
+            SyncV2Parent::Database(id) => {
+                let database = metadata.database(&id)?;
+                parse_parent(database.parent.as_ref(), "database ancestor")?
+            }
+            SyncV2Parent::DataSource(id) => {
+                let data_source = metadata.data_source(&id)?;
+                parse_parent(data_source.parent.as_ref(), "data-source ancestor")?
+            }
+            SyncV2Parent::Block(id) => {
+                let block = metadata.block(&id)?;
+                parse_parent(block.parent.as_ref(), "block ancestor")?
+            }
+            SyncV2Parent::Workspace => unreachable!("handled workspace parent"),
+        };
+    }
+    Err(LocalityError::InvalidState(format!(
+        "Notion portable hints-only ancestry exceeds the depth limit of {SYNC_V2_MAX_ANCESTRY_DEPTH}"
+    )))
+}
+
+fn parse_parent(parent: Option<&ParentDto>, context: &str) -> LocalityResult<SyncV2Parent> {
+    let parent = parent.ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "Notion portable hints-only {context} is missing parent metadata"
+        ))
+    })?;
+    let ids = [
+        ("page_id", parent.page_id.as_deref()),
+        ("database_id", parent.database_id.as_deref()),
+        ("data_source_id", parent.data_source_id.as_deref()),
+        ("block_id", parent.block_id.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(kind, id)| id.map(|id| (kind, id)))
+    .collect::<Vec<_>>();
+    if parent.kind == "workspace" || parent.workspace.is_some() {
+        if parent.kind != "workspace" || parent.workspace != Some(true) || !ids.is_empty() {
+            return Err(LocalityError::InvalidState(format!(
+                "Notion portable hints-only {context} has malformed workspace parent metadata"
+            )));
+        }
+        return Ok(SyncV2Parent::Workspace);
+    }
+    let [(id_kind, id)] = ids.as_slice() else {
+        return Err(LocalityError::InvalidState(format!(
+            "Notion portable hints-only {context} must expose exactly one parent identity"
+        )));
+    };
+    if id.is_empty() || parent.kind != *id_kind {
+        return Err(LocalityError::InvalidState(format!(
+            "Notion portable hints-only {context} parent type does not match its identity"
+        )));
+    }
+    Ok(match *id_kind {
+        "page_id" => SyncV2Parent::Page((*id).to_string()),
+        "database_id" => SyncV2Parent::Database((*id).to_string()),
+        "data_source_id" => SyncV2Parent::DataSource((*id).to_string()),
+        "block_id" => SyncV2Parent::Block((*id).to_string()),
+        _ => unreachable!("parent kind is selected from the fixed identity fields"),
+    })
+}
+
+struct SyncV2Metadata<'a> {
+    api: &'a dyn NotionApi,
+    pages: BTreeMap<String, PageDto>,
+    databases: BTreeMap<String, DatabaseDto>,
+    data_sources: BTreeMap<String, DataSourceDto>,
+    blocks: BTreeMap<String, BlockDto>,
+}
+
+impl<'a> SyncV2Metadata<'a> {
+    fn new(api: &'a dyn NotionApi) -> Self {
+        Self {
+            api,
+            pages: BTreeMap::new(),
+            databases: BTreeMap::new(),
+            data_sources: BTreeMap::new(),
+            blocks: BTreeMap::new(),
+        }
+    }
+
+    fn page(&mut self, page_id: &str) -> LocalityResult<PageDto> {
+        let canonical = normalize_notion_id(page_id);
+        if let Some(page) = self.pages.get(&canonical) {
+            return Ok(page.clone());
+        }
+        let page = self.api.retrieve_page(page_id)?;
+        validate_retrieved_identity("page", page_id, &page.id)?;
+        self.pages.insert(canonical, page.clone());
+        Ok(page)
+    }
+
+    fn database(&mut self, database_id: &str) -> LocalityResult<DatabaseDto> {
+        let canonical = normalize_notion_id(database_id);
+        if let Some(database) = self.databases.get(&canonical) {
+            return Ok(database.clone());
+        }
+        let database = self.api.retrieve_database(database_id)?;
+        validate_retrieved_identity("database", database_id, &database.id)?;
+        self.databases.insert(canonical, database.clone());
+        Ok(database)
+    }
+
+    fn data_source(&mut self, data_source_id: &str) -> LocalityResult<DataSourceDto> {
+        let canonical = normalize_notion_id(data_source_id);
+        if let Some(data_source) = self.data_sources.get(&canonical) {
+            return Ok(data_source.clone());
+        }
+        let data_source = self.api.retrieve_data_source(data_source_id)?;
+        validate_retrieved_identity("data source", data_source_id, &data_source.id)?;
+        self.data_sources.insert(canonical, data_source.clone());
+        Ok(data_source)
+    }
+
+    fn block(&mut self, block_id: &str) -> LocalityResult<BlockDto> {
+        let canonical = normalize_notion_id(block_id);
+        if let Some(block) = self.blocks.get(&canonical) {
+            return Ok(block.clone());
+        }
+        let block = self.api.retrieve_block(block_id)?;
+        validate_retrieved_identity("block", block_id, &block.id)?;
+        self.blocks.insert(canonical, block.clone());
+        Ok(block)
+    }
+
+    fn database_bundle(&mut self, database: DatabaseDto) -> LocalityResult<NotionDatabaseBundle> {
+        database_bundle_from_metadata_bounded(
+            database,
+            SYNC_V2_MAX_DATA_SOURCES_PER_DATABASE,
+            SYNC_V2_MAX_EQUIVALENT_DATA_SOURCE_DUPLICATES,
+            |data_source_id| self.data_source(data_source_id),
+        )
+    }
+}
+
+fn validate_retrieved_identity(
+    kind: &str,
+    requested_id: &str,
+    returned_id: &str,
+) -> LocalityResult<()> {
+    if normalize_notion_id(requested_id).is_empty() || !notion_ids_equal(requested_id, returned_id)
+    {
+        return Err(LocalityError::InvalidState(format!(
+            "Notion portable hints-only {kind} metadata returned `{returned_id}` for requested `{requested_id}`"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn fetch(
     api: &dyn NotionApi,
     media_policy: PortableMediaCapturePolicy,
@@ -207,7 +1091,7 @@ pub(crate) fn fetch(
         }
         Err(LocalityError::RemoteNotFound(_)) => {
             let bundle = fetch_database_bundle(api, request.remote_id.as_str())?;
-            let provider_version = Some(database_bundle_provider_version(&bundle)?);
+            let provider_version = Some(database_bundle_provider_version_token(&bundle)?);
             let remote_id = RemoteId::new(bundle.database.id.clone());
             let raw = serde_json::to_vec(&bundle).map_err(|error| {
                 LocalityError::Io(format!("notion database native encode failed: {error}"))
