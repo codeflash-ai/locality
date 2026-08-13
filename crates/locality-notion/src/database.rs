@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use locality_core::LocalityError;
 use locality_core::LocalityResult;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::client::NotionApi;
 use crate::dto::{
@@ -37,6 +38,14 @@ pub fn fetch_database_bundle(
     api: &dyn NotionApi,
     database_id: &str,
 ) -> LocalityResult<NotionDatabaseBundle> {
+    fetch_database_bundle_with_limits(api, database_id, None)
+}
+
+fn fetch_database_bundle_with_limits(
+    api: &dyn NotionApi,
+    database_id: &str,
+    limits: Option<(usize, usize)>,
+) -> LocalityResult<NotionDatabaseBundle> {
     let requested_database_id = canonical_notion_uuid(database_id).ok_or_else(|| {
         LocalityError::InvalidState(format!(
             "Notion database bundle requires a canonical UUID, got `{database_id}`"
@@ -57,8 +66,47 @@ pub fn fetch_database_bundle(
         )));
     }
 
+    database_bundle_from_metadata_with_limits(database, limits, |data_source_id| {
+        api.retrieve_data_source(data_source_id)
+    })
+}
+
+/// Validates and completes an already retrieved database with bounded declared
+/// data-source metadata. The callback lets callers share a request-local cache.
+pub(crate) fn database_bundle_from_metadata_bounded<F>(
+    database: DatabaseDto,
+    max_data_sources: usize,
+    max_equivalent_duplicates: usize,
+    retrieve_data_source: F,
+) -> LocalityResult<NotionDatabaseBundle>
+where
+    F: FnMut(&str) -> LocalityResult<DataSourceDto>,
+{
+    database_bundle_from_metadata_with_limits(
+        database,
+        Some((max_data_sources, max_equivalent_duplicates)),
+        retrieve_data_source,
+    )
+}
+
+fn database_bundle_from_metadata_with_limits<F>(
+    database: DatabaseDto,
+    limits: Option<(usize, usize)>,
+    mut retrieve_data_source: F,
+) -> LocalityResult<NotionDatabaseBundle>
+where
+    F: FnMut(&str) -> LocalityResult<DataSourceDto>,
+{
+    let returned_database_id = canonical_notion_uuid(&database.id).ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "Notion database bundle contains a non-canonical database ID `{}`",
+            database.id
+        ))
+    })?;
+
     let mut summaries = Vec::new();
     let mut summary_positions = BTreeMap::<String, usize>::new();
+    let mut equivalent_duplicates = 0_usize;
     for summary in &database.data_sources {
         if summary.id.trim().is_empty() {
             return Err(LocalityError::InvalidState(format!(
@@ -80,15 +128,37 @@ pub fn fetch_database_bundle(
                     database.id, summary.id
                 )));
             }
+            equivalent_duplicates = equivalent_duplicates.checked_add(1).ok_or_else(|| {
+                LocalityError::InvalidState(format!(
+                    "Notion database `{}` contains too many duplicate data-source summaries",
+                    database.id
+                ))
+            })?;
+            if let Some((_, max_equivalent_duplicates)) = limits
+                && equivalent_duplicates > max_equivalent_duplicates
+            {
+                return Err(LocalityError::InvalidState(format!(
+                    "Notion database `{}` exceeds the limit of {max_equivalent_duplicates} equivalent duplicate data-source summaries",
+                    database.id
+                )));
+            }
             continue;
         }
         summary_positions.insert(canonical_id, summaries.len());
         summaries.push(summary.clone());
+        if let Some((max_data_sources, _)) = limits
+            && summaries.len() > max_data_sources
+        {
+            return Err(LocalityError::InvalidState(format!(
+                "Notion database `{}` exceeds the limit of {max_data_sources} data sources",
+                database.id
+            )));
+        }
     }
 
     let mut data_sources = Vec::with_capacity(summaries.len());
     for summary in summaries {
-        let data_source = api.retrieve_data_source(&summary.id)?;
+        let data_source = retrieve_data_source(&summary.id)?;
         let returned_data_source_id = canonical_notion_uuid(&data_source.id).ok_or_else(|| {
             LocalityError::InvalidState(format!(
                 "Notion database `{}` returned non-canonical data source ID `{}`",
@@ -198,6 +268,21 @@ pub fn database_bundle_provider_version(bundle: &NotionDatabaseBundle) -> Locali
             "Notion database provider version encode failed: {error}"
         ))
     })
+}
+
+/// Returns the bounded provider-version token used at portable sync/fetch
+/// boundaries.
+///
+/// The exact V1 JSON material remains available through
+/// [`database_bundle_provider_version`] for compatibility and diagnostics. The
+/// token hashes those canonical bytes so even the maximum supported data-source
+/// fanout remains safely below the public portable hint version limit.
+pub fn database_bundle_provider_version_token(
+    bundle: &NotionDatabaseBundle,
+) -> LocalityResult<String> {
+    let material = database_bundle_provider_version(bundle)?;
+    let digest = Sha256::digest(material.as_bytes());
+    Ok(format!("notion-db-v1:sha256:{digest:x}"))
 }
 
 fn canonical_notion_uuid(value: &str) -> Option<String> {
@@ -330,8 +415,8 @@ mod tests {
     };
 
     use super::{
-        database_bundle_provider_version, fetch_database_bundle, render_database_bundle_schema,
-        render_database_schema,
+        database_bundle_provider_version, database_bundle_provider_version_token,
+        fetch_database_bundle, render_database_bundle_schema, render_database_schema,
     };
 
     #[test]
@@ -513,6 +598,15 @@ mod tests {
         assert_eq!(
             database_bundle_provider_version(&alternate_spelling).expect("alternate version"),
             provider_version
+        );
+        let provider_version_token =
+            database_bundle_provider_version_token(&bundle).expect("bounded provider token");
+        assert!(provider_version_token.starts_with("notion-db-v1:sha256:"));
+        assert_eq!(provider_version_token.len(), 84);
+        assert_eq!(
+            database_bundle_provider_version_token(&alternate_spelling)
+                .expect("alternate bounded provider token"),
+            provider_version_token
         );
     }
 

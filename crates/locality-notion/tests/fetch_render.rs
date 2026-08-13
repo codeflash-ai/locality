@@ -17,6 +17,7 @@ use locality_core::portable::{
 };
 use locality_core::shadow::MarkdownBlockKind;
 use locality_notion::client::NotionApi;
+use locality_notion::database::database_bundle_provider_version_token;
 use locality_notion::dto::{
     BlockDto, BlockListDto, BlockTreeDto, ColorOnlyBlockDto, DataSourceDto, DataSourcePropertyDto,
     DataSourceSummaryDto, DatabaseDto, DatabaseListDto, DateMentionDto, EmptyBlockDto,
@@ -2643,16 +2644,11 @@ fn portable_database_root_fetches_and_renders_exact_shared_schema_projection() {
         fetched.native.raw,
         serde_json::to_vec(&expected_bundle).expect("exact native fixture")
     );
+    let expected_provider_version = database_bundle_provider_version_token(&expected_bundle)
+        .expect("bounded database provider version");
     assert_eq!(
         fetched.provider_version.as_deref(),
-        Some(concat!(
-            "{\"format_version\":1,",
-            "\"database\":{\"id\":\"cccccccccccccccccccccccccccccccc\",",
-            "\"last_edited_time\":\"2026-06-10T01:00:00.000Z\"},",
-            "\"data_sources\":[{",
-            "\"id\":\"dddddddddddddddddddddddddddddddd\",",
-            "\"last_edited_time\":\"2026-06-10T01:01:00.000Z\"}]}"
-        ))
+        Some(expected_provider_version.as_str())
     );
 
     let rendered = connector
