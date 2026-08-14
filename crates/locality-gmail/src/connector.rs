@@ -923,7 +923,10 @@ fn portable_gmail_changes(
                         relationship: PORTABLE_SCOPE_ROOT_RELATIONSHIP.to_string(),
                         target_remote_id: RemoteId::new(GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID),
                     }],
-                    opaque_version: entry.remote_edited_at,
+                    opaque_version: entry
+                        .remote_edited_at
+                        .as_deref()
+                        .and_then(gmail_remote_version_observed_at),
                     deleted: false,
                     connector_metadata: BTreeMap::new(),
                     acl_observations: Vec::new(),
@@ -1822,6 +1825,28 @@ fn gmail_internal_date_utc_key(value: &str) -> Option<i32> {
     Some(year * 10_000 + month as i32 * 100 + day as i32)
 }
 
+fn gmail_remote_version_observed_at(value: &str) -> Option<String> {
+    let mut parts = value.splitn(4, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("gmail"), Some(_), Some(internal_date)) => gmail_internal_date_rfc3339(internal_date),
+        _ => None,
+    }
+}
+
+fn gmail_internal_date_rfc3339(value: &str) -> Option<String> {
+    let millis = value.parse::<i64>().ok()?;
+    let days = millis.div_euclid(86_400_000);
+    let day_millis = millis.rem_euclid(86_400_000);
+    let (year, month, day) = civil_date_from_unix_days(days);
+    let hour = day_millis / 3_600_000;
+    let minute = day_millis % 3_600_000 / 60_000;
+    let second = day_millis % 60_000 / 1_000;
+    let millisecond = day_millis % 1_000;
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millisecond:03}Z"
+    ))
+}
+
 fn civil_date_from_unix_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -2340,6 +2365,14 @@ mod tests {
                 .as_ref()
                 .is_some_and(|path| path.as_str().ends_with(".md"))
         }));
+        assert_eq!(
+            batch
+                .changes
+                .iter()
+                .find(|change| change.source_object.remote_id == RemoteId::new("inbox-msg-1"))
+                .and_then(|change| change.source_object.opaque_version.as_deref()),
+            Some("2024-07-13T19:46:40.000Z")
+        );
 
         let calls = api.calls.lock().expect("calls");
         assert_eq!(calls.list_max_results, vec![100, 100]);
