@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${ROOT}/scripts/linux-repository-config.sh"
 DESKTOP_DIR="${ROOT}/apps/desktop"
 DEB_DIR="${ROOT}/target/release/bundle/deb"
 RPM_DIR="${ROOT}/target/release/bundle/rpm"
@@ -13,6 +14,8 @@ CHANNEL="${PUBLISH_CHANNEL:-beta}"
 DATE_STAMP="${PUBLISH_DATE:-$(date +%Y%m%d)}"
 UPDATER_ENDPOINT="${TAURI_UPDATER_ENDPOINT:-https://github.com/codeflash-ai/locality/releases/latest/download/latest-linux.json}"
 APPINDICATOR_PKG_CONFIG_TMP=""
+REPOSITORY_STAGING_DIR="${ROOT}/apps/desktop/src-tauri/linux/repository"
+REPOSITORY_GPG_HOME=""
 
 log() {
   printf 'publish-linux: %s\n' "$*"
@@ -40,6 +43,13 @@ cleanup_appindicator_pkg_config() {
   fi
 }
 
+cleanup_repository_staging() {
+  if [[ -n "${REPOSITORY_GPG_HOME}" ]]; then
+    rm -rf "${REPOSITORY_GPG_HOME}"
+  fi
+  rm -rf "${REPOSITORY_STAGING_DIR}"
+}
+
 assert_clean_tree() {
   if [[ "${PUBLISH_ALLOW_DIRTY:-0}" == "1" ]]; then
     return 0
@@ -59,17 +69,81 @@ updater_enabled() {
   [[ -n "${TAURI_UPDATER_PUBKEY:-}" ]]
 }
 
+repository_enrollment_enabled() {
+  [[ -n "${LINUX_REPO_GPG_PRIVATE_KEY:-}" ]]
+}
+
+prepare_repository_enrollment() {
+  if ! repository_enrollment_enabled; then
+    [[ "${CHANNEL}" != "release" ]] \
+      || fail "release packages require LINUX_REPO_GPG_PRIVATE_KEY so package-manager updates can be enrolled"
+    return 0
+  fi
+
+  require_command gpg
+  REPOSITORY_GPG_HOME="$(mktemp -d)"
+  chmod 700 "${REPOSITORY_GPG_HOME}"
+  mkdir -p "${REPOSITORY_STAGING_DIR}"
+
+  printf '%s\n' "${LINUX_REPO_GPG_PRIVATE_KEY}" \
+    | GNUPGHOME="${REPOSITORY_GPG_HOME}" gpg --batch --import
+
+  local key_id
+  key_id="$(GNUPGHOME="${REPOSITORY_GPG_HOME}" gpg --batch --list-keys --with-colons \
+    | awk -F: '$1 == "pub" { print $5; exit }')"
+  [[ -n "${key_id}" ]] || fail "could not export the Linux repository public key"
+
+  GNUPGHOME="${REPOSITORY_GPG_HOME}" gpg --batch --export "${key_id}" \
+    > "${REPOSITORY_STAGING_DIR}/codeflash-locality-archive-keyring.gpg"
+  GNUPGHOME="${REPOSITORY_GPG_HOME}" gpg --batch --armor --export "${key_id}" \
+    > "${REPOSITORY_STAGING_DIR}/RPM-GPG-KEY-codeflash-locality"
+  write_apt_repository_source "${REPOSITORY_STAGING_DIR}/locality.sources"
+  write_rpm_repository_config \
+    "${REPOSITORY_STAGING_DIR}/locality.repo" \
+    "file://${LINUX_REPOSITORY_RPM_KEY}" \
+    1
+}
+
 build_config_json() {
+  local bundle_json=""
+  local repository_json=""
+
   if updater_enabled; then
     [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]] \
       || fail "TAURI_UPDATER_PUBKEY is set but TAURI_SIGNING_PRIVATE_KEY is missing"
-    printf '{"bundle":{"createUpdaterArtifacts":true},"plugins":{"updater":{"pubkey":"%s","endpoints":["%s"]}}}' \
+    bundle_json='"createUpdaterArtifacts":true'
+  fi
+
+  if repository_enrollment_enabled; then
+    repository_json='"linux":{"deb":{"files":{"/etc/apt/sources.list.d/locality.sources":"linux/repository/locality.sources","/usr/share/keyrings/codeflash-locality-archive-keyring.gpg":"linux/repository/codeflash-locality-archive-keyring.gpg"}},"rpm":{"files":{"/etc/yum.repos.d/locality.repo":"linux/repository/locality.repo","/etc/zypp/repos.d/locality.repo":"linux/repository/locality.repo","/etc/pki/rpm-gpg/RPM-GPG-KEY-codeflash-locality":"linux/repository/RPM-GPG-KEY-codeflash-locality"}}}'
+    bundle_json="${bundle_json}${bundle_json:+,}${repository_json}"
+  fi
+
+  if updater_enabled; then
+    printf '{"bundle":{%s},"plugins":{"updater":{"pubkey":"%s","endpoints":["%s"]}}}' \
+      "${bundle_json}" \
       "$(json_escape "${TAURI_UPDATER_PUBKEY}")" \
       "$(json_escape "${UPDATER_ENDPOINT}")"
     return 0
   fi
 
-  printf '{}'
+  if repository_enrollment_enabled; then
+    printf '{"bundle":{%s}}' "${bundle_json}"
+  else
+    printf '{}'
+  fi
+}
+
+build_linux_packages() {
+  local config_json="$1"
+
+  if updater_enabled; then
+    npm --prefix "${DESKTOP_DIR}" run tauri -- build --bundles deb,rpm,appimage --config "${config_json}"
+  elif repository_enrollment_enabled; then
+    npm --prefix "${DESKTOP_DIR}" run tauri -- build --bundles deb,rpm --config "${config_json}"
+  else
+    npm --prefix "${DESKTOP_DIR}" run build:linux
+  fi
 }
 
 pkg_config_has_appindicator() {
@@ -158,6 +232,10 @@ validate_deb() {
   assert_deb_contains "${deb}" "/usr/bin/loc"
   assert_deb_contains "${deb}" "/usr/bin/localityd"
   assert_deb_contains "${deb}" "/usr/bin/locality-fuse"
+  if repository_enrollment_enabled; then
+    assert_deb_contains "${deb}" "/etc/apt/sources.list.d/locality.sources"
+    assert_deb_contains "${deb}" "${LINUX_REPOSITORY_APT_KEYRING}"
+  fi
 }
 
 validate_rpm() {
@@ -169,6 +247,14 @@ validate_rpm() {
     || fail "${rpm} does not contain /usr/bin/localityd"
   rpm -qlp "${rpm}" | grep -qx '/usr/bin/locality-fuse' \
     || fail "${rpm} does not contain /usr/bin/locality-fuse"
+  if repository_enrollment_enabled; then
+    rpm -qlp "${rpm}" | grep -qx '/etc/yum.repos.d/locality.repo' \
+      || fail "${rpm} does not contain the DNF/YUM repository configuration"
+    rpm -qlp "${rpm}" | grep -qx '/etc/zypp/repos.d/locality.repo' \
+      || fail "${rpm} does not contain the zypper repository configuration"
+    rpm -qlp "${rpm}" | grep -qx "${LINUX_REPOSITORY_RPM_KEY}" \
+      || fail "${rpm} does not contain the RPM repository public key"
+  fi
 }
 
 copy_artifact() {
@@ -220,7 +306,7 @@ copy_updater_artifact() {
 }
 
 main() {
-  trap cleanup_appindicator_pkg_config EXIT
+  trap 'cleanup_appindicator_pkg_config; cleanup_repository_staging' EXIT
   [[ "$(uname -s)" == "Linux" ]] || fail "Linux publishing must run on Linux"
   require_command git
   require_command npm
@@ -235,6 +321,7 @@ main() {
 
   assert_clean_tree
   prepare_appindicator_pkg_config
+  prepare_repository_enrollment
 
   local commit_short commit_full config_json deb rpm appimage arch
   local final_deb final_rpm alias_deb alias_rpm updater_appimage
@@ -252,11 +339,7 @@ main() {
   log "building Tauri Debian, RPM, and optional AppImage packages"
   rm -rf "${DEB_DIR}" "${RPM_DIR}" "${APPIMAGE_DIR}" "${UPDATER_DIR}"
   mkdir -p "${DEB_DIR}" "${RPM_DIR}" "${APPIMAGE_DIR}" "${LINUX_OUT_DIR}"
-  if updater_enabled; then
-    npm --prefix "${DESKTOP_DIR}" run tauri -- build --bundles deb,rpm,appimage --config "${config_json}"
-  else
-    npm --prefix "${DESKTOP_DIR}" run build:linux
-  fi
+  build_linux_packages "${config_json}"
 
   deb="$(latest_artifact "${DEB_DIR}" '*.deb')"
   rpm="$(latest_artifact "${RPM_DIR}" '*.rpm')"

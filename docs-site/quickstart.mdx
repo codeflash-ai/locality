@@ -24,6 +24,10 @@ Locality_Linux_v<version>.rpm
 Locality_Linux_v<version>.AppImage
 ```
 
+DEB and RPM installs enroll the signed Locality repository, so normal
+`apt upgrade`, `dnf upgrade`/`yum update`, or `zypper update` runs install later
+Locality releases. AppImage uses Locality's desktop self-updater instead.
+
 Windows uses the installer release asset:
 
 ```text

@@ -1,6 +1,6 @@
 ---
 title: "Install Locality"
-description: "Install Locality on macOS, Linux, or Windows from GitHub release artifacts."
+description: "Install Locality on macOS, Linux, or Windows, with native Linux package-manager updates."
 ---
 
 The documented public install path is GitHub Releases. Download the asset for your operating system from the latest finalized release.
@@ -19,7 +19,8 @@ Release assets also include updater manifests such as `latest-macos.json`, `late
 
 The download links use stable latest-release aliases and open the GitHub Release asset in a new tab. For a specific version, use the full GitHub Releases page.
 
-Package-manager channels will be documented after they are publicly published and linked from a finalized release.
+The DEB and RPM assets enroll Locality's signed package repository during
+installation. Later system-wide package-manager upgrades include Locality.
 
 ## macOS
 
@@ -44,11 +45,19 @@ Other Linux distributions and older versions are unsupported, even if a package
 can be installed there.
 
 On Ubuntu 24.04+, Debian 13+, or Linux Mint 22+, download the `.deb` release
-asset and install it locally:
+asset and install it locally. The package installs the Locality APT source and
+its dedicated keyring:
 
 ```bash
 curl -L -o /tmp/locality.deb https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.deb
 sudo apt install /tmp/locality.deb
+```
+
+Future releases are then included in the normal system upgrade:
+
+```bash
+sudo apt update
+sudo apt upgrade
 ```
 
 On Fedora 40+, download the `.rpm` release asset and install it locally:
@@ -58,6 +67,15 @@ curl -L -o /tmp/locality.rpm https://github.com/codeflash-ai/locality/releases/l
 sudo dnf install /tmp/locality.rpm
 ```
 
+Future releases are included in the normal system upgrade:
+
+```bash
+sudo dnf upgrade
+```
+
+The same repository works with `yum update` on supported DNF/YUM-based
+systems.
+
 On openSUSE Tumbleweed, use the same `.rpm` release asset with `zypper`:
 
 ```bash
@@ -65,11 +83,26 @@ curl -L -o /tmp/locality.rpm https://github.com/codeflash-ai/locality/releases/l
 sudo zypper install /tmp/locality.rpm
 ```
 
+Future releases are included in the normal system update:
+
+```bash
+sudo zypper refresh
+sudo zypper update
+```
+
 Linux FUSE mounts require `fuse3`, `fusermount3`, `/dev/fuse`, and a user
 `systemd` session. The package installers declare `fuse3` and `systemd`
 dependencies; AppImage users may need to install those dependencies separately.
 The Linux artifacts include the desktop app plus `loc`, `localityd`, and the
 FUSE projection helper.
+
+The native package name is `locality`; `loc` is the installed command-line
+binary. Removing the repository definition opts the machine out of automatic
+package-manager discovery without removing Locality itself.
+
+An older direct package installed before repository enrollment was introduced
+needs this one-time reinstall. After that, the native upgrade commands above
+handle later releases.
 
 ### AppImage
 

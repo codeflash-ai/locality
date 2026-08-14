@@ -2,12 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${ROOT}/scripts/linux-repository-config.sh"
 INPUT_DIR="${LINUX_REPO_INPUT_DIR:-${ROOT}/target/release/bundle/linux}"
 OUTPUT_DIR="${LINUX_REPO_OUTPUT_DIR:-${ROOT}/target/release/linux-repo}"
-BASE_URL="${LINUX_REPO_BASE_URL:-https://codeflash-ai.github.io/locality}"
-APT_SUITE="${APT_SUITE:-stable}"
-APT_COMPONENT="${APT_COMPONENT:-main}"
-APT_ARCH="${APT_ARCH:-amd64}"
 RPM_ARCH="${RPM_ARCH:-x86_64}"
 PACKAGE_PATTERN="${LINUX_REPO_PACKAGE_PATTERN:-Locality-release-[0-9]*-*}"
 GPG_HOME=""
@@ -87,8 +84,24 @@ sign_file() {
 copy_unique() {
   local pattern="$1"
   local output="$2"
+  local package_type="$3"
   local copied=0
   while IFS= read -r artifact; do
+    case "${package_type}" in
+      deb)
+        [[ "$(dpkg-deb -f "${artifact}" Package)" == "${LINUX_REPOSITORY_PACKAGE_NAME}" ]] \
+          || fail "${artifact} has the wrong Debian package name; expected ${LINUX_REPOSITORY_PACKAGE_NAME}"
+        [[ "$(dpkg-deb -f "${artifact}" Architecture)" == "${LINUX_REPOSITORY_APT_ARCH}" ]] \
+          || fail "${artifact} has the wrong Debian architecture; expected ${LINUX_REPOSITORY_APT_ARCH}"
+        ;;
+      rpm)
+        [[ "$(rpm -qp --queryformat '%{NAME}' "${artifact}")" == "${LINUX_REPOSITORY_PACKAGE_NAME}" ]] \
+          || fail "${artifact} has the wrong RPM package name; expected ${LINUX_REPOSITORY_PACKAGE_NAME}"
+        [[ "$(rpm -qp --queryformat '%{ARCH}' "${artifact}")" == "${RPM_ARCH}" ]] \
+          || fail "${artifact} has the wrong RPM architecture; expected ${RPM_ARCH}"
+        ;;
+      *) fail "unknown package type: ${package_type}" ;;
+    esac
     cp "${artifact}" "${output}/"
     copied=1
   done < <(find "${INPUT_DIR}" -maxdepth 1 -type f -name "${pattern}" | sort)
@@ -116,36 +129,39 @@ EOF
 }
 
 render_apt_repo() {
+  require_command dpkg-deb
   require_command dpkg-scanpackages
   require_command apt-ftparchive
   require_command gzip
 
   local apt_root="${OUTPUT_DIR}/apt"
-  local pool="${apt_root}/pool/main/a/loc"
-  mkdir -p "${pool}" "${apt_root}/dists/${APT_SUITE}/${APT_COMPONENT}/binary-${APT_ARCH}"
-  copy_unique "${PACKAGE_PATTERN}.deb" "${pool}"
+  local pool="${apt_root}/pool/main/l/locality"
+  mkdir -p "${pool}" "${apt_root}/dists/${LINUX_REPOSITORY_APT_SUITE}/${LINUX_REPOSITORY_APT_COMPONENT}/binary-${LINUX_REPOSITORY_APT_ARCH}"
+  copy_unique "${PACKAGE_PATTERN}.deb" "${pool}" deb
+  write_apt_repository_source "${apt_root}/locality.sources"
 
   (
     cd "${apt_root}"
-    dpkg-scanpackages --multiversion pool /dev/null > "dists/${APT_SUITE}/${APT_COMPONENT}/binary-${APT_ARCH}/Packages"
-    gzip -kf "dists/${APT_SUITE}/${APT_COMPONENT}/binary-${APT_ARCH}/Packages"
+    dpkg-scanpackages --multiversion pool /dev/null > "dists/${LINUX_REPOSITORY_APT_SUITE}/${LINUX_REPOSITORY_APT_COMPONENT}/binary-${LINUX_REPOSITORY_APT_ARCH}/Packages"
+    gzip -kf "dists/${LINUX_REPOSITORY_APT_SUITE}/${LINUX_REPOSITORY_APT_COMPONENT}/binary-${LINUX_REPOSITORY_APT_ARCH}/Packages"
     apt-ftparchive \
       -o "APT::FTPArchive::Release::Origin=CodeFlash" \
       -o "APT::FTPArchive::Release::Label=Locality" \
-      -o "APT::FTPArchive::Release::Suite=${APT_SUITE}" \
-      -o "APT::FTPArchive::Release::Codename=${APT_SUITE}" \
-      -o "APT::FTPArchive::Release::Architectures=${APT_ARCH}" \
-      -o "APT::FTPArchive::Release::Components=${APT_COMPONENT}" \
-      release "dists/${APT_SUITE}" > "dists/${APT_SUITE}/Release"
+      -o "APT::FTPArchive::Release::Suite=${LINUX_REPOSITORY_APT_SUITE}" \
+      -o "APT::FTPArchive::Release::Codename=${LINUX_REPOSITORY_APT_SUITE}" \
+      -o "APT::FTPArchive::Release::Architectures=${LINUX_REPOSITORY_APT_ARCH}" \
+      -o "APT::FTPArchive::Release::Components=${LINUX_REPOSITORY_APT_COMPONENT}" \
+      release "dists/${LINUX_REPOSITORY_APT_SUITE}" > "dists/${LINUX_REPOSITORY_APT_SUITE}/Release"
   )
 }
 
 render_rpm_repo() {
+  require_command rpm
   require_command createrepo_c
 
   local rpm_root="${OUTPUT_DIR}/rpm"
   mkdir -p "${rpm_root}/${RPM_ARCH}"
-  copy_unique "${PACKAGE_PATTERN}.rpm" "${rpm_root}/${RPM_ARCH}"
+  copy_unique "${PACKAGE_PATTERN}.rpm" "${rpm_root}/${RPM_ARCH}" rpm
   createrepo_c "${rpm_root}/${RPM_ARCH}"
 }
 
@@ -156,15 +172,10 @@ write_rpm_repo_file() {
   if [[ "${signed}" == "1" ]]; then
     repo_gpgcheck=1
   fi
-  cat > "${rpm_root}/loc.repo" <<EOF
-[loc]
-name=Locality
-baseurl=${BASE_URL%/}/rpm/${RPM_ARCH}
-enabled=1
-gpgcheck=0
-repo_gpgcheck=${repo_gpgcheck}
-gpgkey=${BASE_URL%/}/rpm/RPM-GPG-KEY-codeflash-loc
-EOF
+  write_rpm_repository_config \
+    "${rpm_root}/locality.repo" \
+    "${LINUX_REPOSITORY_BASE_URL%/}/rpm/RPM-GPG-KEY-codeflash-locality" \
+    "${repo_gpgcheck}"
 }
 
 sign_repositories() {
@@ -178,14 +189,14 @@ sign_repositories() {
   key_id="$(gpg_key_id)"
   [[ -n "${key_id}" ]] || fail "could not find a GPG signing key"
 
-  local apt_release="${OUTPUT_DIR}/apt/dists/${APT_SUITE}/Release"
-  sign_file "${key_id}" clearsign "${apt_release}" "${OUTPUT_DIR}/apt/dists/${APT_SUITE}/InRelease"
-  sign_file "${key_id}" detach "${apt_release}" "${OUTPUT_DIR}/apt/dists/${APT_SUITE}/Release.gpg"
-  gpg --batch --armor --export "${key_id}" > "${OUTPUT_DIR}/apt/codeflash-loc.asc"
+  local apt_release="${OUTPUT_DIR}/apt/dists/${LINUX_REPOSITORY_APT_SUITE}/Release"
+  sign_file "${key_id}" clearsign "${apt_release}" "${OUTPUT_DIR}/apt/dists/${LINUX_REPOSITORY_APT_SUITE}/InRelease"
+  sign_file "${key_id}" detach "${apt_release}" "${OUTPUT_DIR}/apt/dists/${LINUX_REPOSITORY_APT_SUITE}/Release.gpg"
+  gpg --batch --armor --export "${key_id}" > "${OUTPUT_DIR}/apt/codeflash-locality.asc"
 
   local repomd="${OUTPUT_DIR}/rpm/${RPM_ARCH}/repodata/repomd.xml"
   sign_file "${key_id}" detach "${repomd}" "${repomd}.asc"
-  gpg --batch --armor --export "${key_id}" > "${OUTPUT_DIR}/rpm/RPM-GPG-KEY-codeflash-loc"
+  gpg --batch --armor --export "${key_id}" > "${OUTPUT_DIR}/rpm/RPM-GPG-KEY-codeflash-locality"
   write_rpm_repo_file 1
 }
 

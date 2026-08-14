@@ -95,6 +95,12 @@ Linux package validation checks that both packages contain:
 /usr/bin/locality-fuse
 ```
 
+Stable release packages also enroll the signed package repository. Debian
+packages carry `/etc/apt/sources.list.d/locality.sources` and a dedicated keyring.
+RPM packages carry `locality.repo` for both DNF/YUM and zypper plus the repository
+public key. Beta/local builds omit enrollment unless
+`LINUX_REPO_GPG_PRIVATE_KEY` is provided.
+
 The existing FUSE smoke test remains the runtime check for actual mount
 behavior:
 
@@ -142,13 +148,27 @@ all expected public download assets are present. Until then,
 `/releases/latest/download/...` URLs continue to resolve to the previous complete
 release.
 
-The workflow still renders date-and-commit package files inside the APT/RPM
-repositories deployed to GitHub Pages, but it does not upload those duplicate
-internal package names to the GitHub Release page.
+For stable releases, the Linux workflow uploads the date-and-commit packages as
+a short-lived workflow artifact. Manual prerelease runs and prerelease-form
+tags do not upload that artifact, so repository publishing skips them. The
+separate
+`.github/workflows/publish-linux-repositories.yml` workflow runs from `main`,
+renders signed APT and RPM metadata, rebuilds the existing Jekyll documentation
+site, switches Pages from its legacy branch build to Actions deployments,
+overlays the repositories, and deploys the combined site to GitHub Pages.
+Running the Pages deployment from `main` satisfies the protected `github-pages`
+environment without allowing release tags to deploy arbitrary site content.
+Changes under `docs/` also run the same Pages workflow; those runs rebuild the
+site and regenerate repository metadata from the newest release carrying the
+repository marker (or the current latest release before the first marker), so
+documentation publishing cannot erase or roll back the package repositories.
 
-The same workflow renders static APT and RPM repository metadata under
-`target/release/linux-repo` and deploys it to GitHub Pages for non-prerelease
-builds. The default repository base URL is:
+After deployment, the workflow uploads `linux-repository.json` to the GitHub
+Release and retries release finalization. The finalizer requires that marker, so
+a stable release cannot become latest before package-manager updates are live.
+The repository workflow can also be dispatched with an existing stable tag to
+rebuild from that release's versioned DEB and RPM assets during recovery.
+The default repository base URL is:
 
 ```text
 https://codeflash-ai.github.io/locality
@@ -170,8 +190,8 @@ The companion release-notes workflow requires `CODEX_CONFIG_TOML` plus the
 provider credential it references. For the Azure OpenAI setup, that means
 `AZURE_OPENAI_API_KEY`.
 
-Repository publishing also requires GitHub Pages configured to deploy from
-GitHub Actions.
+Repository publishing uses the existing GitHub Pages site and preserves the
+rendered engineering documentation alongside `/apt` and `/rpm`.
 
 ## APT Repository
 
@@ -182,19 +202,22 @@ apt/dists/stable/Release
 apt/dists/stable/InRelease
 apt/dists/stable/main/binary-amd64/Packages
 apt/dists/stable/main/binary-amd64/Packages.gz
-apt/pool/main/a/loc/*.deb
+apt/pool/main/l/locality/*.deb
+apt/locality.sources
 ```
 
 User install command:
 
 ```sh
-curl -fsSL https://codeflash-ai.github.io/locality/apt/codeflash-loc.asc | sudo gpg --dearmor -o /usr/share/keyrings/codeflash-loc.gpg && echo "deb [signed-by=/usr/share/keyrings/codeflash-loc.gpg] https://codeflash-ai.github.io/locality/apt stable main" | sudo tee /etc/apt/sources.list.d/loc.list >/dev/null && sudo apt update && sudo apt install loc
+curl -fsSL https://codeflash-ai.github.io/locality/apt/codeflash-locality.asc | sudo gpg --dearmor -o /usr/share/keyrings/codeflash-locality-archive-keyring.gpg
+sudo curl -fsSL -o /etc/apt/sources.list.d/locality.sources https://codeflash-ai.github.io/locality/apt/locality.sources
+sudo apt update && sudo apt install locality
 ```
 
 Updates then use the normal distro path:
 
 ```sh
-sudo apt update && sudo apt upgrade loc
+sudo apt update && sudo apt upgrade
 ```
 
 ## RPM/DNF Repository
@@ -204,26 +227,31 @@ RPM metadata is generated with `createrepo_c`:
 ```text
 rpm/x86_64/repodata/repomd.xml
 rpm/x86_64/*.rpm
-rpm/loc.repo
+rpm/locality.repo
 ```
 
 When `LINUX_REPO_GPG_PRIVATE_KEY` is set, the workflow signs `repomd.xml` and
-writes the public key to `rpm/RPM-GPG-KEY-codeflash-loc`. The generated
-`loc.repo` enables `repo_gpgcheck=1` in that case. RPM package payload signing
+writes the public key to `rpm/RPM-GPG-KEY-codeflash-locality`. The generated
+`locality.repo` enables `repo_gpgcheck=1` in that case. RPM package payload signing
 is separate and not enabled yet, so `gpgcheck=0` remains in the generated repo
 file until package signing is added.
 
 User install command:
 
 ```sh
-sudo curl -fsSL -o /etc/yum.repos.d/loc.repo https://codeflash-ai.github.io/locality/rpm/loc.repo && sudo dnf install loc
+sudo curl -fsSL -o /etc/yum.repos.d/locality.repo https://codeflash-ai.github.io/locality/rpm/locality.repo
+sudo dnf install locality
 ```
 
 Updates then use:
 
 ```sh
-sudo dnf upgrade loc
+sudo dnf upgrade
 ```
+
+The same RPM-MD repository supports `yum update` and openSUSE Tumbleweed. The
+RPM package writes the same definition to `/etc/zypp/repos.d/locality.repo`, so
+`sudo zypper refresh && sudo zypper update` discovers new Locality versions.
 
 ## Linux Tauri Self-Update
 
@@ -235,8 +263,10 @@ signed AppImage into release assets, and renders:
 target/release/bundle/updater/latest-linux.json
 ```
 
-Linux packages installed through APT/DNF should update through APT/DNF. Users
-who want Tauri-managed self-update should run the AppImage channel instead.
+Linux packages installed through APT, DNF/YUM, or zypper update through that
+package manager. The package identity is `locality`; `loc` is the CLI binary.
+Users who want Tauri-managed self-update should run the AppImage channel
+instead.
 
 AppImage install command:
 
