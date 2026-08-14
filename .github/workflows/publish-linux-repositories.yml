@@ -157,6 +157,8 @@ jobs:
 
       - name: Add package repositories to the Pages site
         run: |
+          sudo chown -R "$(id -u):$(id -g)" _site
+          rm -rf _site/apt _site/rpm
           cp -R target/release/linux-repo/apt _site/apt
           cp -R target/release/linux-repo/rpm _site/rpm
 
