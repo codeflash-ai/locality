@@ -136,6 +136,11 @@ jobs:
 
       - name: Use Actions deployments for the existing Pages site
         run: |
+          build_type="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq .build_type)"
+          if [[ "${build_type}" == "workflow" ]]; then
+            echo "GitHub Pages already uses Actions deployments."
+            exit 0
+          fi
           gh api \
             --method PUT \
             "repos/${GITHUB_REPOSITORY}/pages" \
