@@ -8,14 +8,22 @@ use std::sync::Arc;
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, ChildContainer,
     Connector, ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest,
-    ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
+    ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest,
+    PORTABLE_SCOPE_ROOT_RELATIONSHIP, ParsedEntity, PortableArtifactKey, PortableBootstrapRequest,
+    PortableChangeBatch, PortableCheckpoint, PortableCompleteness, PortableContentArtifact,
+    PortableFetchRequest, PortableFetchResult, PortableIncompleteReason,
+    PortableProjectionArtifact, PortableRenderRequest, PortableRenderResult, PortableSourceChange,
 };
+use locality_core::canonical::render_canonical_markdown;
 use locality_core::freshness::{RemoteObservation, RemoteVersion};
 use locality_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use locality_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind};
+use locality_core::portable::{
+    LogicalPath, ProjectionFileKind, SourceAction, SourceConnectionId, SourceEdge, SourceObject,
+};
 use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::validation::ValidationIssue;
 use locality_core::{LocalityError, LocalityResult};
@@ -42,6 +50,17 @@ const INBOX_FOLDER_ID: &str = "gmail-folder:inbox";
 const SENT_FOLDER_ID: &str = "gmail-folder:sent";
 const DRAFT_FOLDER_ID: &str = "gmail-folder:draft";
 const OUTBOX_FOLDER_ID: &str = "gmail-folder:outbox";
+const GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID: &str = "gmail";
+const GMAIL_PORTABLE_CHECKPOINT_VERSION: u16 = 1;
+const GMAIL_PORTABLE_NATIVE_KIND: &str = "gmail_portable_mail";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "bundle", rename_all = "snake_case")]
+enum GmailPortableNativeBundle {
+    Message(GmailNativeBundle),
+    Thread(GmailThreadNativeBundle),
+    ThreadMessage(GmailThreadMessageNativeBundle),
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct GmailConfig {
@@ -187,6 +206,55 @@ impl Connector for GmailConnector {
             Path::new("draft"),
         )?);
         Ok(entries)
+    }
+
+    fn bootstrap_portable(
+        &self,
+        request: PortableBootstrapRequest,
+    ) -> LocalityResult<PortableChangeBatch> {
+        if request.scope.root_remote_ids.as_slice()
+            != [RemoteId::new(GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID)]
+        {
+            return Err(LocalityError::Unsupported(
+                "Gmail portable bootstrap requires the gmail scope root",
+            ));
+        }
+
+        let entries = self.enumerate(EnumerateRequest {
+            mount_id: MountId::new("gmail-portable"),
+            cursor: None,
+        })?;
+        let mut changes = portable_gmail_changes(&request.source_connection_id, entries)?;
+        changes.sort_by(|left, right| {
+            left.logical_path
+                .as_ref()
+                .map(LogicalPath::as_str)
+                .cmp(&right.logical_path.as_ref().map(LogicalPath::as_str))
+                .then_with(|| {
+                    left.source_object
+                        .remote_id
+                        .cmp(&right.source_object.remote_id)
+                })
+        });
+
+        let complete = changes.len() <= request.max_changes as usize;
+        if !complete {
+            changes.truncate(request.max_changes as usize);
+        }
+        let completeness = if complete {
+            PortableCompleteness::complete()
+        } else {
+            PortableCompleteness::incomplete(PortableIncompleteReason::ConnectorLimitation {
+                code: "gmail_bootstrap_max_changes_exceeded".to_string(),
+                remote_id: Some(RemoteId::new(GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID)),
+            })
+        };
+
+        Ok(PortableChangeBatch {
+            changes,
+            next_checkpoint: gmail_portable_checkpoint(),
+            completeness,
+        })
     }
 
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {
@@ -463,6 +531,26 @@ impl Connector for GmailConnector {
         })
     }
 
+    fn fetch_portable(&self, request: PortableFetchRequest) -> LocalityResult<PortableFetchResult> {
+        let native = self.fetch(FetchRequest {
+            remote_id: request.remote_id,
+        })?;
+        let (remote_id, bundle, provider_version) = portable_bundle_from_native(native)?;
+        let raw = serde_json::to_vec(&bundle).map_err(|error| {
+            LocalityError::Io(format!("gmail portable native encode failed: {error}"))
+        })?;
+
+        Ok(PortableFetchResult {
+            native: NativeEntity {
+                remote_id,
+                kind: GMAIL_PORTABLE_NATIVE_KIND.to_string(),
+                raw,
+            },
+            provider_version: Some(provider_version),
+            completeness: PortableCompleteness::complete(),
+        })
+    }
+
     fn render(&self, entity: &NativeEntity) -> LocalityResult<CanonicalDocument> {
         if entity.kind == "gmail_thread" {
             let bundle = serde_json::from_slice::<GmailThreadNativeBundle>(&entity.raw).map_err(
@@ -484,6 +572,70 @@ impl Connector for GmailConnector {
         let bundle = serde_json::from_slice::<GmailNativeBundle>(&entity.raw)
             .map_err(|error| LocalityError::Io(format!("gmail native decode failed: {error}")))?;
         render_gmail_message(&bundle).map(|rendered| rendered.document)
+    }
+
+    fn render_portable(
+        &self,
+        request: &PortableRenderRequest,
+    ) -> LocalityResult<PortableRenderResult> {
+        if request.native.kind != GMAIL_PORTABLE_NATIVE_KIND {
+            return Err(LocalityError::Unsupported(
+                "Gmail portable render requires a portable Gmail native bundle",
+            ));
+        }
+
+        let bundle = serde_json::from_slice::<GmailPortableNativeBundle>(&request.native.raw)
+            .map_err(|error| {
+                LocalityError::Io(format!("gmail portable native decode failed: {error}"))
+            })?;
+        let expected_remote_id = portable_bundle_remote_id(&bundle);
+        if expected_remote_id.as_str() != request.native.remote_id.as_str() {
+            return Err(LocalityError::InvalidState(format!(
+                "Gmail portable native remote id `{}` did not match bundle `{}`",
+                request.native.remote_id.as_str(),
+                expected_remote_id.as_str()
+            )));
+        }
+
+        let document = match &bundle {
+            GmailPortableNativeBundle::Message(bundle) => render_gmail_message(bundle)?.document,
+            GmailPortableNativeBundle::Thread(bundle) => render_gmail_thread(bundle)?.document,
+            GmailPortableNativeBundle::ThreadMessage(bundle) => {
+                render_gmail_thread_message(bundle)?.document
+            }
+        };
+        let canonical = PortableContentArtifact {
+            artifact_key: gmail_artifact_key(
+                &request.native.remote_id,
+                "canonical",
+                request.format_version,
+            ),
+            media_type: "application/json".to_string(),
+            body: request.native.raw.clone(),
+        };
+        let projections = vec![PortableProjectionArtifact {
+            artifact: PortableContentArtifact {
+                artifact_key: gmail_artifact_key(
+                    &request.native.remote_id,
+                    "markdown",
+                    request.format_version,
+                ),
+                media_type: "text/markdown; charset=utf-8".to_string(),
+                body: render_canonical_markdown(&document).into_bytes(),
+            },
+            logical_path: request.logical_path.clone(),
+            file_kind: ProjectionFileKind::Markdown,
+            format_version: request.format_version,
+            supported_actions: [SourceAction::Read, SourceAction::Search]
+                .into_iter()
+                .collect(),
+        }];
+
+        Ok(PortableRenderResult {
+            canonical,
+            projections,
+            completeness: PortableCompleteness::complete(),
+        })
     }
 
     fn parse(&self, document: &CanonicalDocument) -> LocalityResult<ParsedEntity> {
@@ -709,6 +861,129 @@ impl Connector for GmailConnector {
     fn apply_undo(&self, _request: ApplyUndoRequest<'_>) -> LocalityResult<ApplyUndoResult> {
         Err(LocalityError::Unsupported("gmail undo"))
     }
+}
+
+fn portable_gmail_changes(
+    source_connection_id: &SourceConnectionId,
+    entries: Vec<TreeEntry>,
+) -> LocalityResult<Vec<PortableSourceChange>> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.kind == EntityKind::Page)
+        .map(|entry| {
+            Ok(PortableSourceChange {
+                source_object: SourceObject {
+                    source_connection_id: source_connection_id.clone(),
+                    remote_id: entry.remote_id.clone(),
+                    kind: entry.kind,
+                    edges: vec![SourceEdge {
+                        relationship: PORTABLE_SCOPE_ROOT_RELATIONSHIP.to_string(),
+                        target_remote_id: RemoteId::new(GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID),
+                    }],
+                    opaque_version: entry.remote_edited_at,
+                    deleted: false,
+                    connector_metadata: BTreeMap::new(),
+                    acl_observations: Vec::new(),
+                    discovered_at: None,
+                    observed_at: None,
+                },
+                logical_path: Some(logical_path_from_tree_path(&entry.path)?),
+                requires_fetch: true,
+            })
+        })
+        .collect()
+}
+
+fn logical_path_from_tree_path(path: &Path) -> LocalityResult<LogicalPath> {
+    LogicalPath::new(path.to_string_lossy().replace('\\', "/")).map_err(|error| {
+        LocalityError::InvalidState(format!("Gmail portable logical path is invalid: {error}"))
+    })
+}
+
+fn gmail_portable_checkpoint() -> PortableCheckpoint {
+    PortableCheckpoint {
+        format_version: GMAIL_PORTABLE_CHECKPOINT_VERSION,
+        opaque: serde_json::json!({ "scope_root": GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID })
+            .to_string(),
+    }
+}
+
+fn portable_bundle_from_native(
+    native: NativeEntity,
+) -> LocalityResult<(RemoteId, GmailPortableNativeBundle, String)> {
+    match native.kind.as_str() {
+        "gmail_message" => {
+            let bundle =
+                serde_json::from_slice::<GmailNativeBundle>(&native.raw).map_err(|error| {
+                    LocalityError::Io(format!("gmail native decode failed: {error}"))
+                })?;
+            let provider_version = remote_version(&bundle.message);
+            Ok((
+                portable_bundle_message_remote_id(&bundle),
+                GmailPortableNativeBundle::Message(bundle),
+                provider_version,
+            ))
+        }
+        "gmail_thread" => {
+            let bundle = serde_json::from_slice::<GmailThreadNativeBundle>(&native.raw).map_err(
+                |error| LocalityError::Io(format!("gmail thread native decode failed: {error}")),
+            )?;
+            let provider_version = thread_remote_version(&bundle.thread);
+            Ok((
+                thread_remote_id(&bundle.mailbox, &bundle.thread.id),
+                GmailPortableNativeBundle::Thread(bundle),
+                provider_version,
+            ))
+        }
+        "gmail_thread_message" => {
+            let bundle = serde_json::from_slice::<GmailThreadMessageNativeBundle>(&native.raw)
+                .map_err(|error| {
+                    LocalityError::Io(format!(
+                        "gmail thread message native decode failed: {error}"
+                    ))
+                })?;
+            let provider_version = remote_version(&bundle.message);
+            Ok((
+                thread_message_remote_id(&bundle.mailbox, &bundle.thread_id, &bundle.message.id),
+                GmailPortableNativeBundle::ThreadMessage(bundle),
+                provider_version,
+            ))
+        }
+        _ => Err(LocalityError::Unsupported(
+            "Gmail portable fetch requires a Gmail native entity",
+        )),
+    }
+}
+
+fn portable_bundle_remote_id(bundle: &GmailPortableNativeBundle) -> RemoteId {
+    match bundle {
+        GmailPortableNativeBundle::Message(bundle) => portable_bundle_message_remote_id(bundle),
+        GmailPortableNativeBundle::Thread(bundle) => {
+            thread_remote_id(&bundle.mailbox, &bundle.thread.id)
+        }
+        GmailPortableNativeBundle::ThreadMessage(bundle) => {
+            thread_message_remote_id(&bundle.mailbox, &bundle.thread_id, &bundle.message.id)
+        }
+    }
+}
+
+fn portable_bundle_message_remote_id(bundle: &GmailNativeBundle) -> RemoteId {
+    bundle
+        .draft_id
+        .as_deref()
+        .map(draft_remote_id)
+        .unwrap_or_else(|| RemoteId::new(bundle.message.id.clone()))
+}
+
+fn gmail_artifact_key(
+    remote_id: &RemoteId,
+    role: &str,
+    format_version: u32,
+) -> PortableArtifactKey {
+    PortableArtifactKey::new(format!(
+        "gmail:source:{}:{role}:v{format_version}",
+        remote_id.as_str()
+    ))
 }
 
 fn find_sent_message_by_message_id(
@@ -1672,12 +1947,16 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use locality_connector::{
         ChildContainer, Connector, EnumerateRequest, FetchRequest, ListChildrenRequest,
-        ObserveRequest,
+        ObserveRequest, PORTABLE_SCOPE_ROOT_RELATIONSHIP, PortableBootstrapRequest,
+        PortableFetchReason, PortableFetchRequest, PortableRenderRequest, PortableSourceScope,
     };
     use locality_core::LocalityError;
     use locality_core::journal::{JournalApplyEffect, PushId, PushOperationId};
     use locality_core::model::{CanonicalDocument, EntityKind, MountId, RemoteId};
     use locality_core::planner::{PropertyValue, PushOperation, PushPlan};
+    use locality_core::portable::{
+        LogicalPath, ProjectionFileKind, SourceAction, SourceConnectionId,
+    };
     use locality_core::push::RemotePrecondition;
     use locality_core::search::RAW_SEARCH_METADATA_KEY;
 
@@ -1883,6 +2162,135 @@ mod tests {
         let calls = api.calls.lock().expect("calls");
         assert_eq!(calls.draft_list_page_tokens, vec![None]);
         assert!(calls.draft_list_queries.is_empty());
+    }
+
+    #[test]
+    fn gmail_bootstrap_portable_lists_complete_mail_scope() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+
+        let batch = connector
+            .bootstrap_portable(PortableBootstrapRequest {
+                source_connection_id: SourceConnectionId::new("gmail-connection"),
+                scope: PortableSourceScope::explicit_roots([RemoteId::new("gmail")]),
+                checkpoint: None,
+                max_changes: 100,
+            })
+            .expect("portable bootstrap");
+
+        assert!(batch.completeness.is_complete());
+        let mut remote_ids = batch
+            .changes
+            .iter()
+            .map(|change| change.source_object.remote_id.as_str().to_string())
+            .collect::<Vec<_>>();
+        remote_ids.sort();
+        assert_eq!(
+            remote_ids,
+            vec![
+                "gmail-draft:draft-1".to_string(),
+                "inbox-msg-1".to_string(),
+                "sent-msg-1".to_string(),
+            ]
+        );
+        assert!(batch.changes.iter().all(|change| {
+            change.source_object.kind == EntityKind::Page
+                && change.requires_fetch
+                && change.source_object.edges.len() == 1
+                && change.source_object.edges[0].relationship == PORTABLE_SCOPE_ROOT_RELATIONSHIP
+                && change.source_object.edges[0].target_remote_id == RemoteId::new("gmail")
+        }));
+        assert!(batch.changes.iter().all(|change| {
+            change
+                .logical_path
+                .as_ref()
+                .is_some_and(|path| path.as_str().ends_with(".md"))
+        }));
+
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.list_max_results, vec![100, 100]);
+        assert_eq!(calls.draft_list_max_results, vec![100]);
+    }
+
+    #[test]
+    fn gmail_fetch_portable_returns_stable_provider_version() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
+
+        let fetched = connector
+            .fetch_portable(PortableFetchRequest {
+                source_connection_id: SourceConnectionId::new("gmail-connection"),
+                remote_id: RemoteId::new("inbox-msg-1"),
+                reason: PortableFetchReason::Bootstrap,
+            })
+            .expect("portable fetch");
+
+        assert!(fetched.completeness.is_complete());
+        assert_eq!(fetched.native.remote_id, RemoteId::new("inbox-msg-1"));
+        assert_eq!(fetched.native.kind, "gmail_portable_mail");
+        assert_eq!(
+            fetched.provider_version.as_deref(),
+            Some("gmail:inbox-msg-1:1720900000000:INBOX")
+        );
+    }
+
+    #[test]
+    fn gmail_render_portable_returns_canonical_and_markdown_projection() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
+        let fetched = connector
+            .fetch_portable(PortableFetchRequest {
+                source_connection_id: SourceConnectionId::new("gmail-connection"),
+                remote_id: RemoteId::new("inbox-msg-1"),
+                reason: PortableFetchReason::Bootstrap,
+            })
+            .expect("portable fetch");
+
+        let rendered = connector
+            .render_portable(&PortableRenderRequest {
+                source_connection_id: SourceConnectionId::new("gmail-connection"),
+                logical_path: LogicalPath::new("inbox/1720900000000-hello-inbox-msg-1.md")
+                    .expect("logical path"),
+                native: fetched.native,
+                format_version: 7,
+            })
+            .expect("portable render");
+
+        assert!(rendered.completeness.is_complete());
+        assert_eq!(
+            rendered.canonical.artifact_key.as_str(),
+            "gmail:source:inbox-msg-1:canonical:v7"
+        );
+        assert_eq!(rendered.canonical.media_type, "application/json");
+        let canonical: serde_json::Value =
+            serde_json::from_slice(&rendered.canonical.body).expect("canonical json");
+        assert_eq!(canonical["kind"], serde_json::json!("message"));
+
+        assert_eq!(rendered.projections.len(), 1);
+        let projection = &rendered.projections[0];
+        assert_eq!(
+            projection.artifact.artifact_key.as_str(),
+            "gmail:source:inbox-msg-1:markdown:v7"
+        );
+        assert_eq!(
+            projection.artifact.media_type,
+            "text/markdown; charset=utf-8"
+        );
+        assert_eq!(
+            projection.logical_path.as_str(),
+            "inbox/1720900000000-hello-inbox-msg-1.md"
+        );
+        assert_eq!(projection.file_kind, ProjectionFileKind::Markdown);
+        assert_eq!(projection.format_version, 7);
+        assert_eq!(
+            projection.supported_actions,
+            [SourceAction::Read, SourceAction::Search]
+                .into_iter()
+                .collect()
+        );
+        let markdown = String::from_utf8(projection.artifact.body.clone()).expect("markdown utf8");
+        assert!(markdown.contains("connector: gmail"));
+        assert!(markdown.contains("Body\n"));
     }
 
     #[test]
