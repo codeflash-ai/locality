@@ -49,8 +49,12 @@ loc connect notion --name work
 The default product path uses the Locality OAuth broker so the local CLI never ships
 or stores the Notion OAuth client secret. The broker URL can be overridden with
 `--broker-url <url>`, `LOCALITY_NOTION_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`.
-The Notion public integration must register the callback URI, which defaults to
-`http://localhost:8757/oauth/notion/callback`.
+For the brokered product flow, the Notion public integration registers the
+broker callback, for example
+`<LOCALITY_BROKER_PUBLIC_BASE_URL>/v1/oauth/notion/callback`. The local client
+still listens on the desktop callback, which defaults to
+`http://localhost:8757/oauth/notion/callback`; the broker redirects the browser
+there after Notion returns the authorization code.
 
 For development with a BYO Notion OAuth app, use direct OAuth:
 
