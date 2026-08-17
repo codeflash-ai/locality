@@ -55,6 +55,10 @@ assert_job_line ".github/workflows/ci.yml" "linux" "    runs-on: ubuntu-latest"
 assert_job_line ".github/workflows/ci.yml" "linux-fuse" "    runs-on: ubuntu-latest"
 assert_job_line ".github/workflows/ci.yml" "linux-fuse" \
   "        run: LOCALITY_FUSE_SMOKE=1 LOCALITY_FUSE_SMOKE_REQUIRED=1 tests/run_linux_fuse_ci.sh tests/linux_fuse_smoke.sh"
+assert_job_line ".github/workflows/ci.yml" "linux" \
+  "        run: npm test -- --run"
+assert_job_line ".github/workflows/ci.yml" "macos" \
+  "        run: swift test --package-path platform/macos/LocalityFileProvider"
 
 assert_job_line ".github/workflows/e2e.yml" "linux-fuse" "    runs-on: ubuntu-latest"
 assert_job_line ".github/workflows/e2e.yml" "linux-fuse" \
