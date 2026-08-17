@@ -339,7 +339,7 @@ fn connect_google_docs_broker_oauth_accepts_google_identity_scope_aliases() {
         "https://www.googleapis.com/auth/userinfo.profile".to_string(),
         "https://www.googleapis.com/auth/documents".to_string(),
         "https://www.googleapis.com/auth/drive.file".to_string(),
-        "https://www.googleapis.com/auth/drive.metadata".to_string(),
+        "https://www.googleapis.com/auth/drive.metadata.readonly".to_string(),
     ];
     let exchange = ScopedFakeGoogleDocsBrokerOAuthExchange {
         scopes: scopes.clone(),
@@ -376,7 +376,7 @@ fn connect_google_docs_broker_oauth_rejects_unsupported_scope_before_persistence
         .iter()
         .map(|scope| scope.to_string())
         .collect::<Vec<_>>();
-    scopes.push("https://www.googleapis.com/auth/calendar.events".to_string());
+    scopes.push("https://www.googleapis.com/auth/calendar.events.owned".to_string());
     let exchange = ScopedFakeGoogleDocsBrokerOAuthExchange { scopes };
 
     let error = run_connect_google_docs_broker_oauth(
@@ -404,7 +404,7 @@ fn connect_google_docs_broker_oauth_rejects_unsupported_scope_before_persistence
     assert!(
         error
             .message()
-            .contains("https://www.googleapis.com/auth/calendar.events")
+            .contains("https://www.googleapis.com/auth/calendar.events.owned")
     );
     assert_eq!(error.suggested_command(), Some("loc connect google-docs"));
     assert!(credentials.get("connection:docs-work").is_err());
@@ -523,7 +523,7 @@ fn connect_google_calendar_broker_oauth_accepts_google_identity_scope_aliases() 
         "openid".to_string(),
         "https://www.googleapis.com/auth/userinfo.email".to_string(),
         "https://www.googleapis.com/auth/userinfo.profile".to_string(),
-        "https://www.googleapis.com/auth/calendar.events".to_string(),
+        "https://www.googleapis.com/auth/calendar.events.owned".to_string(),
     ];
     let exchange = ScopedFakeGoogleCalendarBrokerOAuthExchange {
         scopes: scopes.clone(),
@@ -780,7 +780,7 @@ fn connect_google_calendar_broker_oauth_rejects_missing_required_scope() {
     let exchange = ScopedFakeGoogleCalendarBrokerOAuthExchange {
         scopes: GOOGLE_CALENDAR_OAUTH_SCOPES
             .iter()
-            .filter(|scope| **scope != "https://www.googleapis.com/auth/calendar.events")
+            .filter(|scope| **scope != "https://www.googleapis.com/auth/calendar.events.owned")
             .map(|scope| scope.to_string())
             .collect(),
     };
@@ -800,7 +800,7 @@ fn connect_google_calendar_broker_oauth_rejects_missing_required_scope() {
         "{message}"
     );
     assert!(
-        message.contains("https://www.googleapis.com/auth/calendar.events"),
+        message.contains("https://www.googleapis.com/auth/calendar.events.owned"),
         "{message}"
     );
     assert_eq!(

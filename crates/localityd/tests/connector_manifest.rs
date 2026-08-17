@@ -15,11 +15,14 @@ use locality_connector::manifest::{
 };
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::push::BodyDiffMode;
-use locality_gmail::{GmailConfig, GmailConnector, GmailMountSettings};
+use locality_gmail::{GMAIL_OAUTH_SCOPES, GmailConfig, GmailConnector, GmailMountSettings};
 use locality_google_calendar::{
-    GoogleCalendarConfig, GoogleCalendarConnector, GoogleCalendarMountSettings,
+    GOOGLE_CALENDAR_OAUTH_SCOPES, GoogleCalendarConfig, GoogleCalendarConnector,
+    GoogleCalendarMountSettings,
 };
-use locality_google_docs::{GoogleDocsConfig, GoogleDocsConnector, StoredGoogleDocsCredential};
+use locality_google_docs::{
+    GOOGLE_DOCS_OAUTH_SCOPES, GoogleDocsConfig, GoogleDocsConnector, StoredGoogleDocsCredential,
+};
 use locality_granola::{GranolaConfig, GranolaConnector};
 use locality_linear::{LinearConfig, LinearConnector};
 use locality_notion::{NotionConfig, NotionConnector};
@@ -239,6 +242,234 @@ fn source_descriptors_match_manifest_defaults_and_projection_policy() {
                 ManifestRenamePolicy::FilenameDerived => VirtualRenamePolicy::FilenameDerived,
                 ManifestRenamePolicy::PreserveCanonical => VirtualRenamePolicy::PreserveCanonical,
             }
+        );
+    }
+}
+
+#[test]
+fn google_docs_oauth_verification_scope_manifest_matches_runtime_profile() {
+    assert!(
+        GOOGLE_DOCS_OAUTH_SCOPES
+            .contains(&"https://www.googleapis.com/auth/drive.metadata.readonly"),
+        "Google Docs should request readonly Drive metadata for discovery"
+    );
+    assert!(
+        !GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive.metadata"),
+        "Google Docs must not request writable Drive metadata beyond drive.file app-file writes"
+    );
+
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let verification_path = repository_root.join("connectors/oauth-verification/google-docs.json");
+    let verification_json = fs::read_to_string(&verification_path)
+        .expect("read Google Docs OAuth verification manifest");
+    let verification = serde_json::from_str::<serde_json::Value>(&verification_json)
+        .expect("parse Google Docs OAuth verification manifest");
+
+    assert_eq!(verification["connector"], "google-docs");
+    let registry = bundled_connector_registry().expect("manifest registry");
+    let docs_profile = registry
+        .connector("google-docs")
+        .expect("Google Docs manifest")
+        .profiles
+        .iter()
+        .find(|profile| profile.id == "google-docs-oauth-default")
+        .expect("Google Docs OAuth manifest profile");
+    assert_eq!(
+        docs_profile.scopes,
+        GOOGLE_DOCS_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        verification["runtime_oauth_request_scopes"],
+        serde_json::json!(GOOGLE_DOCS_OAUTH_SCOPES)
+    );
+
+    let docs_api_scopes = GOOGLE_DOCS_OAUTH_SCOPES
+        .iter()
+        .copied()
+        .filter(|scope| scope.starts_with("https://www.googleapis.com/auth/"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        verification["google_api_verification_scopes"],
+        serde_json::json!(docs_api_scopes)
+    );
+
+    let submitted = verification["google_api_verification_scopes"]
+        .as_array()
+        .expect("submitted Google Docs verification scopes array");
+    let excluded = verification["excluded_google_api_scopes"]
+        .as_array()
+        .expect("excluded Google Docs verification scopes array");
+    for scope in [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/drive.metadata",
+        "https://www.googleapis.com/auth/documents.readonly",
+    ] {
+        assert!(
+            !GOOGLE_DOCS_OAUTH_SCOPES.contains(&scope),
+            "runtime Google Docs OAuth profile must not request broad or insufficient scope `{scope}`"
+        );
+        assert!(
+            !submitted.iter().any(|value| value == scope),
+            "verification manifest must not submit broad or insufficient scope `{scope}`"
+        );
+        assert!(
+            excluded.iter().any(|value| value == scope),
+            "verification manifest should document excluded scope `{scope}`"
+        );
+    }
+}
+
+#[test]
+fn google_calendar_oauth_verification_scope_manifest_matches_runtime_profile() {
+    assert!(
+        GOOGLE_CALENDAR_OAUTH_SCOPES
+            .contains(&"https://www.googleapis.com/auth/calendar.events.owned"),
+        "Google Calendar should request event access only for calendars the user owns"
+    );
+    assert!(
+        !GOOGLE_CALENDAR_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/calendar.events"),
+        "Google Calendar must not request all-calendar event access for the primary-calendar-only connector"
+    );
+
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let verification_path =
+        repository_root.join("connectors/oauth-verification/google-calendar.json");
+    let verification_json = fs::read_to_string(&verification_path)
+        .expect("read Google Calendar OAuth verification manifest");
+    let verification = serde_json::from_str::<serde_json::Value>(&verification_json)
+        .expect("parse Google Calendar OAuth verification manifest");
+
+    assert_eq!(verification["connector"], "google-calendar");
+    let registry = bundled_connector_registry().expect("manifest registry");
+    let calendar_profile = registry
+        .connector("google-calendar")
+        .expect("Google Calendar manifest")
+        .profiles
+        .iter()
+        .find(|profile| profile.id == "google-calendar-oauth-default")
+        .expect("Google Calendar OAuth manifest profile");
+    assert_eq!(
+        calendar_profile.scopes,
+        GOOGLE_CALENDAR_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        verification["runtime_oauth_request_scopes"],
+        serde_json::json!(GOOGLE_CALENDAR_OAUTH_SCOPES)
+    );
+
+    let calendar_api_scopes = GOOGLE_CALENDAR_OAUTH_SCOPES
+        .iter()
+        .copied()
+        .filter(|scope| scope.starts_with("https://www.googleapis.com/auth/calendar."))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        verification["google_api_verification_scopes"],
+        serde_json::json!(calendar_api_scopes)
+    );
+
+    let submitted = verification["google_api_verification_scopes"]
+        .as_array()
+        .expect("submitted Google Calendar verification scopes array");
+    let excluded = verification["excluded_google_api_scopes"]
+        .as_array()
+        .expect("excluded Google Calendar verification scopes array");
+    for scope in [
+        "https://www.googleapis.com/auth/calendar",
+        "https://www.googleapis.com/auth/calendar.readonly",
+        "https://www.googleapis.com/auth/calendar.events",
+        "https://www.googleapis.com/auth/calendar.events.readonly",
+        "https://www.googleapis.com/auth/calendar.app.created",
+    ] {
+        assert!(
+            !GOOGLE_CALENDAR_OAUTH_SCOPES.contains(&scope),
+            "runtime Google Calendar OAuth profile must not request broad or insufficient scope `{scope}`"
+        );
+        assert!(
+            !submitted.iter().any(|value| value == scope),
+            "verification manifest must not submit broad or insufficient scope `{scope}`"
+        );
+        assert!(
+            excluded.iter().any(|value| value == scope),
+            "verification manifest should document excluded scope `{scope}`"
+        );
+    }
+}
+
+#[test]
+fn gmail_oauth_verification_scope_manifest_matches_runtime_profile() {
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let verification_path = repository_root.join("connectors/oauth-verification/gmail.json");
+    let verification_json =
+        fs::read_to_string(&verification_path).expect("read Gmail OAuth verification manifest");
+    let verification = serde_json::from_str::<serde_json::Value>(&verification_json)
+        .expect("parse Gmail OAuth verification manifest");
+
+    assert_eq!(verification["connector"], "gmail");
+    let registry = bundled_connector_registry().expect("manifest registry");
+    let gmail_profile = registry
+        .connector("gmail")
+        .expect("Gmail manifest")
+        .profiles
+        .iter()
+        .find(|profile| profile.id == "gmail-oauth-default")
+        .expect("Gmail OAuth manifest profile");
+    assert_eq!(
+        gmail_profile.scopes,
+        GMAIL_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        verification["runtime_oauth_request_scopes"],
+        serde_json::json!(GMAIL_OAUTH_SCOPES)
+    );
+
+    let gmail_api_scopes = GMAIL_OAUTH_SCOPES
+        .iter()
+        .copied()
+        .filter(|scope| scope.starts_with("https://www.googleapis.com/auth/gmail."))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        verification["google_api_verification_scopes"],
+        serde_json::json!(gmail_api_scopes)
+    );
+
+    let submitted = verification["google_api_verification_scopes"]
+        .as_array()
+        .expect("submitted Gmail verification scopes array");
+    let excluded = verification["excluded_google_api_scopes"]
+        .as_array()
+        .expect("excluded Gmail verification scopes array");
+    for scope in [
+        "https://mail.google.com/",
+        "https://www.googleapis.com/auth/gmail.modify",
+        "https://www.googleapis.com/auth/gmail.drafts.create",
+        "https://www.googleapis.com/auth/gmail.drafts.readonly",
+        "https://www.googleapis.com/auth/gmail.metadata",
+        "https://www.googleapis.com/auth/gmail.insert",
+        "https://www.googleapis.com/auth/gmail.addons.current.message.metadata",
+        "https://www.googleapis.com/auth/gmail.addons.current.message.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
+    ] {
+        assert!(
+            !GMAIL_OAUTH_SCOPES.contains(&scope),
+            "runtime Gmail OAuth profile must not request broad or unused scope `{scope}`"
+        );
+        assert!(
+            !submitted.iter().any(|value| value == scope),
+            "verification manifest must not submit broad or unused scope `{scope}`"
+        );
+        assert!(
+            excluded.iter().any(|value| value == scope),
+            "verification manifest should document excluded scope `{scope}`"
         );
     }
 }
