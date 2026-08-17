@@ -100,6 +100,11 @@ Request:
 }
 ```
 
+The broker requests `openid`, `email`, `profile`,
+`https://www.googleapis.com/auth/documents`,
+`https://www.googleapis.com/auth/drive.file`, and
+`https://www.googleapis.com/auth/drive.metadata.readonly`.
+
 Response:
 
 ```json
@@ -155,7 +160,7 @@ Request:
 If omitted, the default callback is
 `http://localhost:8757/oauth/google-calendar/callback`. The broker requests
 `openid`, `email`, `profile`, and
-`https://www.googleapis.com/auth/calendar.events`.
+`https://www.googleapis.com/auth/calendar.events.owned`.
 
 Response:
 

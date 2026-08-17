@@ -1976,7 +1976,7 @@ fn resolving_expired_google_docs_credential_refreshes_with_broker_handle() {
             "profile",
             "https://www.googleapis.com/auth/documents",
             "https://www.googleapis.com/auth/drive.file",
-            "https://www.googleapis.com/auth/drive.metadata"
+            "https://www.googleapis.com/auth/drive.metadata.readonly"
         ],
     })
     .to_string();
@@ -2036,7 +2036,7 @@ fn resolving_expired_google_docs_credential_rejects_refresh_unsupported_scope() 
         .iter()
         .map(|scope| scope.to_string())
         .collect::<Vec<_>>();
-    refresh_scopes.push("https://www.googleapis.com/auth/calendar.events".to_string());
+    refresh_scopes.push("https://www.googleapis.com/auth/calendar.events.owned".to_string());
     let refresh_response = serde_json::json!({
         "access_token": "new-access-token",
         "token_type": "Bearer",
@@ -2096,7 +2096,7 @@ fn resolving_expired_google_docs_credential_rejects_refresh_unsupported_scope() 
     assert!(
         error
             .message()
-            .contains("https://www.googleapis.com/auth/calendar.events")
+            .contains("https://www.googleapis.com/auth/calendar.events.owned")
     );
     assert_eq!(error.suggested_command(), Some("loc connect google-docs"));
     assert_eq!(

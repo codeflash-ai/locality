@@ -45,9 +45,9 @@ The broker allowlist also supports:
 http://127.0.0.1:8757/oauth/gmail/callback
 ```
 
-Gmail and Google Docs use the same broker-configured Google OAuth client:
-`LOCALITY_GOOGLE_CLIENT_ID` and `LOCALITY_GOOGLE_CLIENT_SECRET`. Register both
-the Gmail and Google Docs localhost callbacks on that Google OAuth client.
+Gmail, Google Docs, and Google Calendar use the same broker-configured Google
+OAuth client: `LOCALITY_GOOGLE_CLIENT_ID` and `LOCALITY_GOOGLE_CLIENT_SECRET`.
+Register all Google connector localhost callbacks on that Google OAuth client.
 
 The default connection ID is `gmail-default`, the default mount ID is
 `gmail-main`, and the default OAuth profile is `gmail-oauth-default`.
@@ -61,6 +61,48 @@ The broker requests these scopes:
 - `https://www.googleapis.com/auth/gmail.compose`
 
 No broader Gmail account scope is required for this connector.
+
+## Google OAuth Verification
+
+Use `connectors/oauth-verification/gmail.json` as the source of truth when
+configuring the Google Cloud Console and preparing the verification demo. The
+runtime OAuth request includes the identity scopes above, but the Gmail API
+scopes submitted for verification must be exactly:
+
+- `https://www.googleapis.com/auth/gmail.readonly`
+- `https://www.googleapis.com/auth/gmail.compose`
+
+Do not submit broader or unused Gmail scopes for this connector:
+
+- `https://mail.google.com/`
+- `https://www.googleapis.com/auth/gmail.modify`
+- `https://www.googleapis.com/auth/gmail.drafts.create`
+- `https://www.googleapis.com/auth/gmail.drafts.readonly`
+- `https://www.googleapis.com/auth/gmail.metadata`
+- `https://www.googleapis.com/auth/gmail.insert`
+- `https://www.googleapis.com/auth/gmail.addons.current.message.metadata`
+- `https://www.googleapis.com/auth/gmail.addons.current.message.readonly`
+- `https://www.googleapis.com/auth/gmail.send`
+
+The verification video should show the consent screen with all requested
+permissions expanded and readable, then demonstrate the maximum user-facing
+extent of those two Gmail API scopes:
+
+1. Connect and mount Gmail with `loc connect gmail`, `loc mount gmail`, and
+   `loc pull`.
+2. Open projected inbox or sent Markdown to show Locality reads full message
+   content. This is why `gmail.metadata` is insufficient.
+3. Open a message with an attachment and show the hydrated local attachment
+   file created from Gmail read access.
+4. If thread view is part of the submitted app surface, mount with
+   `--view threads` and open a thread plus a child message.
+5. Create a Markdown file directly under `draft/`, push it after review, and
+   show the matching unsent draft in the user's Gmail account.
+6. Edit an existing remote Gmail draft under `draft/`, push it after review,
+   and show the updated unsent draft in the user's Gmail account.
+7. Create a Markdown file directly under `outbox/` or move a remote draft from
+   `draft/` to `outbox/`, push it after review, and show the matching message
+   in Gmail Sent.
 
 CLI overrides:
 

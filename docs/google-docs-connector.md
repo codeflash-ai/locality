@@ -23,19 +23,44 @@ The Google Docs OAuth flow uses the Locality OAuth broker and requests:
 - `profile`
 - `https://www.googleapis.com/auth/documents`
 - `https://www.googleapis.com/auth/drive.file`
-- `https://www.googleapis.com/auth/drive.metadata`
+- `https://www.googleapis.com/auth/drive.metadata.readonly`
 
 The broker uses the shared `LOCALITY_GOOGLE_CLIENT_ID` and
-`LOCALITY_GOOGLE_CLIENT_SECRET` pair for both Google Docs and Gmail. The Google
-OAuth client must allow the Google Docs and Gmail localhost callbacks.
+`LOCALITY_GOOGLE_CLIENT_SECRET` pair for Google Docs, Google Calendar, and
+Gmail. The Google OAuth client must allow all Google connector localhost
+callbacks.
 
 `documents` is used for Google Docs body read/write. `drive.file` keeps write
-access limited to app-created or explicitly granted files. `drive.metadata`
+access limited to app-created or explicitly granted files. `drive.metadata.readonly`
 allows Locality to discover Drive metadata for Google Docs and folders inside
 the configured workspace folder, including Docs manually created in that folder.
+Locality does not request writable Drive metadata beyond the app-file write
+access already covered by `drive.file`.
 
 The connector still keeps enumeration scoped to the mount workspace folder. It
 does not expose arbitrary Drive traversal as a Locality mount.
+
+## Google OAuth Verification
+
+Keep the Google Cloud Console verification scope list aligned with
+`connectors/oauth-verification/google-docs.json`.
+
+Submit only these Google API scopes:
+
+- `https://www.googleapis.com/auth/documents`
+- `https://www.googleapis.com/auth/drive.file`
+- `https://www.googleapis.com/auth/drive.metadata.readonly`
+
+Do not submit full Drive, Drive readonly, writable Drive metadata, or Docs
+readonly scopes for this connector.
+
+The verification demo should show the OAuth consent screen with all requested
+permissions readable, then demonstrate the code-backed user workflows: mounting
+and enumerating the Drive workspace folder, reading a Google Doc body, editing
+an existing Doc body, creating a new Google Doc, renaming and moving a Doc if
+those workflows are exposed, and archiving or trashing a Doc if that workflow is
+enabled. For every write shown in Locality, show the resulting change in the
+user's Google Drive or Google Docs account.
 
 ## Projection
 

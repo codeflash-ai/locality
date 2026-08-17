@@ -324,7 +324,7 @@ mod tests {
                 "openid",
                 "email",
                 "profile",
-                "https://www.googleapis.com/auth/calendar.events",
+                "https://www.googleapis.com/auth/calendar.events.owned",
             ]
         );
     }
@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn google_calendar_scope_validation_allows_calendar_events_scope_only() {
         validate_google_calendar_oauth_scopes(&vec![
-            "https://www.googleapis.com/auth/calendar.events".to_string(),
+            "https://www.googleapis.com/auth/calendar.events.owned".to_string(),
         ])
         .expect("calendar events scope is sufficient");
     }
@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(
             error,
             GoogleCalendarOAuthScopeError::MissingRequiredScope(
-                "https://www.googleapis.com/auth/calendar.events"
+                "https://www.googleapis.com/auth/calendar.events.owned"
             )
         );
         assert!(
@@ -521,7 +521,7 @@ mod tests {
         assert_eq!(
             error,
             GoogleCalendarOAuthScopeError::MissingRequiredScope(
-                "https://www.googleapis.com/auth/calendar.events"
+                "https://www.googleapis.com/auth/calendar.events.owned"
             )
         );
     }
@@ -608,7 +608,7 @@ mod tests {
                 "account_label": "sam@example.com",
                 "workspace_id": "primary",
                 "workspace_name": "Primary calendar",
-                "scopes": ["https://www.googleapis.com/auth/calendar.events"],
+                "scopes": ["https://www.googleapis.com/auth/calendar.events.owned"],
             })
             .to_string(),
         );
@@ -634,7 +634,7 @@ mod tests {
         assert_eq!(token.workspace_name.as_deref(), Some("Primary calendar"));
         assert_eq!(
             token.scopes,
-            vec!["https://www.googleapis.com/auth/calendar.events".to_string()]
+            vec!["https://www.googleapis.com/auth/calendar.events.owned".to_string()]
         );
         let request = request_rx.recv().expect("request");
         server.join().expect("server exits");
@@ -664,7 +664,7 @@ mod tests {
                 "account_label": "lee@example.com",
                 "workspace_id": "primary",
                 "workspace_name": "Primary calendar",
-                "scope": "openid email profile https://www.googleapis.com/auth/calendar.events",
+                "scope": "openid email profile https://www.googleapis.com/auth/calendar.events.owned",
             })
             .to_string(),
         );
@@ -688,7 +688,7 @@ mod tests {
                 "openid".to_string(),
                 "email".to_string(),
                 "profile".to_string(),
-                "https://www.googleapis.com/auth/calendar.events".to_string(),
+                "https://www.googleapis.com/auth/calendar.events.owned".to_string(),
             ]
         );
         let request = request_rx.recv().expect("request");
