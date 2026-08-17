@@ -73,6 +73,9 @@ jobs:
       - name: Install desktop dependencies
         run: npm ci
         working-directory: apps/desktop
+      - name: Run desktop web UI tests
+        run: npm test -- --run
+        working-directory: apps/desktop
       - name: Build desktop web UI
         run: npm run build
         working-directory: apps/desktop
@@ -139,8 +142,8 @@ jobs:
           echo "::warning::This hosted macOS job compiles the File Provider code, but does not register a real File Provider domain. Real online-only File Provider smoke needs a signed app/extension and macOS user approval."
       - name: Run Rust tests
         run: cargo test --workspace --all-targets
-      - name: Build macOS File Provider package
-        run: swift build --package-path platform/macos/LocalityFileProvider
+      - name: Test macOS File Provider package
+        run: swift test --package-path platform/macos/LocalityFileProvider
       - name: Install desktop dependencies
         run: npm ci
         working-directory: apps/desktop
