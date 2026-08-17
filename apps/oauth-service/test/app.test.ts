@@ -344,7 +344,7 @@ describe("auth broker", () => {
     expect(body.authorization_url).toContain("prompt=consent");
     expect(body.authorization_url).not.toContain("include_granted_scopes");
     expect(body.authorization_url).toContain(
-      "scope=openid+email+profile+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdocuments+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.metadata"
+      "scope=openid+email+profile+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdocuments+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.metadata.readonly"
     );
     expect(body.redirect_uri).toBe("http://localhost:8757/oauth/google-docs/callback");
     expect(body.session).toBeTruthy();
@@ -360,7 +360,7 @@ describe("auth broker", () => {
         token_type: "Bearer",
         expires_in: 3600,
         scope:
-          "openid email profile https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata"
+          "openid email profile https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly"
       })
     );
     globalThis.fetch = fetchMock as unknown as typeof fetch;
@@ -477,7 +477,7 @@ describe("auth broker", () => {
         "openid",
         "email",
         "profile",
-        "https://www.googleapis.com/auth/calendar.events"
+        "https://www.googleapis.com/auth/calendar.events.owned"
       ].sort()
     );
     expect(authorizationUrl.searchParams.get("access_type")).toBe("offline");
@@ -497,7 +497,7 @@ describe("auth broker", () => {
         refresh_token: "calendar-refresh-token",
         token_type: "Bearer",
         expires_in: 3600,
-        scope: "openid email profile https://www.googleapis.com/auth/calendar.events",
+        scope: "openid email profile https://www.googleapis.com/auth/calendar.events.owned",
         id_token: "calendar-id-token"
       })
     );
@@ -522,7 +522,7 @@ describe("auth broker", () => {
     const body = (await response.json()) as BrokerTokenResponse;
     expect(body.connector).toBe("google-calendar");
     expect(body.access_token).toBe("calendar-access-token");
-    expect(body.scope).toBe("openid email profile https://www.googleapis.com/auth/calendar.events");
+    expect(body.scope).toBe("openid email profile https://www.googleapis.com/auth/calendar.events.owned");
     expect(body.id_token).toBe("calendar-id-token");
     expect(body.workspace_id).toBe("primary");
     expect(body.workspace_name).toBe("Primary calendar");

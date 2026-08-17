@@ -1,0 +1,43 @@
+{
+  "connector": "gmail",
+  "profile_id": "gmail-oauth-default",
+  "last_reviewed": "2026-08-13",
+  "runtime_oauth_request_scopes": [
+    "openid",
+    "email",
+    "profile",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.compose"
+  ],
+  "google_api_verification_scopes": [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.compose"
+  ],
+  "excluded_google_api_scopes": [
+    "https://mail.google.com/",
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.drafts.create",
+    "https://www.googleapis.com/auth/gmail.drafts.readonly",
+    "https://www.googleapis.com/auth/gmail.metadata",
+    "https://www.googleapis.com/auth/gmail.insert",
+    "https://www.googleapis.com/auth/gmail.addons.current.message.metadata",
+    "https://www.googleapis.com/auth/gmail.addons.current.message.readonly",
+    "https://www.googleapis.com/auth/gmail.send"
+  ],
+  "demo_must_show": [
+    "OAuth consent flow for Locality with all visible requested permissions expanded and readable.",
+    "Mailbox projection after connecting and pulling Gmail.",
+    "Opening an inbox or sent message to show Locality reads full message content, not only metadata.",
+    "Opening a message with an attachment and showing the hydrated local attachment file created from Gmail read access.",
+    "If thread view is included in the submitted app surface, mounting with thread projection and opening a thread plus a child message.",
+    "Creating or updating a Markdown file under draft/ and showing the resulting unsent Gmail draft in the user's Gmail account.",
+    "Editing an existing remote Gmail draft under draft/ and showing the updated unsent draft in the user's Gmail account.",
+    "Creating a Markdown file under outbox/ or moving a remote draft to outbox/, pushing after review, and showing the resulting email in Gmail Sent."
+  ],
+  "least_privilege_notes": [
+    "gmail.readonly is required because Locality renders inbox, sent, and draft message bodies and attachments metadata as local Markdown.",
+    "gmail.metadata is insufficient because Locality displays message bodies, not only labels and headers.",
+    "gmail.compose is required because Locality creates and updates Gmail drafts and sends reviewed outbound messages.",
+    "Full mailbox, modify, insert/import, add-on current-message, and standalone send scopes are not requested by the runtime OAuth profile and must not be submitted for Gmail verification."
+  ]
+}

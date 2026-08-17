@@ -290,7 +290,7 @@ mod tests {
                 "profile",
                 "https://www.googleapis.com/auth/documents",
                 "https://www.googleapis.com/auth/drive.file",
-                "https://www.googleapis.com/auth/drive.metadata",
+                "https://www.googleapis.com/auth/drive.metadata.readonly",
             ]
         );
     }
@@ -306,17 +306,17 @@ mod tests {
 
         let missing_drive_metadata = GOOGLE_DOCS_OAUTH_SCOPES
             .iter()
-            .filter(|scope| **scope != "https://www.googleapis.com/auth/drive.metadata")
+            .filter(|scope| **scope != "https://www.googleapis.com/auth/drive.metadata.readonly")
             .map(|scope| scope.to_string())
             .collect::<Vec<_>>();
 
         let error = validate_google_docs_oauth_scopes(&missing_drive_metadata)
-            .expect_err("missing drive.metadata scope");
+            .expect_err("missing drive.metadata.readonly scope");
 
         assert_eq!(
             error,
             GoogleDocsOAuthScopeError::MissingRequiredScope(
-                "https://www.googleapis.com/auth/drive.metadata"
+                "https://www.googleapis.com/auth/drive.metadata.readonly"
             )
         );
         assert!(
@@ -332,7 +332,7 @@ mod tests {
             .iter()
             .map(|scope| scope.to_string())
             .collect::<Vec<_>>();
-        scopes.push("https://www.googleapis.com/auth/calendar.events".to_string());
+        scopes.push("https://www.googleapis.com/auth/calendar.events.owned".to_string());
 
         let error = validate_google_docs_oauth_scopes(&scopes)
             .expect_err("unsupported Google Calendar scope");
@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(
             error,
             GoogleDocsOAuthScopeError::UnsupportedScope(
-                "https://www.googleapis.com/auth/calendar.events".to_string()
+                "https://www.googleapis.com/auth/calendar.events.owned".to_string()
             )
         );
         assert!(
@@ -465,7 +465,7 @@ mod tests {
             .iter()
             .map(|scope| scope.to_string())
             .collect::<Vec<_>>();
-        refreshed_scopes.push("https://www.googleapis.com/auth/calendar.events".to_string());
+        refreshed_scopes.push("https://www.googleapis.com/auth/calendar.events.owned".to_string());
 
         let error = stored
             .refreshed(
@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(
             error,
             GoogleDocsOAuthScopeError::UnsupportedScope(
-                "https://www.googleapis.com/auth/calendar.events".to_string()
+                "https://www.googleapis.com/auth/calendar.events.owned".to_string()
             )
         );
     }

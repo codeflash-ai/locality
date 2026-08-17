@@ -52,7 +52,32 @@ The broker requests these scopes:
 - `openid`
 - `email`
 - `profile`
-- `https://www.googleapis.com/auth/calendar.events`
+- `https://www.googleapis.com/auth/calendar.events.owned`
+
+`calendar.events.owned` is used because V1 reads existing events from the
+account's primary calendar and creates reviewed draft events on that same
+primary calendar. The connector does not operate on non-owned calendars or
+request full all-calendar event access.
+
+## Google OAuth Verification
+
+Keep the Google Cloud Console verification scope list aligned with
+`connectors/oauth-verification/google-calendar.json`.
+
+Submit only this Google API scope:
+
+- `https://www.googleapis.com/auth/calendar.events.owned`
+
+Do not submit full calendar, all-calendar events, readonly-only, app-created
+only, freebusy, or settings scopes for this connector.
+
+The verification demo should show the OAuth consent screen with all requested
+permissions readable, then demonstrate the code-backed user workflows: mounting
+Google Calendar, enumerating existing primary-calendar events, opening a pulled
+event with its details, creating a draft event under `draft/`, pushing that
+reviewed draft, and showing the created event in the user's primary Google
+Calendar account. Update and delete workflows are not exposed in Google
+Calendar V1, so the demo should not imply they are available.
 
 ## Projection And Pull
 

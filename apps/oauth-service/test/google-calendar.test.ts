@@ -86,7 +86,7 @@ describe("Google Calendar OAuth broker", () => {
         "openid",
         "email",
         "profile",
-        "https://www.googleapis.com/auth/calendar.events"
+        "https://www.googleapis.com/auth/calendar.events.owned"
       ].sort()
     );
     expect(authorizationUrl.searchParams.get("access_type")).toBe("offline");
@@ -108,7 +108,7 @@ describe("Google Calendar OAuth broker", () => {
         refresh_token: "calendar-refresh-token",
         token_type: "Bearer",
         expires_in: 3600,
-        scope: "openid email profile https://www.googleapis.com/auth/calendar.events",
+        scope: "openid email profile https://www.googleapis.com/auth/calendar.events.owned",
         id_token: "calendar-id-token"
       })
     );
@@ -133,7 +133,7 @@ describe("Google Calendar OAuth broker", () => {
     const body = (await response.json()) as BrokerTokenResponse;
     expect(body.connector).toBe("google-calendar");
     expect(body.access_token).toBe("calendar-access-token");
-    expect(body.scope).toBe("openid email profile https://www.googleapis.com/auth/calendar.events");
+    expect(body.scope).toBe("openid email profile https://www.googleapis.com/auth/calendar.events.owned");
     expect(body.id_token).toBe("calendar-id-token");
     expect(body.workspace_id).toBe("primary");
     expect(body.workspace_name).toBe("Primary calendar");
@@ -189,7 +189,7 @@ describe("Google Calendar OAuth broker", () => {
           access_token: "calendar-access-token",
           refresh_token: "calendar-refresh-token",
           expires_in: 3600,
-          scope: "openid email profile https://www.googleapis.com/auth/calendar.events",
+          scope: "openid email profile https://www.googleapis.com/auth/calendar.events.owned",
           id_token: "calendar-id-token"
         });
       }
@@ -197,7 +197,7 @@ describe("Google Calendar OAuth broker", () => {
         access_token: "new-calendar-access-token",
         refresh_token: "new-calendar-refresh-token",
         expires_in: 3600,
-        scope: "openid email profile https://www.googleapis.com/auth/calendar.events"
+        scope: "openid email profile https://www.googleapis.com/auth/calendar.events.owned"
       });
     });
     globalThis.fetch = fetchMock as unknown as typeof fetch;

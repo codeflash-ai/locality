@@ -1,0 +1,38 @@
+{
+  "connector": "google-calendar",
+  "profile_id": "google-calendar-oauth-default",
+  "last_reviewed": "2026-08-13",
+  "runtime_oauth_request_scopes": [
+    "openid",
+    "email",
+    "profile",
+    "https://www.googleapis.com/auth/calendar.events.owned"
+  ],
+  "google_api_verification_scopes": [
+    "https://www.googleapis.com/auth/calendar.events.owned"
+  ],
+  "excluded_google_api_scopes": [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.events.readonly",
+    "https://www.googleapis.com/auth/calendar.app.created",
+    "https://www.googleapis.com/auth/calendar.freebusy",
+    "https://www.googleapis.com/auth/calendar.settings.readonly"
+  ],
+  "demo_must_show": [
+    "OAuth consent flow for Locality with all visible requested permissions expanded and readable.",
+    "Mounting Google Calendar and showing Locality enumerating existing primary-calendar events in the configured date window.",
+    "Opening a pulled event in Locality to show event metadata and content such as summary, time, location, attendees, description, and conference information are read.",
+    "Creating a Locality draft event with summary, start, end, timezone, optional location, attendees, description, and optional Google Meet conference.",
+    "Pushing the reviewed draft from Locality and showing the created event in the user's primary Google Calendar account with the same fields.",
+    "Stating that update and delete workflows are not exposed for Google Calendar V1 if the demo does not show them."
+  ],
+  "least_privilege_notes": [
+    "calendar.events.owned is required because Locality reads existing events from the user's primary calendar and creates reviewed draft events on that primary calendar.",
+    "calendar.events is not requested because the connector is primary-calendar-only and does not operate on calendars the user does not own.",
+    "calendar.events.readonly and calendar.readonly are insufficient because Locality creates events.",
+    "calendar.app.created is insufficient because Locality must read existing primary-calendar events that were not created by Locality.",
+    "Full calendar, freebusy, settings, and readonly-only scopes are not requested by the runtime OAuth profile and must not be submitted for Google Calendar verification."
+  ]
+}
