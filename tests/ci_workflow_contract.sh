@@ -70,6 +70,12 @@ assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
   "          bash -n tests/live_connector_common_selftest.sh"
 assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
   "          bash -n tests/live_google_docs_mutation_scenario.sh"
+assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
+  "          bash -n tests/live_google_calendar_vfs_roundtrip.sh"
+assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
+  "          bash -n tests/live_gmail_vfs_roundtrip.sh"
+assert_job_line ".github/workflows/connector-live-e2e.yml" "google-docs-live" \
+  '          LOCALITY_LIVE_GOOGLE_DOCS_SCENARIO: "1"'
 
 assert_job_line ".github/workflows/notion-live-e2e.yml" "linux-fuse-live" "    runs-on: ubuntu-latest"
 assert_job_line ".github/workflows/notion-live-e2e.yml" "linux-fuse-live" \
@@ -87,7 +93,7 @@ connector_jobs=(
   "linear-live"
 )
 connector_scripts=(
-  "tests/live_google_docs_vfs_roundtrip.sh"
+  "tests/live_google_docs_mutation_scenario.sh"
   "tests/live_google_calendar_vfs_roundtrip.sh"
   "tests/live_gmail_vfs_roundtrip.sh"
   "tests/live_slack_vfs_read.sh"

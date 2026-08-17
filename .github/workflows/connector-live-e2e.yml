@@ -63,12 +63,14 @@ jobs:
           bash -n tests/live_connector_common.sh
           bash -n tests/live_connector_common_selftest.sh
           bash -n tests/live_google_docs_mutation_scenario.sh
+          bash -n tests/live_google_calendar_vfs_roundtrip.sh
+          bash -n tests/live_gmail_vfs_roundtrip.sh
           LOCALITY_LIVE_COMMON_SELFTEST=1 tests/live_connector_common_selftest.sh
 
   google-docs-live:
     name: Google Docs Linux FUSE live e2e
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     environment: connector-live-e2e
     steps:
       - uses: actions/checkout@v4
@@ -115,14 +117,14 @@ jobs:
             echo "::error::/dev/fuse is unavailable; the live connector Linux FUSE e2e cannot run"
             exit 1
           fi
-      - name: Run live Google Docs Linux FUSE e2e
+      - name: Run live Google Docs mutation and remote-drift e2e
         env:
           LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON }}
           LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER: ${{ secrets.LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER }}
-          LOCALITY_LIVE_GOOGLE_DOCS_VFS: "1"
+          LOCALITY_LIVE_GOOGLE_DOCS_SCENARIO: "1"
           LOCALITY_LIVE_FORCE_OAUTH_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
           LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && format('{0}/locality-google-docs-live-credential.json', runner.temp) || '' }}
-        run: tests/run_linux_fuse_ci.sh tests/live_google_docs_vfs_roundtrip.sh
+        run: tests/run_linux_fuse_ci.sh tests/live_google_docs_mutation_scenario.sh
       - name: Persist refreshed Google Docs credential
         if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true }}
         shell: bash
