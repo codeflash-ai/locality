@@ -87,6 +87,14 @@ pub fn install_agent_guidance(mount_path: Option<&str>) -> AgentGuidanceInstallR
     }
     targets.extend(install_mcp_targets(&home));
 
+    install_agent_guidance_report(&mount_path, prompt, targets)
+}
+
+fn install_agent_guidance_report(
+    mount_path: &str,
+    prompt: String,
+    mut targets: Vec<AgentGuidanceTarget>,
+) -> AgentGuidanceInstallReport {
     if targets.is_empty() {
         targets.push(AgentGuidanceTarget {
             agent: "Locality source folder".to_string(),
@@ -1209,14 +1217,12 @@ mod tests {
 
     #[test]
     fn no_supported_agent_fallback_names_locality_source_folder() {
-        let temp = temp_root("loc-agent-guidance-empty-home");
-        let _env = EnvGuard::set(&[
-            ("HOME", Some(temp.as_os_str().to_os_string())),
-            ("USERPROFILE", Some(temp.as_os_str().to_os_string())),
-            ("PATH", Some(OsString::new())),
-        ]);
-
-        let report = install_agent_guidance(Some("/tmp/Locality"));
+        let mount_path = "/tmp/Locality";
+        let report = install_agent_guidance_report(
+            mount_path,
+            suggested_agent_prompt(mount_path),
+            Vec::new(),
+        );
 
         assert_eq!(report.targets.len(), 1);
         assert_eq!(report.targets[0].agent, "Locality source folder");
@@ -1227,8 +1233,6 @@ mod tests {
         );
         assert!(report.targets[0].detail.contains("connected source folder"));
         assert!(!report.targets[0].detail.contains("Notion folder"));
-
-        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -1597,49 +1601,5 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create temp root");
         root
-    }
-
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Vec<(&'static str, Option<OsString>)>,
-    }
-
-    impl EnvGuard {
-        fn set(vars: &[(&'static str, Option<OsString>)]) -> Self {
-            let lock = ENV_LOCK.lock().expect("env lock");
-            let previous = vars
-                .iter()
-                .map(|(key, _)| (*key, env::var_os(key)))
-                .collect::<Vec<_>>();
-
-            unsafe {
-                for (key, value) in vars {
-                    if let Some(value) = value {
-                        env::set_var(key, value);
-                    } else {
-                        env::remove_var(key);
-                    }
-                }
-            }
-
-            Self {
-                _lock: lock,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                for (key, value) in &self.previous {
-                    if let Some(value) = value {
-                        env::set_var(key, value);
-                    } else {
-                        env::remove_var(key);
-                    }
-                }
-            }
-        }
     }
 }
