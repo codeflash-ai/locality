@@ -1349,8 +1349,9 @@ fn authentication_tag_matches(
 }
 
 struct DurableTemporary {
+    #[cfg(unix)]
     name: String,
-    #[cfg_attr(unix, allow(dead_code))]
+    #[cfg(not(unix))]
     path: PathBuf,
 }
 
@@ -1388,13 +1389,20 @@ fn write_durable_temporary(
                     remove_temporary(
                         lock,
                         &DurableTemporary {
+                            #[cfg(unix)]
                             name,
+                            #[cfg(not(unix))]
                             path: path.clone(),
                         },
                     );
                     return Err(WorkspaceMaterializationError::Journal { path, source });
                 }
-                return Ok(DurableTemporary { name, path });
+                return Ok(DurableTemporary {
+                    #[cfg(unix)]
+                    name,
+                    #[cfg(not(unix))]
+                    path,
+                });
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(source) => {
@@ -1407,21 +1415,21 @@ fn write_durable_temporary(
     ))
 }
 
-fn remove_temporary(lock: &WorkspacePublicationLock, temporary: &DurableTemporary) {
+fn remove_temporary(_lock: &WorkspacePublicationLock, temporary: &DurableTemporary) {
     #[cfg(unix)]
-    let _ = rustix::fs::unlinkat(lock.parent_directory(), &temporary.name, AtFlags::empty());
+    let _ = rustix::fs::unlinkat(_lock.parent_directory(), &temporary.name, AtFlags::empty());
     #[cfg(not(unix))]
     let _ = fs::remove_file(&temporary.path);
 }
 
 fn publication_entry_exists(
-    lock: &WorkspacePublicationLock,
+    _lock: &WorkspacePublicationLock,
     _paths: &PublicationPaths,
-    name: &str,
+    _name: &str,
     path: &Path,
 ) -> Result<bool, WorkspaceMaterializationError> {
     #[cfg(unix)]
-    let result = rustix::fs::statat(lock.parent_directory(), name, AtFlags::SYMLINK_NOFOLLOW)
+    let result = rustix::fs::statat(_lock.parent_directory(), _name, AtFlags::SYMLINK_NOFOLLOW)
         .map(|_| true)
         .or_else(|error| {
             if error == rustix::io::Errno::NOENT {
@@ -1443,14 +1451,14 @@ fn publication_entry_exists(
 }
 
 fn read_json_locked<T: for<'de> Deserialize<'de>>(
-    lock: &WorkspacePublicationLock,
+    _lock: &WorkspacePublicationLock,
     _paths: &PublicationPaths,
-    name: &str,
+    _name: &str,
     path: &Path,
 ) -> Result<T, WorkspaceMaterializationError> {
     #[cfg(unix)]
     let bytes = (|| -> io::Result<Vec<u8>> {
-        let named = rustix::fs::statat(lock.parent_directory(), name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let named = rustix::fs::statat(_lock.parent_directory(), _name, AtFlags::SYMLINK_NOFOLLOW)?;
         if FileType::from_raw_mode(named.st_mode) != FileType::RegularFile {
             return Err(io::Error::other(
                 "workspace publication state is not an ordinary file",
@@ -1462,8 +1470,8 @@ fn read_json_locked<T: for<'de> Deserialize<'de>>(
             ));
         }
         let descriptor = rustix::fs::openat(
-            lock.parent_directory(),
-            name,
+            _lock.parent_directory(),
+            _name,
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
@@ -1555,10 +1563,10 @@ fn remove_journal_if_present(
     }
 }
 
-fn sync_publication_parent(lock: &WorkspacePublicationLock, _path: &Path) -> io::Result<()> {
+fn sync_publication_parent(_lock: &WorkspacePublicationLock, _path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        rustix::fs::fsync(lock.parent_directory()).map_err(Into::into)
+        rustix::fs::fsync(_lock.parent_directory()).map_err(Into::into)
     }
     #[cfg(not(unix))]
     {
@@ -1586,13 +1594,13 @@ fn path_file_name(path: &Path) -> Result<String, WorkspaceMaterializationError> 
 }
 
 fn generation_identity_if_exists_locked(
-    lock: &WorkspacePublicationLock,
+    _lock: &WorkspacePublicationLock,
     paths: &PublicationPaths,
     name: &str,
 ) -> Result<Option<GenerationIdentity>, WorkspaceMaterializationError> {
     #[cfg(unix)]
     let result = workspace_generation_identity_if_exists_at(
-        lock.parent_directory(),
+        _lock.parent_directory(),
         std::ffi::OsStr::new(name),
     );
     #[cfg(not(unix))]
@@ -1621,13 +1629,13 @@ fn generation_identity_locked(
 }
 
 fn generation_marker_binding_locked(
-    lock: &WorkspacePublicationLock,
+    _lock: &WorkspacePublicationLock,
     paths: &PublicationPaths,
     name: &str,
 ) -> Result<GenerationMarkerBinding, WorkspaceMaterializationError> {
     #[cfg(unix)]
     let result = workspace_generation_file_binding_at(
-        lock.parent_directory(),
+        _lock.parent_directory(),
         std::ffi::OsStr::new(name),
         WORKSPACE_OWNERSHIP_MARKER,
         WORKSPACE_OWNERSHIP_NONCE_BYTES,
@@ -1720,7 +1728,7 @@ fn required_identity(
 }
 
 fn remove_generation_locked(
-    lock: &WorkspacePublicationLock,
+    _lock: &WorkspacePublicationLock,
     paths: &PublicationPaths,
     name: &str,
     expected: GenerationIdentity,
@@ -1729,7 +1737,7 @@ fn remove_generation_locked(
     let marker_content = marker_nonce_bytes(&receipt.ownership_marker_nonce)?;
     #[cfg(unix)]
     let result = remove_workspace_generation_at(
-        lock.parent_directory(),
+        _lock.parent_directory(),
         std::ffi::OsStr::new(name),
         expected.into(),
         WORKSPACE_OWNERSHIP_MARKER,
@@ -1751,14 +1759,14 @@ fn remove_generation_locked(
 }
 
 fn repair_generation_locked(
-    lock: &WorkspacePublicationLock,
+    _lock: &WorkspacePublicationLock,
     paths: &PublicationPaths,
     name: &str,
     expected: GenerationIdentity,
 ) -> Result<(), WorkspaceMaterializationError> {
     #[cfg(unix)]
     let result = repair_workspace_generation_at(
-        lock.parent_directory(),
+        _lock.parent_directory(),
         std::ffi::OsStr::new(name),
         expected.into(),
     );

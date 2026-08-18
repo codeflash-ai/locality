@@ -1,9 +1,11 @@
 //! Strict filesystem durability primitives shared by recovery paths.
 
-#[cfg(any(test, not(unix), windows))]
+#[cfg(any(test, not(any(unix, windows))))]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::{self, Write};
 use std::path::Path;
 
 /// Opens a Windows path without following reparse points and returns its
@@ -1435,13 +1437,7 @@ fn open_unix_parent_from_root(
     Ok((directory, name.to_os_string()))
 }
 
-#[cfg(any(
-    test,
-    not(all(
-        unix,
-        any(target_os = "linux", target_vendor = "apple", target_os = "redox")
-    ))
-))]
+#[cfg(test)]
 pub(crate) fn rename_noreplace_durable_with_sync(
     source_root: &Path,
     source: &Path,
@@ -1820,7 +1816,7 @@ pub fn sync_directory(trusted_root: &Path, path: &Path) -> io::Result<()> {
     directories.last().expect("anchored directory").sync()
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn sync_windows_directory_with(
     trusted_root: &Path,
     path: &Path,
@@ -1840,7 +1836,7 @@ fn sync_windows_directory_with(
     flush(&directory)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn windows_directory_sync_access() -> u32 {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, SYNCHRONIZE,
@@ -1885,7 +1881,7 @@ fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     ))
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
@@ -1897,7 +1893,7 @@ fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     )
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn rename_noreplace_windows_with(
     source: &Path,
     destination: &Path,

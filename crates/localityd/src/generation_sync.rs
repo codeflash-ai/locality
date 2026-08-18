@@ -3053,10 +3053,14 @@ impl From<std::io::Error> for GenerationSyncError {
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
-    use std::io::{BufRead, Seek, SeekFrom};
+    use std::io::BufRead;
+    #[cfg(unix)]
+    use std::io::{Seek, SeekFrom};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(unix)]
     use std::sync::{Arc, Barrier};
+    #[cfg(unix)]
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3328,6 +3332,7 @@ mod tests {
         delivery.terminal_receipt.delta_sha256 = delivery.delta.canonical_sha256().unwrap();
     }
 
+    #[cfg(unix)]
     fn reseal_target_inventory(
         delivery: &mut AuthorizedGenerationDelivery,
         inventory: &[GenerationFileIdentity],
@@ -3339,6 +3344,7 @@ mod tests {
         delivery.terminal_receipt.delta_sha256 = delivery.delta.canonical_sha256().unwrap();
     }
 
+    #[cfg(unix)]
     fn authoritative_target_inventory(
         store: &SqliteStateStore,
         mount_id: &MountId,

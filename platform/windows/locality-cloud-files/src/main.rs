@@ -2366,7 +2366,7 @@ fn run_cloud_filter_provider(
     wait_for_daemon(state_dir)?;
     let access_roots =
         windows_cloud_files_active_access_roots(state_dir, mount_id, projection_root)?;
-    let (connected, seeded) = start_cloud_filter_provider_after_recovery(
+    let (_connected, seeded) = start_cloud_filter_provider_after_recovery(
         &access_roots,
         |access_root| repair_windows_cloud_files_access_root_before_startup(state_dir, access_root),
         || connect_cloud_filter_sync_root(mount_id, sync_root, projection_root, state_dir),

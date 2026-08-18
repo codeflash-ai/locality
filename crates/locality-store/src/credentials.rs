@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+#[cfg(any(test, target_os = "macos"))]
+use std::sync::LazyLock;
+use std::sync::{Arc, Mutex};
 
 use fs2::FileExt;
 
