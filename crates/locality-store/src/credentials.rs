@@ -6,8 +6,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
+
+use fs2::FileExt;
 
 pub type CredentialResult<T> = Result<T, CredentialError>;
 
@@ -15,7 +18,20 @@ pub trait CredentialStore: Send + Sync {
     fn put(&self, secret_ref: &str, secret: &str) -> CredentialResult<()>;
     fn get(&self, secret_ref: &str) -> CredentialResult<String>;
     fn delete(&self, secret_ref: &str) -> CredentialResult<()>;
+
+    fn acquire_refresh_lock(
+        &self,
+        _secret_ref: &str,
+    ) -> CredentialResult<Box<dyn CredentialRefreshLock>> {
+        Ok(Box::new(NoopCredentialRefreshLock))
+    }
 }
+
+pub trait CredentialRefreshLock: Send {}
+
+struct NoopCredentialRefreshLock;
+
+impl CredentialRefreshLock for NoopCredentialRefreshLock {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CredentialError {
@@ -100,6 +116,38 @@ impl CredentialStore for FileCredentialStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn acquire_refresh_lock(
+        &self,
+        secret_ref: &str,
+    ) -> CredentialResult<Box<dyn CredentialRefreshLock>> {
+        std::fs::create_dir_all(&self.root)?;
+        let lock_path = self
+            .root
+            .join(format!("{}.refresh.lock", hex_name(secret_ref)));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        set_private_file_permissions(&lock_path)?;
+        file.lock_exclusive()
+            .map_err(|error| CredentialError::Io(error.to_string()))?;
+        Ok(Box::new(FileCredentialRefreshLock { file }))
+    }
+}
+
+struct FileCredentialRefreshLock {
+    file: File,
+}
+
+impl CredentialRefreshLock for FileCredentialRefreshLock {}
+
+impl Drop for FileCredentialRefreshLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -553,14 +601,49 @@ fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     use super::{
-        COMPAT_KEYCHAIN_SERVICES, CredentialResult, CredentialStoreBackend,
-        PRIMARY_KEYCHAIN_SERVICE, credential_store_backend_for_override,
+        COMPAT_KEYCHAIN_SERVICES, CredentialResult, CredentialStore, CredentialStoreBackend,
+        FileCredentialStore, PRIMARY_KEYCHAIN_SERVICE, credential_store_backend_for_override,
         decode_hex_encoded_password, get_cached_keychain_secret,
         keychain_hex_password_from_diagnostics, keychain_output_password,
         primary_windows_target_name, windows_target_names,
     };
+
+    #[test]
+    fn file_credential_refresh_lock_is_exclusive_across_store_instances() {
+        let state_root = tempfile::tempdir().expect("temporary state root");
+        let first_store = FileCredentialStore::new(state_root.path());
+        let second_store = FileCredentialStore::new(state_root.path());
+        let first_lock = first_store
+            .acquire_refresh_lock("connection:slack-live")
+            .expect("first refresh lock");
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+
+        let waiter = thread::spawn(move || {
+            let second_lock = second_store
+                .acquire_refresh_lock("connection:slack-live")
+                .expect("second refresh lock");
+            acquired_tx.send(()).expect("report acquired lock");
+            drop(second_lock);
+        });
+
+        assert!(
+            matches!(
+                acquired_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "second store acquired the refresh lock before the first released it"
+        );
+        drop(first_lock);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second store should acquire released refresh lock");
+        waiter.join().expect("refresh lock waiter");
+    }
 
     #[test]
     fn credential_store_backend_honors_file_override() {

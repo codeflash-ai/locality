@@ -139,10 +139,14 @@ fn connection_access_token(
         let _refresh_guard = refresh_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _credential_refresh_guard = credentials
+            .acquire_refresh_lock(&connection.secret_ref)
+            .map_err(|error| credential_error(connection, error))?;
 
         // Slack refresh handles are single-use. Another daemon request may have
-        // rotated this credential while this request waited for the lock, so
-        // re-read it before deciding whether a refresh is still necessary.
+        // or process may have rotated this credential while this request waited
+        // for the locks, so re-read it before deciding whether a refresh is
+        // still necessary.
         stored = load_slack_credential(credentials, connection)?;
         if stored.expires_soon(timestamp_secs()) {
             let refreshed = refresh_oauth_credential(connection, &stored)?;
