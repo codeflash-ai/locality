@@ -260,6 +260,72 @@ test_dry_run_prefers_explicit_dmg_over_built_app() {
   assert_not_contains "${output}" "source app: ${built_app}"
 }
 
+test_registration_retries_and_surfaces_file_provider_failures() {
+  local tmp app helper counter output attempts failure_output failure_status
+  tmp="$(mktemp -d)"
+  trap '[[ -z "${tmp:-}" ]] || rm -rf "${tmp}"' RETURN
+  app="${tmp}/Applications/Locality Prompt Test.app"
+  helper="${app}/Contents/MacOS/locality-file-providerctl"
+  counter="${tmp}/register-attempts"
+  mkdir -p "$(dirname "${helper}")"
+  cat >"${helper}" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+attempts=0
+[[ ! -f "${REGISTER_COUNTER}" ]] || attempts="$(<"${REGISTER_COUNTER}")"
+attempts=$((attempts + 1))
+printf '%s\n' "${attempts}" >"${REGISTER_COUNTER}"
+if [[ "${REGISTER_ALWAYS_FAIL:-0}" == "1" || "${attempts}" -lt 3 ]]; then
+  printf '{"ok":false,"code":"file_provider_error"}\n'
+  exit 1
+fi
+printf '{"ok":true,"message":"registered loc"}\n'
+SH
+  chmod +x "${helper}"
+
+  output="$(
+    REGISTER_COUNTER="${counter}" \
+      INSTALLER_SCRIPT="${SCRIPT}" \
+      TEST_APP_PATH="${app}" \
+      bash -c '
+        source "${INSTALLER_SCRIPT}"
+        APP_PATH="${TEST_APP_PATH}"
+        DISPLAY_NAME="Locality File Provider Test"
+        DRY_RUN=0
+        register_file_provider_domain 0
+      ' 2>&1
+  )"
+
+  attempts="$(<"${counter}")"
+  [[ "${attempts}" == "3" ]] || fail "expected 3 registration attempts, got ${attempts}"
+  assert_contains "${output}" 'File Provider domain registration is not ready; retrying (1/10)'
+  assert_contains "${output}" 'File Provider domain registration is not ready; retrying (2/10)'
+  assert_contains "${output}" '"ok":true'
+
+  rm -f "${counter}"
+  set +e
+  failure_output="$(
+    REGISTER_ALWAYS_FAIL=1 \
+      REGISTER_COUNTER="${counter}" \
+      INSTALLER_SCRIPT="${SCRIPT}" \
+      TEST_APP_PATH="${app}" \
+      bash -c '
+        source "${INSTALLER_SCRIPT}"
+        APP_PATH="${TEST_APP_PATH}"
+        DISPLAY_NAME="Locality File Provider Test"
+        DRY_RUN=0
+        register_file_provider_domain 0
+      ' 2>&1
+  )"
+  failure_status=$?
+  set -e
+
+  [[ "${failure_status}" -ne 0 ]] || fail "persistent registration failure unexpectedly succeeded"
+  attempts="$(<"${counter}")"
+  [[ "${attempts}" == "10" ]] || fail "expected 10 failed registration attempts, got ${attempts}"
+  assert_contains "${failure_output}" 'File Provider domain registration is not ready; retrying (9/10)'
+}
+
 main() {
   test_dry_run_plans_fresh_prompt_test_app_installation
   test_dry_run_resets_existing_test_app_domain_by_default
@@ -269,6 +335,7 @@ main() {
   test_dry_run_force_allows_non_test_target_path
   test_dry_run_rejects_source_app_as_target
   test_dry_run_prefers_explicit_dmg_over_built_app
+  test_registration_retries_and_surfaces_file_provider_failures
   printf 'install-macos-prompt-test-app helper tests passed\n'
 }
 

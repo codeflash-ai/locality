@@ -95,6 +95,38 @@ run_may_fail() {
   fi
 }
 
+register_file_provider_domain() {
+  local helper="${APP_PATH}/Contents/MacOS/locality-file-providerctl"
+  local attempts=10
+  local delay="${1:-1}"
+  local command=(
+    "${helper}" register
+    --mount-id loc
+    --display-name "${DISPLAY_NAME}"
+    --json
+  )
+
+  print_cmd "${command[@]}"
+  [[ "${DRY_RUN}" -eq 0 ]] || return 0
+
+  # pluginkit registration is asynchronous on macOS. A pre-approved domain can
+  # briefly reject registration while the replacement extension is reconciled.
+  local attempt status
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if "${command[@]}"; then
+      return 0
+    else
+      status=$?
+    fi
+    if [[ "${attempt}" -lt "${attempts}" ]]; then
+      printf 'File Provider domain registration is not ready; retrying (%d/%d)\n' \
+        "${attempt}" "${attempts}" >&2
+      sleep "${delay}"
+    fi
+  done
+  return "${status}"
+}
+
 prompt_test_timestamp() {
   if [[ -n "${LOCALITY_PROMPT_TEST_TIMESTAMP:-}" ]]; then
     printf '%s\n' "${LOCALITY_PROMPT_TEST_TIMESTAMP}"
@@ -322,7 +354,7 @@ install_bundle() {
   run pluginkit -a "${appex}"
   run codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
   run pluginkit -m -v -i "${extension_bundle_id}"
-  run "${APP_PATH}/Contents/MacOS/locality-file-providerctl" register --mount-id loc --display-name "${DISPLAY_NAME}" --json
+  register_file_provider_domain
   run_may_fail "${APP_PATH}/Contents/MacOS/locality-file-providerctl" --json list
 
   if [[ "${LAUNCH}" == "1" ]]; then
@@ -354,4 +386,6 @@ main() {
   install_bundle
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
