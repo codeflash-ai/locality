@@ -649,6 +649,9 @@ fn spawn_counting_refresh_broker(
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("set refresh stream blocking");
                     let request_number = broker_request_count.fetch_add(1, Ordering::SeqCst) + 1;
                     let mut buffer = [0_u8; 4096];
                     let _ = stream.read(&mut buffer).expect("read refresh request");
