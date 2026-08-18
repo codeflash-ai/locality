@@ -1,6 +1,6 @@
 //! Strict filesystem durability primitives shared by recovery paths.
 
-#[cfg(test)]
+#[cfg(any(test, not(any(unix, windows))))]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 #[cfg(unix)]
