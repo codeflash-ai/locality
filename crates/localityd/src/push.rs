@@ -381,7 +381,7 @@ where
             .pipeline
             .plan
             .as_ref()
-            .is_some_and(|plan| plan.operations.iter().all(is_create_operation))
+            .is_some_and(plan_can_apply_without_shadow_preimage)
     {
         return Err(LocalityError::InvalidState(
             "push pipeline approved apply without a shadow preimage".to_string(),
@@ -1154,6 +1154,12 @@ fn is_create_operation(operation: &PushOperation) -> bool {
         operation,
         PushOperation::CreateEntity { .. } | PushOperation::CreateDatabase { .. }
     )
+}
+
+fn plan_can_apply_without_shadow_preimage(plan: &PushPlan) -> bool {
+    plan.operations.iter().all(|operation| {
+        is_create_operation(operation) || matches!(operation, PushOperation::ArchiveEntity { .. })
+    })
 }
 
 fn create_operation_source(operation: &PushOperation) -> Option<(&RemoteId, &PathBuf)> {
