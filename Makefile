@@ -217,6 +217,10 @@ test-macos-publish-config: ## Validate macOS package publish configuration.
 test-macos-prompt-test-app-installer: ## Validate the macOS prompt test app installer dry-run plan.
 	bash scripts/install-macos-prompt-test-app.test.sh
 
+.PHONY: test-live-macos-file-provider
+test-live-macos-file-provider: ## Run the signed-app macOS File Provider live Notion e2e when explicitly enabled.
+	tests/live_macos_file_provider.sh
+
 .PHONY: test-windows-publish-config
 test-windows-publish-config: ## Validate Windows package publish configuration.
 	tests/windows_publish_config.sh

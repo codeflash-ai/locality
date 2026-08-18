@@ -31,6 +31,7 @@ struct LocalityFileProviderCtl {
 private enum Command {
   case register(mountId: String, displayName: String)
   case open(mountId: String)
+  case resolve(mountId: String, identifier: String)
   case signal(mountId: String, identifier: String)
   case reimport(mountId: String, identifier: String)
   case remove(mountId: String, identifier: String)
@@ -42,7 +43,9 @@ private enum Command {
     let args = arguments.filter { $0 != "--json" }
     guard let action = args.first else {
       throw UsageError(
-        "usage: locality-file-providerctl register|open|unregister|list|reset [options]")
+        "usage: locality-file-providerctl "
+          + "register|open|resolve|signal|reimport|remove|unregister|list|reset [options]"
+      )
     }
 
     switch action {
@@ -55,6 +58,11 @@ private enum Command {
       let mountId = try requiredValue(args, "--mount-id")
       try validateDomainIdentifier(mountId)
       return .open(mountId: mountId)
+    case "resolve":
+      let mountId = try requiredValue(args, "--mount-id")
+      let identifier = try requiredValue(args, "--identifier")
+      try validateDomainIdentifier(mountId)
+      return .resolve(mountId: mountId, identifier: identifier)
     case "signal":
       let mountId = try requiredValue(args, "--mount-id")
       let identifier = value(args, "--identifier") ?? "root"
@@ -153,6 +161,25 @@ private enum Command {
         domains: nil,
         url: url.path,
         message: "resolved \(mountId)"
+      )
+    case .resolve(let mountId, let identifier):
+      guard let domain = try getDomains().first(where: { $0.identifier.rawValue == mountId }) else {
+        throw UsageError("File Provider domain \(mountId) is not registered")
+      }
+      guard let manager = NSFileProviderManager(for: domain) else {
+        throw UsageError("No File Provider manager is available for domain \(mountId)")
+      }
+      let url = try userVisibleItemURL(
+        manager: manager,
+        identifier: fileProviderItemIdentifier(identifier)
+      )
+      return FileProviderCtlReport(
+        ok: true,
+        action: "resolve",
+        domain: DomainReport(domain),
+        domains: nil,
+        url: url.path,
+        message: "resolved \(mountId):\(identifier)"
       )
     case .signal(let mountId, let identifier):
       guard let domain = try getDomains().first(where: { $0.identifier.rawValue == mountId }) else {

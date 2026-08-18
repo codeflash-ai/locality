@@ -1,0 +1,102 @@
+name: macos-file-provider-live-e2e
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-file-provider-live-e2e
+  cancel-in-progress: false
+
+jobs:
+  file-provider-live:
+    name: Signed macOS File Provider live Notion e2e
+    runs-on: [self-hosted, macOS, locality-file-provider]
+    timeout-minutes: 45
+    environment: notion-live-e2e
+    env:
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      LOCALITY_NOTION_LIVE_PARENT_PAGE: ${{ secrets.LOCALITY_NOTION_LIVE_PARENT_PAGE || secrets.AFS_NOTION_LIVE_PARENT_PAGE }}
+      LOCALITY_MACOS_FILE_PROVIDER_APP: ${{ vars.LOCALITY_MACOS_FILE_PROVIDER_APP || '/Applications/Locality File Provider Test.app' }}
+      LOCALITY_MACOS_FILE_PROVIDER_EXPECTED_BUNDLE_ID: ${{ vars.LOCALITY_MACOS_FILE_PROVIDER_BUNDLE_ID || 'ai.codeflash.locality.fileprovidertest' }}
+      LOCALITY_PROMPT_TEST_SIGNING_IDENTITY: ${{ vars.LOCALITY_MACOS_FILE_PROVIDER_SIGNING_IDENTITY || secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_SIGNING_IDENTITY: ${{ vars.LOCALITY_MACOS_FILE_PROVIDER_SIGNING_IDENTITY || secrets.APPLE_SIGNING_IDENTITY }}
+      LOCALITY_MACOS_FILE_PROVIDER_LIVE: "1"
+      LOCALITY_MACOS_FILE_PROVIDER_DEDICATED_HOST: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          missing=()
+          [ -n "$APPLE_CERTIFICATE_P12_BASE64" ] || missing+=("APPLE_CERTIFICATE_P12_BASE64")
+          [ -n "$APPLE_CERTIFICATE_PASSWORD" ] || missing+=("APPLE_CERTIFICATE_PASSWORD")
+          [ -n "$APPLE_SIGNING_IDENTITY" ] || missing+=("APPLE_SIGNING_IDENTITY")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing macOS signing configuration: ${missing[*]}"
+            exit 1
+          fi
+
+          keychain_path="${RUNNER_TEMP}/locality-file-provider-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.keychain-db"
+          certificate_path="${RUNNER_TEMP}/locality-file-provider-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.p12"
+          echo "LOCALITY_SIGNING_KEYCHAIN=${keychain_path}" >> "$GITHUB_ENV"
+          trap 'rm -f "$certificate_path"' EXIT
+
+          printf '%s' "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate_path" 2>/dev/null \
+            || printf '%s' "$APPLE_CERTIFICATE_P12_BASE64" | base64 -D > "$certificate_path"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$certificate_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$keychain_path"
+          security list-keychains -d user -s "$keychain_path" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security find-identity -v -p codesigning "$keychain_path" | grep -F "$APPLE_SIGNING_IDENTITY"
+      - name: Check dedicated runner configuration
+        run: |
+          missing=()
+          [ -n "$NOTION_TOKEN" ] || missing+=("NOTION_TOKEN")
+          [ -n "$LOCALITY_NOTION_LIVE_PARENT_PAGE" ] || missing+=("LOCALITY_NOTION_LIVE_PARENT_PAGE or AFS_NOTION_LIVE_PARENT_PAGE")
+          [ -n "$LOCALITY_MACOS_FILE_PROVIDER_APP" ] || missing+=("LOCALITY_MACOS_FILE_PROVIDER_APP")
+          [ -n "$LOCALITY_MACOS_FILE_PROVIDER_EXPECTED_BUNDLE_ID" ] || missing+=("LOCALITY_MACOS_FILE_PROVIDER_BUNDLE_ID")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing macOS File Provider live configuration: ${missing[*]}"
+            exit 1
+          fi
+          bash -n tests/live_macos_file_provider.sh
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: apps/desktop
+      - name: Build current signed-app candidate
+        run: make build-tauri
+      - name: Install without resetting the approved domain
+        run: |
+          scripts/install-macos-prompt-test-app.sh \
+            --app-path "$LOCALITY_MACOS_FILE_PROVIDER_APP" \
+            --bundle-id "$LOCALITY_MACOS_FILE_PROVIDER_EXPECTED_BUNDLE_ID" \
+            --display-name "Locality File Provider Test" \
+            --no-reset-domain \
+            --no-launch
+      - name: Run real File Provider round trip
+        run: tests/live_macos_file_provider.sh
+      - name: Remove temporary signing keychain
+        if: ${{ always() }}
+        run: |
+          if [ -n "${LOCALITY_SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$LOCALITY_SIGNING_KEYCHAIN" 2>/dev/null || true
+          fi

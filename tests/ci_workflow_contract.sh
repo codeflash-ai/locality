@@ -59,6 +59,15 @@ assert_job_line ".github/workflows/ci.yml" "linux" \
   "        run: npm test -- --run"
 assert_job_line ".github/workflows/ci.yml" "macos" \
   "        run: swift test --package-path platform/macos/LocalityFileProvider"
+assert_job_line ".github/workflows/ci.yml" "macos" \
+  "          bash -n tests/live_macos_file_provider.sh"
+
+assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "file-provider-live" \
+  "    runs-on: [self-hosted, macOS, locality-file-provider]"
+assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "file-provider-live" \
+  "            --no-reset-domain \\"
+assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "file-provider-live" \
+  "        run: tests/live_macos_file_provider.sh"
 
 assert_job_line ".github/workflows/e2e.yml" "linux-fuse" "    runs-on: ubuntu-latest"
 assert_job_line ".github/workflows/e2e.yml" "linux-fuse" \
