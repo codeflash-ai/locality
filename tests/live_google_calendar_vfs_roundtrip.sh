@@ -40,7 +40,9 @@ initial_pull_report="$tmp_root/initial-pull.json"
 diff_report="$tmp_root/diff.json"
 push_report="$tmp_root/push.json"
 pull_after_push_report="$tmp_root/pull-after-push.json"
+event_status_report="$tmp_root/event-status.json"
 calendar_search_report="$tmp_root/calendar-events.json"
+original_event_copy="$tmp_root/original-event.md"
 credential_path=""
 oauth_refresh_marker=""
 daemon_pid=""
@@ -101,14 +103,19 @@ wait_for_draft_dir() {
   live_fail "Google Calendar draft directory did not appear under the mount"
 }
 
-wait_for_marker_under_events() {
+find_marker_under_events() {
   local marker="$1"
   local events_dir="$mount_root/events"
   local attempts="${LOCALITY_GOOGLE_CALENDAR_LIVE_MARKER_WAIT_ATTEMPTS:-120}"
   local attempt
+  local match
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if [[ -d "$events_dir" ]] && grep -R -Fq -- "$marker" "$events_dir" 2>/dev/null; then
-      return 0
+    if [[ -d "$events_dir" ]]; then
+      match="$(grep -R -F -l -- "$marker" "$events_dir" 2>/dev/null | head -n 1 || true)"
+      if [[ -n "$match" ]]; then
+        printf '%s\n' "$match"
+        return 0
+      fi
     fi
     sleep 0.25
   done
@@ -353,10 +360,34 @@ LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root" \
 assert_json_ok "$pull_after_push_report" "Google Calendar pull-after-push report"
 
 step="verifying created Google Calendar marker under events"
-wait_for_marker_under_events "$marker"
+event_path="$(find_marker_under_events "$marker")"
+
+step="verifying projected Google Calendar event rejects Linux FUSE writes"
+cp "$event_path" "$original_event_copy"
+original_hash="$(sha256sum "$event_path" | awk '{print $1}')"
+write_status=0
+{ printf '\nlive e2e must not write\n' >>"$event_path"; } 2>>"$command_log" || write_status="$?"
+after_write_hash="$(sha256sum "$event_path" | awk '{print $1}')"
+if [[ "$write_status" == "0" ]]; then
+  if [[ "$original_hash" != "$after_write_hash" ]]; then
+    cp "$original_event_copy" "$event_path" 2>>"$command_log" || true
+    live_fail "Google Calendar projected event unexpectedly accepted a filesystem write"
+  fi
+  live_fail "Google Calendar projected event write command unexpectedly exited successfully"
+fi
+if [[ "$original_hash" != "$after_write_hash" ]]; then
+  cp "$original_event_copy" "$event_path" 2>>"$command_log" || true
+  live_fail "Google Calendar projected event changed after a rejected write"
+fi
+
+step="checking rejected Google Calendar event write leaves status clean"
+LOCALITY_STATE_DIR="$state_root" "$loc_bin" status --json "$event_path" \
+  >"$event_status_report" 2>>"$command_log"
+assert_json_ok "$event_status_report" "Google Calendar event status report"
+assert_json_field_equals "$event_status_report" "clean" "true" "Google Calendar event status report"
 
 step="deleting created Google Calendar event"
 delete_created_calendar_event required
 event_cleanup_needed=0
 
-echo "live Google Calendar API, CLI, daemon, and Linux FUSE create checks passed"
+echo "live Google Calendar API, CLI, daemon, and Linux FUSE create and read-only event checks passed"
