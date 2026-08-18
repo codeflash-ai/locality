@@ -70,6 +70,8 @@ assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
   "          bash -n tests/live_connector_common_selftest.sh"
 assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
   "          bash -n tests/live_google_docs_mutation_scenario.sh"
+assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
+  "          bash -n tests/live_gmail_vfs_roundtrip.sh"
 
 assert_job_line ".github/workflows/notion-live-e2e.yml" "linux-fuse-live" "    runs-on: ubuntu-latest"
 assert_job_line ".github/workflows/notion-live-e2e.yml" "linux-fuse-live" \

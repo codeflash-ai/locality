@@ -52,6 +52,8 @@ send_status_report="$tmp_root/send-status.json"
 send_diff_report="$tmp_root/send-diff.json"
 send_push_report="$tmp_root/send-push.json"
 send_pull_after_push_report="$tmp_root/send-pull-after-push.json"
+send_status_after_rejected_write_report="$tmp_root/send-status-after-rejected-write.json"
+original_sent_copy="$tmp_root/original-sent.md"
 remote_draft_diff_report="$tmp_root/remote-draft-diff.json"
 remote_draft_push_report="$tmp_root/remote-draft-push.json"
 remote_draft_get_report="$tmp_root/remote-draft.json"
@@ -277,7 +279,7 @@ wait_for_path_absent() {
   live_fail "$label remained visible at $path"
 }
 
-wait_for_marker_under_sent() {
+find_marker_under_sent() {
   local marker="$1"
   local sent_dir="$mount_root/sent"
   local attempts="${LOCALITY_GMAIL_LIVE_SENT_MARKER_WAIT_ATTEMPTS:-120}"
@@ -290,6 +292,7 @@ wait_for_marker_under_sent() {
         [[ -n "$path" ]] || continue
         if timeout "${LOCALITY_GMAIL_LIVE_FILE_READ_TIMEOUT:-3s}" \
           grep -F -q -- "$marker" "$path" 2>/dev/null; then
+          printf '%s\n' "$path"
           return 0
         fi
       done < <(find "$sent_dir" -maxdepth 1 -type f -name '*.md' -print 2>/dev/null | sort -r)
@@ -1048,7 +1051,35 @@ if [[ "${LOCALITY_LIVE_GMAIL_SEND:-0}" == "1" ]]; then
   assert_json_ok "$send_pull_after_push_report" "Gmail send pull-after-push report"
 
   step="verifying Gmail direct send marker under sent"
-  wait_for_marker_under_sent "$send_marker"
+  sent_path="$(find_marker_under_sent "$send_marker")"
+
+  step="verifying projected Gmail sent message rejects Linux FUSE writes"
+  cp "$sent_path" "$original_sent_copy"
+  original_hash="$(sha256sum "$sent_path" | awk '{print $1}')"
+  write_status=0
+  { printf '\nlive e2e must not write\n' >>"$sent_path"; } 2>>"$command_log" || write_status="$?"
+  after_write_hash="$(sha256sum "$sent_path" | awk '{print $1}')"
+  if [[ "$write_status" == "0" ]]; then
+    if [[ "$original_hash" != "$after_write_hash" ]]; then
+      cp "$original_sent_copy" "$sent_path" 2>>"$command_log" || true
+      live_fail "Gmail projected sent message unexpectedly accepted a filesystem write"
+    fi
+    live_fail "Gmail projected sent message write command unexpectedly exited successfully"
+  fi
+  if [[ "$original_hash" != "$after_write_hash" ]]; then
+    cp "$original_sent_copy" "$sent_path" 2>>"$command_log" || true
+    live_fail "Gmail projected sent message changed after a rejected write"
+  fi
+
+  step="checking rejected Gmail sent-message write leaves status clean"
+  LOCALITY_STATE_DIR="$state_root" "$loc_bin" status --json "$sent_path" \
+    >"$send_status_after_rejected_write_report" 2>>"$command_log"
+  assert_json_ok "$send_status_after_rejected_write_report" "Gmail sent-message status report"
+  assert_json_field_equals \
+    "$send_status_after_rejected_write_report" \
+    "clean" \
+    "true" \
+    "Gmail sent-message status report"
 
   stale_subject="Locality live Gmail stale remote draft $unique"
   stale_marker="Locality live Gmail stale remote draft marker $unique"
@@ -1208,7 +1239,7 @@ if [[ "${LOCALITY_LIVE_GMAIL_SEND:-0}" == "1" ]]; then
     echo "warning: Gmail OAuth scope did not allow trashing sent scratch message" >&2
   remote_sent_message_id=""
 
-  echo "live Gmail API, CLI, daemon, and Linux FUSE draft, direct-send, stale draft prune, and remote draft edit/send checks passed"
+  echo "live Gmail API, CLI, daemon, and Linux FUSE draft, direct-send, sent-message guardrail, stale draft prune, and remote draft edit/send checks passed"
 else
   echo "skip: set LOCALITY_LIVE_GMAIL_SEND=1 to run the live Gmail direct-send and remote draft edit/send checks; this sends real email"
   echo "live Gmail API, CLI, daemon, and Linux FUSE draft checks passed"

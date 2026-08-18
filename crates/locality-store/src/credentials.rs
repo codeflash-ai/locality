@@ -6,8 +6,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
+
+use fs2::FileExt;
 
 pub type CredentialResult<T> = Result<T, CredentialError>;
 
@@ -15,7 +18,26 @@ pub trait CredentialStore: Send + Sync {
     fn put(&self, secret_ref: &str, secret: &str) -> CredentialResult<()>;
     fn get(&self, secret_ref: &str) -> CredentialResult<String>;
     fn delete(&self, secret_ref: &str) -> CredentialResult<()>;
+
+    /// Reads persisted credential state without trusting an in-process cache.
+    /// Backends without a cache can use the default implementation.
+    fn get_fresh(&self, secret_ref: &str) -> CredentialResult<String> {
+        self.get(secret_ref)
+    }
+
+    fn acquire_refresh_lock(
+        &self,
+        _secret_ref: &str,
+    ) -> CredentialResult<Box<dyn CredentialRefreshLock>> {
+        Ok(Box::new(NoopCredentialRefreshLock))
+    }
 }
+
+pub trait CredentialRefreshLock: Send {}
+
+struct NoopCredentialRefreshLock;
+
+impl CredentialRefreshLock for NoopCredentialRefreshLock {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CredentialError {
@@ -101,6 +123,43 @@ impl CredentialStore for FileCredentialStore {
             Err(error) => Err(error.into()),
         }
     }
+
+    fn acquire_refresh_lock(
+        &self,
+        secret_ref: &str,
+    ) -> CredentialResult<Box<dyn CredentialRefreshLock>> {
+        acquire_file_refresh_lock(&self.root, secret_ref)
+    }
+}
+
+fn acquire_file_refresh_lock(
+    lock_root: &Path,
+    secret_ref: &str,
+) -> CredentialResult<Box<dyn CredentialRefreshLock>> {
+    std::fs::create_dir_all(lock_root)?;
+    let lock_path = lock_root.join(format!("{}.refresh.lock", hex_name(secret_ref)));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    set_private_file_permissions(&lock_path)?;
+    file.lock_exclusive()
+        .map_err(|error| CredentialError::Io(error.to_string()))?;
+    Ok(Box::new(FileCredentialRefreshLock { file }))
+}
+
+struct FileCredentialRefreshLock {
+    file: File,
+}
+
+impl CredentialRefreshLock for FileCredentialRefreshLock {}
+
+impl Drop for FileCredentialRefreshLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -183,6 +242,12 @@ impl CredentialStore for KeychainCredentialStore {
         })
     }
 
+    fn get_fresh(&self, secret_ref: &str) -> CredentialResult<String> {
+        get_uncached_keychain_secret(secret_ref, read_keychain_password, |secret_ref, secret| {
+            self.put(secret_ref, secret)
+        })
+    }
+
     fn delete(&self, secret_ref: &str) -> CredentialResult<()> {
         for service in COMPAT_KEYCHAIN_SERVICES {
             let _ = std::process::Command::new("security")
@@ -202,12 +267,23 @@ static KEYCHAIN_CREDENTIAL_CACHE: LazyLock<Mutex<BTreeMap<String, String>>> =
 #[cfg(any(test, target_os = "macos"))]
 fn get_cached_keychain_secret(
     secret_ref: &str,
-    mut read_keychain_password: impl FnMut(&str, &str) -> CredentialResult<Option<String>>,
-    mut promote_secret: impl FnMut(&str, &str) -> CredentialResult<()>,
+    read_keychain_password: impl FnMut(&str, &str) -> CredentialResult<Option<String>>,
+    promote_secret: impl FnMut(&str, &str) -> CredentialResult<()>,
 ) -> CredentialResult<String> {
     if let Some(secret) = cached_keychain_secret(secret_ref)? {
         return Ok(secret);
     }
+
+    get_uncached_keychain_secret(secret_ref, read_keychain_password, promote_secret)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn get_uncached_keychain_secret(
+    secret_ref: &str,
+    mut read_keychain_password: impl FnMut(&str, &str) -> CredentialResult<Option<String>>,
+    mut promote_secret: impl FnMut(&str, &str) -> CredentialResult<()>,
+) -> CredentialResult<String> {
+    forget_keychain_secret(secret_ref)?;
 
     for service in COMPAT_KEYCHAIN_SERVICES {
         if let Some(password) = read_keychain_password(secret_ref, service)? {
@@ -503,29 +579,70 @@ fn credential_store_backend_for_override(value: Option<&str>) -> CredentialStore
     }
 }
 
+/// Adds state-root refresh coordination to every production credential backend.
+struct CoordinatedCredentialStore {
+    inner: Box<dyn CredentialStore>,
+    refresh_lock_root: PathBuf,
+}
+
+impl CoordinatedCredentialStore {
+    fn new(state_root: &Path, inner: Box<dyn CredentialStore>) -> Self {
+        Self {
+            inner,
+            refresh_lock_root: state_root.join("credentials"),
+        }
+    }
+}
+
+impl CredentialStore for CoordinatedCredentialStore {
+    fn put(&self, secret_ref: &str, secret: &str) -> CredentialResult<()> {
+        self.inner.put(secret_ref, secret)
+    }
+
+    fn get(&self, secret_ref: &str) -> CredentialResult<String> {
+        self.inner.get(secret_ref)
+    }
+
+    fn get_fresh(&self, secret_ref: &str) -> CredentialResult<String> {
+        self.inner.get_fresh(secret_ref)
+    }
+
+    fn delete(&self, secret_ref: &str) -> CredentialResult<()> {
+        self.inner.delete(secret_ref)
+    }
+
+    fn acquire_refresh_lock(
+        &self,
+        secret_ref: &str,
+    ) -> CredentialResult<Box<dyn CredentialRefreshLock>> {
+        acquire_file_refresh_lock(&self.refresh_lock_root, secret_ref)
+    }
+}
+
 pub fn open_credential_store(state_root: &Path) -> Box<dyn CredentialStore> {
-    if credential_store_backend_for_override(std::env::var(CREDENTIAL_STORE_ENV).ok().as_deref())
-        == CredentialStoreBackend::File
-    {
-        return Box::new(FileCredentialStore::new(state_root));
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let _ = state_root;
-        Box::new(KeychainCredentialStore)
-    }
-
-    #[cfg(windows)]
-    {
-        let _ = state_root;
-        Box::new(WindowsCredentialStore)
-    }
-
-    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    let inner: Box<dyn CredentialStore> = if credential_store_backend_for_override(
+        std::env::var(CREDENTIAL_STORE_ENV).ok().as_deref(),
+    ) == CredentialStoreBackend::File
     {
         Box::new(FileCredentialStore::new(state_root))
-    }
+    } else {
+        #[cfg(target_os = "macos")]
+        {
+            Box::new(KeychainCredentialStore)
+        }
+
+        #[cfg(windows)]
+        {
+            Box::new(WindowsCredentialStore)
+        }
+
+        #[cfg(all(not(target_os = "macos"), not(windows)))]
+        {
+            Box::new(FileCredentialStore::new(state_root))
+        }
+    };
+
+    Box::new(CoordinatedCredentialStore::new(state_root, inner))
 }
 
 fn hex_name(value: &str) -> String {
@@ -553,14 +670,128 @@ fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::{
-        COMPAT_KEYCHAIN_SERVICES, CredentialResult, CredentialStoreBackend,
-        PRIMARY_KEYCHAIN_SERVICE, credential_store_backend_for_override,
-        decode_hex_encoded_password, get_cached_keychain_secret,
+        COMPAT_KEYCHAIN_SERVICES, CoordinatedCredentialStore, CredentialResult, CredentialStore,
+        CredentialStoreBackend, FileCredentialStore, InMemoryCredentialStore,
+        PRIMARY_KEYCHAIN_SERVICE, cache_keychain_secret, cached_keychain_secret,
+        credential_store_backend_for_override, decode_hex_encoded_password, forget_keychain_secret,
+        get_cached_keychain_secret, get_uncached_keychain_secret,
         keychain_hex_password_from_diagnostics, keychain_output_password,
         primary_windows_target_name, windows_target_names,
     };
+
+    #[test]
+    fn file_credential_refresh_lock_is_exclusive_across_store_instances() {
+        let state_root = tempfile::tempdir().expect("temporary state root");
+        let first_store = FileCredentialStore::new(state_root.path());
+        let second_store = FileCredentialStore::new(state_root.path());
+        let first_lock = first_store
+            .acquire_refresh_lock("connection:slack-live")
+            .expect("first refresh lock");
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+
+        let waiter = thread::spawn(move || {
+            let second_lock = second_store
+                .acquire_refresh_lock("connection:slack-live")
+                .expect("second refresh lock");
+            acquired_tx.send(()).expect("report acquired lock");
+            drop(second_lock);
+        });
+
+        assert!(
+            matches!(
+                acquired_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "second store acquired the refresh lock before the first released it"
+        );
+        drop(first_lock);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second store should acquire released refresh lock");
+        waiter.join().expect("refresh lock waiter");
+    }
+
+    #[test]
+    fn production_credential_wrapper_locks_across_processes() {
+        let state_root = tempfile::tempdir().expect("temporary state root");
+        let store = CoordinatedCredentialStore::new(
+            state_root.path(),
+            Box::new(InMemoryCredentialStore::new()),
+        );
+        let first_lock = store
+            .acquire_refresh_lock("connection:slack-live")
+            .expect("first refresh lock");
+        let acquired_marker = state_root.path().join("child-acquired-refresh-lock");
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "credentials::tests::production_credential_wrapper_process_lock_child",
+                "--nocapture",
+            ])
+            .env(
+                "LOCALITY_CREDENTIAL_LOCK_TEST_ROOT",
+                state_root.path().as_os_str(),
+            )
+            .env(
+                "LOCALITY_CREDENTIAL_LOCK_TEST_MARKER",
+                acquired_marker.as_os_str(),
+            )
+            .spawn()
+            .expect("spawn credential lock child");
+
+        thread::sleep(Duration::from_millis(150));
+        let child_blocked = child
+            .try_wait()
+            .expect("poll credential lock child")
+            .is_none()
+            && !acquired_marker.exists();
+        drop(first_lock);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll credential lock child") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("stop timed out credential lock child");
+                panic!("credential lock child did not finish after the parent released the lock");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        assert!(
+            child_blocked,
+            "production credential wrapper did not block the independent process"
+        );
+        assert!(status.success(), "credential lock child failed: {status}");
+        assert!(
+            acquired_marker.exists(),
+            "credential lock child did not acquire the released lock"
+        );
+    }
+
+    #[test]
+    fn production_credential_wrapper_process_lock_child() {
+        let Ok(state_root) = std::env::var("LOCALITY_CREDENTIAL_LOCK_TEST_ROOT") else {
+            return;
+        };
+        let acquired_marker = std::env::var("LOCALITY_CREDENTIAL_LOCK_TEST_MARKER")
+            .expect("credential lock child marker");
+        let store = CoordinatedCredentialStore::new(
+            Path::new(&state_root),
+            Box::new(InMemoryCredentialStore::new()),
+        );
+        let _lock = store
+            .acquire_refresh_lock("connection:slack-live")
+            .expect("child refresh lock");
+        std::fs::write(acquired_marker, b"acquired").expect("write child lock marker");
+    }
 
     #[test]
     fn credential_store_backend_honors_file_override() {
@@ -652,6 +883,33 @@ mod tests {
         assert_eq!(first, "cached-secret");
         assert_eq!(second, "cached-secret");
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn keychain_fresh_get_bypasses_and_replaces_process_cache() {
+        let calls = Cell::new(0);
+        let secret_ref = "connection:test-cache-fresh";
+        cache_keychain_secret(secret_ref, "stale-secret").expect("seed stale credential cache");
+
+        let fresh = get_uncached_keychain_secret(
+            secret_ref,
+            |read_ref, service| {
+                assert_eq!(read_ref, secret_ref);
+                assert_eq!(service, PRIMARY_KEYCHAIN_SERVICE);
+                calls.set(calls.get() + 1);
+                Ok(Some("fresh-secret".to_string()))
+            },
+            |_, _| -> CredentialResult<()> { panic!("primary keychain hit should not promote") },
+        )
+        .expect("fresh keychain lookup");
+
+        assert_eq!(fresh, "fresh-secret");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            cached_keychain_secret(secret_ref).expect("read credential cache"),
+            Some("fresh-secret".to_string())
+        );
+        forget_keychain_secret(secret_ref).expect("clear credential cache");
     }
 
     #[test]

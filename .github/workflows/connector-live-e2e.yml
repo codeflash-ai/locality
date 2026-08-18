@@ -63,6 +63,7 @@ jobs:
           bash -n tests/live_connector_common.sh
           bash -n tests/live_connector_common_selftest.sh
           bash -n tests/live_google_docs_mutation_scenario.sh
+          bash -n tests/live_gmail_vfs_roundtrip.sh
           LOCALITY_LIVE_COMMON_SELFTEST=1 tests/live_connector_common_selftest.sh
 
   google-docs-live:

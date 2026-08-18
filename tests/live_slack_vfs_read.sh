@@ -345,6 +345,29 @@ LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 \
 assert_json_ok "$mount_report" "Slack mount report"
 assert_json_field_equals "$mount_report" "read_only" "true" "Slack mount report"
 
+if [[ -n "$oauth_refresh_marker" ]]; then
+  # Slack refresh handles are single-use. Refresh once before starting the
+  # daemon and FUSE consumers so the deliberately expired test credential is
+  # never presented concurrently by multiple processes.
+  step="refreshing Slack OAuth credential before starting live consumers"
+  LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 \
+    "$loc_bin" pull --json "$mount_root" \
+    >"$initial_pull_report" 2>>"$command_log"
+  assert_json_ok "$initial_pull_report" "Slack credential refresh pull report"
+
+  step="verifying Slack OAuth credential refresh"
+  assert_oauth_credential_refreshed \
+    "$credential_path" \
+    "slack" \
+    "$oauth_refresh_marker" \
+    "Slack live credential"
+  export_refreshed_oauth_credential_if_requested \
+    "$credential_path" \
+    "slack" \
+    "$oauth_refresh_marker" \
+    "Slack live credential"
+fi
+
 step="starting localityd"
 daemon_pid="$(start_live_daemon "$localityd_bin" "$state_root" "$daemon_log")"
 wait_for_daemon "$loc_bin" "$state_root"
@@ -358,19 +381,6 @@ step="pulling Slack workspace"
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root" \
   >"$initial_pull_report" 2>>"$command_log"
 assert_json_ok "$initial_pull_report" "Slack initial pull report"
-if [[ -n "$oauth_refresh_marker" ]]; then
-  step="verifying Slack OAuth credential refresh"
-  assert_oauth_credential_refreshed \
-    "$credential_path" \
-    "slack" \
-    "$oauth_refresh_marker" \
-    "Slack live credential"
-  export_refreshed_oauth_credential_if_requested \
-    "$credential_path" \
-    "slack" \
-    "$oauth_refresh_marker" \
-    "Slack live credential"
-fi
 
 step="finding configured Slack conversation recent.md"
 recent_path="$(wait_for_target_recent "$LOCALITY_SLACK_LIVE_CONVERSATION_ID")"
