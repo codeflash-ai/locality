@@ -709,17 +709,28 @@ fn apply_plan(
                 content,
             } => {
                 let document = docs.get_document(parent_id.as_str())?;
-                let base_index = after
+                let after_range = after
                     .as_ref()
                     .and_then(|after| GoogleBlockRange::parse(after).ok())
                     .map(|range| {
-                        shift_index_for_insertions(
-                            range.end_index,
+                        range.shifted_for_insertions(
                             inserted_ranges
                                 .get(&range.document_id)
                                 .map(Vec::as_slice)
                                 .unwrap_or(&[]),
                         )
+                    });
+                let final_block_append = after_range
+                    .as_ref()
+                    .is_some_and(|range| range.end_index == document_end_index(&document));
+                let base_index = after_range
+                    .as_ref()
+                    .map(|range| {
+                        if final_block_append && range.end_index > range.start_index {
+                            range.end_index - 1
+                        } else {
+                            range.end_index
+                        }
                     })
                     .unwrap_or_else(|| document_start_index(&document));
                 let append_key = (
@@ -728,7 +739,10 @@ fn apply_plan(
                 );
                 let index_position =
                     base_index + append_offsets.get(&append_key).copied().unwrap_or_default();
-                let docs_text = docs_block_text(content);
+                let mut docs_text = docs_block_text(content);
+                if final_block_append {
+                    move_docs_text_before_segment_newline(&mut docs_text);
+                }
                 let inserted_len = docs_text_len(&docs_text.text);
                 let new_block_end = index_position + inserted_len;
                 let requests = docs_text_requests_from_parsed(index_position, docs_text, None);
@@ -751,7 +765,13 @@ fn apply_plan(
                     parent_id: parent_id.clone(),
                     block_id: RemoteId::new(format!(
                         "{}:{}:{}",
-                        parent_id.0, index_position, new_block_end
+                        parent_id.0,
+                        if final_block_append {
+                            index_position + 1
+                        } else {
+                            index_position
+                        },
+                        new_block_end
                     )),
                 });
             }
@@ -2566,6 +2586,27 @@ fn strip_trailing_segment_newline(docs_text: &mut DocsText) {
     docs_text
         .bullet_ranges
         .retain(|range| range.end > range.start);
+}
+
+fn move_docs_text_before_segment_newline(docs_text: &mut DocsText) {
+    strip_trailing_segment_newline(docs_text);
+    docs_text.text.insert(0, '\n');
+    shift_docs_text_ranges(docs_text, 1);
+}
+
+fn shift_docs_text_ranges(docs_text: &mut DocsText, amount: usize) {
+    for range in &mut docs_text.style_ranges {
+        range.start += amount;
+        range.end += amount;
+    }
+    for range in &mut docs_text.paragraph_styles {
+        range.start += amount;
+        range.end += amount;
+    }
+    for range in &mut docs_text.bullet_ranges {
+        range.start += amount;
+        range.end += amount;
+    }
 }
 
 fn parse_docs_markdown_blocks(content: &str) -> DocsText {
@@ -5804,6 +5845,58 @@ mod tests {
         };
         assert_eq!(insert_text.location.index, 1);
         assert_eq!(insert_text.text, "Before intro\n");
+    }
+
+    #[test]
+    fn append_block_after_final_block_inserts_before_segment_newline() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Shape Doc", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Shape Doc",
+            "rev-1",
+            "Intro\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::AppendBlock {
+                parent_id: RemoteId::new("doc-1"),
+                after: Some(RemoteId::new("doc-1:1:7")),
+                content: "## Appended Section".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:append_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let DocsRequest::InsertText { insert_text } = &batch.requests[0] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(insert_text.location.index, 6);
+        assert_eq!(insert_text.text, "\nAppended Section");
+        assert!(batch.requests.iter().any(|request| {
+            let value = serde_json::to_value(request).expect("request json");
+            value["updateParagraphStyle"]["range"]["startIndex"] == 7
+                && value["updateParagraphStyle"]["range"]["endIndex"] == 23
+                && value["updateParagraphStyle"]["paragraphStyle"]["namedStyleType"] == "HEADING_2"
+        }));
     }
 
     #[test]
