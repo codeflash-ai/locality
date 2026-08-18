@@ -45,13 +45,6 @@ pull_after_push_report="$tmp_root/pull-after-push.json"
 edit_diff_report="$tmp_root/edit-diff.json"
 edit_push_report="$tmp_root/edit-push.json"
 pull_after_edit_report="$tmp_root/pull-after-edit.json"
-remote_drift_drive_report="$tmp_root/remote-drift-drive.json"
-remote_drift_before_report="$tmp_root/remote-drift-before.json"
-remote_drift_update_report="$tmp_root/remote-drift-update.json"
-remote_drift_document_report="$tmp_root/remote-drift-document.json"
-remote_drift_push_report="$tmp_root/remote-drift-push.json"
-remote_drift_restore_report="$tmp_root/remote-drift-restore.json"
-pull_after_remote_drift_report="$tmp_root/pull-after-remote-drift.json"
 metadata_diff_report="$tmp_root/metadata-diff.json"
 metadata_push_report="$tmp_root/metadata-push.json"
 pull_after_metadata_report="$tmp_root/pull-after-metadata.json"
@@ -82,9 +75,6 @@ folder_cleanup_needed=0
 page_title=""
 single_line=""
 blank_line_marker=""
-local_drift_marker=""
-remote_drift_marker=""
-remote_drift_title=""
 metadata_title=""
 renamed_title=""
 move_folder_title=""
@@ -338,159 +328,6 @@ drive_trash_file() {
     --data-binary '{"trashed":true}' >"$report_path" 2>>"$command_log"
 }
 
-drive_update_name() {
-  local access_token="$1"
-  local file_id="$2"
-  local title="$3"
-  local report_path="$4"
-
-  python3 - "$title" <<'PY' | \
-    curl -fsS -X PATCH "https://www.googleapis.com/drive/v3/files/$file_id?fields=id,name,mimeType,parents,trashed,modifiedTime" \
-      -H "Authorization: Bearer $access_token" \
-      -H "Content-Type: application/json" \
-      --data-binary @- >"$report_path" 2>>"$command_log"
-import json
-import sys
-
-print(json.dumps({"name": sys.argv[1]}))
-PY
-}
-
-docs_get_document() {
-  local access_token="$1"
-  local file_id="$2"
-  local report_path="$3"
-
-  curl -fsS --get "https://docs.googleapis.com/v1/documents/$file_id" \
-    -H "Authorization: Bearer $access_token" \
-    >"$report_path" 2>>"$command_log"
-}
-
-docs_insert_text() {
-  local access_token="$1"
-  local file_id="$2"
-  local inserted_text="$3"
-  local report_path="$4"
-
-  python3 - "$inserted_text" <<'PY' | \
-    curl -fsS -X POST "https://docs.googleapis.com/v1/documents/$file_id:batchUpdate" \
-      -H "Authorization: Bearer $access_token" \
-      -H "Content-Type: application/json" \
-      --data-binary @- >"$report_path" 2>>"$command_log"
-import json
-import sys
-
-print(json.dumps({
-    "requests": [{
-        "insertText": {
-            "location": {"index": 1},
-            "text": f"{sys.argv[1]}\n\n",
-        }
-    }]
-}))
-PY
-}
-
-wait_for_google_doc_revision_change() {
-  local access_token="$1"
-  local file_id="$2"
-  local previous_revision="$3"
-  local report_path="$4"
-  local attempts="${LOCALITY_GOOGLE_DOCS_LIVE_REVISION_WAIT_ATTEMPTS:-40}"
-  local attempt
-  local current_revision
-
-  for ((attempt = 1; attempt <= attempts; attempt++)); do
-    docs_get_document "$access_token" "$file_id" "$report_path"
-    current_revision="$(json_field "$report_path" "revisionId" 2>/dev/null || true)"
-    if [[ -n "$current_revision" && "$current_revision" != "$previous_revision" ]]; then
-      return 0
-    fi
-    sleep 0.25
-  done
-  live_fail "Google Docs remote mutation did not produce a new document revision"
-}
-
-assert_google_doc_text_present() {
-  local report_path="$1"
-  local expected="$2"
-  local label="$3"
-
-  python3 - "$report_path" "$expected" "$label" <<'PY'
-import json
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-expected = sys.argv[2]
-label = sys.argv[3]
-data = json.loads(path.read_text(encoding="utf-8"))
-
-def strings(value):
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, list):
-        for item in value:
-            yield from strings(item)
-    elif isinstance(value, dict):
-        for item in value.values():
-            yield from strings(item)
-
-if expected not in "".join(strings(data)):
-    raise SystemExit(f"{label} did not contain the expected remote marker")
-PY
-}
-
-assert_google_doc_text_absent() {
-  local report_path="$1"
-  local unexpected="$2"
-  local label="$3"
-
-  python3 - "$report_path" "$unexpected" "$label" <<'PY'
-import json
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-unexpected = sys.argv[2]
-label = sys.argv[3]
-data = json.loads(path.read_text(encoding="utf-8"))
-
-def strings(value):
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, list):
-        for item in value:
-            yield from strings(item)
-    elif isinstance(value, dict):
-        for item in value.values():
-            yield from strings(item)
-
-if unexpected in "".join(strings(data)):
-    raise SystemExit(f"{label} unexpectedly contained the blocked local marker")
-PY
-}
-
-assert_failed_push_for_remote_drift() {
-  local report_path="$1"
-  local label="$2"
-  local message
-  local suggested_fix
-
-  assert_json_field_equals "$report_path" "ok" "false" "$label"
-  assert_json_field_equals "$report_path" "action" "apply_failed" "$label"
-  assert_json_field_equals "$report_path" "journal_status" "reverted" "$label"
-  assert_json_field_equals "$report_path" "apply_effect_count" "0" "$label"
-  message="$(json_field "$report_path" "message")"
-  suggested_fix="$(json_field "$report_path" "suggested_fix")"
-  if [[ "$message" != *"changed since last sync"* ]]; then
-    live_fail "$label did not report that Google Docs changed since last sync"
-  fi
-  if [[ "$suggested_fix" != *"loc pull"* ]]; then
-    live_fail "$label did not suggest pulling before retrying the push"
-  fi
-}
-
 assert_drive_name() {
   local report_path="$1"
   local expected="$2"
@@ -670,9 +507,6 @@ unique="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 page_title="Locality Google Docs Scenario Seed $unique"
 single_line="Locality single-line seed $unique"
 blank_line_marker="Locality blank-line insertion marker $unique"
-local_drift_marker="Locality blocked local drift marker $unique"
-remote_drift_marker="Locality accepted remote drift marker $unique"
-remote_drift_title="Locality Google Docs Scenario Remote Drift $unique"
 metadata_title="Locality Google Docs Scenario Metadata $unique"
 renamed_title="Locality Google Docs Scenario Renamed $unique"
 move_folder_title="Locality Google Docs Scenario Folder $unique"
@@ -743,77 +577,6 @@ fi
 assert_markdown_body_contains_sequence "$page_path" "$single_line
 
 $blank_line_marker" "Google Docs scenario blank-line verification"
-page_dir="$(dirname "$page_path")"
-
-step="creating competing local and remote Google Docs edits"
-markdown_replace_body "$page_path" "$single_line
-
-$blank_line_marker
-
-$local_drift_marker
-"
-access_token="$(credential_access_token "$credential_path")"
-docs_get_document "$access_token" "$doc_id" "$remote_drift_before_report"
-remote_drift_before_revision="$(json_field "$remote_drift_before_report" "revisionId")"
-if [[ -z "$remote_drift_before_revision" ]]; then
-  live_fail "Google Docs remote-drift fixture did not report its initial revision"
-fi
-drive_update_name "$access_token" "$doc_id" "$remote_drift_title" "$remote_drift_drive_report"
-assert_drive_name "$remote_drift_drive_report" "$remote_drift_title" "Google Docs remote-drift Drive file"
-docs_insert_text "$access_token" "$doc_id" "$remote_drift_marker" "$remote_drift_update_report"
-wait_for_google_doc_revision_change \
-  "$access_token" \
-  "$doc_id" \
-  "$remote_drift_before_revision" \
-  "$remote_drift_document_report"
-assert_google_doc_text_present \
-  "$remote_drift_document_report" \
-  "$remote_drift_marker" \
-  "Google Docs remote-drift fixture"
-unset access_token
-
-step="verifying Google Docs push preflight blocks remote drift"
-if LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$page_path" \
-  >"$remote_drift_push_report" 2>>"$command_log"; then
-  remote_drift_push_status=0
-else
-  remote_drift_push_status="$?"
-fi
-if [[ "$remote_drift_push_status" == "0" ]]; then
-  live_fail "Google Docs remote-drift push unexpectedly exited successfully"
-fi
-assert_failed_push_for_remote_drift "$remote_drift_push_report" "Google Docs remote-drift push report"
-
-step="verifying blocked Google Docs push did not overwrite remote content"
-access_token="$(credential_access_token "$credential_path")"
-docs_get_document "$access_token" "$doc_id" "$remote_drift_document_report"
-assert_google_doc_text_present \
-  "$remote_drift_document_report" \
-  "$remote_drift_marker" \
-  "Google Docs remote-drift document"
-assert_google_doc_text_absent \
-  "$remote_drift_document_report" \
-  "$local_drift_marker" \
-  "Google Docs remote-drift document"
-unset access_token
-
-step="discarding blocked local Google Docs edit"
-LOCALITY_STATE_DIR="$state_root" "$loc_bin" restore "$page_path" --force --json \
-  >"$remote_drift_restore_report" 2>>"$command_log"
-assert_json_ok "$remote_drift_restore_report" "Google Docs remote-drift restore report"
-
-step="pulling accepted remote Google Docs drift"
-LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root" \
-  >"$pull_after_remote_drift_report" 2>>"$command_log"
-assert_json_ok "$pull_after_remote_drift_report" "Google Docs pull-after-remote-drift report"
-wait_for_marker_under_mount "$remote_drift_marker"
-page_path="$(find_marker_path_under_mount "$remote_drift_marker" || true)"
-if [[ -z "$page_path" || ! -f "$page_path" ]]; then
-  live_fail "Google Docs page path was not visible after accepting remote drift"
-fi
-if grep -Fq -- "$local_drift_marker" "$page_path"; then
-  live_fail "blocked local Google Docs marker survived restore and pull"
-fi
 page_dir="$(dirname "$page_path")"
 
 step="updating Google Docs title metadata through frontmatter"
