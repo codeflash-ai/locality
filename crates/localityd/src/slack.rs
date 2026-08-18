@@ -147,7 +147,7 @@ fn connection_access_token(
         // or process may have rotated this credential while this request waited
         // for the locks, so re-read it before deciding whether a refresh is
         // still necessary.
-        stored = load_slack_credential(credentials, connection)?;
+        stored = load_fresh_slack_credential(credentials, connection)?;
         if stored.expires_soon(timestamp_secs()) {
             let refreshed = refresh_oauth_credential(connection, &stored)?;
             stored = stored
@@ -171,6 +171,23 @@ fn load_slack_credential(
     let secret = credentials
         .get(&connection.secret_ref)
         .map_err(|error| credential_error(connection, error))?;
+    parse_slack_credential(connection, &secret)
+}
+
+fn load_fresh_slack_credential(
+    credentials: &dyn CredentialStore,
+    connection: &ConnectionRecord,
+) -> Result<StoredSlackCredential, ConnectorResolveError> {
+    let secret = credentials
+        .get_fresh(&connection.secret_ref)
+        .map_err(|error| credential_error(connection, error))?;
+    parse_slack_credential(connection, &secret)
+}
+
+fn parse_slack_credential(
+    connection: &ConnectionRecord,
+    secret: &str,
+) -> Result<StoredSlackCredential, ConnectorResolveError> {
     let stored = serde_json::from_str::<StoredSlackCredential>(&secret)
         .map_err(|error| invalid_slack_credential(connection, error.to_string()))?;
     if stored.connector != SLACK_CONNECTOR_ID || stored.kind != "oauth" {
