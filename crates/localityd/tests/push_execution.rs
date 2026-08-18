@@ -4023,6 +4023,75 @@ fn daemon_push_job_plans_pending_virtual_delete_from_file_path() {
 }
 
 #[test]
+fn reviewed_virtual_delete_without_shadow_applies_archive() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(
+                fixture.mount_id.clone(),
+                "google-docs",
+                fixture.root.clone(),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                fixture.remote_id.clone(),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(HydrationState::Hydrated)
+            .with_remote_edited_at("drive:7:2026-06-25T10:00:00.000Z|docs:rev-1"),
+        )
+        .expect("save page");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "delete:page-1",
+            VirtualMutationKind::Delete,
+            Some(fixture.remote_id.clone()),
+            None,
+            "Roadmap.md",
+            None,
+        ))
+        .expect("save mutation");
+    let source = FakePushSource::default()
+        .with_apply_effects(vec![JournalApplyEffect::ArchivedEntity {
+            operation_id: PushOperationId("push-1:0:archive_entity:page-1".to_string()),
+            operation_index: 0,
+            entity_id: fixture.remote_id.clone(),
+        }])
+        .with_changed_remote_ids(vec![fixture.remote_id.clone()]);
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.clone(),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("execute reviewed delete");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    assert_eq!(source.applied_count(), 1);
+    assert_eq!(
+        report.pipeline.plan.expect("plan").operations,
+        vec![PushOperation::ArchiveEntity {
+            entity_id: fixture.remote_id.clone()
+        }]
+    );
+}
+
+#[test]
 fn auto_save_push_blocks_pending_virtual_delete_without_applying() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
