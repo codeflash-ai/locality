@@ -31,8 +31,10 @@ use localityd::source::{
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn notion_descriptor_exposes_cli_and_mount_metadata() {
@@ -629,6 +631,86 @@ fn spawn_refresh_broker(status: &'static str, body: String) -> (String, thread::
             .expect("write refresh response");
     });
     (url, handle)
+}
+
+fn spawn_counting_refresh_broker(
+    body: String,
+) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind refresh broker");
+    listener
+        .set_nonblocking(true)
+        .expect("set refresh broker nonblocking");
+    let url = format!("http://{}", listener.local_addr().expect("broker addr"));
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let broker_request_count = Arc::clone(&request_count);
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut first_response_at = None;
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let request_number = broker_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let mut buffer = [0_u8; 4096];
+                    let _ = stream.read(&mut buffer).expect("read refresh request");
+                    let (status, response_body) = if request_number == 1 {
+                        ("HTTP/1.1 200 OK", body.as_str())
+                    } else {
+                        (
+                            "HTTP/1.1 409 Conflict",
+                            r#"{"error":"refresh handle already used"}"#,
+                        )
+                    };
+                    let response = format!(
+                        "{status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                        response_body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("write refresh response");
+                    first_response_at.get_or_insert_with(Instant::now);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if first_response_at
+                        .is_some_and(|first| first.elapsed() >= Duration::from_millis(200))
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for refresh request"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept refresh request: {error}"),
+            }
+        }
+    });
+    (url, request_count, handle)
+}
+
+#[derive(Clone)]
+struct ConcurrentReadCredentialStore {
+    inner: InMemoryCredentialStore,
+    initial_reads: Arc<AtomicUsize>,
+    initial_read_barrier: Arc<Barrier>,
+}
+
+impl CredentialStore for ConcurrentReadCredentialStore {
+    fn put(&self, secret_ref: &str, secret: &str) -> Result<(), locality_store::CredentialError> {
+        self.inner.put(secret_ref, secret)
+    }
+
+    fn get(&self, secret_ref: &str) -> Result<String, locality_store::CredentialError> {
+        let secret = self.inner.get(secret_ref)?;
+        if self.initial_reads.fetch_add(1, Ordering::SeqCst) < 2 {
+            self.initial_read_barrier.wait();
+        }
+        Ok(secret)
+    }
+
+    fn delete(&self, secret_ref: &str) -> Result<(), locality_store::CredentialError> {
+        self.inner.delete(secret_ref)
+    }
 }
 
 fn save_google_docs_oauth_connection(store: &mut InMemoryStateStore) -> (ConnectionId, String) {
@@ -1635,6 +1717,79 @@ fn resolving_expired_slack_credential_refreshes_with_broker_handle() {
     };
     assert_eq!(connector.config().access_token, "new-slack-access-token");
     let saved = credentials.get(&secret_ref).expect("saved credential");
+    let saved = serde_json::from_str::<StoredSlackCredential>(&saved).expect("stored credential");
+    assert_eq!(saved.access_token, "new-slack-access-token");
+    assert_eq!(saved.refresh_token_handle.as_deref(), Some("handle-2"));
+}
+
+#[test]
+fn concurrent_expired_slack_resolution_refreshes_rotating_handle_once() {
+    let mut store = InMemoryStateStore::new();
+    let inner_credentials = InMemoryCredentialStore::new();
+    let credentials = ConcurrentReadCredentialStore {
+        inner: inner_credentials.clone(),
+        initial_reads: Arc::new(AtomicUsize::new(0)),
+        initial_read_barrier: Arc::new(Barrier::new(2)),
+    };
+    let (connection_id, secret_ref) = save_slack_oauth_connection(&mut store);
+    let refresh_response = serde_json::json!({
+        "access_token": "new-slack-access-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token_handle": "handle-2",
+        "account_id": "acct-1",
+        "account_label": "user@example.com",
+        "workspace_id": "slack-workspace",
+        "workspace_name": "Slack Workspace",
+        "scopes": SLACK_OAUTH_SCOPES,
+    })
+    .to_string();
+    let (broker_url, request_count, broker) = spawn_counting_refresh_broker(refresh_response);
+    let stored = expired_slack_credential("expired-slack-access-token", broker_url);
+    inner_credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored).expect("credential json"),
+        )
+        .expect("save credential");
+    let mount = MountConfig::new(
+        MountId::new("slack-main"),
+        SLACK_CONNECTOR_ID,
+        "/tmp/locality/slack",
+    )
+    .with_connection_id(connection_id);
+
+    let store = Arc::new(store);
+    let credentials = Arc::new(credentials);
+    let mount = Arc::new(mount);
+    let resolutions = (0..2)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            let credentials = Arc::clone(&credentials);
+            let mount = Arc::clone(&mount);
+            thread::spawn(move || {
+                let source = resolve_source_for_mount(&*store, &*credentials, &mount)
+                    .expect("resolve concurrent Slack source");
+                let ResolvedSource::Slack(connector) = source else {
+                    panic!("expected slack source");
+                };
+                connector.config().access_token.clone()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for resolution in resolutions {
+        assert_eq!(
+            resolution.join().expect("Slack resolver thread"),
+            "new-slack-access-token"
+        );
+    }
+    broker.join().expect("broker thread");
+
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    let saved = inner_credentials
+        .get(&secret_ref)
+        .expect("saved credential");
     let saved = serde_json::from_str::<StoredSlackCredential>(&saved).expect("stored credential");
     assert_eq!(saved.access_token, "new-slack-access-token");
     assert_eq!(saved.refresh_token_handle.as_deref(), Some("handle-2"));

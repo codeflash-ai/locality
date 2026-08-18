@@ -134,8 +134,9 @@ Use the full stored credential JSON. The live harness requires
 The GitHub live job always forces that refresh assertion and persists the
 replacement `LOCALITY_SLACK_LIVE_CREDENTIAL_JSON` environment secret with
 `LOCALITY_SECRET_ROTATOR_TOKEN`. Slack refresh tokens are single-use, so a live
-job must not consume one without saving its replacement for the next serialized
-run.
+daemon coalesces concurrent refresh attempts for the same credential and reuses
+the newly rotated credential for waiting requests. The job must not consume one
+without saving its replacement for the next serialized run.
 
 Set `LOCALITY_SLACK_LIVE_TYPES` when the target conversation is not covered by
 the default `private_channel,im,mpim` type set. Do not set `public_channel` for

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_connector::oauth_broker::OAuthBrokerRefresh;
@@ -22,6 +24,9 @@ use crate::notion::ConnectorResolveError;
 use crate::source::{SourceAdapter, SourcePushValidator, SourceValidationContext};
 
 const SLACK_CONNECT_COMMAND: &str = "loc connect slack";
+
+static SLACK_REFRESH_LOCKS: LazyLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn resolve_slack_connector_for_mount<S>(
     store: &S,
@@ -128,10 +133,41 @@ fn connection_access_token(
     credentials: &dyn CredentialStore,
     connection: &ConnectionRecord,
 ) -> Result<String, ConnectorResolveError> {
+    let mut stored = load_slack_credential(credentials, connection)?;
+    if stored.expires_soon(timestamp_secs()) {
+        let refresh_lock = slack_refresh_lock(&connection.secret_ref);
+        let _refresh_guard = refresh_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Slack refresh handles are single-use. Another daemon request may have
+        // rotated this credential while this request waited for the lock, so
+        // re-read it before deciding whether a refresh is still necessary.
+        stored = load_slack_credential(credentials, connection)?;
+        if stored.expires_soon(timestamp_secs()) {
+            let refreshed = refresh_oauth_credential(connection, &stored)?;
+            stored = stored
+                .refreshed(refreshed, timestamp_secs())
+                .map_err(|error| slack_refresh_scope_error(connection, error))?;
+            let secret = serde_json::to_string(&stored).map_err(|error| {
+                ConnectorResolveError::CredentialStoreUnavailable(error.to_string())
+            })?;
+            credentials
+                .put(&connection.secret_ref, &secret)
+                .map_err(|error| credential_error(connection, error))?;
+        }
+    }
+    Ok(stored.access_token)
+}
+
+fn load_slack_credential(
+    credentials: &dyn CredentialStore,
+    connection: &ConnectionRecord,
+) -> Result<StoredSlackCredential, ConnectorResolveError> {
     let secret = credentials
         .get(&connection.secret_ref)
         .map_err(|error| credential_error(connection, error))?;
-    let mut stored = serde_json::from_str::<StoredSlackCredential>(&secret)
+    let stored = serde_json::from_str::<StoredSlackCredential>(&secret)
         .map_err(|error| invalid_slack_credential(connection, error.to_string()))?;
     if stored.connector != SLACK_CONNECTOR_ID || stored.kind != "oauth" {
         return Err(invalid_slack_credential(
@@ -142,19 +178,21 @@ fn connection_access_token(
             ),
         ));
     }
-    if stored.expires_soon(timestamp_secs()) {
-        let refreshed = refresh_oauth_credential(connection, &stored)?;
-        stored = stored
-            .refreshed(refreshed, timestamp_secs())
-            .map_err(|error| slack_refresh_scope_error(connection, error))?;
-        let secret = serde_json::to_string(&stored).map_err(|error| {
-            ConnectorResolveError::CredentialStoreUnavailable(error.to_string())
-        })?;
-        credentials
-            .put(&connection.secret_ref, &secret)
-            .map_err(|error| credential_error(connection, error))?;
+    Ok(stored)
+}
+
+fn slack_refresh_lock(secret_ref: &str) -> Arc<Mutex<()>> {
+    let mut locks = SLACK_REFRESH_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(secret_ref).and_then(Weak::upgrade) {
+        return lock;
     }
-    Ok(stored.access_token)
+
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(secret_ref.to_string(), Arc::downgrade(&lock));
+    lock
 }
 
 fn invalid_slack_credential(
