@@ -137,7 +137,9 @@ replacement `LOCALITY_SLACK_LIVE_CREDENTIAL_JSON` environment secret with
 credential-store lock coalesces concurrent refresh attempts across the daemon,
 CLI, and FUSE processes and reuses the newly rotated credential for waiting
 requests. The job must not consume one without saving its replacement for the
-next serialized run.
+next serialized run. The live harness performs its forced refresh before it
+starts daemon and FUSE consumers, then validates and exports the replacement
+credential before continuing with the mounted-filesystem scenario.
 
 Set `LOCALITY_SLACK_LIVE_TYPES` when the target conversation is not covered by
 the default `private_channel,im,mpim` type set. Do not set `public_channel` for
