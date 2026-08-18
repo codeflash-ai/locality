@@ -144,7 +144,7 @@ pub const NOTION_HOSTED_ADMIN_SCOPES: &[&str] = &[];
 pub const GOOGLE_DOCS_REQUIRED_API_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/drive.metadata.readonly",
+    "https://www.googleapis.com/auth/drive.metadata",
 ];
 pub const GOOGLE_DOCS_LOCAL_BROKER_SCOPES: &[&str] = &[
     "openid",
@@ -152,7 +152,7 @@ pub const GOOGLE_DOCS_LOCAL_BROKER_SCOPES: &[&str] = &[
     "profile",
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/drive.metadata.readonly",
+    "https://www.googleapis.com/auth/drive.metadata",
 ];
 pub const GOOGLE_DOCS_HOSTED_ADMIN_SCOPES: &[&str] = GOOGLE_DOCS_LOCAL_BROKER_SCOPES;
 
@@ -790,7 +790,7 @@ mod tests {
         assert!(url.contains(
             "redirect_uri=https%3A%2F%2Fapi.locality.test%2Fv1%2Foauth%2Fgoogle-docs%2Fcallback"
         ));
-        assert!(url.contains("scope=openid%20email%20profile%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdocuments%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.metadata.readonly"));
+        assert!(url.contains("scope=openid%20email%20profile%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdocuments%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.metadata"));
         assert!(url.contains("state=intent.random"));
         assert!(url.contains("access_type=offline"));
         assert!(url.contains("prompt=consent"));
@@ -896,7 +896,7 @@ mod tests {
             "profile",
             "https://www.googleapis.com/auth/documents",
             "https://www.googleapis.com/auth/drive.file",
-            "https://www.googleapis.com/auth/drive.metadata.readonly",
+            "https://www.googleapis.com/auth/drive.metadata",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -938,7 +938,7 @@ mod tests {
             "https://www.googleapis.com/auth/userinfo.profile",
             "https://www.googleapis.com/auth/documents",
             "https://www.googleapis.com/auth/drive.file",
-            "https://www.googleapis.com/auth/drive.metadata.readonly",
+            "https://www.googleapis.com/auth/drive.metadata",
         ]
         .into_iter()
         .map(str::to_owned)
