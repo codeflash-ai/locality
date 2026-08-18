@@ -4194,7 +4194,7 @@ fn remove_pending_virtual_move_cleanup_state(
 
 fn virtual_move_source_trusted_root(
     content_root: &Path,
-    mount_id: &MountId,
+    _mount_id: &MountId,
     source: &Path,
 ) -> LocalityResult<PathBuf> {
     if source.starts_with(content_root) {
@@ -4202,14 +4202,14 @@ fn virtual_move_source_trusted_root(
     }
     #[cfg(target_os = "macos")]
     {
-        let inferred = state_root_for_current_content_root(content_root, mount_id);
+        let inferred = state_root_for_current_content_root(content_root, _mount_id);
         let configured = locality_platform::default_state_root();
         for state_root in inferred.iter().chain(std::iter::once(&configured)) {
-            if virtual_fs_content_root(state_root, mount_id) != content_root {
+            if virtual_fs_content_root(state_root, _mount_id) != content_root {
                 continue;
             }
             if let Some(legacy_root) = macos_app_group_container_for_state_root(state_root)
-                .map(|container| container.join("content").join(&mount_id.0).join("files"))
+                .map(|container| container.join("content").join(&_mount_id.0).join("files"))
                 && source.starts_with(&legacy_root)
             {
                 return Ok(legacy_root);
@@ -6020,14 +6020,18 @@ mod tests {
         AGENTS_GUIDANCE_IDENTIFIER, CLAUDE_GUIDANCE_IDENTIFIER, ROOT_CONTAINER_IDENTIFIER,
         VirtualFsItemKind, VirtualFsMaterializeOutcome, commit_virtual_fs_write,
         create_virtual_fs_directory, create_virtual_fs_file,
-        materialize_virtual_fs_guidance_with_content_root,
         materialize_virtual_fs_item_with_content_root, mount_point_identifier,
         persist_and_publish_virtual_move, refresh_virtual_fs_children,
         refresh_virtual_fs_children_with_content_root, rename_virtual_fs_item,
-        repair_legacy_macos_content_root, trash_virtual_fs_item, validate_virtual_projection_root,
+        trash_virtual_fs_item, validate_virtual_projection_root,
         virtual_fs_ancestor_container_identifiers, virtual_fs_children,
-        virtual_fs_children_with_content_root, virtual_fs_content_path, virtual_fs_content_root,
-        virtual_fs_item, virtual_fs_item_with_content_root, virtual_projection_root,
+        virtual_fs_children_with_content_root, virtual_fs_content_path, virtual_fs_item,
+        virtual_fs_item_with_content_root, virtual_projection_root,
+    };
+    #[cfg(target_os = "macos")]
+    use super::{
+        materialize_virtual_fs_guidance_with_content_root, repair_legacy_macos_content_root,
+        virtual_fs_content_root,
     };
 
     #[test]

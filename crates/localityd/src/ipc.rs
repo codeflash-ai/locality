@@ -605,7 +605,9 @@ where
 mod tests {
     #[cfg(unix)]
     use super::DaemonClientError;
-    use super::{DaemonEndpoint, DaemonRequest, DaemonResponse, DaemonTransport};
+    #[cfg(unix)]
+    use super::DaemonResponse;
+    use super::{DaemonEndpoint, DaemonRequest, DaemonTransport};
     use locality_store::ProjectionMode;
     #[cfg(unix)]
     use std::io::{BufRead, BufReader};

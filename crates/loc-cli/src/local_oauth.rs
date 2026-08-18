@@ -372,9 +372,11 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     use super::browser_command;
+    #[cfg(unix)]
+    use super::{BrowserCommandSpec, launch_browser_command};
     use super::{
-        BrowserCommandSpec, LocalOAuthAuthorization, launch_browser_command, local_redirect,
-        parse_oauth_callback, retryable_callback_error, wait_for_oauth_callback,
+        LocalOAuthAuthorization, local_redirect, parse_oauth_callback, retryable_callback_error,
+        wait_for_oauth_callback,
     };
 
     #[cfg(target_os = "windows")]

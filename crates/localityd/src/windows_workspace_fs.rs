@@ -493,19 +493,6 @@ impl WindowsDirectory {
         Ok(File::from(handle))
     }
 
-    fn open_file_cleanup_handle(&self, name: &OsStr) -> io::Result<OwnedHandle> {
-        let handle = nt_open_relative(
-            &self.handle,
-            name,
-            CLEANUP_FILE_ACCESS,
-            FILE_OPEN,
-            FILE_NON_DIRECTORY_FILE,
-            SHARING,
-        )?;
-        reject_reparse(&handle)?;
-        Ok(handle)
-    }
-
     fn open_any_cleanup_handle_allow_reparse(&self, name: &OsStr) -> io::Result<OwnedHandle> {
         nt_open_relative(
             &self.handle,

@@ -925,8 +925,11 @@ fn default_state_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use localityd::ipc::{DaemonBuildInfo, DaemonRuntimeStatus, DaemonWatchStatus};
+    #[cfg(unix)]
     use std::io::{BufRead, BufReader};
+    #[cfg(unix)]
     use std::net::TcpListener;
 
     #[test]

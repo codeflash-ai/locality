@@ -903,7 +903,7 @@ fn invalid_batches_are_rejected_before_any_state_change() {
     let absolute_path = page_entry("issue-5", "/outside/page.md", "remote-v1");
     let dotted_path = page_entry("issue-6", "one/./page.md", "remote-v1");
     let backslash_path = page_entry("issue-7", r"one\page.md", "remote-v1");
-    let mut cases = vec![
+    let cases = vec![
         BatchObserveResult::incremental(
             vec![BatchObservationChange::Upsert(wrong_mount)],
             checkpoint(1, "{}"),
@@ -955,14 +955,16 @@ fn invalid_batches_are_rejected_before_any_state_change() {
         BatchObserveResult::incremental(vec![], checkpoint(1, "not-json")),
     ];
     #[cfg(unix)]
-    {
+    let cases = {
+        let mut cases = cases;
         let mut non_utf8 = page_entry("issue-8", "placeholder/page.md", "remote-v1");
         non_utf8.path = PathBuf::from(std::ffi::OsString::from_vec(vec![b'a', 0xff, b'b']));
         cases.push(BatchObserveResult::incremental(
             vec![BatchObservationChange::Upsert(non_utf8)],
             checkpoint(1, "{}"),
         ));
-    }
+        cases
+    };
 
     for batch in cases {
         assert!(plan_batch_discovery(&store, &mount, batch, NOW, None, &BTreeMap::new()).is_err());

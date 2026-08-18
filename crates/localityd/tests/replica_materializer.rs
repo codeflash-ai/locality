@@ -22,11 +22,12 @@ use locality_protocol::{
     TarContentEncoding, canonical_export_inventory_sha256, canonical_writable_metadata_sha256,
 };
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
+#[cfg(unix)]
+use localityd::replica_materializer::materialize_replica_archive_with_expected_receipt_and_prepublication_check;
 use localityd::replica_materializer::{
     ExpectedReplicaMaterializationReceipt, ReplicaMaterializationLimits,
     ReplicaMaterializationSummary, materialize_replica_archive,
     materialize_replica_archive_with_expected_receipt,
-    materialize_replica_archive_with_expected_receipt_and_prepublication_check,
     materialize_scope_authorized_replica_archive,
 };
 use sha2::{Digest, Sha256};

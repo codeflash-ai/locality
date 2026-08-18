@@ -46,6 +46,12 @@ use localityd::replica_materializer::ReplicaMaterializationLimits;
 use localityd::workspace_materializer::{
     WorkspaceMaterializationLimits, WorkspaceOwnershipCapability, WorkspacePublicationCheckpoint,
     WorkspacePublicationHooks, materialize_workspace_archive_durable_with_hooks,
+};
+#[cfg(all(
+    unix,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
+use localityd::workspace_materializer::{
     publish_staged_workspace_with_hooks, stage_workspace_archive,
 };
 use serde::Deserialize;
@@ -3128,6 +3134,7 @@ fn freshness_attempt_for_request(request: &CapturedRequest, outcome: &str) -> Ve
     serde_json::to_vec(&attempt).expect("serialize freshness wait response")
 }
 
+#[cfg(unix)]
 fn workspace_v2_server(
     session: &WorkspaceProfileSessionV2,
     offer: &WorkspaceExportOfferV2,
@@ -3143,8 +3150,10 @@ fn workspace_v2_server(
     ])
 }
 
+#[cfg(unix)]
 struct FailWorkspacePublicationAt(WorkspacePublicationCheckpoint);
 
+#[cfg(unix)]
 impl WorkspacePublicationHooks for FailWorkspacePublicationAt {
     fn checkpoint(&mut self, checkpoint: WorkspacePublicationCheckpoint) -> std::io::Result<()> {
         if checkpoint == self.0 {

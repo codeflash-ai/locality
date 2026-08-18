@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 #[cfg(unix)]
@@ -28,6 +28,7 @@ use rustix::fs::ResolveFlags;
 #[cfg(unix)]
 use rustix::fs::{AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, Stat};
 
+#[cfg(unix)]
 use caseless::default_case_fold_str;
 use locality_core::portable::LogicalPath;
 use locality_protocol::{
@@ -1258,7 +1259,7 @@ impl ExtractionState {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn write_file_at_path<R: Read + ?Sized>(
     path: &Path,
     reader: &mut R,
@@ -1398,7 +1399,7 @@ fn collect_directories(root: &Path, directories: &mut Vec<PathBuf>) -> io::Resul
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn sync_path_tree(root: &Path) -> io::Result<()> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -1421,7 +1422,7 @@ fn sync_path_tree(root: &Path) -> io::Result<()> {
     sync_directory_if_supported(root)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn sync_directory_if_supported(path: &Path) -> io::Result<()> {
     match fs::File::open(path).and_then(|directory| directory.sync_all()) {
         Ok(()) => Ok(()),
@@ -1437,21 +1438,21 @@ fn sync_directory_if_supported(path: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn set_file_read_only(path: &Path) -> io::Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_readonly(true);
     fs::set_permissions(path, permissions)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn set_directory_read_only(path: &Path) -> io::Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_readonly(true);
     fs::set_permissions(path, permissions)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn make_tree_removable(root: &Path) {
     let Ok(metadata) = fs::symlink_metadata(root) else {
         return;
@@ -1468,14 +1469,14 @@ fn make_tree_removable(root: &Path) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn make_directory_writable(path: &Path) -> io::Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_readonly(false);
     fs::set_permissions(path, permissions)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn make_file_writable(path: &Path) -> io::Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_readonly(false);
@@ -1935,7 +1936,7 @@ fn workspace_root_is_mount_point(path: &Path) -> Result<bool, ReplicaMaterializa
     Ok(canonical.as_os_str().as_bytes() == mount_name_bytes)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn decode_mountinfo_path(input: &[u8]) -> Result<Vec<u8>, ReplicaMaterializationError> {
     let mut output = Vec::with_capacity(input.len());
     let mut cursor = 0;
@@ -1960,7 +1961,7 @@ fn decode_mountinfo_path(input: &[u8]) -> Result<Vec<u8>, ReplicaMaterialization
     Ok(output)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn mountinfo_has_workspace_mount(root: &Path, mountinfo: &[u8]) -> io::Result<bool> {
     for line in mountinfo.split(|byte| *byte == b'\n') {
         let Some(separator) = line.windows(3).position(|window| window == b" - ") else {

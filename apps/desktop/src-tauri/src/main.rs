@@ -410,7 +410,9 @@ struct FileProviderEnablementReport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MacosWorkspaceMountOnboardingState {
     Created,
+    #[cfg(any(target_os = "macos", test))]
     ApprovalRequired,
+    #[cfg(any(target_os = "macos", test))]
     WaitingForCloudStorageRoot,
     Failed,
 }
@@ -419,7 +421,9 @@ impl MacosWorkspaceMountOnboardingState {
     fn as_str(self) -> &'static str {
         match self {
             Self::Created => "created",
+            #[cfg(any(target_os = "macos", test))]
             Self::ApprovalRequired => "needs_finder_enable",
+            #[cfg(any(target_os = "macos", test))]
             Self::WaitingForCloudStorageRoot => "waiting_for_cloudstorage_root",
             Self::Failed => "failed",
         }
@@ -428,7 +432,9 @@ impl MacosWorkspaceMountOnboardingState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspaceMountOnboardingPrimaryAction {
+    #[cfg(target_os = "macos")]
     AllowInMacos,
+    #[cfg(any(target_os = "macos", test))]
     CheckAgain,
     RetrySetup,
 }
@@ -436,7 +442,9 @@ enum WorkspaceMountOnboardingPrimaryAction {
 impl WorkspaceMountOnboardingPrimaryAction {
     fn as_str(self) -> &'static str {
         match self {
+            #[cfg(target_os = "macos")]
             Self::AllowInMacos => "allow_in_macos",
+            #[cfg(any(target_os = "macos", test))]
             Self::CheckAgain => "check_again",
             Self::RetrySetup => "retry_setup",
         }
@@ -445,7 +453,9 @@ impl WorkspaceMountOnboardingPrimaryAction {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspaceMountOnboardingLaunchStrategy {
+    #[cfg(target_os = "macos")]
     OpenFinder,
+    #[cfg(any(target_os = "macos", test))]
     InstructionsOnly,
     None,
 }
@@ -453,7 +463,9 @@ enum WorkspaceMountOnboardingLaunchStrategy {
 impl WorkspaceMountOnboardingLaunchStrategy {
     fn as_str(self) -> &'static str {
         match self {
+            #[cfg(target_os = "macos")]
             Self::OpenFinder => "open_finder",
+            #[cfg(any(target_os = "macos", test))]
             Self::InstructionsOnly => "instructions_only",
             Self::None => "none",
         }
@@ -7423,6 +7435,7 @@ fn schedule_relaunch_after_process_exit(pid: u32, executable: &Path) -> Result<(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn macos_app_bundle_for_exe(executable: &Path) -> Option<PathBuf> {
     let macos_dir = executable.parent()?;
     if macos_dir.file_name()? != "MacOS" {
@@ -9603,6 +9616,7 @@ fn wait_for_macos_file_provider_mount_root_recovery(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn macos_file_provider_mount_root_inspection_recovery_reason(
     root: &Path,
     inspection: Result<&str, &str>,
@@ -9658,6 +9672,7 @@ fn evaluate_macos_file_provider_mount_root(root: &Path) -> Result<String, String
     Ok(details)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn macos_file_provider_mount_root_health_error(root: &Path, details: &str) -> Option<String> {
     if details.contains("uploadingError") || details.contains("NSCocoaErrorDomain Code=3328") {
         return Some(format!(
@@ -9668,6 +9683,7 @@ fn macos_file_provider_mount_root_health_error(root: &Path, details: &str) -> Op
     None
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn macos_file_provider_mount_root_recovery_reason(
     root: &Path,
     details: &str,
@@ -9693,6 +9709,7 @@ fn macos_file_provider_mount_root_recovery_reason(
     None
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn macos_file_provider_child_item_count(details: &str) -> Option<usize> {
     let (_, after_label) = details.split_once("childItemCount")?;
     let (_, after_equals) = after_label.split_once('=')?;
@@ -10464,6 +10481,7 @@ impl VirtualProjectionRefreshAction {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn signal_virtual_projection_refresh(mount: &MountConfig) {
     for action in virtual_projection_refresh_actions(mount) {
         run_virtual_projection_refresh_action(mount, &action);
@@ -11228,6 +11246,7 @@ fn workspace_mount_onboarding_report(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn workspace_mount_onboarding_curated_message(
     state: MacosWorkspaceMountOnboardingState,
 ) -> Option<&'static str> {
@@ -11265,7 +11284,7 @@ fn macos_workspace_mount_onboarding_state(
     None
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), test))]
 fn macos_workspace_mount_onboarding_state(
     _message: &str,
     _user_enabled: bool,
@@ -11325,6 +11344,7 @@ fn macos_workspace_mount_domain_user_enabled() -> Result<bool, String> {
         .unwrap_or(false))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn classify_macos_file_provider_enablement(
     user_enabled: Option<bool>,
     fallback_path: Option<PathBuf>,
@@ -11362,6 +11382,7 @@ fn classify_macos_file_provider_enablement(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn macos_file_provider_domain_status(
     report: &serde_json::Value,
 ) -> (Option<bool>, Option<PathBuf>) {
@@ -11428,6 +11449,7 @@ fn macos_file_provider_enablement_status_blocking() -> FileProviderEnablementRep
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn macos_file_provider_reveal_path(
     domain_path: Option<&Path>,
     candidates: &[PathBuf],
@@ -11461,17 +11483,12 @@ fn reveal_file_provider_enablement_blocking() -> Result<String, String> {
     Err("File Provider enablement is only available on macOS.".to_string())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn macos_workspace_mount_domain_user_enabled() -> Result<bool, String> {
-    Ok(false)
-}
-
 #[cfg(target_os = "macos")]
 fn macos_file_provider_approval_surface_path(candidates: &[PathBuf]) -> Option<PathBuf> {
     candidates.iter().find(|path| path.exists()).cloned()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), test))]
 fn macos_file_provider_approval_surface_path(_candidates: &[PathBuf]) -> Option<PathBuf> {
     None
 }
@@ -11486,11 +11503,6 @@ fn launch_macos_file_provider_approval_surface() -> WorkspaceMountOnboardingLaun
         }
     }
     WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly
-}
-
-#[cfg(not(target_os = "macos"))]
-fn launch_macos_file_provider_approval_surface() -> WorkspaceMountOnboardingLaunchStrategy {
-    WorkspaceMountOnboardingLaunchStrategy::None
 }
 
 fn connection_metadata_key(
@@ -22204,10 +22216,10 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Locality desktop app")
-        .run(|app, event| {
+        .run(|_app, _event| {
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = event {
-                show_main_window_with_view(app, None);
+            if let tauri::RunEvent::Reopen { .. } = _event {
+                show_main_window_with_view(_app, None);
             }
         });
 }

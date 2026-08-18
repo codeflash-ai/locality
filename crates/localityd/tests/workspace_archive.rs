@@ -1306,12 +1306,20 @@ impl WorkspacePublicationHooks for PauseAtJournal {
     }
 }
 
+#[cfg(all(
+    unix,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
 struct SubstituteAt {
     checkpoint: WorkspacePublicationCheckpoint,
     path: PathBuf,
     retained: PathBuf,
 }
 
+#[cfg(all(
+    unix,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
 impl WorkspacePublicationHooks for SubstituteAt {
     fn checkpoint(&mut self, checkpoint: WorkspacePublicationCheckpoint) -> io::Result<()> {
         if checkpoint == self.checkpoint {
