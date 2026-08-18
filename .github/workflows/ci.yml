@@ -144,6 +144,16 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Test macOS File Provider package
         run: swift test --package-path platform/macos/LocalityFileProvider
+      - name: Validate live macOS File Provider harness
+        run: |
+          bash -n tests/live_macos_file_provider.sh
+          output="$(tests/live_macos_file_provider.sh)"
+          test "$output" = "skip: set LOCALITY_MACOS_FILE_PROVIDER_LIVE=1 to run the live macOS File Provider test"
+          if LOCALITY_MACOS_FILE_PROVIDER_LIVE=1 tests/live_macos_file_provider.sh 2>preflight-error.log; then
+            echo "::error::Live File Provider harness bypassed its dedicated-host guard"
+            exit 1
+          fi
+          grep -Fq "refusing to run outside a dedicated macOS test user" preflight-error.log
       - name: Install desktop dependencies
         run: npm ci
         working-directory: apps/desktop

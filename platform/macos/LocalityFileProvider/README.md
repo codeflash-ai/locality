@@ -86,6 +86,37 @@ before inspecting it and retries the scoped refresh once. Automatic activation
 never resets or re-registers the shared domain. Reconnecting an existing source
 retries this activation path instead of only reloading daemon mounts.
 
-Delete support still returns unsupported. Creates and renames are represented as
-daemon virtual mutations and stay pending until the normal review and push flow
-applies them to the remote source.
+Creates, renames, and supported page/draft deletes are represented as daemon
+virtual mutations and stay pending until the normal review and push flow applies
+them to the remote source. Mount points and remote-only items remain protected
+from unsupported deletion.
+
+## Live Kernel E2E
+
+`tests/live_macos_file_provider.sh` exercises the installed extension through
+the real user-visible CloudStorage directory. It creates an isolated Locality
+state directory and a scratch Notion page, then verifies File Provider
+enumeration, hydration, an atomic `page.md.tmp.*` replacement, push, child-page
+create, rename, and delete. Cleanup archives scratch Notion content and refreshes
+the shared domain against an empty temporary state so the test mount disappears.
+
+The test deliberately does not register, unregister, or reset the shared `loc`
+domain. Run it only in a dedicated macOS user session with a signed test app
+whose stable bundle identity has already been enabled in Finder or System
+Settings:
+
+```sh
+export LOCALITY_MACOS_FILE_PROVIDER_LIVE=1
+export LOCALITY_MACOS_FILE_PROVIDER_DEDICATED_HOST=1
+export LOCALITY_MACOS_FILE_PROVIDER_APP='/Applications/Locality File Provider Test.app'
+export LOCALITY_MACOS_FILE_PROVIDER_EXPECTED_BUNDLE_ID='ai.codeflash.locality.fileprovidertest'
+export NOTION_TOKEN=...
+export LOCALITY_NOTION_LIVE_PARENT_PAGE=...
+make test-live-macos-file-provider
+```
+
+The manual `macos-file-provider-live-e2e` workflow builds the current checkout,
+reinstalls the stable test identity without resetting its approved domain, and
+runs this test on a runner labeled `self-hosted`, `macOS`, and
+`locality-file-provider`. A first-time runner must approve that stable extension
+identity before the workflow can pass.

@@ -1,0 +1,62 @@
+name: macos-file-provider-live-e2e
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-file-provider-live-e2e
+  cancel-in-progress: false
+
+jobs:
+  file-provider-live:
+    name: Signed macOS File Provider live Notion e2e
+    runs-on: [self-hosted, macOS, locality-file-provider]
+    timeout-minutes: 45
+    environment: notion-live-e2e
+    env:
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      LOCALITY_NOTION_LIVE_PARENT_PAGE: ${{ secrets.LOCALITY_NOTION_LIVE_PARENT_PAGE || secrets.AFS_NOTION_LIVE_PARENT_PAGE }}
+      LOCALITY_MACOS_FILE_PROVIDER_APP: ${{ vars.LOCALITY_MACOS_FILE_PROVIDER_APP || '/Applications/Locality File Provider Test.app' }}
+      LOCALITY_MACOS_FILE_PROVIDER_EXPECTED_BUNDLE_ID: ${{ vars.LOCALITY_MACOS_FILE_PROVIDER_BUNDLE_ID || 'ai.codeflash.locality.fileprovidertest' }}
+      LOCALITY_PROMPT_TEST_SIGNING_IDENTITY: ${{ vars.LOCALITY_MACOS_FILE_PROVIDER_SIGNING_IDENTITY }}
+      APPLE_SIGNING_IDENTITY: ${{ vars.LOCALITY_MACOS_FILE_PROVIDER_SIGNING_IDENTITY }}
+      LOCALITY_MACOS_FILE_PROVIDER_LIVE: "1"
+      LOCALITY_MACOS_FILE_PROVIDER_DEDICATED_HOST: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Check dedicated runner configuration
+        run: |
+          missing=()
+          [ -n "$NOTION_TOKEN" ] || missing+=("NOTION_TOKEN")
+          [ -n "$LOCALITY_NOTION_LIVE_PARENT_PAGE" ] || missing+=("LOCALITY_NOTION_LIVE_PARENT_PAGE or AFS_NOTION_LIVE_PARENT_PAGE")
+          [ -n "$LOCALITY_MACOS_FILE_PROVIDER_APP" ] || missing+=("LOCALITY_MACOS_FILE_PROVIDER_APP")
+          [ -n "$LOCALITY_MACOS_FILE_PROVIDER_EXPECTED_BUNDLE_ID" ] || missing+=("LOCALITY_MACOS_FILE_PROVIDER_BUNDLE_ID")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing macOS File Provider live configuration: ${missing[*]}"
+            exit 1
+          fi
+          bash -n tests/live_macos_file_provider.sh
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: apps/desktop
+      - name: Build current signed-app candidate
+        run: make build-tauri
+      - name: Install without resetting the approved domain
+        run: |
+          scripts/install-macos-prompt-test-app.sh \
+            --app-path "$LOCALITY_MACOS_FILE_PROVIDER_APP" \
+            --bundle-id "$LOCALITY_MACOS_FILE_PROVIDER_EXPECTED_BUNDLE_ID" \
+            --display-name "Locality File Provider Test" \
+            --no-reset-domain \
+            --no-launch
+      - name: Run real File Provider round trip
+        run: tests/live_macos_file_provider.sh
