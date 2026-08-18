@@ -4203,6 +4203,7 @@ fn invalidate_desktop_snapshot_cache() {
     }
 }
 
+#[cfg(test)]
 fn load_desktop_snapshot_from_store(
     store: &SqliteStateStore,
     state_root: &Path,
@@ -8107,6 +8108,7 @@ fn reconcile_daemon_remount_fence_with(
     })
 }
 
+#[cfg(test)]
 fn restore_supervision_before_clearing_remount_fence(
     ownership: &mut WorkspaceRemountOwnership,
     restore: impl FnOnce() -> Result<(), String>,
@@ -14116,6 +14118,7 @@ mod tests {
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    #[cfg(not(target_os = "macos"))]
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21269,11 +21272,13 @@ mod tests {
             .count()
     }
 
+    #[cfg(not(target_os = "macos"))]
     struct LocalityStateDirGuard {
         previous: Option<std::ffi::OsString>,
         state_root: PathBuf,
     }
 
+    #[cfg(not(target_os = "macos"))]
     impl LocalityStateDirGuard {
         fn set(state_root: &Path) -> Self {
             let previous = std::env::var_os("LOCALITY_STATE_DIR");
@@ -21287,6 +21292,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     impl Drop for LocalityStateDirGuard {
         fn drop(&mut self) {
             match self.previous.as_ref() {
@@ -21304,6 +21310,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn state_root_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
