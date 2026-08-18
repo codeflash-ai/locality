@@ -339,7 +339,7 @@ fn connect_google_docs_broker_oauth_accepts_google_identity_scope_aliases() {
         "https://www.googleapis.com/auth/userinfo.profile".to_string(),
         "https://www.googleapis.com/auth/documents".to_string(),
         "https://www.googleapis.com/auth/drive.file".to_string(),
-        "https://www.googleapis.com/auth/drive.metadata.readonly".to_string(),
+        "https://www.googleapis.com/auth/drive.metadata".to_string(),
     ];
     let exchange = ScopedFakeGoogleDocsBrokerOAuthExchange {
         scopes: scopes.clone(),

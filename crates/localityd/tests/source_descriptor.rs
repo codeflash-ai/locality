@@ -1976,7 +1976,7 @@ fn resolving_expired_google_docs_credential_refreshes_with_broker_handle() {
             "profile",
             "https://www.googleapis.com/auth/documents",
             "https://www.googleapis.com/auth/drive.file",
-            "https://www.googleapis.com/auth/drive.metadata.readonly"
+            "https://www.googleapis.com/auth/drive.metadata"
         ],
     })
     .to_string();

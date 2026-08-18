@@ -347,11 +347,48 @@ fn docs_revision_matches(expected: &str, current: &str) -> bool {
     }
 }
 
+fn remote_versions_match_except_drive_counter(expected: &str, current: &str) -> bool {
+    drive_modified_time_from_remote_version(expected)
+        .zip(drive_modified_time_from_remote_version(current))
+        .is_some_and(|(expected_modified, current_modified)| {
+            expected_modified == current_modified
+                && docs_revision_semantically_matches(expected, current)
+        })
+}
+
+fn docs_revision_semantically_matches(expected: &str, current: &str) -> bool {
+    match (
+        docs_revision_from_remote_version(expected),
+        docs_revision_from_remote_version(current),
+    ) {
+        (Some(expected), Some(current)) => expected == current,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 fn docs_revision_from_remote_version(version: &str) -> Option<&str> {
     version
         .rsplit_once("|docs:")
         .map(|(_, revision)| revision)
         .or_else(|| version.strip_prefix("docs:"))
+}
+
+fn drive_modified_time_from_remote_version(version: &str) -> Option<&str> {
+    let drive = version
+        .split_once("|docs:")
+        .map(|(drive, _)| drive)
+        .unwrap_or(version)
+        .strip_prefix("drive:")?;
+    if let Some((counter, modified_time)) = drive.split_once(':')
+        && counter.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Some(modified_time);
+    }
+    if drive.contains('T') {
+        return Some(drive);
+    }
+    None
 }
 
 fn plan_changes_only_document_body(plan: &PushPlan, remote_id: &RemoteId) -> bool {
@@ -463,6 +500,9 @@ fn check_remote_preconditions(
         };
         let current = remote_version_from_apis(drive, docs, &precondition.remote_id)?;
         if expected == current.as_str() {
+            continue;
+        }
+        if remote_versions_match_except_drive_counter(expected, current.as_str()) {
             continue;
         }
         if docs_revision_matches(expected, current.as_str())
@@ -3119,7 +3159,7 @@ mod tests {
     };
     use locality_core::journal::{PushId, PushOperationId};
     use locality_core::model::{EntityKind, MountId, RemoteId};
-    use locality_core::planner::{PushOperation, PushPlan};
+    use locality_core::planner::{PropertyValue, PushOperation, PushPlan};
     use locality_core::push::RemotePrecondition;
     use locality_core::search::RAW_SEARCH_METADATA_KEY;
 
@@ -3376,6 +3416,48 @@ mod tests {
                 local_root: None,
             })
             .expect("drive-only version drift should not block body push");
+    }
+
+    #[test]
+    fn concurrency_allows_drive_version_only_drift_for_title_metadata_update() {
+        let mut file = doc_file("doc-1", "Launch Brief", "workspace");
+        file.version = Some("8".to_string());
+        let drive = Arc::new(FakeDrive::default().with_file(file));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Launch Brief",
+            "rev-1",
+            "Hello\n",
+        )));
+        let connector = GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs);
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateProperties {
+                entity_id: RemoteId::new("doc-1"),
+                properties: BTreeMap::from([(
+                    "title".to_string(),
+                    PropertyValue::String("Launch Brief Renamed".to_string()),
+                )]),
+            }],
+        );
+        let op_ids = vec![PushOperationId(
+            "push-1:0:update_properties:doc-1".to_string(),
+        )];
+        let preconditions = vec![RemotePrecondition {
+            remote_id: RemoteId::new("doc-1"),
+            remote_edited_at: Some("drive:7:2026-06-25T10:00:00.000Z|docs:rev-1".to_string()),
+        }];
+
+        connector
+            .check_concurrency(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &preconditions,
+                local_root: None,
+            })
+            .expect("Drive version-only drift should not block metadata update");
     }
 
     #[test]

@@ -249,13 +249,12 @@ fn source_descriptors_match_manifest_defaults_and_projection_policy() {
 #[test]
 fn google_docs_oauth_verification_scope_manifest_matches_runtime_profile() {
     assert!(
-        GOOGLE_DOCS_OAUTH_SCOPES
-            .contains(&"https://www.googleapis.com/auth/drive.metadata.readonly"),
-        "Google Docs should request readonly Drive metadata for discovery"
+        GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive.metadata"),
+        "Google Docs should request writable Drive metadata for mounted-file rename, move, and trash"
     );
     assert!(
-        !GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive.metadata"),
-        "Google Docs must not request writable Drive metadata beyond drive.file app-file writes"
+        !GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive"),
+        "Google Docs must not request full Drive access"
     );
 
     let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -305,7 +304,7 @@ fn google_docs_oauth_verification_scope_manifest_matches_runtime_profile() {
     for scope in [
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/drive.readonly",
-        "https://www.googleapis.com/auth/drive.metadata",
+        "https://www.googleapis.com/auth/drive.metadata.readonly",
         "https://www.googleapis.com/auth/documents.readonly",
     ] {
         assert!(

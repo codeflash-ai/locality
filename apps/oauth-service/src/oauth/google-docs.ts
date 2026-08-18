@@ -8,7 +8,7 @@ export const GOOGLE_DOCS_OAUTH_SCOPES = [
   "profile",
   "https://www.googleapis.com/auth/documents",
   "https://www.googleapis.com/auth/drive.file",
-  "https://www.googleapis.com/auth/drive.metadata.readonly"
+  "https://www.googleapis.com/auth/drive.metadata"
 ];
 
 export interface GoogleDocsTokenResponse {
