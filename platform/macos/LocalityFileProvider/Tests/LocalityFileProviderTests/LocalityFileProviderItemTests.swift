@@ -228,6 +228,21 @@ final class LocalityFileProviderItemTests: XCTestCase {
     XCTAssertTrue(item.capabilities.contains(.allowsAddingSubItems))
   }
 
+  func testSharedDomainIdentifierEncodingRoundTrips() {
+    let raw = LocalitySharedDomain.itemIdentifier(
+      mountId: "notion-main",
+      daemonIdentifier: "children:page-1"
+    )
+
+    XCTAssertEqual(
+      raw,
+      "m:bm90aW9uLW1haW4:Y2hpbGRyZW46cGFnZS0x"
+    )
+    let resolved = LocalitySharedDomain.resolve(NSFileProviderItemIdentifier(raw))
+    XCTAssertEqual(resolved?.mountId, "notion-main")
+    XCTAssertEqual(resolved?.daemonIdentifier, "children:page-1")
+  }
+
   func testPendingPageFolderAllowsAddingSubitems() {
     let item = LocalityFileProviderItem(
       metadata: metadata(

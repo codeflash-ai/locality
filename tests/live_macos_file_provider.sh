@@ -65,8 +65,10 @@ pull_report="$tmp_root/pull.json"
 status_report="$tmp_root/status.json"
 push_report="$tmp_root/push.json"
 child_push_report="$tmp_root/child-push.json"
+child_reconcile_pull_report="$tmp_root/child-reconcile-pull.json"
 rename_push_report="$tmp_root/rename-push.json"
 delete_push_report="$tmp_root/delete-push.json"
+resolved_item_report="$tmp_root/resolved-item.json"
 notion_response="$tmp_root/notion-response.json"
 tcp_addr="127.0.0.1:38567"
 connection_id="macos-file-provider-live"
@@ -84,6 +86,7 @@ page_dir=""
 page_file=""
 daemon_started=0
 mount_registered=0
+connection_created=0
 step="preflight"
 
 normalize_notion_page_id() {
@@ -100,6 +103,20 @@ if not matches:
     raise SystemExit(f"invalid Notion page id or URL: {value}")
 raw = matches[-1].replace("-", "").lower()
 print(f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}")
+PY
+}
+
+shared_file_provider_identifier() {
+  python3 - "$1" "$2" <<'PY'
+import base64
+import sys
+
+mount_id, daemon_identifier = sys.argv[1:]
+
+def encode(value):
+    return base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
+
+print(f"m:{encode(mount_id)}:{encode(daemon_identifier)}")
 PY
 }
 
@@ -181,6 +198,47 @@ wait_for_status() {
   done
   printf 'timed out waiting for status of %s to contain %s\n' "$path" "$needle" >&2
   [[ ! -s "$status_report" ]] || cat "$status_report" >&2
+  return 1
+}
+
+wait_for_remote_backed_item() {
+  local remote_id="$1"
+  local expected_path="$2"
+  local identifier
+  identifier="$(shared_file_provider_identifier "$mount_id" "children:$remote_id")"
+  local attempts="${LOCALITY_MACOS_FILE_PROVIDER_WAIT_ATTEMPTS:-120}"
+  local index resolved_path
+  for ((index = 1; index <= attempts; index++)); do
+    if run_with_timeout 20 "$helper_bin" resolve \
+      --mount-id loc \
+      --identifier "$identifier" \
+      --json >"$resolved_item_report" 2>/dev/null; then
+      resolved_path="$(python3 - "$resolved_item_report" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(report.get("url") or "")
+PY
+)"
+      if [[ -n "$resolved_path" ]] && python3 - "$resolved_path" "$expected_path" <<'PY'
+import os
+import sys
+
+raise SystemExit(0 if os.path.realpath(sys.argv[1]) == os.path.realpath(sys.argv[2]) else 1)
+PY
+      then
+        printf '%s\n' "$resolved_path"
+        return 0
+      fi
+    fi
+    /bin/ls "$(dirname "$expected_path")" >/dev/null 2>&1 || true
+    sleep 0.5
+  done
+  printf 'timed out waiting for remote-backed File Provider item children:%s at %s\n' \
+    "$remote_id" "$expected_path" >&2
+  [[ ! -s "$resolved_item_report" ]] || cat "$resolved_item_report" >&2
   return 1
 }
 
@@ -329,7 +387,14 @@ archive_page() {
   [[ -n "$page_id" ]] || return 0
   local body="$tmp_root/archive-${page_id//-/}.json"
   printf '{"archived":true}\n' >"$body"
-  notion_api PATCH "pages/$page_id" "$body" >/dev/null 2>&1 || true
+  notion_api PATCH "pages/$page_id" "$body" >/dev/null
+}
+
+archive_page_best_effort() {
+  local page_id="$1"
+  [[ -n "$page_id" ]] || return 0
+  archive_page "$page_id" >/dev/null 2>&1 \
+    || printf 'warning: failed to archive scratch Notion page %s during cleanup\n' "$page_id" >&2
 }
 
 created_remote_id_from_push() {
@@ -349,6 +414,75 @@ for remote_id in report.get("changed_remote_ids") or []:
 else:
     raise SystemExit("push report did not include a created remote id")
 PY
+}
+
+assert_push_reconciled_remote_id() {
+  local report="$1"
+  local expected_id="$2"
+  python3 - "$report" "$expected_id" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = sys.argv[2].replace("-", "").lower()
+actual = {
+    value.replace("-", "").lower()
+    for value in report.get("reconciled_remote_ids") or []
+}
+if expected not in actual:
+    raise SystemExit(
+        f"push report did not reconcile remote id {sys.argv[2]}: "
+        f"{report.get('reconciled_remote_ids') or []}"
+    )
+PY
+}
+
+write_expected_canonical_page() {
+  local page_id="$1"
+  local title="$2"
+  local paragraph="$3"
+  local output="$4"
+  notion_api GET "pages/$page_id" >"$notion_response"
+  python3 - "$notion_response" "$title" "$paragraph" "$output" <<'PY'
+import json
+import pathlib
+import sys
+
+response_path, title, paragraph, output_path = sys.argv[1:]
+page = json.loads(pathlib.Path(response_path).read_text(encoding="utf-8"))
+page_id = page.get("id")
+remote_edited_at = page.get("last_edited_time")
+if not page_id or not remote_edited_at:
+    raise SystemExit(f"Notion page metadata is incomplete: {page}")
+
+def yaml_string(value):
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t') + '"'
+
+expected = (
+    "---\n"
+    "loc:\n"
+    f"  id: {page_id}\n"
+    "  type: page\n"
+    f"  synced_at: {yaml_string(remote_edited_at)}\n"
+    f"  remote_edited_at: {yaml_string(remote_edited_at)}\n"
+    f"title: {yaml_string(title)}\n"
+    "---\n"
+    f"{paragraph}\n"
+)
+pathlib.Path(output_path).write_text(expected, encoding="utf-8")
+PY
+}
+
+assert_exact_file() {
+  local actual="$1"
+  local expected="$2"
+  local description="$3"
+  if ! cmp -s "$expected" "$actual"; then
+    printf '%s did not match the complete canonical Markdown document\n' "$description" >&2
+    diff -u "$expected" "$actual" >&2 || true
+    return 1
+  fi
 }
 
 archive_status_is_true() {
@@ -412,11 +546,21 @@ remove_visible_test_mount() {
   stop_daemon
 }
 
+disconnect_test_connection() {
+  [[ "$connection_created" == "1" ]] || return 0
+  env -u NOTION_TOKEN -u NOTION_AT \
+    LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 \
+    "$loc_bin" disconnect "$connection_id" --json >/dev/null
+  connection_created=0
+}
+
 cleanup() {
   trap - ERR
   set +e
-  archive_page "$created_child_page_id"
-  archive_page "$scratch_page_id"
+  archive_page_best_effort "$created_child_page_id"
+  archive_page_best_effort "$scratch_page_id"
+  disconnect_test_connection \
+    || printf 'warning: failed to remove the test credential during cleanup\n' >&2
   remove_visible_test_mount
   if [[ "${LOCALITY_MACOS_FILE_PROVIDER_KEEP_TMP:-}" == "1" ]]; then
     printf 'kept live macOS File Provider temp root (contains credentials): %s\n' "$tmp_root" >&2
@@ -455,6 +599,7 @@ scratch_page_id="$(create_scratch_page)"
 
 step="creating isolated Locality state"
 mkdir -p "$state_root"
+connection_created=1
 printf '%s' "$notion_token" | env -u NOTION_TOKEN -u NOTION_AT \
   LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 \
   "$loc_bin" connect notion --name "$connection_id" --token-stdin --json >/dev/null
@@ -488,11 +633,15 @@ cache_file="$state_root/content/$mount_id/files/$scratch_title/page.md"
 
 step="hydrating page.md through File Provider"
 hydrated_file="$tmp_root/hydrated-page.md"
+expected_hydrated_file="$tmp_root/expected-hydrated-page.md"
 run_with_timeout 60 /bin/cat "$page_file" >"$hydrated_file"
-grep -Fq "Initial paragraph for the live macOS File Provider e2e." "$hydrated_file" \
-  || fail "hydrated page.md did not contain the expected Notion paragraph"
-grep -Fq "Initial paragraph for the live macOS File Provider e2e." "$cache_file" \
-  || fail "opening the CloudStorage placeholder did not hydrate the daemon content cache"
+write_expected_canonical_page \
+  "$scratch_page_id" \
+  "$scratch_title" \
+  "Initial paragraph for the live macOS File Provider e2e." \
+  "$expected_hydrated_file"
+assert_exact_file "$hydrated_file" "$expected_hydrated_file" "hydrated page.md"
+assert_exact_file "$cache_file" "$expected_hydrated_file" "daemon content cache"
 
 step="committing an atomic editor-style page.md replacement"
 edit_marker="macOS File Provider atomic edit $unique"
@@ -522,13 +671,22 @@ run_with_timeout 30 /bin/cp "$child_source" "$child_page"
 wait_for_status "$child_page" 'pending_virtual_create'
 run_loc push "$child_page" -y --json >"$child_push_report"
 created_child_page_id="$(created_remote_id_from_push "$child_push_report" "$scratch_page_id")"
+assert_push_reconciled_remote_id "$child_push_report" "$created_child_page_id"
 grep -Fq "$child_marker" <<<"$(remote_page_text "$created_child_page_id")" \
   || fail "created child Notion page did not contain the expected marker"
 
-step="renaming the child page through File Provider"
+step="refreshing the parent after child page creation"
+run_loc pull "$page_dir" --json >"$child_reconcile_pull_report"
+parent_identifier="$(shared_file_provider_identifier "$mount_id" "children:$scratch_page_id")"
+"$helper_bin" reimport --mount-id loc --identifier "$parent_identifier" --json >/dev/null
+"$helper_bin" signal --mount-id loc --identifier working-set --json >/dev/null
+child_dir="$(wait_for_remote_backed_item "$created_child_page_id" "$child_dir")"
+child_page="$child_dir/page.md"
+wait_for_command "reconciled child page" /usr/bin/stat "$child_page"
+
+step="renaming the remote-backed child page through File Provider"
 renamed_child_dir="$page_dir/$renamed_child_title"
 renamed_child_page="$renamed_child_dir/page.md"
-wait_for_command "reconciled child page" /usr/bin/stat "$child_page"
 run_with_timeout 30 /bin/mv "$child_dir" "$renamed_child_dir"
 wait_for_status "$renamed_child_page" 'pending_virtual_rename'
 run_loc push "$renamed_child_page" -y --json >"$rename_push_report"
@@ -546,5 +704,8 @@ created_child_page_id=""
 step="cleaning the scratch page"
 archive_page "$scratch_page_id"
 scratch_page_id=""
+
+step="removing the test credential"
+disconnect_test_connection
 
 echo "ok: live macOS File Provider enumerate, hydrate, atomic edit, create, rename, and delete passed"
