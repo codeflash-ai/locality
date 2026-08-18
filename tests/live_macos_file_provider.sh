@@ -47,6 +47,8 @@ done
 
 actual_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Contents/Info.plist")"
 actual_extension_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$appex_plist")"
+actual_extension_short_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$appex_plist")"
+actual_extension_build_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$appex_plist")"
 [[ "$actual_bundle_id" == "$expected_bundle_id" ]] \
   || fail "test app bundle id was '$actual_bundle_id', expected '$expected_bundle_id'"
 [[ "$actual_extension_id" == "$expected_bundle_id.FileProvider" ]] \
@@ -54,8 +56,43 @@ actual_extension_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$
 
 codesign --verify --deep --strict "$app_path" >/dev/null 2>&1 \
   || fail "test app signature verification failed: $app_path"
-pluginkit -m -i "$actual_extension_id" | grep -Fq "$actual_extension_id" \
-  || fail "File Provider extension is not registered with pluginkit: $actual_extension_id"
+if ! registered_extension="$(pluginkit -m -v -i "$actual_extension_id" 2>&1)"; then
+  fail "File Provider extension is not registered with pluginkit: $actual_extension_id"
+fi
+python3 - \
+  "$actual_extension_id" \
+  "$appex" \
+  "$actual_extension_short_version" \
+  "$actual_extension_build_version" \
+  "$registered_extension" <<'PY'
+import pathlib
+import re
+import sys
+
+bundle_id, expected_path, short_version, build_version, output = sys.argv[1:]
+matches = [line for line in output.splitlines() if bundle_id in line]
+if len(matches) != 1:
+    raise SystemExit(
+        f"expected one active pluginkit registration for {bundle_id}, found {len(matches)}:\n{output}"
+    )
+line = matches[0]
+if line.lstrip().startswith("-"):
+    raise SystemExit(f"pluginkit registration is disabled: {line}")
+expected_path = str(pathlib.Path(expected_path))
+if expected_path not in line:
+    raise SystemExit(
+        f"active File Provider extension is not from {expected_path}: {line}"
+    )
+version_match = re.search(re.escape(bundle_id) + r"\s*\(([^()]*)\)", line)
+if not version_match:
+    raise SystemExit(f"pluginkit registration did not report a version: {line}")
+registered_version = version_match.group(1)
+if registered_version not in {short_version, build_version}:
+    raise SystemExit(
+        f"active File Provider extension version {registered_version!r} does not match "
+        f"CFBundleShortVersionString {short_version!r} or CFBundleVersion {build_version!r}: {line}"
+    )
+PY
 
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-macos-file-provider-live.XXXXXX")"
 state_root="$tmp_root/state"
@@ -87,6 +124,7 @@ page_file=""
 daemon_started=0
 mount_registered=0
 connection_created=0
+test_completed=0
 step="preflight"
 
 normalize_notion_page_id() {
@@ -124,15 +162,17 @@ notion_api() {
   local method="$1"
   local path="$2"
   local body="${3:-}"
+  local retry_count=2
+  [[ "$method" != "POST" ]] || retry_count=0
   if [[ -n "$body" ]]; then
-    curl -fsS --retry 2 --connect-timeout 10 --max-time 30 \
+    curl -fsS --retry "$retry_count" --connect-timeout 10 --max-time 30 \
       -X "$method" "https://api.notion.com/v1/$path" \
       -H "Authorization: Bearer $notion_token" \
       -H "Notion-Version: ${LOCALITY_NOTION_VERSION:-2026-03-11}" \
       -H "Content-Type: application/json" \
       --data-binary "@$body"
   else
-    curl -fsS --retry 2 --connect-timeout 10 --max-time 30 \
+    curl -fsS --retry "$retry_count" --connect-timeout 10 --max-time 30 \
       -X "$method" "https://api.notion.com/v1/$path" \
       -H "Authorization: Bearer $notion_token" \
       -H "Notion-Version: ${LOCALITY_NOTION_VERSION:-2026-03-11}"
@@ -531,6 +571,7 @@ remove_visible_test_mount() {
     mv "$state_root" "$retired_state_root"
   fi
   mkdir -p "$state_root"
+  local cleanup_status=0
   if start_daemon; then
     "$helper_bin" reimport --mount-id loc --identifier root --json >/dev/null 2>&1 || true
     "$helper_bin" signal --mount-id loc --identifier working-set --json >/dev/null 2>&1 || true
@@ -540,10 +581,18 @@ remove_visible_test_mount() {
       /bin/ls "$domain_url" >/dev/null 2>&1 || true
       sleep 0.5
     done
-    [[ ! -e "$mount_root" ]] \
-      || printf 'warning: test mount is still visible after cleanup: %s\n' "$mount_root" >&2
+    if [[ -e "$mount_root" ]]; then
+      printf 'test mount is still visible after cleanup: %s\n' "$mount_root" >&2
+      cleanup_status=1
+    else
+      mount_registered=0
+    fi
+  else
+    printf 'could not start the repair daemon while removing test mount: %s\n' "$mount_root" >&2
+    cleanup_status=1
   fi
   stop_daemon
+  return "$cleanup_status"
 }
 
 disconnect_test_connection() {
@@ -555,18 +604,30 @@ disconnect_test_connection() {
 }
 
 cleanup() {
-  trap - ERR
+  local test_status="$?"
+  trap - ERR EXIT
   set +e
+  local mount_cleanup_status=0
   archive_page_best_effort "$created_child_page_id"
   archive_page_best_effort "$scratch_page_id"
   disconnect_test_connection \
     || printf 'warning: failed to remove the test credential during cleanup\n' >&2
-  remove_visible_test_mount
-  if [[ "${LOCALITY_MACOS_FILE_PROVIDER_KEEP_TMP:-}" == "1" ]]; then
-    printf 'kept live macOS File Provider temp root (contains credentials): %s\n' "$tmp_root" >&2
+  remove_visible_test_mount || mount_cleanup_status="$?"
+  if [[ "${LOCALITY_MACOS_FILE_PROVIDER_KEEP_TMP:-}" == "1" || "$mount_cleanup_status" != "0" ]]; then
+    printf 'kept live macOS File Provider temp root for diagnostics or repair: %s\n' "$tmp_root" >&2
   else
-    rm -rf "$tmp_root"
+    rm -rf "$tmp_root" || mount_cleanup_status="$?"
   fi
+  if [[ "$test_status" != "0" ]]; then
+    exit "$test_status"
+  fi
+  if [[ "$mount_cleanup_status" != "0" ]]; then
+    exit "$mount_cleanup_status"
+  fi
+  if [[ "$test_completed" == "1" ]]; then
+    echo "ok: live macOS File Provider enumerate, hydrate, atomic edit, create, rename, and delete passed"
+  fi
+  exit 0
 }
 trap on_error ERR
 trap cleanup EXIT
@@ -708,4 +769,4 @@ scratch_page_id=""
 step="removing the test credential"
 disconnect_test_connection
 
-echo "ok: live macOS File Provider enumerate, hydrate, atomic edit, create, rename, and delete passed"
+test_completed=1
