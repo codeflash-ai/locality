@@ -103,6 +103,7 @@ retired_state_root="$tmp_root/retired-state"
 export LOCALITY_CREDENTIAL_STORE=file
 domain_report="$tmp_root/domain.json"
 connect_report="$tmp_root/connect.json"
+mount_report="$tmp_root/mount.json"
 pull_report="$tmp_root/pull.json"
 status_report="$tmp_root/status.json"
 push_report="$tmp_root/push.json"
@@ -563,9 +564,11 @@ PY
   done < <(find "$state_root/logs" -type f -name '*.log' -print 2>/dev/null | sort)
 }
 
-emit_safe_connect_failure() {
-  [[ -s "$connect_report" ]] || return 0
-  LOCALITY_E2E_REDACT_TOKEN="$notion_token" python3 - "$connect_report" <<'PY' >&2
+emit_safe_command_failure() {
+  local command="$1"
+  local report_path="$2"
+  [[ -s "$report_path" ]] || return 0
+  LOCALITY_E2E_REDACT_TOKEN="$notion_token" python3 - "$command" "$report_path" <<'PY' >&2
 import json
 import os
 import pathlib
@@ -573,9 +576,9 @@ import re
 import sys
 
 try:
-    report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+    report = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 except (OSError, json.JSONDecodeError):
-    print("loc connect failed without a valid JSON diagnostic")
+    print(f"loc {sys.argv[1]} failed without a valid JSON diagnostic")
     raise SystemExit(0)
 
 code = str(report.get("code") or "unknown_error")
@@ -589,7 +592,7 @@ message = re.sub(
     message,
 )
 message = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[redacted-email]", message)
-print(f"loc connect failed ({code}): {message}")
+print(f"loc {sys.argv[1]} failed ({code}): {message}")
 PY
 }
 
@@ -699,19 +702,22 @@ connection_created=1
 if ! printf '%s' "$notion_token" | env -u NOTION_TOKEN -u NOTION_AT \
   LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 \
   "$loc_bin" connect notion --name "$connection_id" --token-stdin --json >"$connect_report"; then
-  emit_safe_connect_failure
+  emit_safe_command_failure connect "$connect_report"
   false
 fi
 
 step="registering the isolated macOS File Provider mount"
-env -u NOTION_TOKEN -u NOTION_AT \
+if ! env -u NOTION_TOKEN -u NOTION_AT \
   LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 \
   "$loc_bin" mount notion "$mount_root" \
     --root-page "$scratch_page_id" \
     --connection "$connection_id" \
     --mount-id "$mount_id" \
     --projection macos-file-provider \
-    --json >/dev/null
+    --json >"$mount_report"; then
+  emit_safe_command_failure mount "$mount_report"
+  false
+fi
 mount_registered=1
 
 step="starting the isolated packaged daemon"
