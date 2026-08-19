@@ -98,6 +98,7 @@ tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-macos-file-provider-live.XXXXXX")"
 state_root="$tmp_root/state"
 retired_state_root="$tmp_root/retired-state"
 domain_report="$tmp_root/domain.json"
+connect_report="$tmp_root/connect.json"
 pull_report="$tmp_root/pull.json"
 status_report="$tmp_root/status.json"
 push_report="$tmp_root/push.json"
@@ -558,6 +559,36 @@ PY
   done < <(find "$state_root/logs" -type f -name '*.log' -print 2>/dev/null | sort)
 }
 
+emit_safe_connect_failure() {
+  [[ -s "$connect_report" ]] || return 0
+  LOCALITY_E2E_REDACT_TOKEN="$notion_token" python3 - "$connect_report" <<'PY' >&2
+import json
+import os
+import pathlib
+import re
+import sys
+
+try:
+    report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    print("loc connect failed without a valid JSON diagnostic")
+    raise SystemExit(0)
+
+code = str(report.get("code") or "unknown_error")
+message = str(report.get("message") or "no diagnostic message")
+token = os.environ.get("LOCALITY_E2E_REDACT_TOKEN", "")
+if token:
+    message = message.replace(token, "[REDACTED]")
+message = re.sub(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+    "[redacted-id]",
+    message,
+)
+message = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[redacted-email]", message)
+print(f"loc connect failed ({code}): {message}")
+PY
+}
+
 on_error() {
   local status="$?"
   (set +e; emit_diagnostics || true)
@@ -661,9 +692,12 @@ scratch_page_id="$(create_scratch_page)"
 step="creating isolated Locality state"
 mkdir -p "$state_root"
 connection_created=1
-printf '%s' "$notion_token" | env -u NOTION_TOKEN -u NOTION_AT \
+if ! printf '%s' "$notion_token" | env -u NOTION_TOKEN -u NOTION_AT \
   LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 \
-  "$loc_bin" connect notion --name "$connection_id" --token-stdin --json >/dev/null
+  "$loc_bin" connect notion --name "$connection_id" --token-stdin --json >"$connect_report"; then
+  emit_safe_connect_failure
+  false
+fi
 
 step="registering the isolated macOS File Provider mount"
 env -u NOTION_TOKEN -u NOTION_AT \
