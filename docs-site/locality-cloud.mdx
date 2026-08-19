@@ -1,32 +1,32 @@
 ---
-title: "Admin console guide"
-description: "Set up a Locality organization, control source access, create a sandbox key, and understand when to use Admin or Desktop."
+title: "Locality Cloud guide"
+description: "Set up a Locality organization, control source access, create a sandbox key, and understand when to use Locality Cloud or Desktop."
 ---
 
-The Locality Admin console is for teams that need centrally managed access to company knowledge. An Owner or Admin connects a source, chooses who may use it, and creates a reusable workspace setup. A Developer then uses a sandbox key to materialize an approved, read-only copy of that data wherever an agent runs.
+Locality Cloud is for teams that need centrally managed access to company knowledge. An Owner or Admin connects a source, chooses who may use it, and creates a reusable workspace setup. A Developer then uses a sandbox key to materialize an approved, read-only copy of that data wherever an agent runs.
 
 For the current hosted beta, open [api.dev.locality.dev/admin](https://api.dev.locality.dev/admin/).
 
-## Choose Admin or Desktop
+## Choose Locality Cloud or Desktop
 
 Start with the outcome you need.
 
 | I want to... | Use | What it gives me |
 | --- | --- | --- |
 | Work with connected apps as files on my own computer | **Desktop** | A personal mounted workspace that can pull remote changes and push reviewed edits back to supported sources |
-| Decide which company data a person or agent may receive | **Admin** | Organization roles, connected sources, folder-level grants, reusable workspace profiles, and access history |
-| Give a remote agent an approved knowledge snapshot | **Admin + `loc`** | A sealed, read-only filesystem replica created from a Workspace Profile key |
+| Decide which company data a person or agent may receive | **Locality Cloud** | Organization roles, connected sources, folder-level grants, reusable workspace profiles, and access history |
+| Give a remote agent an approved knowledge snapshot | **Locality Cloud + `loc`** | A sealed, read-only filesystem replica created from a Workspace Profile key |
 | Automate a personal local workflow | **Desktop + `loc`** | Commands for local mounts, status, diff, pull, and push |
 
 <Note>
-  Admin and Desktop solve different problems. Connecting a provider in Admin does not create a Desktop mount. Connecting the same provider in Desktop does not add an organization source in Admin.
+  Locality Cloud and Desktop solve different problems. Connecting a provider in Locality Cloud does not create a Desktop mount. Connecting the same provider in Desktop does not add an organization source in Locality Cloud.
 </Note>
 
 <Frame caption="The Locality Desktop source view manages personal mounts on this computer.">
   <img src="/images/desktop-sources.png" alt="Locality Desktop Sources page with Notion and Google Docs mounted and ready" />
 </Frame>
 
-## The Admin model in one minute
+## The Locality Cloud model in one minute
 
 The setup follows one path:
 
@@ -54,14 +54,14 @@ A sandbox key is not a source-provider credential. It cannot choose extra folder
 
 ### 1. Sign in, join, or create an organization
 
-Open the Admin console and choose the path that matches your situation:
+Open Locality Cloud and choose the path that matches your situation:
 
 - **Sign in** if you already belong to a Locality organization.
 - **Create your account** if an Owner or Admin invited you.
 - **Create organization** if your company is new to Locality. Enter the organization name, then create the first Owner account.
 
-<Frame caption="New teams can create an organization from the Admin sign-in page. Invited users create an account from the same page.">
-  <img src="/images/admin-sign-in.png" alt="Locality Administration sign-in page with sign in, invited account, and create organization options" />
+<Frame caption="New teams can create an organization from the Locality Cloud sign-in page. Invited users create an account from the same page.">
+  <img src="/images/admin-sign-in.png" alt="Locality Cloud sign-in page with sign in, invited account, and create organization options" />
 </Frame>
 
 The first person who creates an organization becomes its Owner. Other people should join through **Team**, not create another organization for the same company.
@@ -192,7 +192,7 @@ Do not claim that you changed the source provider. This workspace is read-only.
 
 To refresh an existing generation-2 replica, run the same command with the exact same key and root. A replacement key for the same profile does not own the old root. After rotating or revoking a key, materialize into a new root.
 
-## What each Admin page does
+## What each Locality Cloud page does
 
 | Page | Use it to |
 | --- | --- |
@@ -200,7 +200,7 @@ To refresh an existing generation-2 replica, run the same command with the exact
 | **Sources** | Connect providers, choose included roots, watch ingestion, and investigate source health |
 | **Access** | Publish Data Grants, create Workspace Profiles, set freshness, and create administrator-managed keys |
 | **Sandboxes** | Review active and recent organization sandbox sessions |
-| **Activity** | Review important administration and data access events |
+| **Activity** | Review important organization and data access events |
 | **Team** | Add members, assign profiles, create personal keys, revoke keys, and review personal sandboxes |
 | **Settings** | Review organization identity and administrator settings |
 
@@ -220,7 +220,7 @@ Confirm that the content is visible to the provider connection and included in i
 
 The profile required data newer than the latest published snapshot. Check the source status and **Last refreshed** time. Resolve **Needs attention**, or ask an Owner or Admin whether the profile's maximum data age is appropriate for this workflow.
 
-### Can an Admin sandbox edit the connected source?
+### Can a Locality Cloud sandbox edit the connected source?
 
 No. `loc sandbox init` materializes a sealed, read-only replica for an agent. Use Locality Desktop when a person or agent needs a reviewed edit and sync workflow back to a supported source.
 
