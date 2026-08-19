@@ -81,6 +81,12 @@ Examples under a shared Locality root:
 
 Non-Google-Docs Drive files are ignored by the V1 connector.
 
+An empty Drive workspace folder is valid. Desktop File Provider and Cloud Files
+setup accepts the generated agent-guidance files as a successful initial listing
+for Google Docs, so the mount can open and the first document can be created from
+local Markdown. Google Docs elsewhere in the connected account are not projected
+unless they are moved into the selected Drive folder or one of its descendants.
+
 ## Hydration And Markdown
 
 Hydration fetches Drive metadata and Google Docs body content, then renders a

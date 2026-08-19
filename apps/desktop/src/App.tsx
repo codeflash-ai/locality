@@ -98,6 +98,7 @@ import {
   type UpdateStatus,
 } from "./updater";
 import {
+  GOOGLE_DOCS_FOLDER_SCOPE_HELP,
   connectedSourcesReadyToMount,
   isSourceConnectorId,
   sourceConnectionReady,
@@ -2622,6 +2623,7 @@ function Onboarding({
                   disabled={oauthInFlight}
                   onChange={(event) => setGoogleDocsWorkspaceFolder(event.target.value)}
                 />
+                <small>{GOOGLE_DOCS_FOLDER_SCOPE_HELP}</small>
               </label>
             )}
             <div className="button-row onboarding-nav-actions">
@@ -4201,6 +4203,7 @@ function AddSourceDialog({
                         placeholder="Folder name, URL, or ID"
                         onChange={(event) => setGoogleDocsWorkspaceFolder(event.target.value)}
                       />
+                      <small>{GOOGLE_DOCS_FOLDER_SCOPE_HELP}</small>
                     </label>
                   )}
                   {apiKeyConnector && !connector.mounted && needsConnection && (

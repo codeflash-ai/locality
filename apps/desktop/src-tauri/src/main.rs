@@ -9859,6 +9859,20 @@ fn is_virtual_projection_guidance_child(identifier: &str) -> bool {
     identifier.starts_with("guidance:")
 }
 
+fn virtual_projection_mount_point_is_ready(
+    connector: &str,
+    summary: &VirtualProjectionChildrenSummary,
+) -> bool {
+    if summary.content_children > 0 {
+        return true;
+    }
+
+    // Google Docs workspace folders are writable even when they do not contain
+    // a document yet. A successful guidance-only listing is enough to mount
+    // the folder and let the user create its first document locally.
+    connector == GOOGLE_DOCS_CONNECTOR_ID && summary.total_children > 0
+}
+
 fn wait_for_virtual_projection_mount_point_children(
     state_root: &Path,
     mount: &MountConfig,
@@ -9891,20 +9905,15 @@ fn wait_for_virtual_projection_mount_point_children(
             Ok(report) => {
                 let summary = summarize_virtual_projection_children(&report);
                 last_error = None;
-                if summary.content_children > 0 {
+                if virtual_projection_mount_point_is_ready(&mount.connector, &summary) {
                     desktop_log(
                         "info",
                         "file_provider.source_ready.ready",
                         format!(
-                            "`{mount_id}:{mount_point_container_identifier}` exposed {} content child{} after {}ms across {attempts} attempt{} ({} total; preview: {})",
-                            summary.content_children,
-                            if summary.content_children == 1 {
-                                ""
-                            } else {
-                                "ren"
-                            },
+                            "`{mount_id}:{mount_point_container_identifier}` became ready after {}ms across {attempts} attempt{} ({} content; {} total; preview: {})",
                             started.elapsed().as_millis(),
                             if attempts == 1 { "" } else { "s" },
+                            summary.content_children,
                             summary.total_children,
                             summary.preview()
                         ),
@@ -17691,6 +17700,35 @@ mod tests {
             summary.preview(),
             "teamspace-0, teamspace-1, teamspace-2, teamspace-3, teamspace-4, teamspace-5, +2 more"
         );
+    }
+
+    #[test]
+    fn google_docs_guidance_only_projection_is_ready_for_empty_workspace() {
+        let report = localityd::virtual_fs::VirtualFsChildrenReport {
+            mount_id: "google-docs-main".to_string(),
+            container_identifier: "mount:google-docs-main".to_string(),
+            children: vec![
+                virtual_projection_test_item("guidance:AGENTS.md", "AGENTS.md", None),
+                virtual_projection_test_item("guidance:CLAUDE.md", "CLAUDE.md", None),
+            ],
+        };
+        let summary = summarize_virtual_projection_children(&report);
+
+        assert!(super::virtual_projection_mount_point_is_ready(
+            super::GOOGLE_DOCS_CONNECTOR_ID,
+            &summary
+        ));
+        assert!(!super::virtual_projection_mount_point_is_ready(
+            "notion", &summary
+        ));
+    }
+
+    #[test]
+    fn google_docs_projection_still_waits_for_a_successful_child_listing() {
+        assert!(!super::virtual_projection_mount_point_is_ready(
+            super::GOOGLE_DOCS_CONNECTOR_ID,
+            &Default::default()
+        ));
     }
 
     fn virtual_projection_test_item(

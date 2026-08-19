@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  GOOGLE_DOCS_FOLDER_SCOPE_HELP,
   connectedSourcesReadyToMount,
   isSourceConnectorId,
   sourceConnectorIds,
@@ -11,6 +12,14 @@ import {
   sourceSetupIsBusy,
   sourceSetupProgressLabel,
 } from "./source-setup";
+
+describe("Google Docs folder scope", () => {
+  it("explains that mounts are folder-scoped", () => {
+    expect(GOOGLE_DOCS_FOLDER_SCOPE_HELP).toBe(
+      "Only Google Docs inside this Drive folder are mounted; Docs elsewhere in the account are not included. Locality creates the folder if it does not exist.",
+    );
+  });
+});
 
 describe("source setup progress", () => {
   it("marks only the connector running the shared setup operation as active", () => {

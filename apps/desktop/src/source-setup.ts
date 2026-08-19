@@ -2,6 +2,8 @@ import { classifyMountSetupError } from "./onboarding-errors";
 
 export type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
 const SOURCE_CONNECTORS = ["notion", "google-docs", "google-calendar", "gmail", "granola", "linear", "slack"] as const;
+export const GOOGLE_DOCS_FOLDER_SCOPE_HELP =
+  "Only Google Docs inside this Drive folder are mounted; Docs elsewhere in the account are not included. Locality creates the folder if it does not exist.";
 export type SourceConnectorId = (typeof SOURCE_CONNECTORS)[number];
 export type ApiKeySourceConnectorId = Extract<SourceConnectorId, "granola" | "linear">;
 export type SourceMountRetryOutcome =
