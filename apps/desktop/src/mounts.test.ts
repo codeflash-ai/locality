@@ -4,6 +4,7 @@ import {
   mountEntityCountLabel,
   mountFileIndexProgressLabel,
   mountAccessLabel,
+  mountManualSyncAvailable,
   mountRows,
   mountStatusLabel,
   mountStatusTone,
@@ -121,6 +122,30 @@ describe("mount display helpers", () => {
       title: "Google Calendar",
       subtitle: "Primary calendar / google-calendar-main",
     });
+  });
+
+  it("offers manual sync for every connector with a mounted local path", () => {
+    const connectors = [
+      "notion",
+      "google-docs",
+      "google-calendar",
+      "gmail",
+      "granola",
+      "linear",
+      "slack",
+    ];
+
+    expect(
+      connectors.map((connector) =>
+        mountManualSyncAvailable(
+          mount({
+            connector,
+            localPath: `/home/ada/Locality/${connector}`,
+          }),
+        ),
+      ),
+    ).toEqual([true, true, true, true, true, true, true]);
+    expect(mountManualSyncAvailable(mount({ localPath: "  " }))).toBe(false);
   });
 
   it("labels indexed mount entities as items, not physical files", () => {
