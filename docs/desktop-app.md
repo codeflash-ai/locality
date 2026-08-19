@@ -230,7 +230,9 @@ state; missing helpers or extensions remain explicit setup failures.
 Later source mounts reuse the existing shared File Provider domain. Adding a
 top-level source folder such as `google-calendar-main` signals the working-set
 enumerator because macOS can drop root-container signals when no root enumerator
-is active. The working set reads the complete known projection recursively from
+is active, then resolves the new mount-point identifier to force macOS to
+materialize that specific source folder even when the root signal was dropped.
+The working set reads the complete known projection recursively from
 durable local daemon state; it must not make connector API requests while
 enumerating folders. This seeds already-discovered nested Notion directories in
 macOS before the user opens them. Compact sync anchors reference rebuildable
@@ -243,7 +245,8 @@ reimporting an unchanged `notion` subtree. The shared root is never reimported
 or re-registered. Registration is idempotent when the domain already exists;
 automatic setup treats that registration as authoritative rather than removing
 and recreating it to repair metadata. Reimport and readiness repair stay scoped
-to the new mount-point identifier.
+to the new mount-point identifier, including the explicit mount-point resolution
+used to create a missing CloudStorage folder.
 Mount-point appearance gets an initial 30-second wait and one 30-second scoped
 refresh window; if it is still unavailable, Locality reports a recoverable
 preparation warning without resetting the domain. Whole-domain unregister or

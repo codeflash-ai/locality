@@ -71,7 +71,9 @@ Finder must enter the File Provider domain so directory listings call
 
 Mount activation signals the working-set enumerator after adding a source
 because macOS can ignore a root-container signal when no root enumerator is
-active. The working set recursively reads every already-known item from local
+active. It then resolves the new mount-point identifier so macOS materializes
+that source folder even when the root signal was dropped. The working set
+recursively reads every already-known item from local
 daemon state, without calling connector APIs, so macOS can ingest cached nested
 directories before Finder opens them. Compact sync anchors reference
 rebuildable item-version snapshots in the File Provider app-group cache;

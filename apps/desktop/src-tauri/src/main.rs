@@ -10471,12 +10471,15 @@ fn running_daemon_build(state_root: &Path) -> Option<DaemonBuildInfo> {
 enum VirtualProjectionRefreshAction {
     Signal(String),
     ReimportThenSignal(String),
+    Resolve(String),
 }
 
 impl VirtualProjectionRefreshAction {
     fn identifier(&self) -> &str {
         match self {
-            Self::Signal(identifier) | Self::ReimportThenSignal(identifier) => identifier,
+            Self::Signal(identifier)
+            | Self::ReimportThenSignal(identifier)
+            | Self::Resolve(identifier) => identifier,
         }
     }
 }
@@ -10503,7 +10506,7 @@ fn run_virtual_projection_refresh_action(
             "warn",
             "file_provider.signal_failed",
             format!(
-                "could not signal {}:{} refresh: {error}",
+                "could not refresh {}:{}: {error}",
                 mount.mount_id.0,
                 action.identifier()
             ),
@@ -10533,6 +10536,7 @@ fn virtual_projection_mount_activation_refresh_actions(
             VirtualProjectionRefreshAction::Signal(ROOT_CONTAINER_IDENTIFIER.to_string()),
             VirtualProjectionRefreshAction::ReimportThenSignal(mount_point_identifier(mount)),
             VirtualProjectionRefreshAction::Signal("working-set".to_string()),
+            VirtualProjectionRefreshAction::Resolve(mount_point_identifier(mount)),
         ];
     }
     virtual_projection_refresh_actions(mount)
@@ -10565,7 +10569,23 @@ fn refresh_macos_virtual_projection(
             reimport_macos_virtual_projection(mount_id, identifier)
                 .or_else(|_| signal_macos_virtual_projection(mount_id, identifier))
         }
+        VirtualProjectionRefreshAction::Resolve(identifier) => {
+            resolve_macos_virtual_projection(mount_id, identifier)
+        }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_virtual_projection(mount_id: &str, identifier: &str) -> Result<(), String> {
+    let provider_identifier =
+        daemon_file_provider::macos_file_provider_item_identifier(mount_id, identifier);
+    run_macos_file_provider_refresh_action("resolve", &provider_identifier).map_err(
+        |resolve_error| {
+            format!(
+                "Could not materialize macOS File Provider item `{identifier}`: resolve failed: {resolve_error}"
+            )
+        },
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -17372,7 +17392,7 @@ mod tests {
     }
 
     #[test]
-    fn macos_file_provider_mount_activation_uses_delta_aware_working_set() {
+    fn macos_file_provider_mount_activation_materializes_the_new_mount_point() {
         let mount = MountConfig::new(
             MountId::new("google-calendar-main"),
             "google-calendar",
@@ -17388,6 +17408,7 @@ mod tests {
                     "mount:google-calendar-main".to_string(),
                 ),
                 VirtualProjectionRefreshAction::Signal("working-set".to_string()),
+                VirtualProjectionRefreshAction::Resolve("mount:google-calendar-main".to_string(),),
             ]
         );
     }
