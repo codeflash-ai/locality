@@ -150,13 +150,14 @@ jobs:
       LOCALITY_SLACK_LIVE_TYPES: ${{ secrets.LOCALITY_SLACK_LIVE_TYPES }}
       LOCALITY_LIVE_CONNECTOR: slack
       LOCALITY_LIVE_FORCE_OAUTH_REFRESH: "1"
-      LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ runner.temp }}/locality-slack-macos-credential.json
       LOCALITY_MACOS_FILE_PROVIDER_APP: ${{ needs.file-provider-live.outputs.app_path }}
       LOCALITY_MACOS_FILE_PROVIDER_EXPECTED_BUNDLE_ID: ${{ needs.file-provider-live.outputs.bundle_id }}
       LOCALITY_MACOS_CONNECTOR_FILE_PROVIDER_LIVE: "1"
       LOCALITY_MACOS_FILE_PROVIDER_DEDICATED_HOST: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Initialize Slack credential rotation path
+        run: echo "LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT=$RUNNER_TEMP/locality-slack-macos-credential.json" >> "$GITHUB_ENV"
       - name: Preflight Slack credential rotation
         env:
           GH_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
@@ -169,8 +170,8 @@ jobs:
         if: ${{ always() }}
         env:
           GH_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
-          ROTATED_CREDENTIAL_PATH: ${{ runner.temp }}/locality-slack-macos-credential.json
         run: |
+          ROTATED_CREDENTIAL_PATH="${LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT:-}"
           trap 'rm -f "$ROTATED_CREDENTIAL_PATH"' EXIT
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::LOCALITY_SECRET_ROTATOR_TOKEN is required"; exit 1; }
           [ -s "$ROTATED_CREDENTIAL_PATH" ] || { echo "::error::refreshed Slack credential was not exported"; exit 1; }

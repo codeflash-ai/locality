@@ -532,11 +532,13 @@ jobs:
       LOCALITY_SLACK_LIVE_TYPES: ${{ secrets.LOCALITY_SLACK_LIVE_TYPES }}
       LOCALITY_LIVE_CONNECTOR: slack
       LOCALITY_LIVE_FORCE_OAUTH_REFRESH: "1"
-      LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ runner.temp }}/locality-slack-windows-credential.json
       LOCALITY_WINDOWS_CONNECTOR_CLOUD_FILES_LIVE: "1"
       LOCALITY_WINDOWS_CLOUD_FILES_LIVE_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Initialize Slack credential rotation path
+        shell: pwsh
+        run: '"LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT=$env:RUNNER_TEMP\locality-slack-windows-credential.json" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
@@ -557,8 +559,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
-          ROTATED_CREDENTIAL_PATH: ${{ runner.temp }}/locality-slack-windows-credential.json
         run: |
+          ROTATED_CREDENTIAL_PATH="${LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT:-}"
           trap 'rm -f "$ROTATED_CREDENTIAL_PATH"' EXIT
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::LOCALITY_SECRET_ROTATOR_TOKEN is required"; exit 1; }
           [ -s "$ROTATED_CREDENTIAL_PATH" ] || { echo "::error::refreshed Slack credential was not exported"; exit 1; }

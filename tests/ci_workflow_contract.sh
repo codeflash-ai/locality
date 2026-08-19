@@ -76,6 +76,8 @@ assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "slack-file
   "        run: tests/live_macos_connector_file_provider.sh"
 assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "slack-file-provider-live" \
   '          gh api "repos/$GITHUB_REPOSITORY/environments/connector-live-e2e/secrets/public-key" >/dev/null'
+assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "slack-file-provider-live" \
+  '        run: echo "LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT=$RUNNER_TEMP/locality-slack-macos-credential.json" >> "$GITHUB_ENV"'
 assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "granola-file-provider-live" \
   "        run: tests/live_macos_connector_file_provider.sh"
 grep -Fqx "  group: locality-live-secret-consumers" "$ROOT/.github/workflows/macos-file-provider-live-e2e.yml" ||
@@ -200,6 +202,8 @@ assert_job_line ".github/workflows/connector-live-e2e.yml" "slack-live" \
   '        if: ${{ always() }}'
 assert_job_line ".github/workflows/connector-live-e2e.yml" "slack-live" \
   "            gh api \"repos/\$GITHUB_REPOSITORY/environments/connector-live-e2e/secrets/public-key\" \\"
+assert_job_line ".github/workflows/connector-live-e2e.yml" "slack-windows-cloud-files-live" \
+  '        run: '\''"LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT=$env:RUNNER_TEMP\locality-slack-windows-credential.json" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'\'''
 
 grep -Fqx '  --privileged' "$ROOT/tests/run_linux_fuse_ci.sh" ||
   fail "Linux FUSE CI wrapper must keep Docker privileged mode enabled"
