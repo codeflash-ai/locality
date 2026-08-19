@@ -679,8 +679,8 @@ impl WorkspaceHostBindingResolver {
         let mount_aliases = inspect_persistent_mount_aliases_with(
             self.platform,
             host_binding.projection_identity(),
+            host_binding.trusted_workspace_root(),
             mount_root,
-            component,
             &trusted_aliases,
             HostFilesystemAliases::inspect,
             |path| fs::symlink_metadata(path),
@@ -1047,13 +1047,14 @@ impl HostFilesystemAliases {
 
 // A not-yet-materialized File Provider child can report EDEADLK instead of
 // ENOENT on macOS. Re-anchor only that direct child to the already-inspected
-// trusted root. An existing filesystem object still fails closed because
-// symlink_metadata succeeds without following it.
+// trusted root. An existing filesystem object still fails closed: if
+// symlink_metadata also deadlocks, enumerating the trusted parent must
+// independently prove that no matching child exists.
 fn inspect_persistent_mount_aliases_with<I, M>(
     platform: WorkspaceHostPlatform,
     projection_identity: &WorkspaceProjectionIdentity,
+    trusted_root: &Path,
     mount_root: &Path,
-    component: &str,
     trusted_aliases: &HostFilesystemAliases,
     inspect: I,
     symlink_metadata: M,
@@ -1069,17 +1070,43 @@ where
     if !is_macos_file_provider_deadlock(platform, projection_identity, &inspection_error) {
         return Err(inspection_error);
     }
+    let component = mount_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid direct child"))?;
 
     match symlink_metadata(mount_root) {
-        Err(error)
-            if error.kind() == io::ErrorKind::NotFound
-                || is_macos_file_provider_deadlock(platform, projection_identity, &error) =>
-        {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             Ok(trusted_aliases.missing_direct_child(component))
+        }
+        Err(error) if is_macos_file_provider_deadlock(platform, projection_identity, &error) => {
+            if trusted_direct_child_exists(platform, trusted_root, component)? {
+                Err(inspection_error)
+            } else {
+                Ok(trusted_aliases.missing_direct_child(component))
+            }
         }
         Ok(_) => Err(inspection_error),
         Err(error) => Err(error),
     }
+}
+
+fn trusted_direct_child_exists(
+    platform: WorkspaceHostPlatform,
+    trusted_root: &Path,
+    component: &str,
+) -> io::Result<bool> {
+    for entry in fs::read_dir(trusted_root)? {
+        let file_name = entry?.file_name();
+        let matches = match file_name.to_str() {
+            Some(file_name) => path_token_eq(platform, file_name, component),
+            None => file_name == component,
+        };
+        if matches {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn is_macos_file_provider_deadlock(
@@ -1546,8 +1573,8 @@ mod tests {
         let aliases = super::inspect_persistent_mount_aliases_with(
             WorkspaceHostPlatform::Macos,
             &projection,
+            &root,
             &mount_root,
-            "notion-main",
             &trusted,
             |_| Err(std::io::Error::from_raw_os_error(super::MACOS_EDEADLK)),
             |_| Err(std::io::Error::from_raw_os_error(super::MACOS_EDEADLK)),
@@ -1574,8 +1601,8 @@ mod tests {
         let error = super::inspect_persistent_mount_aliases_with(
             WorkspaceHostPlatform::Macos,
             &projection,
+            &root,
             &mount_root,
-            "notion-main",
             &trusted,
             |_| Err(std::io::Error::from_raw_os_error(super::MACOS_EDEADLK)),
             |_| panic!("non-File-Provider errors must not inspect the child again"),
@@ -1588,7 +1615,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn macos_file_provider_deadlock_does_not_hide_an_existing_symlink() {
+    fn macos_file_provider_double_deadlock_does_not_hide_an_existing_symlink() {
         use std::os::unix::fs::symlink;
 
         let root = unique_host_equivalence_root("file-provider-symlink");
@@ -1604,13 +1631,13 @@ mod tests {
         let error = super::inspect_persistent_mount_aliases_with(
             WorkspaceHostPlatform::Macos,
             &projection,
+            &root,
             &mount_root,
-            "notion-main",
             &trusted,
             |_| Err(std::io::Error::from_raw_os_error(super::MACOS_EDEADLK)),
-            |path| std::fs::symlink_metadata(path),
+            |_| Err(std::io::Error::from_raw_os_error(super::MACOS_EDEADLK)),
         )
-        .expect_err("an existing symlink must remain fail-closed");
+        .expect_err("parent enumeration must keep an uninspectable symlink fail-closed");
 
         assert_eq!(error.raw_os_error(), Some(super::MACOS_EDEADLK));
         std::fs::remove_file(&mount_root).expect("remove mount-root symlink");

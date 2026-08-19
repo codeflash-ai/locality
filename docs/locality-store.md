@@ -94,10 +94,12 @@
   the provider has not materialized yet. Persistent mount validation treats
   that condition as a missing tail only for a `macos-file-provider` host
   binding, after the trusted parent has been inspected and the requested path
-  has passed the exact direct-child check. A successful `symlink_metadata`
-  lookup, a non-provider projection, a deeper path, or any other error remains
-  fail-closed, so existing aliases and escapes are never accepted through this
-  compatibility path.
+  has passed the exact direct-child check. If `symlink_metadata` also reports
+  `EDEADLK`, enumerating the already-inspected parent must independently prove
+  that no matching child exists before validation synthesizes missing-child
+  aliases. An existing child, a non-provider projection, a deeper path, or any
+  other error remains fail-closed, so existing aliases and escapes are never
+  accepted through this compatibility path.
 - Virtual-mutations component v4 stores native content pointers with reversible
   platform path encoding. It continues reading released plain UTF-8 rows while
   preventing older readers from treating an encoded non-UTF-8 pointer as a
