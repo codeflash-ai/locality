@@ -431,16 +431,39 @@ PY
 archive_page() {
   local page_id="$1"
   [[ -n "$page_id" ]] || return 0
-  local body="$tmp_root/archive-${page_id//-/}.json"
-  printf '{"archived":true}\n' >"$body"
-  notion_api PATCH "pages/$page_id" "$body" >/dev/null
+  notion_api DELETE "blocks/$page_id" >/dev/null
 }
 
 archive_page_best_effort() {
   local page_id="$1"
   [[ -n "$page_id" ]] || return 0
   archive_page "$page_id" >/dev/null 2>&1 \
-    || printf 'warning: failed to archive scratch Notion page %s during cleanup\n' "$page_id" >&2
+    || printf 'warning: failed to archive a scratch Notion page during cleanup\n' >&2
+}
+
+cleanup_stale_scratch_pages() {
+  local report="$tmp_root/stale-scratch-children.json"
+  local ids="$tmp_root/stale-scratch-ids.txt"
+  notion_api GET "blocks/$parent_page_id/children?page_size=100" >"$report"
+  python3 - "$report" >"$ids" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+prefix = "Locality macOS File Provider scratch "
+for block in report.get("results") or []:
+    if block.get("type") != "child_page":
+        continue
+    title = (block.get("child_page") or {}).get("title") or ""
+    if title.startswith(prefix) and block.get("id"):
+        print(block["id"])
+PY
+  local stale_page_id
+  while IFS= read -r stale_page_id; do
+    [[ -n "$stale_page_id" ]] || continue
+    notion_api DELETE "blocks/$stale_page_id" >/dev/null
+  done <"$ids"
 }
 
 created_remote_id_from_push() {
@@ -693,6 +716,8 @@ then
 fi
 
 parent_page_id="$(normalize_notion_page_id "$parent_page_id")"
+step="cleaning stale scratch Notion pages"
+cleanup_stale_scratch_pages
 step="creating a scratch Notion page"
 scratch_page_id="$(create_scratch_page)"
 
