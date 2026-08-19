@@ -296,7 +296,7 @@ jobs:
           LOCALITY_LIVE_GMAIL_VFS: "1"
           LOCALITY_LIVE_GMAIL_SEND: "1"
           LOCALITY_LIVE_FORCE_OAUTH_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
-          LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && format('{0}/locality-gmail-live-credential.json', runner.temp) || '' }}
+          LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ runner.temp }}/locality-gmail-live-credential.json
         run: tests/run_linux_fuse_ci.sh tests/live_gmail_vfs_roundtrip.sh
       - name: Run Gmail connector live integrity
         shell: bash

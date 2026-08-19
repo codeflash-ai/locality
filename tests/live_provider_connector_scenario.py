@@ -173,9 +173,10 @@ class Runner:
                     failures.append(f"provider {action}: {error}")
         if self.daemon_started:
             try:
-                self.command(
+                report = self.command(
                     "daemon", "stop", "--state-dir", str(self.state), "--tcp-addr", self.tcp_addr, "--json", check=False
                 )
+                self._require_cleanup_success("daemon stop", report)
             except Exception as error:
                 failures.append(f"daemon stop: {error}")
         if self.platform == "macos-file-provider" and self.args.file_providerctl:
@@ -187,9 +188,10 @@ class Runner:
                 self._start_daemon()
                 self._refresh_provider_root()
                 self._wait(lambda: not self.mount.exists(), "strict File Provider mount removal")
-                self.command(
+                report = self.command(
                     "daemon", "stop", "--state-dir", str(self.state), "--tcp-addr", self.tcp_addr, "--json", check=False
                 )
+                self._require_cleanup_success("retired daemon stop", report)
             except Exception as error:
                 failures.append(f"File Provider mount removal: {error}")
         if os.environ.get("LOCALITY_LIVE_PROVIDER_KEEP_TMP") == "1" or failures:
@@ -331,10 +333,18 @@ class Runner:
     def _start_provider(self) -> None:
         if self.platform == "windows-cloud-files":
             report = self.command("file-provider", "start", str(self.mount), "--json")
-            sync_root = pathlib.Path(report["helper_report"]["sync_root"]).resolve()
+            self.provider_started = True
+            helper_report = report.get("helper_report")
+            sync_root_value = (
+                helper_report.get("sync_root")
+                if isinstance(helper_report, dict)
+                else None
+            )
+            if not isinstance(sync_root_value, str) or not sync_root_value:
+                raise ScenarioError("Cloud Files start omitted its sync root")
+            sync_root = pathlib.Path(sync_root_value).resolve()
             if sync_root != self.root:
                 raise ScenarioError("Cloud Files registered an unexpected sync root")
-            self.provider_started = True
         else:
             self.provider_started = True
             self._refresh_provider_root()

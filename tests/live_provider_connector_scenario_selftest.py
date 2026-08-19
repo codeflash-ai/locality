@@ -135,6 +135,55 @@ try:
                 assert "provider stop failed" in str(error)
             else:
                 raise AssertionError("provider cleanup failure was not propagated")
+
+        if connector == "gmail":
+            os.environ.update(fake_environment)
+            windows_args = argparse.Namespace(
+                connector=connector,
+                projection="windows-cloud-files",
+                provider_root=str(provider_root),
+                loc=str(loc),
+                localityd=str(localityd),
+                file_providerctl=None,
+                matrix=ROOT / "tests/live_connector_scenarios.json",
+                wait_seconds=1,
+            )
+            windows_runner = Runner(windows_args)
+            provider_commands: list[tuple[str, ...]] = []
+
+            def malformed_provider_start(*arguments: str, **kwargs: object) -> dict[str, object]:
+                provider_commands.append(arguments)
+                return {"returncode": 0, "ok": True}
+
+            windows_runner.command = malformed_provider_start
+            try:
+                windows_runner._start_provider()
+            except ScenarioError as error:
+                assert "omitted its sync root" in str(error)
+                assert windows_runner.provider_started
+            else:
+                raise AssertionError("malformed provider startup report was accepted")
+            finally:
+                windows_runner.cleanup()
+                shutil.rmtree(windows_runner.tmp, ignore_errors=True)
+            assert [arguments[1] for arguments in provider_commands] == [
+                "start",
+                "stop",
+                "unregister",
+            ]
+
+            runner.daemon_started = True
+            runner.command = lambda *arguments, **kwargs: {
+                "returncode": 1,
+                "ok": False,
+                "message": "daemon refused to stop",
+            }
+            try:
+                runner.cleanup()
+            except ScenarioError as error:
+                assert "daemon stop failed" in str(error)
+            else:
+                raise AssertionError("daemon cleanup failure was not propagated")
         shutil.rmtree(runner.tmp)
 finally:
     shutil.rmtree(provider_root, ignore_errors=True)

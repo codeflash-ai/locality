@@ -844,15 +844,28 @@ on_error() {
   return "$code"
 }
 
-cleanup() {
-  set +e
-  if [[ -n "${credential_path:-}" && -n "${oauth_refresh_marker:-}" ]]; then
+export_gmail_credential_if_requested() {
+  if [[ -z "${credential_path:-}" || -z "${LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT:-}" ]]; then
+    return 0
+  fi
+  if [[ -n "${oauth_refresh_marker:-}" ]]; then
     export_refreshed_oauth_credential_if_requested \
       "$credential_path" \
       "gmail" \
       "$oauth_refresh_marker" \
-      "Gmail live credential" >/dev/null 2>&1 || true
+      "Gmail live credential"
+    return
   fi
+  export_oauth_credential_file \
+    "$credential_path" \
+    "$LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT" \
+    "gmail" \
+    "Gmail live credential"
+}
+
+cleanup() {
+  set +e
+  export_gmail_credential_if_requested >/dev/null 2>&1 || true
   if [[ "$draft_deleted" != "1" \
     && ( -n "${draft_id:-}" || -n "${raw_message_id:-}" || "$draft_cleanup_needed" == "1" ) ]]; then
     delete_created_gmail_draft best_effort >/dev/null 2>&1 || \
@@ -877,6 +890,17 @@ run_gmail_helper_selftest() {
   local encoded_marker
   local draft_json="$tmp_root/selftest-draft.json"
   local message_json="$tmp_root/selftest-message.json"
+  local credential_path="$tmp_root/selftest-credential.json"
+  local LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT="$tmp_root/selftest-exported-credential.json"
+  local oauth_refresh_marker=""
+
+  printf '%s' \
+    '{"kind":"oauth","connector":"gmail","access_token":"selftest-access","oauth_broker_url":"https://auth.example.test","refresh_token_handle":"selftest-refresh","acquired_at":100,"expires_at":4102444800}' \
+    >"$credential_path"
+  export_gmail_credential_if_requested
+  if ! cmp -s "$credential_path" "$LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT"; then
+    live_fail "Gmail helper self-test did not export an unforced current credential"
+  fi
 
   encoded_marker="$(python3 - "$selftest_marker" <<'PY'
 import base64
@@ -972,9 +996,6 @@ seed_connector_credential \
   "$LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON"
 credential_path="$(credential_file_path "$state_root" "connection:$connection_id")"
 require_oauth_credential_file "$credential_path" "gmail" "Gmail live credential"
-if [[ -n "${LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT:-}" && "${LOCALITY_LIVE_FORCE_OAUTH_REFRESH:-0}" != "1" ]]; then
-  live_fail "LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT requires LOCALITY_LIVE_FORCE_OAUTH_REFRESH=1"
-fi
 if [[ "${LOCALITY_LIVE_FORCE_OAUTH_REFRESH:-0}" == "1" ]]; then
   step="forcing Gmail OAuth credential refresh"
   force_oauth_credential_refresh "$credential_path" "gmail" "Gmail live credential"
@@ -1012,12 +1033,8 @@ if [[ -n "$oauth_refresh_marker" ]]; then
     "gmail" \
     "$oauth_refresh_marker" \
     "Gmail live credential"
-  export_refreshed_oauth_credential_if_requested \
-    "$credential_path" \
-    "gmail" \
-    "$oauth_refresh_marker" \
-    "Gmail live credential"
 fi
+export_gmail_credential_if_requested
 
 step="verifying retrieved Gmail mailbox projection"
 assert_initial_mailboxes_retrievable

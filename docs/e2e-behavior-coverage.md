@@ -213,8 +213,11 @@ GitHub Actions runs `.github/workflows/connector-live-e2e.yml` for relevant
 changes on `main` and on manual dispatch. The workflow uses the
 `connector-live-e2e` environment and uploads no artifacts. Google OAuth jobs
 validate refresh-capable credential JSON but do not write back to GitHub
-Secrets during normal push runs. Manual dispatch can set
-`force_oauth_refresh=true` to exercise their broker refresh paths, and can set
+Secrets during normal push runs. The Gmail FUSE scenario always exports its
+latest stored credential to runner-local state so a transparent access-token
+refresh is passed to the connector integrity step in the same job. Manual
+dispatch can set `force_oauth_refresh=true` to exercise their broker refresh
+paths, and can set
 `persist_rotated_oauth_secrets=true`; in that mode each OAuth job requires
 `LOCALITY_SECRET_ROTATOR_TOKEN`, exports its refreshed credential JSON after the
 first successful pull, and uses `gh secret set --env connector-live-e2e` to

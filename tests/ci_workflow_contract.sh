@@ -106,7 +106,7 @@ assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
 assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
   "          python3 tests/live_provider_connector_scenario_selftest.py"
 assert_job_line ".github/workflows/connector-live-e2e.yml" "gmail-live" \
-  '          LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ github.event_name == '\''workflow_dispatch'\'' && inputs.force_oauth_refresh == true && format('\''{0}/locality-gmail-live-credential.json'\'', runner.temp) || '\'''\'' }}'
+  '          LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ runner.temp }}/locality-gmail-live-credential.json'
 
 assert_job_line ".github/workflows/notion-live-e2e.yml" "linux-fuse-live" "    runs-on: ubuntu-latest"
 assert_job_line ".github/workflows/notion-live-e2e.yml" "linux-fuse-live" \
@@ -199,6 +199,12 @@ grep -Fq "def cleanup(self)" "$ROOT/tests/live_provider_connector_scenario.py" |
   fail "provider runner must retain its strict cleanup hook"
 grep -Fq "def _sanitize(self" "$ROOT/tests/live_provider_connector_scenario.py" ||
   fail "provider runner must retain privacy-safe diagnostics"
+grep -Fq "export_gmail_credential_if_requested" "$ROOT/tests/live_gmail_vfs_roundtrip.sh" ||
+  fail "Gmail FUSE live scenario must hand its current credential to later consumers"
+if grep -Fq "LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT requires LOCALITY_LIVE_FORCE_OAUTH_REFRESH=1" \
+  "$ROOT/tests/live_gmail_vfs_roundtrip.sh"; then
+  fail "Gmail FUSE credential handoff must also support transparent refresh"
+fi
 
 # Slack refresh tokens are single-use. Every live run must force refresh,
 # export the replacement, and persist it even if a later live assertion fails.
