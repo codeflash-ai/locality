@@ -80,6 +80,8 @@ assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "slack-file
   '        run: echo "LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT=$RUNNER_TEMP/locality-slack-macos-credential.json" >> "$GITHUB_ENV"'
 assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "granola-file-provider-live" \
   "        run: tests/live_macos_connector_file_provider.sh"
+grep -Fqx "export LOCALITY_CREDENTIAL_STORE=file" "$ROOT/tests/live_macos_file_provider.sh" ||
+  fail "macOS live harness must use its isolated file credential store"
 grep -Fqx "  group: locality-live-secret-consumers" "$ROOT/.github/workflows/macos-file-provider-live-e2e.yml" ||
   fail "macOS provider workflow must serialize live secret consumers"
 grep -Fqx "  group: locality-live-secret-consumers" "$ROOT/.github/workflows/connector-live-e2e.yml" ||

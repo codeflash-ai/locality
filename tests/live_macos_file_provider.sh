@@ -97,6 +97,10 @@ PY
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-macos-file-provider-live.XXXXXX")"
 state_root="$tmp_root/state"
 retired_state_root="$tmp_root/retired-state"
+# The dedicated runner has no interactive login keychain. Keep live-test
+# credentials inside the isolated state root, matching the connector provider
+# harness, and remove them during strict cleanup.
+export LOCALITY_CREDENTIAL_STORE=file
 domain_report="$tmp_root/domain.json"
 connect_report="$tmp_root/connect.json"
 pull_report="$tmp_root/pull.json"
