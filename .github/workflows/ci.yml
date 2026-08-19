@@ -147,6 +147,8 @@ jobs:
       - name: Validate live macOS File Provider harness
         run: |
           bash -n tests/live_macos_file_provider.sh
+          self_test_output="$(LOCALITY_MACOS_FILE_PROVIDER_HARNESS_SELF_TEST=1 tests/live_macos_file_provider.sh)"
+          test "$self_test_output" = "ok: live macOS File Provider harness enforces short daemon socket paths"
           output="$(tests/live_macos_file_provider.sh)"
           test "$output" = "skip: set LOCALITY_MACOS_FILE_PROVIDER_LIVE=1 to run the live macOS File Provider test"
           if LOCALITY_MACOS_FILE_PROVIDER_LIVE=1 tests/live_macos_file_provider.sh 2>preflight-error.log; then
