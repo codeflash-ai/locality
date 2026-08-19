@@ -7,12 +7,14 @@ import json
 import os
 import pathlib
 import shutil
+import sqlite3
 import tempfile
 
 from live_provider_connector_scenario import (
     MACOS_FILE_PROVIDER_DAEMON_ADDR,
     Runner,
     ScenarioError,
+    linear_restoration_values,
 )
 
 
@@ -54,6 +56,10 @@ fake_environment = {
 
 provider_root = pathlib.Path(tempfile.mkdtemp(prefix="locality-provider-runner-selftest-"))
 try:
+    nullable_linear = linear_restoration_values(
+        "issue-null-description", {"description": None, "title": "Nullable fixture"}
+    )
+    assert nullable_linear["description"] is None
     for connector in ("gmail", "slack", "linear", "granola"):
         os.environ.update(fake_environment)
         args = argparse.Namespace(
@@ -75,6 +81,49 @@ try:
         sanitized = runner._sanitize(f"secret={runner.credential}")
         assert runner.credential not in sanitized
         assert "<redacted>" in sanitized
+
+        database = sqlite3.connect(runner.state / "state.sqlite3")
+        try:
+            database.execute(
+                """
+                INSERT INTO entities (
+                    mount_id, remote_id, kind_json, title, path,
+                    hydration_json, content_hash, remote_edited_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "fingerprint-mount",
+                    "fingerprint-remote",
+                    '"page"',
+                    "before",
+                    "fingerprint/page.md",
+                    '"hydrated"',
+                    "content-hash",
+                    "2026-08-19T00:00:00Z",
+                ),
+            )
+            database.commit()
+            database_before = runner._state_fingerprint()
+            database.execute(
+                "UPDATE entities SET title = ? WHERE mount_id = ? AND remote_id = ?",
+                ("after", "fingerprint-mount", "fingerprint-remote"),
+            )
+            database.commit()
+            assert runner._state_fingerprint() != database_before
+            database.execute(
+                "DELETE FROM entities WHERE mount_id = ? AND remote_id = ?",
+                ("fingerprint-mount", "fingerprint-remote"),
+            )
+            database.commit()
+        finally:
+            database.close()
+
+        cache_file = runner.state / "content" / "fingerprint-mount" / "files" / "page.md"
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text("before", encoding="utf-8")
+        cache_before = runner._state_fingerprint()
+        cache_file.write_text("after!", encoding="utf-8")
+        assert runner._state_fingerprint() != cache_before
         runner._require_cleanup_success("provider stop", {"returncode": 0, "ok": True})
         for failed_report in (
             {"returncode": 1, "ok": False, "message": "stop failed"},

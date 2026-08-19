@@ -332,6 +332,7 @@ live_mutation_state_fingerprint() {
   python3 - "$state_root/state.sqlite3" <<'PY'
 import hashlib
 import json
+import os
 import pathlib
 import sqlite3
 import sys
@@ -339,16 +340,48 @@ import sys
 path = pathlib.Path(sys.argv[1])
 connection = sqlite3.connect(path)
 try:
-    values = []
-    for table in ("entities", "journals", "virtual_mutations"):
+    tables = {}
+    for table in ("entities", "shadows", "journals", "virtual_mutations", "content_cache"):
         exists = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
         ).fetchone()
-        count = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] if exists else 0
-        values.append((table, count))
+        if not exists:
+            tables[table] = None
+            continue
+        columns = [row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')]
+        rows = []
+        for row in connection.execute(f'SELECT * FROM "{table}"'):
+            normalized = []
+            for value in row:
+                if isinstance(value, bytes):
+                    normalized.append(
+                        {"blob_sha256": hashlib.sha256(value).hexdigest(), "length": len(value)}
+                    )
+                else:
+                    normalized.append(value)
+            rows.append(normalized)
+        rows.sort(key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")))
+        tables[table] = {"columns": columns, "rows": rows}
 finally:
     connection.close()
-print(hashlib.sha256(json.dumps(values, separators=(",", ":")).encode()).hexdigest())
+
+content_root = path.parent / "content"
+cache_files = []
+if content_root.exists():
+    for item in sorted(content_root.rglob("*")):
+        relative = item.relative_to(content_root).as_posix()
+        if item.is_symlink():
+            cache_files.append((relative, "symlink", os.readlink(item)))
+        elif item.is_file():
+            cache_files.append(
+                (relative, "file", hashlib.sha256(item.read_bytes()).hexdigest())
+            )
+payload = {"tables": tables, "content_cache": cache_files}
+print(
+    hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+)
 PY
 }
 

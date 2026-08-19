@@ -35,6 +35,14 @@ class ScenarioError(RuntimeError):
     pass
 
 
+def linear_restoration_values(issue_id: str, issue: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": issue_id,
+        "description": issue.get("description"),
+        "title": issue.get("title"),
+    }
+
+
 class Runner:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -151,7 +159,7 @@ class Runner:
             failures.append(f"Gmail draft cleanup: {error}")
         try:
             if self.linear_original is not None:
-                self._linear_update(self.linear_original)
+                self._restore_linear_original()
         except Exception as error:
             failures.append(f"Linear restoration: {error}")
         if self.provider_started and self.platform == "windows-cloud-files":
@@ -374,8 +382,11 @@ class Runner:
 
     def _read_only_scenario(self, remote_id: str, leaf: str = "") -> None:
         target = self._entity_path(remote_id, leaf)
+        # The first provider read is allowed to hydrate the durable content
+        # cache. Snapshot only after that expected state transition.
+        original = target.read_bytes()
         before = self._state_fingerprint()
-        original = self._assert_file_read_only(target)
+        self._assert_file_read_only(target, original)
         push = self.command("push", str(target), "-y", "--json", check=False)
         if push.get("returncode") == 0 or push.get("ok") is True:
             raise ScenarioError("read-only connector push unexpectedly succeeded")
@@ -386,8 +397,9 @@ class Runner:
         if target.read_bytes() != original:
             raise ScenarioError("read-only provider content changed after repeat observation")
 
-    def _assert_file_read_only(self, target: pathlib.Path) -> bytes:
-        original = target.read_bytes()
+    def _assert_file_read_only(self, target: pathlib.Path, original: bytes | None = None) -> bytes:
+        if original is None:
+            original = target.read_bytes()
         self._expect_filesystem_rejection("write", lambda: target.write_bytes(original + b"\nforbidden\n"))
         self._expect_filesystem_rejection("rename", lambda: target.rename(target.with_name(target.name + ".forbidden")))
         self._expect_filesystem_rejection("delete", target.unlink)
@@ -452,7 +464,7 @@ class Runner:
     def _linear_scenario(self) -> None:
         issue_id = self.fixtures["issue_id"]
         issue = self._linear_get()
-        self.linear_original = {"id": issue_id, "description": issue.get("description") or "", "title": issue.get("title") or ""}
+        self.linear_original = linear_restoration_values(issue_id, issue)
         page = self._entity_path(issue_id, "page.md")
         original_page = page.read_text(encoding="utf-8")
         marker = f"Locality provider Linear marker {int(time.time())}-{os.getpid()}"
@@ -475,9 +487,10 @@ class Runner:
         else:
             page.write_text(original_page, encoding="utf-8")
         self.command("push", str(page), "-y", "--json")
-        restored = self._linear_get()
-        if (restored.get("description") or "") != self.linear_original["description"]:
-            raise ScenarioError("Linear scratch issue body was not deterministically restored")
+        # Product restoration exercises the mounted write path first. Always
+        # finish with an exact API restoration so a nullable description is
+        # not collapsed to an empty string in the shared fixture.
+        self._restore_linear_original()
         self.linear_original = None
         self.command("pull", str(self.mount), "--json")
         self._status_clean(page)
@@ -498,16 +511,45 @@ class Runner:
     def _state_fingerprint(self) -> str:
         db = sqlite3.connect(self.state / "state.sqlite3")
         try:
-            values = []
-            for table in ("journals", "virtual_mutations"):
-                exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
-                values.append((table, db.execute(f"SELECT count(*) FROM {table}").fetchone()[0] if exists else 0))
-            for table in ("entities", "content_cache"):
-                exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
-                values.append((table, db.execute(f"SELECT count(*) FROM {table}").fetchone()[0] if exists else 0))
+            tables: dict[str, Any] = {}
+            for table in ("entities", "shadows", "journals", "virtual_mutations", "content_cache"):
+                exists = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchone()
+                if not exists:
+                    tables[table] = None
+                    continue
+                columns = [row[1] for row in db.execute(f'PRAGMA table_info("{table}")')]
+                rows = [
+                    [self._fingerprint_sql_value(value) for value in row]
+                    for row in db.execute(f'SELECT * FROM "{table}"')
+                ]
+                rows.sort(key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")))
+                tables[table] = {"columns": columns, "rows": rows}
         finally:
             db.close()
-        return hashlib.sha256(json.dumps(values).encode()).hexdigest()
+
+        cache_files = []
+        content_root = pathlib.Path(
+            self.env.get("LOCALITY_VIRTUAL_FS_CONTENT_ROOT", str(self.state / "content"))
+        )
+        if content_root.exists():
+            for path in sorted(content_root.rglob("*")):
+                relative = path.relative_to(content_root).as_posix()
+                if path.is_symlink():
+                    cache_files.append((relative, "symlink", os.readlink(path)))
+                elif path.is_file():
+                    cache_files.append((relative, "file", hashlib.sha256(path.read_bytes()).hexdigest()))
+        payload = {"tables": tables, "content_cache": cache_files}
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    @staticmethod
+    def _fingerprint_sql_value(value: Any) -> Any:
+        if isinstance(value, bytes):
+            return {"blob_sha256": hashlib.sha256(value).hexdigest(), "length": len(value)}
+        return value
 
     def _expect_filesystem_rejection(self, label: str, action: Callable[[], object]) -> None:
         try:
@@ -572,10 +614,23 @@ class Runner:
         return issue
 
     def _linear_update(self, values: dict[str, Any]) -> None:
-        self._linear_graphql(
+        result = self._linear_graphql(
             "mutation ProviderLiveRestore($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { id } } }",
             {"id": values["id"], "input": {key: values[key] for key in ("description", "title") if key in values}},
         )
+        if (result.get("issueUpdate") or {}).get("success") is not True:
+            raise ScenarioError("Linear scratch issue restoration mutation did not succeed")
+
+    def _restore_linear_original(self) -> None:
+        if self.linear_original is None:
+            return
+        self._linear_update(self.linear_original)
+        restored = self._linear_get()
+        for field in ("description", "title"):
+            if restored.get(field) != self.linear_original[field]:
+                raise ScenarioError(
+                    f"Linear scratch issue {field} was not deterministically restored"
+                )
 
     def _linear_graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps({"query": query, "variables": variables}).encode()

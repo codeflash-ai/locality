@@ -289,6 +289,36 @@ if [[ ! "$mutation_fingerprint" =~ ^[0-9a-f]{64}$ ]]; then
   live_fail "live_mutation_state_fingerprint did not return a SHA-256 digest"
 fi
 
+sqlite3 "$db" <<'SQL'
+INSERT INTO entities (
+  mount_id, remote_id, kind_json, title, path,
+  hydration_json, content_hash, remote_edited_at
+) VALUES (
+  'fingerprint-mount', 'fingerprint-remote', '"page"', 'before',
+  'fingerprint/page.md', '"hydrated"', 'content-hash', '2026-08-19T00:00:00Z'
+);
+SQL
+database_fingerprint_before="$(live_mutation_state_fingerprint "$state_root")"
+sqlite3 "$db" \
+  "UPDATE entities SET title = 'after' WHERE mount_id = 'fingerprint-mount' AND remote_id = 'fingerprint-remote';"
+database_fingerprint_after="$(live_mutation_state_fingerprint "$state_root")"
+if [[ "$database_fingerprint_before" == "$database_fingerprint_after" ]]; then
+  live_fail "live_mutation_state_fingerprint ignored an in-place entity update"
+fi
+sqlite3 "$db" \
+  "DELETE FROM entities WHERE mount_id = 'fingerprint-mount' AND remote_id = 'fingerprint-remote';"
+
+fingerprint_cache_file="$state_root/content/fingerprint-mount/files/page.md"
+mkdir -p "$(dirname "$fingerprint_cache_file")"
+printf 'before' >"$fingerprint_cache_file"
+cache_fingerprint_before="$(live_mutation_state_fingerprint "$state_root")"
+printf 'after!' >"$fingerprint_cache_file"
+cache_fingerprint_after="$(live_mutation_state_fingerprint "$state_root")"
+if [[ "$cache_fingerprint_before" == "$cache_fingerprint_after" ]]; then
+  live_fail "live_mutation_state_fingerprint ignored an in-place content-cache update"
+fi
+rm -rf "$state_root/content/fingerprint-mount"
+
 connection_count="$(
   sqlite3 "$db" \
     "SELECT count(*) FROM connections WHERE connection_id = 'google-docs-live' AND connector = 'google-docs' AND auth_kind = 'oauth';"

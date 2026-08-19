@@ -94,6 +94,8 @@ assert_job_line ".github/workflows/e2e.yml" "linux-fuse" \
 assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
   "          bash -n tests/live_connector_common.sh"
 assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
+  "        run: cargo build -p loc-cli -p localityd"
+assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
   "          bash -n tests/live_connector_common_selftest.sh"
 assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
   "          bash -n tests/live_google_docs_mutation_scenario.sh"
@@ -103,6 +105,8 @@ assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
   "          python3 tests/live_connector_matrix.py validate"
 assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
   "          python3 tests/live_provider_connector_scenario_selftest.py"
+assert_job_line ".github/workflows/connector-live-e2e.yml" "gmail-live" \
+  '          LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ github.event_name == '\''workflow_dispatch'\'' && inputs.force_oauth_refresh == true && format('\''{0}/locality-gmail-live-credential.json'\'', runner.temp) || '\'''\'' }}'
 
 assert_job_line ".github/workflows/notion-live-e2e.yml" "linux-fuse-live" "    runs-on: ubuntu-latest"
 assert_job_line ".github/workflows/notion-live-e2e.yml" "linux-fuse-live" \
