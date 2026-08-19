@@ -146,6 +146,10 @@ The `Sources` breadcrumb returns to the table without changing the selected
 source in backend state. No backend source selection command is introduced by
 this screen.
 
+Every registered connector exposes `Sync source` on Source Detail. The action
+pulls the latest safe remote state for that selected source through the shared
+connector resolver while preserving pending local edits for review.
+
 Source Detail keeps destructive maintenance inside a collapsed Danger Zone.
 Both actions require a phrase containing the selected mount id:
 

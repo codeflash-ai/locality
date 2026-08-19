@@ -45,6 +45,7 @@ import {
   mountFileIndexProgressLabel,
   mountFileIndexProgressValue,
   mountAccessLabel,
+  mountManualSyncAvailable,
   mountRows,
   mountStatusLabel,
   mountStatusTone,
@@ -4610,7 +4611,7 @@ function CurrentWorkspacePanel({
     setPullState("pulling");
 
     try {
-      const report = await callCommand<ActionReport>("pull_notion_file", {
+      const report = await callCommand<ActionReport>("pull_source", {
         path: snapshot.mount.localPath,
       });
       setPullMessage(report.message);
@@ -4726,7 +4727,7 @@ function MountDetailView({
   const hasPendingChanges = mount.pendingChangeCount > 0;
   const isActiveMount = snapshot.activeMountId === mount.mountId;
   const showNotionAccessAction = mount.connector === "notion" && isActiveMount;
-  const showNotionPullAction = mount.connector === "notion";
+  const manualSyncAvailable = mountManualSyncAvailable(mount);
   const [actionError, setActionError] = useState("");
   const [accessMessage, setAccessMessage] = useState("");
   const [accessState, setAccessState] = useState<"idle" | "changing" | "success" | "error">("idle");
@@ -4803,7 +4804,7 @@ function MountDetailView({
   }
 
   async function pullChanges() {
-    if (pullState === "pulling" || !showNotionPullAction) {
+    if (pullState === "pulling" || !manualSyncAvailable) {
       return;
     }
 
@@ -4813,7 +4814,7 @@ function MountDetailView({
     setPullState("pulling");
 
     try {
-      const report = await callCommand<ActionReport>("pull_notion_file", {
+      const report = await callCommand<ActionReport>("pull_source", {
         path: mount.localPath,
       });
       setPullMessage(report.message);
@@ -4952,16 +4953,14 @@ function MountDetailView({
               {accessState === "changing" ? "Waiting for Notion" : "Change Notion Access"}
             </SecondaryButton>
           )}
-          {showNotionPullAction && (
-            <SecondaryButton
-              compact
-              disabled={!mount.localPath.trim() || accessState === "changing" || pullState === "pulling"}
-              icon={pullState === "pulling" ? <Loader2 className="spin-icon" /> : <RefreshCw />}
-              onClick={() => void pullChanges()}
-            >
-              {pullState === "pulling" ? "Syncing source" : "Sync source"}
-            </SecondaryButton>
-          )}
+          <SecondaryButton
+            compact
+            disabled={!manualSyncAvailable || accessState === "changing" || pullState === "pulling"}
+            icon={pullState === "pulling" ? <Loader2 className="spin-icon" /> : <RefreshCw />}
+            onClick={() => void pullChanges()}
+          >
+            {pullState === "pulling" ? "Syncing source" : "Sync source"}
+          </SecondaryButton>
         </div>
       </section>
       {actionError && <p className="field-error">{actionError}</p>}
@@ -5043,16 +5042,14 @@ function MountDetailView({
               <i />
             </span>
           </button>
-          {showNotionPullAction && (
-            <SecondaryButton
-              compact
-              disabled={!mount.localPath.trim() || accessState === "changing" || pullState === "pulling"}
-              icon={pullState === "pulling" ? <Loader2 className="spin-icon" /> : <RefreshCw />}
-              onClick={() => void pullChanges()}
-            >
-              {pullState === "pulling" ? "Syncing" : "Sync Now"}
-            </SecondaryButton>
-          )}
+          <SecondaryButton
+            compact
+            disabled={!manualSyncAvailable || accessState === "changing" || pullState === "pulling"}
+            icon={pullState === "pulling" ? <Loader2 className="spin-icon" /> : <RefreshCw />}
+            onClick={() => void pullChanges()}
+          >
+            {pullState === "pulling" ? "Syncing" : "Sync Now"}
+          </SecondaryButton>
           <SecondaryButton compact disabled>
             Use Global Default
           </SecondaryButton>
@@ -6977,7 +6974,7 @@ function fileActionCommand(action: FileAction) {
     case "reset":
       return "reset_notion_file_to_remote";
     case "resolve":
-      return "pull_notion_file";
+      return "pull_source";
   }
 }
 
