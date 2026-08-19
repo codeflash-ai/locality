@@ -28,6 +28,9 @@ from typing import Any, Callable
 import live_connector_matrix
 
 
+MACOS_FILE_PROVIDER_DAEMON_ADDR = "127.0.0.1:38567"
+
+
 class ScenarioError(RuntimeError):
     pass
 
@@ -82,7 +85,11 @@ class Runner:
         self.connection_id = f"{self.connector}-provider-live"
         self.mount_id = f"{self.connector}-provider-{os.getpid()}"
         self.mount = self.root / self.mount_id
-        self.tcp_addr = f"127.0.0.1:{free_port()}"
+        self.tcp_addr = (
+            MACOS_FILE_PROVIDER_DAEMON_ADDR
+            if self.platform == "macos-file-provider"
+            else f"127.0.0.1:{free_port()}"
+        )
         self.env = os.environ.copy()
         self.env.update(
             {
@@ -150,7 +157,10 @@ class Runner:
         if self.provider_started and self.platform == "windows-cloud-files":
             for action in ("stop", "unregister"):
                 try:
-                    self.command("file-provider", action, str(self.mount), "--json", check=False)
+                    report = self.command(
+                        "file-provider", action, str(self.mount), "--json", check=False
+                    )
+                    self._require_cleanup_success(f"provider {action}", report)
                 except Exception as error:
                     failures.append(f"provider {action}: {error}")
         if self.daemon_started:
@@ -214,6 +224,15 @@ class Runner:
             if len(value) >= 4:
                 text = text.replace(value, "<redacted>")
         return "\n".join(text.splitlines()[-40:])[:8000]
+
+    def _require_cleanup_success(self, label: str, report: dict[str, Any]) -> None:
+        if report.get("returncode") == 0 and report.get("ok") is True:
+            return
+        detail = report.get("message") or report.get("text") or "ok was not true"
+        raise ScenarioError(
+            f"{label} failed with exit {report.get('returncode', 'unknown')}: "
+            f"{self._sanitize(str(detail))}"
+        )
 
     def _initialize_and_seed(self) -> None:
         disabled = self.env.copy()

@@ -137,6 +137,8 @@ for index in "${!connector_jobs[@]}"; do
 done
 assert_job_line ".github/workflows/connector-live-e2e.yml" "slack-windows-cloud-files-live" \
   '          gh api "repos/$GITHUB_REPOSITORY/environments/connector-live-e2e/secrets/public-key" >/dev/null'
+assert_job_line ".github/workflows/connector-live-e2e.yml" "linear-windows-cloud-files-live" \
+  "    needs: linear-live"
 
 windows_connector_jobs=(
   "gmail-windows-cloud-files-live:gmail"

@@ -231,9 +231,11 @@ handle.
 The Windows Cloud Files jobs run on relevant `main` changes. They build and
 start the real daemon and Cloud Files process, register the actual sync root,
 exercise the visible filesystem, require `loc doctor` to pass, and remove the
-provider registration and isolated state. Gmail uses reversible drafts and
-Linear restores the scratch issue; Slack and Granola prove the entire mount is
-read-only without changing cache or journal state. Run one locally on Windows:
+provider registration and isolated state, failing cleanup if provider stop or
+unregister does not succeed. Gmail uses reversible drafts. The Windows Linear
+job waits for the Linux Linear job because both edit and restore the same
+scratch issue. Slack and Granola prove the entire mount is read-only without
+changing cache or journal state. Run one locally on Windows:
 
 ```powershell
 $env:LOCALITY_LIVE_CONNECTOR = "gmail" # or slack, linear, granola
@@ -245,7 +247,8 @@ The signed macOS scenarios remain manual because they require the dedicated,
 pre-approved `loc` File Provider domain. Dispatch
 `.github/workflows/macos-file-provider-live-e2e.yml`; it installs one signed
 candidate, runs Notion, Gmail, Linear, Slack, and Granola serially across the
-existing secret environments, and strictly removes each visible test mount.
+existing secret environments, starts connector daemons on the extension's fixed
+`127.0.0.1:38567` endpoint, and strictly removes each visible test mount.
 Gmail outbound send is deliberately absent from macOS and Windows; only the
 reversible draft path runs there. The workflow and the connector Linux/Windows
 workflow share a concurrency group, and each Slack consumer persists its

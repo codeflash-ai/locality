@@ -9,7 +9,11 @@ import pathlib
 import shutil
 import tempfile
 
-from live_provider_connector_scenario import Runner
+from live_provider_connector_scenario import (
+    MACOS_FILE_PROVIDER_DAEMON_ADDR,
+    Runner,
+    ScenarioError,
+)
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -63,6 +67,7 @@ try:
             wait_seconds=1,
         )
         runner = Runner(args)
+        assert runner.tcp_addr == MACOS_FILE_PROVIDER_DAEMON_ADDR
         runner._initialize_and_seed()
         assert (runner.state / "state.sqlite3").is_file()
         secret = runner._stored_credential()
@@ -70,6 +75,17 @@ try:
         sanitized = runner._sanitize(f"secret={runner.credential}")
         assert runner.credential not in sanitized
         assert "<redacted>" in sanitized
+        runner._require_cleanup_success("provider stop", {"returncode": 0, "ok": True})
+        for failed_report in (
+            {"returncode": 1, "ok": False, "message": "stop failed"},
+            {"returncode": 0, "ok": False, "message": "registration remains"},
+        ):
+            try:
+                runner._require_cleanup_success("provider stop", failed_report)
+            except ScenarioError as error:
+                assert "provider stop failed" in str(error)
+            else:
+                raise AssertionError("provider cleanup failure was not propagated")
         shutil.rmtree(runner.tmp)
 finally:
     shutil.rmtree(provider_root, ignore_errors=True)

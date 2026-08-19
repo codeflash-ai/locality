@@ -500,6 +500,7 @@ jobs:
 
   linear-windows-cloud-files-live:
     name: Linear Windows Cloud Files live e2e
+    needs: linear-live
     runs-on: windows-latest
     timeout-minutes: 35
     environment: connector-live-e2e
