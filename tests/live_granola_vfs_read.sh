@@ -10,6 +10,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck source=tests/live_connector_common.sh
 source "$script_dir/live_connector_common.sh"
+assert_live_scenario_contract "granola" "linux-fuse" "tests/live_granola_vfs_read.sh"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "skip: live Granola VFS test requires Linux"
@@ -27,16 +28,9 @@ if [[ ! -e /dev/fuse ]]; then
   exit 1
 fi
 
+require_live_scenario_env "granola"
 granola_api_key="${GRANOLA_API_KEY:-}"
 live_note_id="${LOCALITY_GRANOLA_LIVE_NOTE_ID:-}"
-if [[ -z "$granola_api_key" ]]; then
-  echo "missing GRANOLA_API_KEY" >&2
-  exit 1
-fi
-if [[ -z "$live_note_id" ]]; then
-  echo "missing LOCALITY_GRANOLA_LIVE_NOTE_ID" >&2
-  exit 1
-fi
 if [[ ! "$live_note_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
   echo "LOCALITY_GRANOLA_LIVE_NOTE_ID has an invalid shape" >&2
   exit 1
@@ -64,6 +58,7 @@ first_pull_report="$tmp_root/first-pull.json"
 second_pull_report="$tmp_root/second-pull.json"
 doctor_report="$tmp_root/doctor.json"
 status_report="$tmp_root/status.json"
+push_report="$tmp_root/push.json"
 info_report="$tmp_root/info.json"
 summary_copy="$tmp_root/summary.md"
 summary_reopen_copy="$tmp_root/summary-reopen.md"
@@ -366,6 +361,7 @@ assert_json_true "$info_report" mount.read_only
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" status "$selected_meeting/summary.md" --json \
   >"$status_report" 2>>"$command_log"
 assert_json_true "$status_report" clean
+mutation_state_before="$(live_mutation_state_fingerprint "$state_root")"
 summary_hash_before="$(sha256sum "$selected_meeting/summary.md" | awk '{print $1}')"
 if { printf 'live e2e must not write\n' >"$selected_meeting/summary.md"; } 2>/dev/null; then
   echo "Granola mounted file unexpectedly accepted a filesystem write" >&2
@@ -374,6 +370,49 @@ fi
 summary_hash_after="$(sha256sum "$selected_meeting/summary.md" | awk '{print $1}')"
 if [[ "$summary_hash_before" != "$summary_hash_after" ]]; then
   echo "Granola mounted file changed after a rejected write" >&2
+  exit 1
+fi
+forbidden_create="$selected_meeting/forbidden-create.md"
+forbidden_rename="$selected_meeting/summary.md.forbidden-rename"
+if printf 'forbidden\n' >"$forbidden_create" 2>>"$command_log"; then
+  rm -f "$forbidden_create" 2>>"$command_log" || true
+  echo "Granola read-only mount unexpectedly accepted a file create" >&2
+  exit 1
+fi
+if mv "$selected_meeting/summary.md" "$forbidden_rename" 2>>"$command_log"; then
+  mv "$forbidden_rename" "$selected_meeting/summary.md" 2>>"$command_log" || true
+  echo "Granola read-only mount unexpectedly accepted a rename" >&2
+  exit 1
+fi
+if rm "$selected_meeting/summary.md" 2>>"$command_log"; then
+  cp "$summary_copy" "$selected_meeting/summary.md" 2>>"$command_log" || true
+  echo "Granola read-only mount unexpectedly accepted a delete" >&2
+  exit 1
+fi
+if [[ ! -e "$selected_meeting/summary.md" || -e "$forbidden_create" || -e "$forbidden_rename" ]]; then
+  echo "Granola rejected mutation changed provider content" >&2
+  exit 1
+fi
+if LOCALITY_STATE_DIR="$state_root" "$loc_bin" push "$selected_meeting/summary.md" -y --json \
+  >"$push_report" 2>>"$command_log"; then
+  echo "Granola read-only push unexpectedly succeeded" >&2
+  exit 1
+fi
+python3 - "$push_report" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if report.get("ok") is True:
+    raise SystemExit("Granola read-only push unexpectedly reported ok=true")
+PY
+LOCALITY_STATE_DIR="$state_root" "$loc_bin" status "$selected_meeting/summary.md" --json \
+  >"$status_report" 2>>"$command_log"
+assert_json_true "$status_report" clean
+mutation_state_after="$(live_mutation_state_fingerprint "$state_root")"
+if [[ "$mutation_state_before" != "$mutation_state_after" ]]; then
+  echo "Granola rejected mutations changed entities, journals, or virtual mutations" >&2
   exit 1
 fi
 

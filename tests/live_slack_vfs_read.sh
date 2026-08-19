@@ -10,6 +10,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck source=tests/live_connector_common.sh
 source "$script_dir/live_connector_common.sh"
+assert_live_scenario_contract "slack" "linux-fuse" "tests/live_slack_vfs_read.sh"
 
 loc_bin="${LOCALITY_BIN:-./target/debug/loc}"
 localityd_bin="${LOCALITYD_BIN:-./target/debug/localityd}"
@@ -30,9 +31,7 @@ for slack_type in "${slack_type_parts[@]}"; do
 done
 
 require_linux_fuse
-require_live_env \
-  LOCALITY_SLACK_LIVE_CREDENTIAL_JSON \
-  LOCALITY_SLACK_LIVE_CONVERSATION_ID
+require_live_scenario_env "slack"
 
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-live-slack-vfs.XXXXXX")"
 state_root="$tmp_root/state"
@@ -390,6 +389,7 @@ validate_recent_markdown "$recent_path" "$LOCALITY_SLACK_LIVE_CONVERSATION_ID"
 
 step="verifying Slack recent.md rejects Linux FUSE writes"
 cp "$recent_path" "$original_copy"
+mutation_state_before="$(live_mutation_state_fingerprint "$state_root")"
 original_hash="$(sha256sum "$recent_path" | awk '{print $1}')"
 write_status=0
 { printf '\nlive e2e must not write\n' >>"$recent_path"; } 2>>"$command_log" || write_status="$?"
@@ -405,6 +405,26 @@ if [[ "$original_hash" != "$after_write_hash" ]]; then
   cp "$original_copy" "$recent_path" 2>>"$command_log" || true
   live_fail "Slack mounted recent.md changed after a rejected write"
 fi
+
+step="verifying Slack rejects Linux FUSE create, rename, and delete"
+forbidden_create="$(dirname "$recent_path")/forbidden-create.md"
+forbidden_rename="$recent_path.forbidden-rename"
+if printf 'forbidden\n' >"$forbidden_create" 2>>"$command_log"; then
+  rm -f "$forbidden_create" 2>>"$command_log" || true
+  live_fail "Slack read-only mount unexpectedly accepted a file create"
+fi
+[[ ! -e "$forbidden_create" ]] || live_fail "Slack rejected create left provider content behind"
+if mv "$recent_path" "$forbidden_rename" 2>>"$command_log"; then
+  mv "$forbidden_rename" "$recent_path" 2>>"$command_log" || true
+  live_fail "Slack read-only mount unexpectedly accepted a rename"
+fi
+[[ -e "$recent_path" && ! -e "$forbidden_rename" ]] \
+  || live_fail "Slack rejected rename changed provider content"
+if rm "$recent_path" 2>>"$command_log"; then
+  cp "$original_copy" "$recent_path" 2>>"$command_log" || true
+  live_fail "Slack read-only mount unexpectedly accepted a delete"
+fi
+[[ -e "$recent_path" ]] || live_fail "Slack rejected delete removed provider content"
 
 step="verifying Slack read-only push validation"
 if LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$recent_path" \
@@ -422,5 +442,9 @@ step="checking Slack recent.md status"
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" status --json "$recent_path" \
   >"$status_report" 2>>"$command_log"
 assert_status_clean_for_target "$status_report" "$recent_path"
+mutation_state_after="$(live_mutation_state_fingerprint "$state_root")"
+if [[ "$mutation_state_before" != "$mutation_state_after" ]]; then
+  live_fail "Slack rejected mutations changed entities, journals, or virtual mutations"
+fi
 
-echo "live Slack API, CLI, daemon, and Linux FUSE read-only checks passed"
+echo "live Slack API, CLI, daemon, and Linux FUSE complete read-only checks passed"

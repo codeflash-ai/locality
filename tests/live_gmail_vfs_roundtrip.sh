@@ -5,6 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck source=tests/live_connector_common.sh
 source "$script_dir/live_connector_common.sh"
+assert_live_scenario_contract "gmail" "linux-fuse" "tests/live_gmail_vfs_roundtrip.sh"
 
 if [[ "${LOCALITY_LIVE_GMAIL_SELFTEST:-}" != "1" ]]; then
   if [[ "${LOCALITY_LIVE_GMAIL_VFS:-}" != "1" ]]; then
@@ -13,9 +14,7 @@ if [[ "${LOCALITY_LIVE_GMAIL_SELFTEST:-}" != "1" ]]; then
   fi
 
   require_linux_fuse
-  require_live_env \
-    LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON \
-    LOCALITY_GMAIL_LIVE_TO_EMAIL
+  require_live_scenario_env "gmail"
 
   if ! command -v curl >/dev/null 2>&1; then
     live_fail "curl is not installed"
@@ -59,6 +58,9 @@ remote_draft_push_report="$tmp_root/remote-draft-push.json"
 remote_draft_get_report="$tmp_root/remote-draft.json"
 remote_draft_send_diff_report="$tmp_root/remote-draft-send-diff.json"
 remote_draft_send_push_report="$tmp_root/remote-draft-send-push.json"
+remote_draft_drift_push_report="$tmp_root/remote-draft-drift-push.json"
+remote_draft_drift_pull_report="$tmp_root/remote-draft-drift-pull.json"
+remote_draft_drift_restore_report="$tmp_root/remote-draft-drift-restore.json"
 remote_sent_list_report="$tmp_root/remote-sent-list.json"
 remote_sent_get_report="$tmp_root/remote-sent-message.json"
 stale_draft_push_report="$tmp_root/stale-draft-push.json"
@@ -579,6 +581,46 @@ import sys
 print(json.dumps({"id": sys.argv[1]}))
 PY
   if curl -fsS -X POST "https://gmail.googleapis.com/gmail/v1/users/me/drafts/send" \
+    -H "Authorization: Bearer $access_token" \
+    -H "Content-Type: application/json" \
+    --data-binary "@$request_body" \
+    >"$output_path" 2>>"$command_log"; then
+    unset access_token
+    return 0
+  fi
+  unset access_token
+  return 1
+}
+
+update_gmail_draft_via_api() {
+  local searched_draft_id="$1"
+  local recipient="$2"
+  local updated_subject="$3"
+  local updated_body="$4"
+  local output_path="$5"
+  local request_body="$tmp_root/gmail-draft-update-body.json"
+  local access_token
+
+  access_token="$(gmail_access_token required)"
+  python3 - "$recipient" "$updated_subject" "$updated_body" >"$request_body" <<'PY'
+import base64
+import json
+import sys
+
+recipient, subject, body = sys.argv[1:]
+message = (
+    f"To: {recipient}\r\n"
+    f"Subject: {subject}\r\n"
+    "MIME-Version: 1.0\r\n"
+    "Content-Type: text/plain; charset=UTF-8\r\n"
+    "Content-Transfer-Encoding: 8bit\r\n"
+    "\r\n"
+    f"{body}\r\n"
+).encode("utf-8")
+raw = base64.urlsafe_b64encode(message).decode("ascii").rstrip("=")
+print(json.dumps({"message": {"raw": raw}}, separators=(",", ":")))
+PY
+  if curl -fsS -X PUT "https://gmail.googleapis.com/gmail/v1/users/me/drafts/$searched_draft_id" \
     -H "Authorization: Bearer $access_token" \
     -H "Content-Type: application/json" \
     --data-binary "@$request_body" \
@@ -1208,6 +1250,63 @@ if [[ "${LOCALITY_LIVE_GMAIL_SEND:-0}" == "1" ]]; then
 
   step="verifying edited Gmail remote draft through drafts API"
   wait_for_gmail_draft_content "$draft_id" "$remote_updated_subject" "$remote_updated_marker"
+
+  step="creating concurrent local and remote Gmail draft drift"
+  local_drift_subject="Locality live Gmail local drift $unique"
+  local_drift_marker="Locality live Gmail local drift marker $unique"
+  remote_drift_subject="Locality live Gmail remote drift $unique"
+  remote_drift_marker="Locality live Gmail remote drift marker $unique"
+  rewrite_gmail_markdown_subject_body \
+    "$remote_projected_draft_path" \
+    "$local_drift_subject" \
+    "$local_drift_marker"
+  update_gmail_draft_via_api \
+    "$draft_id" \
+    "$LOCALITY_GMAIL_LIVE_TO_EMAIL" \
+    "$remote_drift_subject" \
+    "$remote_drift_marker" \
+    "$remote_draft_get_report"
+  wait_for_gmail_draft_content "$draft_id" "$remote_drift_subject" "$remote_drift_marker"
+
+  step="verifying Gmail remote draft drift blocks local push"
+  if LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$remote_projected_draft_path" \
+    >"$remote_draft_drift_push_report" 2>>"$command_log"; then
+    live_fail "Gmail push unexpectedly overwrote remote draft drift"
+  fi
+  python3 - "$remote_draft_drift_push_report" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if report.get("ok") is True:
+    raise SystemExit("Gmail drift push unexpectedly reported ok=true")
+text = json.dumps(report).lower()
+if not any(word in text for word in ("drift", "conflict", "changed", "concurrency")):
+    raise SystemExit("Gmail drift push did not report a concurrency-safe failure")
+PY
+  wait_for_gmail_draft_content "$draft_id" "$remote_drift_subject" "$remote_drift_marker"
+
+  step="restoring Gmail remote draft after drift protection check"
+  update_gmail_draft_via_api \
+    "$draft_id" \
+    "$LOCALITY_GMAIL_LIVE_TO_EMAIL" \
+    "$remote_updated_subject" \
+    "$remote_updated_marker" \
+    "$remote_draft_get_report"
+  LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root/draft" \
+    >"$remote_draft_drift_pull_report" 2>>"$command_log"
+  assert_json_ok "$remote_draft_drift_pull_report" "Gmail remote-drift restore pull report"
+  LOCALITY_STATE_DIR="$state_root" "$loc_bin" restore --force "$remote_projected_draft_path" --json \
+    >"$remote_draft_drift_restore_report" 2>>"$command_log"
+  assert_json_ok "$remote_draft_drift_restore_report" "Gmail remote-drift local restore report"
+  LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root/draft" \
+    >"$remote_draft_drift_pull_report" 2>>"$command_log"
+  assert_json_ok "$remote_draft_drift_pull_report" "Gmail remote-drift final pull report"
+  remote_projected_draft_path="$(find_marker_under_draft "$remote_updated_marker" "" "$draft_id")"
+  if [[ -z "$remote_projected_draft_path" ]]; then
+    live_fail "restored Gmail remote draft was not visible under draft/"
+  fi
 
   step="moving edited Gmail remote draft to outbox"
   mv "$remote_projected_draft_path" "$remote_outbox_path"

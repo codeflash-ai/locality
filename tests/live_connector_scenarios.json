@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "connectors": {
+    "gmail": {
+      "display_name": "Gmail",
+      "credential": {
+        "kind": "oauth",
+        "environment": "LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON",
+        "secret_ref": "connection:gmail-live",
+        "refresh": "broker",
+        "rotation": "optional"
+      },
+      "fixtures": {
+        "recipient": "LOCALITY_GMAIL_LIVE_TO_EMAIL"
+      },
+      "capabilities": {
+        "read": true,
+        "create": ["draft"],
+        "edit": ["draft"],
+        "delete": ["draft"],
+        "read_only": ["inbox", "sent"],
+        "remote_drift": ["draft-edit", "draft-delete"],
+        "outbound_send": ["linux-fuse"]
+      },
+      "projection": {
+        "lookup": "mailbox",
+        "roots": ["inbox", "sent", "draft", "outbox"],
+        "hydrate": "first-message-or-created-draft"
+      },
+      "provider_verification": "gmail-drafts-api",
+      "restoration": "delete-created-drafts",
+      "cleanup": ["delete-created-drafts", "remove-mount", "remove-credential", "remove-state"],
+      "scenarios": {
+        "linux-fuse": "tests/live_gmail_vfs_roundtrip.sh",
+        "macos-file-provider": "tests/live_macos_connector_file_provider.sh",
+        "windows-cloud-files": "tests/windows_connector_cloud_files_live.ps1"
+      }
+    },
+    "slack": {
+      "display_name": "Slack",
+      "credential": {
+        "kind": "oauth",
+        "environment": "LOCALITY_SLACK_LIVE_CREDENTIAL_JSON",
+        "secret_ref": "connection:slack-live",
+        "refresh": "broker",
+        "rotation": "required-after-every-consumer"
+      },
+      "fixtures": {
+        "conversation_id": "LOCALITY_SLACK_LIVE_CONVERSATION_ID",
+        "conversation_types": "LOCALITY_SLACK_LIVE_TYPES"
+      },
+      "capabilities": {
+        "read": true,
+        "create": [],
+        "edit": [],
+        "delete": [],
+        "read_only": ["entire-mount"],
+        "remote_drift": [],
+        "outbound_send": []
+      },
+      "projection": {
+        "lookup": "remote-id",
+        "remote_id_prefix": "slack-recent:",
+        "hydrate": "recent.md-and-first-thread"
+      },
+      "provider_verification": "slack-conversations-api-read-only",
+      "restoration": "not-applicable-read-only",
+      "cleanup": ["persist-rotated-credential", "remove-mount", "remove-credential", "remove-state"],
+      "scenarios": {
+        "linux-fuse": "tests/live_slack_vfs_read.sh",
+        "macos-file-provider": "tests/live_macos_connector_file_provider.sh",
+        "windows-cloud-files": "tests/windows_connector_cloud_files_live.ps1"
+      }
+    },
+    "linear": {
+      "display_name": "Linear",
+      "credential": {
+        "kind": "api_key",
+        "environment": "LINEAR_API_KEY",
+        "secret_ref": "connection:linear-live",
+        "refresh": "not-applicable",
+        "rotation": "not-applicable"
+      },
+      "fixtures": {
+        "issue_id": "LOCALITY_LINEAR_LIVE_ISSUE_ID"
+      },
+      "capabilities": {
+        "read": true,
+        "create": [],
+        "edit": ["issue-body", "title", "status", "project", "assignee"],
+        "delete": [],
+        "read_only": ["comments.md", "attachments.md", "pull-requests.md", "history.md", "generated-metadata"],
+        "remote_drift": ["issue-body", "issue-metadata"],
+        "outbound_send": []
+      },
+      "projection": {
+        "lookup": "remote-id",
+        "remote_id_prefix": "",
+        "hydrate": "page.md-and-sidecars"
+      },
+      "provider_verification": "linear-graphql-issue-readback",
+      "restoration": "restore-scratch-issue-body-and-metadata",
+      "cleanup": ["restore-scratch-issue", "remove-mount", "remove-credential", "remove-state"],
+      "scenarios": {
+        "linux-fuse": "tests/live_linear_vfs_roundtrip.sh",
+        "macos-file-provider": "tests/live_macos_connector_file_provider.sh",
+        "windows-cloud-files": "tests/windows_connector_cloud_files_live.ps1"
+      }
+    },
+    "granola": {
+      "display_name": "Granola",
+      "credential": {
+        "kind": "api_key",
+        "environment": "GRANOLA_API_KEY",
+        "secret_ref": "connection:granola-live",
+        "refresh": "not-applicable",
+        "rotation": "not-applicable"
+      },
+      "fixtures": {
+        "note_id": "LOCALITY_GRANOLA_LIVE_NOTE_ID"
+      },
+      "capabilities": {
+        "read": true,
+        "create": [],
+        "edit": [],
+        "delete": [],
+        "read_only": ["entire-mount"],
+        "remote_drift": [],
+        "outbound_send": []
+      },
+      "projection": {
+        "lookup": "remote-id",
+        "remote_id_prefix": "",
+        "hydrate": "summary.md-and-transcript.md"
+      },
+      "provider_verification": "granola-notes-api-read-only",
+      "restoration": "not-applicable-read-only",
+      "cleanup": ["remove-mount", "remove-credential", "remove-state"],
+      "scenarios": {
+        "linux-fuse": "tests/live_granola_vfs_read.sh",
+        "macos-file-provider": "tests/live_macos_connector_file_provider.sh",
+        "windows-cloud-files": "tests/windows_connector_cloud_files_live.ps1"
+      }
+    }
+  }
+}

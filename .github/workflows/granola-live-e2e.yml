@@ -18,7 +18,11 @@ on:
       - "tests/linux-fuse-ci.Dockerfile"
       - "tests/linux-fuse-ci-entrypoint.sh"
       - "tests/run_linux_fuse_ci.sh"
+      - "tests/live_connector_scenarios.json"
+      - "tests/live_connector_matrix.py"
+      - "tests/live_provider_connector_scenario.py"
       - "tests/live_granola_vfs_read.sh"
+      - "tests/windows_connector_cloud_files_live.ps1"
   schedule:
     - cron: "23 15 * * 2"
   workflow_dispatch:
@@ -99,3 +103,25 @@ jobs:
           fi
       - name: Run live mounted-filesystem test
         run: tests/run_linux_fuse_ci.sh tests/live_granola_vfs_read.sh
+
+  windows-cloud-files-live:
+    name: Granola Windows Cloud Files live e2e
+    runs-on: windows-latest
+    timeout-minutes: 35
+    environment: granola-live-e2e
+    env:
+      GRANOLA_API_KEY: ${{ secrets.GRANOLA_API_KEY }}
+      LOCALITY_GRANOLA_LIVE_NOTE_ID: ${{ secrets.LOCALITY_GRANOLA_LIVE_NOTE_ID }}
+      LOCALITY_LIVE_CONNECTOR: granola
+      LOCALITY_WINDOWS_CONNECTOR_CLOUD_FILES_LIVE: "1"
+      LOCALITY_WINDOWS_CLOUD_FILES_LIVE_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run Granola real Cloud Files read-only scenario
+        shell: pwsh
+        run: ./tests/windows_connector_cloud_files_live.ps1 -Connector granola
