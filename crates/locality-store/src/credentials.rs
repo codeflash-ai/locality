@@ -212,30 +212,20 @@ const PRIMARY_KEYCHAIN_SERVICE: &str = "loc";
 #[cfg(any(test, target_os = "macos"))]
 const COMPAT_KEYCHAIN_SERVICES: [&str; 2] = [PRIMARY_KEYCHAIN_SERVICE, "afs"];
 
+// `/usr/bin/security` returns the low byte of `errSecItemNotFound` (-25300)
+// as its process exit status.
+#[cfg(any(test, target_os = "macos"))]
+const SECURITY_ITEM_NOT_FOUND_EXIT_CODE: i32 = 44;
+
 #[cfg(target_os = "macos")]
 impl CredentialStore for KeychainCredentialStore {
     fn put(&self, secret_ref: &str, secret: &str) -> CredentialResult<()> {
-        let output = std::process::Command::new("security")
-            .args([
-                "add-generic-password",
-                "-a",
-                secret_ref,
-                "-s",
-                PRIMARY_KEYCHAIN_SERVICE,
-                "-w",
-                secret,
-                "-U",
-            ])
-            .output()
-            .map_err(|error| CredentialError::Unavailable(error.to_string()))?;
-        if output.status.success() {
-            cache_keychain_secret(secret_ref, secret)?;
-            Ok(())
-        } else {
-            Err(CredentialError::Unavailable(
-                "macOS keychain write failed".to_string(),
-            ))
-        }
+        put_keychain_secret(
+            secret_ref,
+            secret,
+            write_keychain_password,
+            read_keychain_password,
+        )
     }
 
     fn get(&self, secret_ref: &str) -> CredentialResult<String> {
@@ -259,6 +249,54 @@ impl CredentialStore for KeychainCredentialStore {
         }
         forget_keychain_secret(secret_ref)?;
         Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_keychain_password(secret_ref: &str, service: &str, secret: &str) -> CredentialResult<()> {
+    let output = std::process::Command::new("security")
+        .args([
+            "add-generic-password",
+            "-a",
+            secret_ref,
+            "-s",
+            service,
+            "-w",
+            secret,
+            "-U",
+        ])
+        .output()
+        .map_err(|error| CredentialError::Unavailable(error.to_string()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(CredentialError::Unavailable(
+            "macOS keychain write failed".to_string(),
+        ))
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn put_keychain_secret(
+    secret_ref: &str,
+    secret: &str,
+    mut write_keychain_password: impl FnMut(&str, &str, &str) -> CredentialResult<()>,
+    mut read_keychain_password: impl FnMut(&str, &str) -> CredentialResult<Option<String>>,
+) -> CredentialResult<()> {
+    // A previous credential may still be cached even when another process has
+    // removed or replaced the durable item. Do not let that copy survive a
+    // failed write or participate in verification.
+    forget_keychain_secret(secret_ref)?;
+    write_keychain_password(secret_ref, PRIMARY_KEYCHAIN_SERVICE, secret)?;
+
+    match read_keychain_password(secret_ref, PRIMARY_KEYCHAIN_SERVICE)? {
+        Some(persisted) if persisted == secret => cache_keychain_secret(secret_ref, secret),
+        Some(_) => Err(CredentialError::Unavailable(
+            "macOS keychain write verification returned different credential data".to_string(),
+        )),
+        None => Err(CredentialError::Unavailable(
+            "macOS keychain write was not readable after it completed".to_string(),
+        )),
     }
 }
 
@@ -341,7 +379,17 @@ fn read_keychain_password(secret_ref: &str, service: &str) -> CredentialResult<O
         .output()
         .map_err(|error| CredentialError::Unavailable(error.to_string()))?;
     if !output.status.success() {
-        return Ok(None);
+        if keychain_read_failure_is_not_found(output.status.code(), &output.stderr) {
+            return Ok(None);
+        }
+        return Err(CredentialError::Unavailable(format!(
+            "macOS keychain read failed{}",
+            output
+                .status
+                .code()
+                .map(|code| format!(" with status {code}"))
+                .unwrap_or_default()
+        )));
     }
 
     let password = keychain_output_password(&output.stdout);
@@ -352,6 +400,14 @@ fn read_keychain_password(secret_ref: &str, service: &str) -> CredentialResult<O
     }
 
     Ok(Some(password))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn keychain_read_failure_is_not_found(status_code: Option<i32>, stderr: &[u8]) -> bool {
+    status_code == Some(SECURITY_ITEM_NOT_FOUND_EXIT_CODE)
+        || String::from_utf8_lossy(stderr)
+            .to_ascii_lowercase()
+            .contains("item could not be found")
 }
 
 #[cfg(windows)]
@@ -679,13 +735,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        COMPAT_KEYCHAIN_SERVICES, CoordinatedCredentialStore, CredentialResult, CredentialStore,
-        CredentialStoreBackend, FileCredentialStore, InMemoryCredentialStore,
+        COMPAT_KEYCHAIN_SERVICES, CoordinatedCredentialStore, CredentialError, CredentialResult,
+        CredentialStore, CredentialStoreBackend, FileCredentialStore, InMemoryCredentialStore,
         PRIMARY_KEYCHAIN_SERVICE, cache_keychain_secret, cached_keychain_secret,
         credential_store_backend_for_override, decode_hex_encoded_password, forget_keychain_secret,
         get_cached_keychain_secret, get_uncached_keychain_secret,
         keychain_hex_password_from_diagnostics, keychain_output_password,
-        primary_windows_target_name, windows_target_names,
+        keychain_read_failure_is_not_found, primary_windows_target_name, put_keychain_secret,
+        windows_target_names,
     };
 
     #[test]
@@ -852,6 +909,82 @@ mod tests {
     #[test]
     fn keychain_services_include_afs_compatibility_alias() {
         assert_eq!(COMPAT_KEYCHAIN_SERVICES, [PRIMARY_KEYCHAIN_SERVICE, "afs"]);
+    }
+
+    #[test]
+    fn keychain_put_is_readable_after_process_cache_is_cleared() {
+        let secret_ref = "connection:test-restart-readable";
+        let persisted = RefCell::new(None::<String>);
+
+        put_keychain_secret(
+            secret_ref,
+            "oauth-json",
+            |write_ref, service, secret| {
+                assert_eq!(write_ref, secret_ref);
+                assert_eq!(service, PRIMARY_KEYCHAIN_SERVICE);
+                *persisted.borrow_mut() = Some(secret.to_string());
+                Ok(())
+            },
+            |read_ref, service| {
+                assert_eq!(read_ref, secret_ref);
+                assert_eq!(service, PRIMARY_KEYCHAIN_SERVICE);
+                Ok(persisted.borrow().clone())
+            },
+        )
+        .expect("put verified credential");
+
+        forget_keychain_secret(secret_ref).expect("simulate process restart");
+        let restarted_read = get_cached_keychain_secret(
+            secret_ref,
+            |read_ref, service| {
+                assert_eq!(read_ref, secret_ref);
+                assert_eq!(service, PRIMARY_KEYCHAIN_SERVICE);
+                Ok(persisted.borrow().clone())
+            },
+            |_, _| -> CredentialResult<()> { panic!("primary credential should not promote") },
+        )
+        .expect("read credential after simulated restart");
+
+        assert_eq!(restarted_read, "oauth-json");
+        forget_keychain_secret(secret_ref).expect("clear test credential cache");
+    }
+
+    #[test]
+    fn keychain_put_rejects_write_that_is_not_durably_readable() {
+        let secret_ref = "connection:test-unreadable-write";
+        cache_keychain_secret(secret_ref, "stale-oauth-json").expect("seed process cache");
+
+        let error = put_keychain_secret(
+            secret_ref,
+            "new-oauth-json",
+            |_, _, _| Ok(()),
+            |_, _| Ok(None),
+        )
+        .expect_err("unreadable write must fail");
+
+        assert_eq!(
+            error,
+            CredentialError::Unavailable(
+                "macOS keychain write was not readable after it completed".to_string()
+            )
+        );
+        assert_eq!(
+            cached_keychain_secret(secret_ref).expect("read process cache"),
+            None
+        );
+    }
+
+    #[test]
+    fn keychain_read_distinguishes_missing_item_from_store_failure() {
+        assert!(keychain_read_failure_is_not_found(Some(44), b""));
+        assert!(keychain_read_failure_is_not_found(
+            None,
+            b"The specified item could not be found in the keychain."
+        ));
+        assert!(!keychain_read_failure_is_not_found(
+            Some(51),
+            b"User interaction is not allowed."
+        ));
     }
 
     #[test]

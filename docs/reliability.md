@@ -18,6 +18,9 @@ Correctness belongs primarily in `locality-core` and `locality-store`.
 - Search and navigation indexes are derived caches. Losing or rebuilding an
   index must never lose local edits, shadows, journals, credentials, or pending
   virtual mutations.
+- Credential writes must be read back from the durable platform store before a
+  connection is accepted. An in-process credential copy must not mask a write
+  that will be missing after relaunch.
 - Virtual filesystem reads must never overwrite dirty or conflicted content.
   Hydration can prepare missing content, but local user edits remain the higher
   trust source until the user restores or pushes.
