@@ -54,7 +54,7 @@
           "overview",
           "install",
           "quickstart",
-          "admin-console"
+          "locality-cloud"
         ]
       },
       {
@@ -100,6 +100,10 @@
     {
       "source": "/docs/:path*",
       "destination": "/:path*"
+    },
+    {
+      "source": "/admin-console",
+      "destination": "/locality-cloud"
     }
   ],
   "footer": {

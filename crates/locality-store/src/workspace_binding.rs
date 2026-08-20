@@ -34,6 +34,9 @@ use locality_core::workspace_layout::MountTarget;
 use serde::{Deserialize, Deserializer, Serialize};
 use unicode_normalization_v16::UnicodeNormalization;
 
+const MACOS_FILE_PROVIDER_PROJECTION_PREFIX: &str = "macos-file-provider:";
+const MACOS_EDEADLK: i32 = 11;
+
 pub const LEGACY_WORKSPACE_BINDING_VERSION: u16 = 1;
 pub const WORKSPACE_BINDING_VERSION: u16 = 2;
 pub const WORKSPACE_BINDING_LAYOUT_VERSION: u16 = 1;
@@ -673,11 +676,18 @@ impl WorkspaceHostBindingResolver {
                 path: host_binding.trusted_workspace_root().to_path_buf(),
                 detail: source.to_string(),
             })?;
-        let mount_aliases = HostFilesystemAliases::inspect(mount_root).map_err(|source| {
-            WorkspaceHostBindingError::HostPathInspection {
-                path: mount_root.to_path_buf(),
-                detail: source.to_string(),
-            }
+        let mount_aliases = inspect_persistent_mount_aliases_with(
+            self.platform,
+            host_binding.projection_identity(),
+            host_binding.trusted_workspace_root(),
+            mount_root,
+            &trusted_aliases,
+            HostFilesystemAliases::inspect,
+            |path| fs::symlink_metadata(path),
+        )
+        .map_err(|source| WorkspaceHostBindingError::HostPathInspection {
+            path: mount_root.to_path_buf(),
+            detail: source.to_string(),
         })?;
         let Some(canonical_trusted) =
             ParsedHostPath::parse(self.platform, &trusted_aliases.canonical)
@@ -1014,6 +1024,101 @@ impl HostFilesystemAliases {
 
         false
     }
+
+    fn missing_direct_child(&self, component: &str) -> Self {
+        let canonical = self.canonical.join(component);
+        #[cfg(any(unix, windows))]
+        let native_anchors = self
+            .native_anchors
+            .iter()
+            .cloned()
+            .map(|mut anchor| {
+                anchor.suffix.push(OsString::from(component));
+                anchor
+            })
+            .collect();
+        Self {
+            canonical,
+            #[cfg(any(unix, windows))]
+            native_anchors,
+        }
+    }
+}
+
+// A not-yet-materialized File Provider child can report EDEADLK instead of
+// ENOENT on macOS. Re-anchor only that direct child to the already-inspected
+// trusted root. An existing filesystem object still fails closed: if
+// symlink_metadata also deadlocks, enumerating the trusted parent must
+// independently prove that no matching child exists.
+fn inspect_persistent_mount_aliases_with<I, M>(
+    platform: WorkspaceHostPlatform,
+    projection_identity: &WorkspaceProjectionIdentity,
+    trusted_root: &Path,
+    mount_root: &Path,
+    trusted_aliases: &HostFilesystemAliases,
+    inspect: I,
+    symlink_metadata: M,
+) -> io::Result<HostFilesystemAliases>
+where
+    I: FnOnce(&Path) -> io::Result<HostFilesystemAliases>,
+    M: FnOnce(&Path) -> io::Result<fs::Metadata>,
+{
+    let inspection_error = match inspect(mount_root) {
+        Ok(aliases) => return Ok(aliases),
+        Err(error) => error,
+    };
+    if !is_macos_file_provider_deadlock(platform, projection_identity, &inspection_error) {
+        return Err(inspection_error);
+    }
+    let component = mount_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid direct child"))?;
+
+    match symlink_metadata(mount_root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(trusted_aliases.missing_direct_child(component))
+        }
+        Err(error) if is_macos_file_provider_deadlock(platform, projection_identity, &error) => {
+            if trusted_direct_child_exists(platform, trusted_root, component)? {
+                Err(inspection_error)
+            } else {
+                Ok(trusted_aliases.missing_direct_child(component))
+            }
+        }
+        Ok(_) => Err(inspection_error),
+        Err(error) => Err(error),
+    }
+}
+
+fn trusted_direct_child_exists(
+    platform: WorkspaceHostPlatform,
+    trusted_root: &Path,
+    component: &str,
+) -> io::Result<bool> {
+    for entry in fs::read_dir(trusted_root)? {
+        let file_name = entry?.file_name();
+        let matches = match file_name.to_str() {
+            Some(file_name) => path_token_eq(platform, file_name, component),
+            None => file_name == component,
+        };
+        if matches {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn is_macos_file_provider_deadlock(
+    platform: WorkspaceHostPlatform,
+    projection_identity: &WorkspaceProjectionIdentity,
+    error: &io::Error,
+) -> bool {
+    platform == WorkspaceHostPlatform::Macos
+        && projection_identity
+            .as_str()
+            .starts_with(MACOS_FILE_PROVIDER_PROJECTION_PREFIX)
+        && error.raw_os_error() == Some(MACOS_EDEADLK)
 }
 
 /// Returns whether two host spellings identify the same filesystem path under
@@ -1454,6 +1559,90 @@ mod tests {
         }
 
         std::fs::remove_dir_all(root).expect("remove identity root");
+    }
+
+    #[test]
+    fn macos_file_provider_deadlock_treats_only_an_absent_direct_child_as_missing() {
+        let root = unique_host_equivalence_root("file-provider-deadlock");
+        std::fs::create_dir_all(&root).expect("create trusted provider root");
+        let trusted = super::HostFilesystemAliases::inspect(&root).expect("inspect trusted root");
+        let mount_root = root.join("notion-main");
+        let projection = WorkspaceProjectionIdentity::new("macos-file-provider:loc")
+            .expect("projection identity");
+
+        let aliases = super::inspect_persistent_mount_aliases_with(
+            WorkspaceHostPlatform::Macos,
+            &projection,
+            &root,
+            &mount_root,
+            &trusted,
+            |_| Err(std::io::Error::from_raw_os_error(super::MACOS_EDEADLK)),
+            |_| Err(std::io::Error::from_raw_os_error(super::MACOS_EDEADLK)),
+        )
+        .expect("provider transient represents the missing direct child");
+
+        assert_eq!(aliases.canonical, trusted.canonical.join("notion-main"));
+        #[cfg(any(unix, windows))]
+        assert!(aliases.native_anchors.iter().all(|anchor| {
+            anchor.suffix.last().and_then(|value| value.to_str()) == Some("notion-main")
+        }));
+        std::fs::remove_dir_all(root).expect("remove trusted provider root");
+    }
+
+    #[test]
+    fn deadlock_remains_fatal_outside_macos_file_provider_projection() {
+        let root = unique_host_equivalence_root("non-provider-deadlock");
+        std::fs::create_dir_all(&root).expect("create trusted root");
+        let trusted = super::HostFilesystemAliases::inspect(&root).expect("inspect trusted root");
+        let mount_root = root.join("notion-main");
+        let projection = WorkspaceProjectionIdentity::new("linux-fuse:locality-shared-root")
+            .expect("projection identity");
+
+        let error = super::inspect_persistent_mount_aliases_with(
+            WorkspaceHostPlatform::Macos,
+            &projection,
+            &root,
+            &mount_root,
+            &trusted,
+            |_| Err(std::io::Error::from_raw_os_error(super::MACOS_EDEADLK)),
+            |_| panic!("non-File-Provider errors must not inspect the child again"),
+        )
+        .expect_err("deadlock is not generally equivalent to a missing path");
+
+        assert_eq!(error.raw_os_error(), Some(super::MACOS_EDEADLK));
+        std::fs::remove_dir_all(root).expect("remove trusted root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_file_provider_double_deadlock_does_not_hide_an_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_host_equivalence_root("file-provider-symlink");
+        let outside = unique_host_equivalence_root("file-provider-symlink-outside");
+        std::fs::create_dir_all(&root).expect("create trusted provider root");
+        std::fs::create_dir_all(&outside).expect("create outside root");
+        let trusted = super::HostFilesystemAliases::inspect(&root).expect("inspect trusted root");
+        let mount_root = root.join("notion-main");
+        symlink(&outside, &mount_root).expect("create mount-root symlink");
+        let projection = WorkspaceProjectionIdentity::new("macos-file-provider:loc")
+            .expect("projection identity");
+
+        let error = super::inspect_persistent_mount_aliases_with(
+            WorkspaceHostPlatform::Macos,
+            &projection,
+            &root,
+            &mount_root,
+            &trusted,
+            |_| Err(std::io::Error::from_raw_os_error(super::MACOS_EDEADLK)),
+            |_| Err(std::io::Error::from_raw_os_error(super::MACOS_EDEADLK)),
+        )
+        .expect_err("parent enumeration must keep an uninspectable symlink fail-closed");
+
+        assert_eq!(error.raw_os_error(), Some(super::MACOS_EDEADLK));
+        std::fs::remove_file(&mount_root).expect("remove mount-root symlink");
+        std::fs::remove_dir_all(root).expect("remove trusted provider root");
+        std::fs::remove_dir_all(outside).expect("remove outside root");
     }
 
     #[cfg(any(unix, windows))]

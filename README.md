@@ -1,343 +1,339 @@
-# Locality
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs-site/images/locality-logo-light.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs-site/images/locality-logo-dark.svg">
+    <img alt="Locality" src="docs-site/images/locality-logo-dark.svg" width="420">
+  </picture>
 
-Locality turns apps and systems of record into local files and keeps them in sync. You or 
-you agents only need to work with local files - everything else is taken care of by Locality.
-There is no need to directly run api calls or use MCP - upon opening files Locality
-gets the upto date version, one edits only the local files, and updates it back 
-on file saves or on `push` command.
+  <h3>Your work apps, available as local files.</h3>
 
-This file approach simplifies external apps for your agents, and collaborating with agents for work.
+  <p>
+    Locality turns the knowledge in Notion, Slack, Google Docs, Linear, and other
+    work apps into a private, live-synced filesystem workspace for you and your AI agents.
+  </p>
 
-https://github.com/user-attachments/assets/b2486a4a-e957-4c4f-8e4d-12163c920b16
+  <p>
+    <a href="https://www.locality.dev/downloads">
+      <img alt="Download Locality" src="https://img.shields.io/badge/Download_Locality-007AFF?style=for-the-badge">
+    </a>
+  </p>
 
-Locality began with Notion support: pages become directories, page bodies live
-in `page.md`, child pages become child directories, and database rows become
-page-like folders with frontmatter. Humans, editors, scripts, and coding agents
-can search, read, and edit mounted files with ordinary filesystem tools while
-keeping the remote app as the source of truth.
+  <p>
+    <a href="https://github.com/codeflash-ai/locality/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/codeflash-ai/locality?style=flat-square&label=release"></a>
+    <a href="https://github.com/codeflash-ai/locality/actions/workflows/ci.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/codeflash-ai/locality/ci.yml?branch=main&style=flat-square&label=build"></a>
+    <a href="LICENSE"><img alt="Apache 2.0 license" src="https://img.shields.io/github/license/codeflash-ai/locality?style=flat-square"></a>
+    <a href="https://github.com/codeflash-ai/locality/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/codeflash-ai/locality?style=flat-square"></a>
+  </p>
 
-```text
-~/Library/CloudStorage/Locality/notion
-└── Company Wiki
-    ├── page.md
-    ├── Product
-    │   ├── Roadmap
-    │   │   └── page.md
-    │   └── Launch Plan
-    │       └── page.md
-    └── Meetings
-        ├── page.md
-        └── Tasks
-            ├── _schema.yaml
-            └── Follow up with design
-                └── page.md
-```
+  <p>
+    <a href="https://www.locality.dev/">Website</a>
+    &nbsp;&bull;&nbsp;
+    <a href="https://docs.locality.dev/overview">Documentation</a>
+    &nbsp;&bull;&nbsp;
+    <a href="https://www.locality.dev/blog/locality-why-filesystems-perform-better-than-mcps-for-production-agents">Locality vs. MCP</a>
+  </p>
+</div>
 
-Locality is local-first, but not reckless. It keeps durable sync state in
-SQLite, handles merges and conflicts, validates changes before
-remote writes, journals push plans, and pauses for review when it cannot safely
-decide what to do.
+<p align="center">
+  <a href="https://www.locality.dev/downloads">
+    <img src="docs-site/images/locality-quick-start.gif" alt="Connect an app with Locality and work with its content as local files" width="900">
+  </a>
+</p>
 
-## Why Locality Exists
+## Why Locality
 
-Knowledge work increasingly happens across remote apps, local editors, and AI
-agents. Most apps are excellent collaboration databases but poor
-local programming surfaces. Locality gives those systems a filesystem interface:
+Your company's knowledge already exists. It lives across documents, messages,
+issues, meetings, and calendars. But every app exposes that knowledge through a
+different interface, and every agent integration adds another API, tool schema,
+authentication flow, and runtime dependency.
 
-- let agents edit mounted Markdown directly with repo-local guidance;
-- use `rg`, `grep`, editors, scripts, and agents against real Markdown files;
-- review local edits with `loc diff` before anything touches the remote source;
-- push safe changes back through file operations instead of browser automation;
-- collaborate with other people in realtime by keeping content fresh with Live Mode.
+Locality makes those systems feel local. It presents their content as local
+files and folders while keeping the original applications synchronized. People,
+editors, scripts, and agents can use the filesystem tools they already understand.
 
-The goal is not to export a workspace and fork reality. The goal is to make the
-remote workspace feel locally available while preserving remote identity,
-structure, permissions, and safety.
+This is not a one-time export and it is not another knowledge silo. Your connected
+apps remain the systems of record; Locality gives them a shared, local file-based interface.
 
-## What It Does Today
+## Locality vs. MCP
 
-Locality currently includes:
+MCP is useful for making individual tools callable at runtime. Locality takes a
+different approach for knowledge-heavy and production agent workflows: it prepares
+a unified filesystem workspace before the agent begins, so the agent can discover,
+search, and combine information with normal file tools.
 
-- a desktop app for connecting Notion, creating a local mount, opening the
-  mounted folder, and managing Live Mode;
-- a `loc` CLI for connecting, mounting, locating, pulling, diffing, pushing,
-  restoring, inspecting, and debugging mounts;
-- a per-user daemon process, `localityd`, that owns hydration, background freshness,
-  virtual filesystem requests, local write tracking, and Live Mode;
-- seven direct connectors: Notion and Google Docs with conservative document
-  writes, Google Calendar and Gmail with reviewed draft creation, Linear with
-  issue edits, and read-only Granola and Slack projections;
-- virtual filesystem projections through macOS File Provider, Linux FUSE, and
-  Windows Cloud Files.
-- generated `AGENTS.md` and `CLAUDE.md` guidance inside mounts so coding agents
-  understand the filesystem contract.
+In our evaluation of 20 cross-application scenarios using Notion, Slack, Linear,
+and source repositories, agents working through Locality completed tasks faster,
+used fewer tool calls, cost less, and produced the preferred result more often.
 
-## Install
+<p align="center">
+  <a href="https://www.locality.dev/blog/locality-why-filesystems-perform-better-than-mcps-for-production-agents">
+    <img src="docs-site/images/locality-vs-mcp.png" alt="Locality compared with MCP: faster completion, fewer tool calls, higher quality, and lower cost" width="900">
+  </a>
+</p>
 
-The most reliable user install path is downloading the installer from the (Downloads page)[https://www.locality.dev/downloads].
-The app auto-updates as new versions are released.
+<p align="center">
+  <a href="https://www.locality.dev/blog/locality-why-filesystems-perform-better-than-mcps-for-production-agents"><strong>Read the full methodology and results &rarr;</strong></a>
+</p>
 
-For development builds, use the source workflow below.
+With files, agents can use fast, composable operations such as search, filtering,
+parallel reads, and scripts across every connected source. They do not need to
+reason through a different tool surface for every application or place broad app
+credentials inside the agent sandbox.
 
-## Quick Start
+## Get started in minutes
 
-Install dependencies and build from a fresh checkout:
+<table>
+  <tr>
+    <td width="50%">
+      <h3>1. Download Locality</h3>
+      <p>Get the latest desktop release from the <a href="https://www.locality.dev/downloads">Locality website</a>. The app keeps itself up to date.</p>
+    </td>
+    <td width="50%">
+      <h3>2. Connect your apps</h3>
+      <p>Choose a source such as Notion, Google Docs, Slack, Linear, Gmail, Calendar, or Granola and approve the access you want Locality to use.</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <h3>3. Open your Locality folder</h3>
+      <p>Your connected knowledge appears as files and folders that work with Finder, editors, search tools, scripts, and terminals.</p>
+    </td>
+    <td width="50%">
+      <h3>4. Work with any agent</h3>
+      <p>Open the workspace with Codex, Claude Code, or another filesystem-capable agent. Live Mode keeps active work fresh and safely synchronized.</p>
+    </td>
+  </tr>
+</table>
 
-```sh
-make setup
-make build
-```
+## One knowledge layer for you and your agents
 
-Start the desktop app in development mode:
+<table>
+  <tr>
+    <th width="50%">For you</th>
+    <th width="50%">For your agents</th>
+  </tr>
+  <tr>
+    <td>
+      <ul>
+        <li>Browse knowledge from different apps in one familiar place.</li>
+        <li>Search with Finder, your editor, or ordinary filesystem tools.</li>
+        <li>Edit supported content without changing how your team collaborates.</li>
+        <li>Keep a local, inspectable workspace instead of another hosted copy.</li>
+      </ul>
+    </td>
+    <td>
+      <ul>
+        <li>Give agents durable context without building an integration per app.</li>
+        <li>Search across sources with the same tools agents use for code.</li>
+        <li>Keep app credentials outside the agent's working directory.</li>
+        <li>Review and safely synchronize agent-generated changes.</li>
+      </ul>
+    </td>
+  </tr>
+</table>
 
-```sh
-make dev-tauri
-```
+### What can you do with Locality?
 
-Or use the CLI directly. The OAuth flow is the normal product path:
+- **Build a personal knowledge base** from the work already spread across your apps.
+- **Give agents better context** across documents, conversations, issues, and meetings.
+- **Research across sources** without copying and pasting content between tools.
+- **Edit through files** and synchronize supported changes back to the original app.
+- **Use existing workflows** built around editors, shell tools, scripts, and coding agents.
+- **Keep collaboration intact** because teammates can continue working in the source apps.
 
-```sh
-loc connect notion --name work
-loc mount notion ~/Locality/notion --workspace --connection work --projection plain-files
-loc pull ~/Locality/notion
-```
+## How it works
 
-Then locate a page from a Notion URL, title, path fragment, or remote id:
+<table>
+  <tr>
+    <td align="center" width="20%"><strong>Your apps</strong><br><sub>Notion, Slack, Linear, Google, Granola</sub></td>
+    <td align="center" width="6%">&#8644;</td>
+    <td align="center" width="20%"><strong>Locality</strong><br><sub>Connect, project, validate, synchronize</sub></td>
+    <td align="center" width="6%">&#8644;</td>
+    <td align="center" width="20%"><strong>Local files</strong><br><sub>Markdown, folders, metadata, attachments</sub></td>
+    <td align="center" width="6%">&#8644;</td>
+    <td align="center" width="20%"><strong>You + agents</strong><br><sub>Editors, search, scripts, Codex, Claude</sub></td>
+  </tr>
+</table>
 
-```sh
-loc locate "https://app.notion.com/..."
-```
+Locality maintains a synchronized view of connected content and exposes it through
+the operating system's filesystem. Opening or searching a file can hydrate current
+content on demand. Supported edits are validated and translated back into operations
+for the source application.
 
-The command prints the resolved local path, for example:
+The remote app keeps its identity, structure, permissions, and collaboration model.
+Locality keeps durable local sync state so it can distinguish remote changes, local
+changes, and conflicts rather than blindly overwriting either side.
 
-```text
-/Users/alice/Library/CloudStorage/Locality/notion/Product/Initial Idea/page.md
-```
+## Private by design. Yours by default.
 
-Edit the file in your editor, then review and push:
+For the desktop app, your workspace and sync state live on your machine. The
+desktop client talks directly to each connected app's API for content and
+synchronization. No Locality backend or middleman sits between you and your apps,
+and the desktop app does not collect or transmit usage telemetry.
 
-```sh
-loc status /path/to/page.md
-loc diff /path/to/page.md
-loc push /path/to/page.md -y
-```
+Locality does not require moving your knowledge into a new proprietary knowledge database.
 
-With Live Mode enabled for a file, safe local edits can push automatically:
+<table>
+  <tr>
+    <td colspan="2">
+      <strong>Direct connections. No telemetry.</strong><br>
+      Your desktop client communicates directly with your connected apps. Your workspace content and activity are not routed through a Locality backend or telemetry service.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <strong>Local workspace</strong><br>
+      Connected content is presented through files you can inspect and use with the tools you choose.
+    </td>
+    <td width="50%">
+      <strong>Protected credentials</strong><br>
+      App credentials live in the operating system credential store; Locality keeps only credential metadata in its local database.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <strong>Your apps remain authoritative</strong><br>
+      Locality preserves remote identity and structure instead of asking you to migrate your team's knowledge into another silo.
+    </td>
+    <td width="50%">
+      <strong>Safe synchronization</strong><br>
+      Locality checks the current remote version before writes and pauses when a conflict or risky change needs review.
+    </td>
+  </tr>
+</table>
 
-```sh
-loc live-mode on /path/to/page.md
-loc live-mode status /path/to/page.md
-```
+You decide which sources to connect, which content to expose, and which agents or
+local tools can access the resulting workspace.
 
-Live Mode remains conservative. It pauses for conflicts, remote drift that needs
-review, unsupported plans, destructive or large changes, and anything requiring
-explicit user approval.
+## Features
 
-
-## Command Line Workflow
-
-Common commands:
-
-| Command | Purpose |
+| Feature | What it means |
 | --- | --- |
-| `loc locate <query>` | Find a Notion page/database and print its local path. |
-| `loc status [path]` | Show local state, pending edits, conflicts, and known remote drift. |
-| `loc diff <path>` | Review the planned connector operations and readable Markdown diff. |
-| `loc mv <source> <dest>` | Move or rename mounted pages/files locally without pushing. |
-| `loc push <path> -y` | Apply a safe plan to the remote source and reconcile local state. |
-| `loc pull <path>` | Refresh a mount, folder, page directory, or `page.md`. |
-| `loc inspect <path>` | Fetch the current remote page and explain local-vs-remote drift. |
-| `loc restore <path>` | Reset a local file from the last synced shadow without calling Notion. |
-| `loc log --diff` | Review journaled pushes and their readable diffs. |
-| `loc daemon status` | Inspect the background daemon. |
+| **Live Mode** | Keeps active files fresh, automatically synchronizes safe edits, and pauses when human review is needed. |
+| **A filesystem for every app** | Work with one familiar interface instead of learning a new API or agent tool schema for each source. |
+| **Two-way synchronization** | Supported edits can flow back to the source app while remote updates flow into clean local files. |
+| **Conflict-aware writes** | Locality compares local, remote, and last-synced state before applying mutations. |
+| **Agent-ready workspaces** | Generated `AGENTS.md` and `CLAUDE.md` guidance helps coding agents understand mounted content and safe write behavior. |
+| **Fast local discovery** | Agents and people can use familiar search, filtering, scripting, and editor workflows across sources. |
+| **On-demand content** | Large workspaces can appear locally without eagerly downloading every file before you begin. |
+| **Reviewable changes** | Inspect pending changes and planned source operations before applying sensitive updates. |
 
-For agents, the preferred path is usually:
+### Live Mode
 
-1. Use `loc locate` or normal filesystem search to find the page.
-2. Edit mounted Markdown directly.
-3. Use `loc mv` for intentional mounted page/file moves or renames.
-4. Stop unless the user asked for review or push.
-5. Use `loc status` and `loc diff` for inspection.
-6. Use `loc push` only when explicitly requested or when recovering a known
-   pending local change.
+Live Mode is Locality's background synchronization loop. It prioritizes open,
+recently used, and locally changed files instead of continuously crawling an entire
+workspace.
 
-## Sync Engine
+When a change is clearly safe, Live Mode can synchronize it automatically. When
+Locality detects concurrent edits, unsupported operations, destructive changes, or
+remote drift that needs a decision, it pauses and asks for review instead of guessing.
 
-Locality uses a connector-neutral three-tree model:
+## Connected apps
 
-- **Remote Tree**: the latest source-side state Locality has observed.
-- **Local Tree**: the current local file or virtual projection content.
-- **Synced Tree**: the last accepted version shared by remote and local,
-  stored as a canonical shadow.
+| Source | Local workspace | Write support |
+| --- | --- | --- |
+| **Notion** | Pages, databases, properties, and supported media | Conservative page, block, property, and database-row updates |
+| **Google Docs** | Documents and Drive-backed structure | Conservative document updates |
+| **Google Calendar** | Primary-calendar events | Reviewed event-draft creation |
+| **Gmail** | Messages and threads | Reviewed Gmail-draft creation |
+| **Linear** | Teams, issues, and issue context | Supported issue edits |
+| **Slack** | Channels, private channels, DMs, group DMs, and users | Read-only |
+| **Granola** | Meeting summaries and transcripts | Read-only |
 
-The planner compares those trees and chooses one of the safe outcomes:
+Connector capabilities are intentionally explicit. Locality does not pretend every
+shape in every source can be edited safely. Unsupported or lossy operations pause
+before mutation rather than silently degrading the original content.
 
-```text
-Remote == Synced, Local == Synced  -> clean
-Remote != Synced, Local == Synced  -> fast-forward possible
-Remote == Synced, Local != Synced  -> local pending change
-Remote != Synced, Local != Synced  -> review or conflict
-```
+## Our philosophy
 
-`loc push` re-checks the current remote version before it
-applies mutations.
+- **Files are the universal interface.** Editors, scripts, operating systems, people,
+  and agents already know how to work with them.
+- **Connected, not exported.** A local workspace should stay linked to the place where
+  teams already collaborate.
+- **Your context should outlive any agent.** Knowledge should not be trapped inside a
+  model provider, chat session, or proprietary agent memory.
+- **Inspectability beats hidden magic.** You should be able to see the files, changes,
+  sync state, and evidence an agent used.
+- **Safety comes before automation.** Locality automates obvious operations and pauses
+  when the correct action requires human judgment.
+- **Bring your own agent.** Locality is a workspace layer, not an AI-provider lock-in.
 
-Freshness work is budgeted. Locality prioritizes push preflight, pending files,
-opened files, recently listed folders, pasted URLs, active workspace navigation,
-and then cold background sampling. It avoids crawling a whole workspace just to
-keep idle state warm.
+## FAQ
 
-## Live Mode
+<details>
+  <summary><strong>Is Locality an export tool?</strong></summary>
+  <br>
+  No. Exports become stale snapshots. Locality keeps a synchronized local projection while preserving the connected app as the system of record. If you do want to export an app workspace as ordinary files, pass <code>--projection plain-files</code> when mounting it with <code>loc</code>.
+</details>
 
-Live Mode is the desktop background sync loop. It combines local filesystem
-signals, virtual-provider callbacks, recent user activity, bounded remote
-freshness checks, and the same push planner used by the CLI.
+<details>
+  <summary><strong>Does Locality replace Notion, Slack, Google Docs, or Linear?</strong></summary>
+  <br>
+  No. Your team can continue collaborating in those apps. Locality adds a filesystem interface for local tools and agents.
+</details>
 
-When Live Mode is enabled and a file is safe:
+<details>
+  <summary><strong>Does Locality replace MCP?</strong></summary>
+  <br>
+  Not in every situation. MCP is useful for invoking tools and perfoming actions dynamically. Locality is designed for workflows where agents need broad, repeated, cross-source access to knowledge. It can replace many app-specific retrieval calls with a prepared filesystem workspace. See our <a href="https://www.locality.dev/blog/locality-why-filesystems-perform-better-than-mcps-for-production-agents">Locality vs. MCP evaluation</a> for the tradeoffs and results.
+</details>
 
-- local edits can be auto-pushed;
-- clean files can fast-forward when the remote changes;
-- active files and folders are checked at higher priority;
-- remote-only updates can hydrate into the local cache and visible projection.
+<details>
+  <summary><strong>Which agents work with Locality?</strong></summary>
+  <br>
+  Any agent that can read files can use a Locality workspace. Locality includes generated guidance for agents such as Codex and Claude Code.
+</details>
 
-When the situation is not obviously safe, Live Mode does not guess. It reports a
-paused, review-needed, or conflicted state that humans and agents can inspect
-with `loc status`, `loc diff`, and `loc inspect`.
+<details>
+  <summary><strong>Can agents write back to connected apps?</strong></summary>
+  <br>
+  Yes, for supported connectors and operations. Locality validates changes, checks for remote drift, and pauses risky or conflicting writes for review. Read-only connectors remain read-only.
+</details>
 
-## Architecture
-
-Locality is a Rust workspace with user-facing desktop and CLI surfaces over a
-shared sync core.
-
-```text
-desktop app / loc CLI / editor / agent
-        |
-        v
-platform projection
-  macOS File Provider | Linux FUSE | Windows Cloud Files | plain files
-        |
-        v
-localityd daemon
-  hydration, freshness, virtual FS, write tracking, Live Mode
-        |
-        v
-locality-core + locality-store
-  three-tree planner, validation, journals, SQLite state
-        |
-        v
-connector SDK + descriptive connector registry
-        |
-        v
-locality-notion -> Notion API
-```
-
-Core crates and directories:
-
-| Path | Responsibility |
-| --- | --- |
-| `apps/desktop` | Tauri desktop app and tray UI. |
-| `crates/loc-cli` | Stable `loc` command surface for humans and agents. |
-| `crates/localityd` | Per-user daemon for mounts, hydration, freshness, virtual filesystem IPC, and Live Mode. |
-| `crates/locality-core` | Connector-neutral sync model, canonical Markdown, diff planning, validation, guardrails, conflicts, and journals. |
-| `crates/locality-connector` | Connector trait and data types for enumerate, fetch, render, parse, apply, and reverse apply. |
-| `connectors/` | Versioned language-neutral connector registry and JSON schema. |
-| `crates/locality-notion` | Notion API client, DTOs, renderer, parser/apply support, database schema handling, media, and OAuth integration. |
-| `crates/locality-google-docs` | Google Docs/Drive projection, rendering, OAuth, and conservative document writes. |
-| `crates/locality-google-calendar` | Primary-calendar event projection and reviewed event-draft creation. |
-| `crates/locality-gmail` | Read-only mail projection and reviewed Gmail draft creation. |
-| `crates/locality-granola` | Read-only Granola meeting summary and transcript projection. |
-| `crates/locality-linear` | Linear issue projection, issue edits, context sidecars, and API-key auth. |
-| `crates/locality-slack` | Slack Web API client, OAuth credential handling, read-only conversation projection, and Markdown rendering. |
-| `crates/locality-store` | SQLite state store, migrations, mounts, entities, shadows, journals, credentials metadata, and freshness state. |
-| `platform/linux/locality-fuse` | Linux FUSE helper for online-only virtual mounts. |
-| `platform/windows/locality-cloud-files` | Windows Cloud Files provider runtime. |
-| `platform/macos/LocalityFileProvider` | macOS File Provider extension and helper. |
-| `templates/mount/AGENTS.md` | Generated mount guidance for coding agents. |
-| `docs/` | Engineering notes, architecture, sync behavior, platform internals, and release references. |
-| `docs-site/` | Public documentation site. |
-
-## Notion Support
-
-The Notion connector supports broad read/render coverage and conservative
-writes. It can render paragraphs, headings, lists, to-dos, quotes, callouts,
-code blocks, simple tables, dividers, equations, bookmark/embed/link-preview
-URLs, child-page links, database rows, supported rich text, page/database
-mentions, and file-like media. Unsupported or lossy Notion blocks are preserved
-as `::loc{...}` directives with remote identity metadata when possible.
-
-Writable support is intentionally narrower. Locality can update, append, move
-safe directive-backed blocks, archive supported blocks, upload supported local
-media, update supported page properties, create database rows, and reconcile
-changed pages back into local shadows. Unsupported shapes fail before mutation
-or pause for review rather than silently degrading the source.
-
-## Safety And State
-
-Locality treats local state as durable user state, not disposable cache:
-
-- SQLite state lives under `~/.loc/`;
-- credentials live in the OS credential store with metadata in SQLite;
-- hydrated virtual-file content lives in Locality-managed content roots;
-- push plans are journaled before remote apply;
-- failed journals remain visible for recovery and audit;
-- schema and compatibility changes are migrated or repaired rather than asking
-  users to reset state.
-
-For local recovery:
-
-```sh
-loc status /path/to/mount
-loc inspect /path/to/page.md
-loc restore /path/to/page.md
-loc log --diff
-```
-
-For destructive local-state cleanup during development:
-
-```sh
-loc reset --yes
-```
+<details>
+  <summary><strong>Where is my data stored?</strong></summary>
+  <br>
+  The desktop workspace, sync metadata, and hydrated content are stored locally. Credentials are protected by the operating system credential store. The original content also remains in the connected source application.
+</details>
 
 ## Development
 
-The root `Makefile` is the easiest entry point:
+<details>
+  <summary><strong>Build and test Locality from source</strong></summary>
+  <br>
+
+The root `Makefile` is the shortest path into the project:
 
 ```sh
-make help
 make setup
 make build
 make test
 ```
 
-Common targets:
+For local development:
 
-| Target | What it does |
-| --- | --- |
-| `make build` | Builds the Rust workspace and desktop frontend. |
-| `make check` | Runs Rust checks plus the desktop TypeScript/Vite build. |
-| `make test` | Runs the default Rust workspace test suite. |
-| `make ci` | Runs formatting and workspace tests similar to GitHub Actions. |
-| `make lint` | Runs Rust formatting checks and clippy with warnings denied. |
-| `make fmt` | Formats all Rust code. |
-| `make dev-desktop` | Starts the desktop Vite dev server. |
-| `make dev-tauri` | Builds debug sidecars and starts the Tauri desktop app. |
-| `make build-tauri` | Builds the packaged Tauri desktop app locally. |
-| `make run-cli ARGS='status --json'` | Runs the `loc` CLI with custom arguments. |
-| `make clean` | Removes Rust and desktop build outputs. |
+```sh
+make dev-tauri
+```
 
+Useful engineering references:
 
-## Testing
+- [Sync model](docs/sync-model.md)
+- [Live Mode](docs/live-mode.md)
+- [Connector SDK](docs/connector-sdk.md)
+- [Agent guidance](docs/agent-guidance.md)
+- [Public documentation source](docs-site/README.md)
 
-Locality has fixture-backed unit and integration tests for the sync core, store,
-CLI, daemon, Notion rendering/apply behavior, virtual filesystem paths, desktop
-commands, and platform packaging checks.
+Run `make help` for the complete list of build, test, lint, packaging, and release targets.
+</details>
 
-Live Notion tests use scratch content in a disposable workspace. They are wired
-into the `notion-live-e2e` GitHub Actions workflow when the repository secrets
-are configured. The live jobs exercise connector behavior, mounted workflows,
-Linux FUSE, Windows Cloud Files, and desktop Live Mode against real Notion API
-calls.
+## Community and support
 
-For local live Notion testing, configure a writable parent page and use the
-ignored tests or scripts documented in `docs/notion-connector.md` and
-`docs/linux-fuse.md`.
+- Read the [documentation](https://docs.locality.dev/overview).
+- Download the [latest desktop release](https://www.locality.dev/downloads).
+- Report bugs or request features through [GitHub Issues](https://github.com/codeflash-ai/locality/issues).
+- Talk to us about an agent workflow through the [Locality contact page](https://www.locality.dev/contact).
+
+## License
+
+Locality is available under the [Apache License 2.0](LICENSE).

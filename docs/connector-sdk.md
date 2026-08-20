@@ -100,6 +100,15 @@ can park the job; the response message remains redacted. Limit and validation
 failures are permanent for that attempt, while rate limits and provider
 unavailability are retryable.
 
+Invalid trusted scope is also reported separately from an invalid provider
+response. Its reason is a stable, redaction-safe code such as
+`overlapping_roots`; root identities, titles, paths, and provider payloads are
+not retained in the error. Notion partitions ordinary parent/child root overlap
+at the selected child boundary; the error remains fail-closed for provider
+shapes that still project one object ambiguously across unrelated roots. Hosts
+can use that distinction to offer scope reselection instead of telling an
+administrator that provider data was bad.
+
 `locality_notion::hydration` provides the first bounded primitives: page and
 database native fetch, recursive block traversal, hosted-media fetch, native
 JSON encoding, ordinary and portable render accounting, and change accounting.
