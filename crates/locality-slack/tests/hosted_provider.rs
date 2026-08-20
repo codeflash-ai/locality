@@ -298,6 +298,11 @@ fn every_provider_operation_maps_legacy_encoding_and_exact_request_endpoint() {
             "conversations.replies",
         ),
         (
+            HostedSlackProviderOperationV1::UsersList,
+            "users_list",
+            "users.list",
+        ),
+        (
             HostedSlackProviderOperationV1::UsersInfo,
             "users_info",
             "users.info",

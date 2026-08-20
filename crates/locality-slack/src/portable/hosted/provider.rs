@@ -21,13 +21,13 @@ use super::checkpoint::{
     HostedSlackPollPhaseV1,
 };
 use super::identity::{
-    HostedSlackInstallationBinding, HostedSlackObservedInstallationIdentity,
-    HostedSlackPortableError, validate_slack_id,
+    HOSTED_SLACK_CONVERSATION_ID_PREFIXES, HostedSlackInstallationBinding,
+    HostedSlackObservedInstallationIdentity, HostedSlackPortableError, validate_slack_id,
 };
 use super::native::{
-    HostedSlackFileMetadata, HostedSlackUser, MAX_HOSTED_SLACK_MESSAGE_FILES,
-    MAX_HOSTED_SLACK_MESSAGE_TEXT_BYTES, RawHostedSlackChannel, RawHostedSlackFileMetadata,
-    RawHostedSlackMessage, RawHostedSlackUser,
+    HostedSlackConversationKindV1, HostedSlackFileMetadata, HostedSlackUser,
+    MAX_HOSTED_SLACK_MESSAGE_FILES, MAX_HOSTED_SLACK_MESSAGE_TEXT_BYTES, RawHostedSlackChannel,
+    RawHostedSlackFileMetadata, RawHostedSlackMessage, RawHostedSlackUser,
 };
 use super::poll::{
     HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1, HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
@@ -37,6 +37,7 @@ use super::poll::{
     HostedSlackHistoryPageV2, HostedSlackPollOutputV1, HostedSlackRepliesPageV2,
     hosted_slack_history_page_reference_closure_v2, hosted_slack_replies_page_reference_closure_v2,
 };
+use super::render::MAX_HOSTED_SLACK_RENDERED_DOCUMENT_BYTES_V1;
 
 pub const HOSTED_SLACK_PROVIDER_PAGE_LIMIT_V1: u32 = 15;
 pub const MAX_HOSTED_SLACK_PROVIDER_RESPONSE_BYTES_V1: usize = 512 * 1024;
@@ -49,6 +50,11 @@ pub const HOSTED_SLACK_DISCOVERY_PAGE_LIMIT_V1: u32 = 100;
 pub const MAX_HOSTED_SLACK_DISCOVERY_PAGES_V1: usize = 10;
 pub const MAX_HOSTED_SLACK_DISCOVERY_CHANNELS_V1: usize = 1_000;
 pub const MAX_HOSTED_SLACK_DISCOVERY_CURSOR_BYTES_V1: usize = 512;
+pub const HOSTED_SLACK_USERS_LIST_PAGE_LIMIT_V1: u32 = 200;
+pub const MAX_HOSTED_SLACK_USERS_LIST_PAGES_V1: usize = 10;
+pub const MAX_HOSTED_SLACK_USERS_LIST_USERS_V1: usize = 2_000;
+pub const MAX_HOSTED_SLACK_USERS_LIST_CURSOR_BYTES_V1: usize = 512;
+const HOSTED_SLACK_USERS_MARKDOWN_FIXED_BYTES_V1: usize = 512;
 
 const HOSTED_SLACK_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const HOSTED_SLACK_MAX_RETRIES: usize = 4;
@@ -69,6 +75,7 @@ pub enum HostedSlackProviderOperationV1 {
     ConversationsInfo,
     ConversationsHistory,
     ConversationsReplies,
+    UsersList,
     UsersInfo,
     FilesInfo,
 }
@@ -97,6 +104,8 @@ pub enum HostedSlackApiMethodV2 {
     ConversationsHistory,
     #[serde(rename = "conversations.replies")]
     ConversationsReplies,
+    #[serde(rename = "users.list")]
+    UsersList,
     #[serde(rename = "users.info")]
     UsersInfo,
     #[serde(rename = "files.info")]
@@ -196,11 +205,24 @@ pub struct HostedSlackChannelDiscoveryPageV1 {
     pub channels: Vec<HostedSlackDiscoveredChannelV1>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedSlackUsersPageV1 {
+    pub observed_at: String,
+    pub next_cursor: Option<String>,
+    pub users: Vec<RawHostedSlackUser>,
+}
+
 pub trait HostedSlackDiscoveryProviderPort: Debug + Send + Sync {
     fn conversations_list(
         &self,
         request: HostedSlackChannelDiscoveryRequestV1,
     ) -> HostedSlackProviderFuture<'_, HostedSlackChannelDiscoveryPageV1>;
+
+    fn users_list(
+        &self,
+        cursor: Option<String>,
+    ) -> HostedSlackProviderFuture<'_, HostedSlackUsersPageV1>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -372,6 +394,14 @@ pub struct HostedSlackChannelDiscoveryV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct HostedSlackUsersDiscoveryV1 {
+    pub installation: HostedSlackObservedInstallationIdentity,
+    pub observed_at: String,
+    pub users: Vec<RawHostedSlackUser>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostedSlackInitialChannelDescriptorV1 {
     pub selector: HostedSlackChannelSelector,
     pub channel: RawHostedSlackChannel,
@@ -509,6 +539,88 @@ where
     Err(HostedSlackProviderError::LimitExceeded("discovery pages"))
 }
 
+pub async fn discover_hosted_slack_users_v1<P>(
+    provider: &P,
+    binding: &HostedSlackInstallationBinding,
+    control: &HostedSlackDriveControlV1,
+) -> Result<HostedSlackUsersDiscoveryV1, HostedSlackProviderError>
+where
+    P: HostedSlackProviderPort + HostedSlackDiscoveryProviderPort,
+{
+    binding.validate()?;
+    ensure_active(control)?;
+    let mut request_count = 0;
+    let installation = call_with_retry(
+        control,
+        &mut request_count,
+        HostedSlackProviderOperationV1::VerifyInstallation,
+        || provider.verify_installation(),
+    )
+    .await?;
+    binding
+        .verify_observed_identity(&installation)
+        .map_err(|_| HostedSlackProviderError::IdentityMismatch("installation"))?;
+    let mut cursor = None;
+    let mut users = Vec::new();
+    let mut observed_at = None;
+    let mut user_ids = BTreeSet::new();
+    let mut cursors = BTreeSet::new();
+    let mut rendered_user_bytes = HOSTED_SLACK_USERS_MARKDOWN_FIXED_BYTES_V1;
+    for _ in 0..MAX_HOSTED_SLACK_USERS_LIST_PAGES_V1 {
+        let page = call_with_retry(
+            control,
+            &mut request_count,
+            HostedSlackProviderOperationV1::UsersList,
+            || provider.users_list(cursor.clone()),
+        )
+        .await?;
+        super::checkpoint::parse_canonical_utc_timestamp("users observed_at", &page.observed_at)?;
+        if page.users.len() > HOSTED_SLACK_USERS_LIST_PAGE_LIMIT_V1 as usize {
+            return Err(HostedSlackProviderError::LimitExceeded("users page users"));
+        }
+        observed_at.get_or_insert(page.observed_at.clone());
+        for user in page.users {
+            let hosted = HostedSlackUser::try_from(user.clone())?;
+            if user.team_id != binding.team_id {
+                return Err(HostedSlackProviderError::IdentityMismatch("user team_id"));
+            }
+            if !user_ids.insert(hosted.user_id().to_owned()) {
+                return Err(HostedSlackProviderError::InvalidResponse("duplicate user"));
+            }
+            rendered_user_bytes = rendered_user_bytes
+                .saturating_add(estimated_hosted_slack_user_markdown_row_bytes(&hosted));
+            if rendered_user_bytes > MAX_HOSTED_SLACK_RENDERED_DOCUMENT_BYTES_V1 {
+                return Err(HostedSlackProviderError::LimitExceeded(
+                    "users rendered document",
+                ));
+            }
+            users.push(user);
+            if users.len() > MAX_HOSTED_SLACK_USERS_LIST_USERS_V1 {
+                return Err(HostedSlackProviderError::LimitExceeded("users"));
+            }
+        }
+        cursor = page.next_cursor.filter(|value| !value.is_empty());
+        if let Some(next_cursor) = &cursor {
+            if next_cursor.len() > MAX_HOSTED_SLACK_USERS_LIST_CURSOR_BYTES_V1 {
+                return Err(HostedSlackProviderError::LimitExceeded("users cursor"));
+            }
+            if !cursors.insert(next_cursor.clone()) {
+                return Err(HostedSlackProviderError::InvalidResponse(
+                    "repeated users cursor",
+                ));
+            }
+        }
+        if cursor.is_none() {
+            return Ok(HostedSlackUsersDiscoveryV1 {
+                installation,
+                observed_at: observed_at.unwrap_or_else(current_canonical_utc),
+                users,
+            });
+        }
+    }
+    Err(HostedSlackProviderError::LimitExceeded("users pages"))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostedSlackProviderError {
     Authentication,
@@ -597,6 +709,7 @@ impl HostedSlackProviderOperationV1 {
             Self::ConversationsInfo => HostedSlackApiMethodV2::ConversationsInfo,
             Self::ConversationsHistory => HostedSlackApiMethodV2::ConversationsHistory,
             Self::ConversationsReplies => HostedSlackApiMethodV2::ConversationsReplies,
+            Self::UsersList => HostedSlackApiMethodV2::UsersList,
             Self::UsersInfo => HostedSlackApiMethodV2::UsersInfo,
             Self::FilesInfo => HostedSlackApiMethodV2::FilesInfo,
         }
@@ -607,6 +720,7 @@ impl HostedSlackProviderOperationV1 {
             Self::VerifyInstallation
             | Self::ConversationsList
             | Self::ConversationsInfo
+            | Self::UsersList
             | Self::UsersInfo
             | Self::FilesInfo => RetryConfig::exponential(
                 HOSTED_SLACK_MAX_RETRIES,
@@ -630,6 +744,7 @@ impl HostedSlackApiMethodV2 {
             Self::ConversationsInfo => "conversations.info",
             Self::ConversationsHistory => "conversations.history",
             Self::ConversationsReplies => "conversations.replies",
+            Self::UsersList => "users.list",
             Self::UsersInfo => "users.info",
             Self::FilesInfo => "files.info",
         }
@@ -756,7 +871,11 @@ fn verify_channel_authority(
     authority: &HostedSlackObservedChannelAuthorityV1,
 ) -> Result<(), HostedSlackProviderError> {
     validate_slack_id("provider.channel.team_id", &authority.team_id, b"T")?;
-    validate_slack_id("provider.channel.channel_id", &authority.channel_id, b"CG")?;
+    validate_slack_id(
+        "provider.channel.channel_id",
+        &authority.channel_id,
+        HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+    )?;
     if authority.shared_team_ids.len() > MAX_HOSTED_SLACK_PROVIDER_METADATA_IDS_V1 {
         return Err(HostedSlackProviderError::LimitExceeded(
             "channel shared team ids",
@@ -1394,6 +1513,7 @@ struct HostedSlackProviderGates {
     conversations_info: HostedSlackMethodGate,
     conversations_history: HostedSlackMethodGate,
     conversations_replies: HostedSlackMethodGate,
+    users_list: HostedSlackMethodGate,
     users_info: HostedSlackMethodGate,
     files_info: HostedSlackMethodGate,
 }
@@ -1421,6 +1541,7 @@ impl HostedSlackProviderGates {
             conversations_info: gate(HostedSlackProviderOperationV1::ConversationsInfo),
             conversations_history: gate(HostedSlackProviderOperationV1::ConversationsHistory),
             conversations_replies: gate(HostedSlackProviderOperationV1::ConversationsReplies),
+            users_list: gate(HostedSlackProviderOperationV1::UsersList),
             users_info: gate(HostedSlackProviderOperationV1::UsersInfo),
             files_info: gate(HostedSlackProviderOperationV1::FilesInfo),
         }
@@ -1433,6 +1554,7 @@ impl HostedSlackProviderGates {
             HostedSlackProviderOperationV1::ConversationsInfo => &self.conversations_info,
             HostedSlackProviderOperationV1::ConversationsHistory => &self.conversations_history,
             HostedSlackProviderOperationV1::ConversationsReplies => &self.conversations_replies,
+            HostedSlackProviderOperationV1::UsersList => &self.users_list,
             HostedSlackProviderOperationV1::UsersInfo => &self.users_info,
             HostedSlackProviderOperationV1::FilesInfo => &self.files_info,
         }
@@ -1852,7 +1974,11 @@ impl HostedSlackProviderPort for HttpHostedSlackProvider {
         channel_id: String,
     ) -> HostedSlackProviderFuture<'_, HostedSlackObservedChannelAuthorityV1> {
         Box::pin(async move {
-            validate_slack_id("provider.channel_id", &channel_id, b"CG")?;
+            validate_slack_id(
+                "provider.channel_id",
+                &channel_id,
+                HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+            )?;
             let response = self
                 .request::<ConversationInfoResponse>(
                     Method::GET,
@@ -1969,7 +2095,7 @@ impl HostedSlackDiscoveryProviderPort for HttpHostedSlackProvider {
                 ));
             }
             let mut query = vec![
-                ("types", "public_channel,private_channel".to_owned()),
+                ("types", "public_channel,private_channel,im,mpim".to_owned()),
                 ("exclude_archived", "false".to_owned()),
                 ("limit", request.limit.to_string()),
             ];
@@ -2006,6 +2132,45 @@ impl HostedSlackDiscoveryProviderPort for HttpHostedSlackProvider {
                     .and_then(|metadata| metadata.next_cursor)
                     .filter(|cursor| !cursor.is_empty()),
                 channels,
+            })
+        })
+    }
+
+    fn users_list(
+        &self,
+        cursor: Option<String>,
+    ) -> HostedSlackProviderFuture<'_, HostedSlackUsersPageV1> {
+        Box::pin(async move {
+            let mut query = vec![("limit", HOSTED_SLACK_USERS_LIST_PAGE_LIMIT_V1.to_string())];
+            if let Some(cursor) = cursor {
+                if cursor.len() > MAX_HOSTED_SLACK_USERS_LIST_CURSOR_BYTES_V1 {
+                    return Err(HostedSlackProviderError::LimitExceeded("users cursor"));
+                }
+                query.push(("cursor", cursor));
+            }
+            let response = self
+                .request::<UsersListResponse>(
+                    Method::GET,
+                    query,
+                    HostedSlackProviderOperationV1::UsersList,
+                )
+                .await?;
+            let users = response
+                .members
+                .ok_or(HostedSlackProviderError::InvalidResponse("members"))?
+                .into_iter()
+                .map(|user| provider_user_wire(user, None, &self.credential_identity.team_id))
+                .collect::<Result<Vec<_>, _>>()?;
+            if users.len() > HOSTED_SLACK_USERS_LIST_PAGE_LIMIT_V1 as usize {
+                return Err(HostedSlackProviderError::LimitExceeded("users page users"));
+            }
+            Ok(HostedSlackUsersPageV1 {
+                observed_at: current_canonical_utc(),
+                next_cursor: response
+                    .response_metadata
+                    .and_then(|metadata| metadata.next_cursor)
+                    .filter(|cursor| !cursor.is_empty()),
+                users,
             })
         })
     }
@@ -2060,6 +2225,14 @@ struct ChannelAuthorityWire {
     #[serde(default)]
     team_id: Option<String>,
     #[serde(default)]
+    is_channel: Option<bool>,
+    #[serde(default)]
+    is_group: Option<bool>,
+    #[serde(default)]
+    is_im: Option<bool>,
+    #[serde(default)]
+    is_mpim: Option<bool>,
+    #[serde(default)]
     is_private: Option<bool>,
     #[serde(default)]
     is_shared: Option<bool>,
@@ -2073,6 +2246,8 @@ struct ChannelAuthorityWire {
     shared_team_ids: Vec<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
     #[serde(default)]
     topic: Option<ConversationTextWire>,
     #[serde(default)]
@@ -2155,6 +2330,17 @@ struct UserInfoResponse {
 }
 
 #[derive(Deserialize)]
+struct UsersListResponse {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    members: Option<Vec<UserWire>>,
+    #[serde(default)]
+    response_metadata: Option<ResponseMetadata>,
+}
+
+#[derive(Deserialize)]
 struct UserWire {
     id: String,
     #[serde(default)]
@@ -2233,6 +2419,7 @@ impl_envelope!(
     ConversationInfoResponse,
     ConversationsListResponse,
     HistoryResponse,
+    UsersListResponse,
     UserInfoResponse,
     FileInfoResponse,
 );
@@ -2270,7 +2457,11 @@ fn validate_history_request(
         ));
     }
     validate_slack_id("provider.history.team_id", &request.team_id, b"T")?;
-    validate_slack_id("provider.history.channel_id", &request.channel_id, b"CG")?;
+    validate_slack_id(
+        "provider.history.channel_id",
+        &request.channel_id,
+        HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+    )?;
     let oldest =
         super::checkpoint::parse_slack_timestamp("provider.history.oldest", &request.oldest)?;
     let latest =
@@ -2294,7 +2485,11 @@ fn validate_replies_request(
         ));
     }
     validate_slack_id("provider.replies.team_id", &request.team_id, b"T")?;
-    validate_slack_id("provider.replies.channel_id", &request.channel_id, b"CG")?;
+    validate_slack_id(
+        "provider.replies.channel_id",
+        &request.channel_id,
+        HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+    )?;
     super::checkpoint::parse_slack_timestamp(
         "provider.replies.root_message_id",
         &request.root_message_id,
@@ -2321,6 +2516,7 @@ fn provider_channel_authority_wire(
     if channel.id != expected_channel_id {
         return Err(HostedSlackProviderError::IdentityMismatch("channel_id"));
     }
+    let conversation_kind = hosted_conversation_kind_from_authority_wire(&channel)?;
     if channel
         .context_team_id
         .as_ref()
@@ -2331,6 +2527,13 @@ fn provider_channel_authority_wire(
             "channel team_id",
         ));
     }
+    let is_private = hosted_authority_private(&channel, conversation_kind)?;
+    let is_shared = hosted_authority_bool(&channel, conversation_kind, "channel is_shared")?;
+    let is_externally_shared =
+        hosted_authority_bool(&channel, conversation_kind, "channel is_ext_shared")?;
+    let is_org_shared =
+        hosted_authority_bool(&channel, conversation_kind, "channel is_org_shared")?;
+    let is_member = hosted_authority_member(&channel, conversation_kind)?;
     let team_id = channel
         .context_team_id
         .or(channel.team_id)
@@ -2340,31 +2543,69 @@ fn provider_channel_authority_wire(
     Ok(HostedSlackObservedChannelAuthorityV1 {
         team_id,
         channel_id: channel.id,
-        is_private: channel
-            .is_private
-            .ok_or(HostedSlackProviderError::InvalidResponse(
-                "channel is_private",
-            ))?,
-        is_shared: channel
-            .is_shared
-            .ok_or(HostedSlackProviderError::InvalidResponse(
-                "channel is_shared",
-            ))?,
-        is_externally_shared: channel.is_ext_shared.ok_or(
-            HostedSlackProviderError::InvalidResponse("channel is_ext_shared"),
-        )?,
-        is_org_shared: channel
-            .is_org_shared
-            .ok_or(HostedSlackProviderError::InvalidResponse(
-                "channel is_org_shared",
-            ))?,
-        is_member: channel
-            .is_member
-            .ok_or(HostedSlackProviderError::InvalidResponse(
-                "channel is_member",
-            ))?,
+        is_private,
+        is_shared,
+        is_externally_shared,
+        is_org_shared,
+        is_member,
         shared_team_ids,
     })
+}
+
+fn hosted_authority_private(
+    channel: &ChannelAuthorityWire,
+    conversation_kind: HostedSlackConversationKindV1,
+) -> Result<bool, HostedSlackProviderError> {
+    match conversation_kind {
+        HostedSlackConversationKindV1::PublicChannel
+        | HostedSlackConversationKindV1::PrivateChannel => {
+            channel
+                .is_private
+                .ok_or(HostedSlackProviderError::InvalidResponse(
+                    "channel is_private",
+                ))
+        }
+        HostedSlackConversationKindV1::Im | HostedSlackConversationKindV1::Mpim => Ok(true),
+    }
+}
+
+fn hosted_authority_bool(
+    channel: &ChannelAuthorityWire,
+    conversation_kind: HostedSlackConversationKindV1,
+    field: &'static str,
+) -> Result<bool, HostedSlackProviderError> {
+    match conversation_kind {
+        HostedSlackConversationKindV1::PublicChannel
+        | HostedSlackConversationKindV1::PrivateChannel => {
+            let value = match field {
+                "channel is_shared" => channel.is_shared,
+                "channel is_ext_shared" => channel.is_ext_shared,
+                "channel is_org_shared" => channel.is_org_shared,
+                _ => None,
+            };
+            value.ok_or(HostedSlackProviderError::InvalidResponse(field))
+        }
+        HostedSlackConversationKindV1::Im | HostedSlackConversationKindV1::Mpim => Ok(false),
+    }
+}
+
+fn hosted_authority_member(
+    channel: &ChannelAuthorityWire,
+    conversation_kind: HostedSlackConversationKindV1,
+) -> Result<bool, HostedSlackProviderError> {
+    match conversation_kind {
+        HostedSlackConversationKindV1::PublicChannel
+        | HostedSlackConversationKindV1::PrivateChannel => {
+            channel
+                .is_member
+                .ok_or(HostedSlackProviderError::InvalidResponse(
+                    "channel is_member",
+                ))
+        }
+        HostedSlackConversationKindV1::Im | HostedSlackConversationKindV1::Mpim => {
+            Ok(channel.is_member.unwrap_or(true))
+        }
+    }
 }
 
 fn provider_discovered_channel(
@@ -2372,10 +2613,8 @@ fn provider_discovered_channel(
     expected_team_id: &str,
 ) -> Result<HostedSlackDiscoveredChannelV1, HostedSlackProviderError> {
     let channel_id = channel.id.clone();
-    let name = channel
-        .name
-        .clone()
-        .ok_or(HostedSlackProviderError::InvalidResponse("channel name"))?;
+    let conversation_kind = hosted_conversation_kind_from_wire(&channel)?;
+    let name = hosted_conversation_name(&channel, conversation_kind)?;
     let topic = channel.topic.as_ref().map(|value| value.value.clone());
     let purpose = channel.purpose.as_ref().map(|value| value.value.clone());
     let created = channel
@@ -2399,6 +2638,7 @@ fn provider_discovered_channel(
     let raw = RawHostedSlackChannel {
         team_id: authority.team_id,
         id: authority.channel_id,
+        conversation_kind,
         name,
         topic,
         purpose,
@@ -2412,6 +2652,115 @@ fn provider_discovered_channel(
         is_member: authority.is_member,
         is_archived,
     })
+}
+
+fn hosted_conversation_kind(
+    is_channel: bool,
+    is_group: bool,
+    is_im: bool,
+    is_mpim: bool,
+    is_private: bool,
+) -> Result<HostedSlackConversationKindV1, HostedSlackProviderError> {
+    match (is_channel, is_group, is_im, is_mpim, is_private) {
+        (false, false, true, false, _) => Ok(HostedSlackConversationKindV1::Im),
+        (false, false, false, true, _) => Ok(HostedSlackConversationKindV1::Mpim),
+        (_, true, false, false, true) | (true, false, false, false, true) => {
+            Ok(HostedSlackConversationKindV1::PrivateChannel)
+        }
+        (true, false, false, false, false) => Ok(HostedSlackConversationKindV1::PublicChannel),
+        _ => Err(HostedSlackProviderError::InvalidResponse(
+            "conversation kind",
+        )),
+    }
+}
+
+fn hosted_conversation_kind_from_wire(
+    channel: &ChannelAuthorityWire,
+) -> Result<HostedSlackConversationKindV1, HostedSlackProviderError> {
+    hosted_conversation_kind(
+        channel.is_channel.unwrap_or(false),
+        channel.is_group.unwrap_or(false),
+        channel.is_im.unwrap_or(false),
+        channel.is_mpim.unwrap_or(false),
+        channel.is_private.unwrap_or(false),
+    )
+}
+
+fn hosted_conversation_kind_from_authority_wire(
+    channel: &ChannelAuthorityWire,
+) -> Result<HostedSlackConversationKindV1, HostedSlackProviderError> {
+    if channel.is_channel.is_some()
+        || channel.is_group.is_some()
+        || channel.is_im.is_some()
+        || channel.is_mpim.is_some()
+    {
+        return hosted_conversation_kind_from_wire(channel);
+    }
+    match channel.id.as_bytes().first().copied() {
+        Some(b'C') => {
+            if channel.is_private.unwrap_or(false) {
+                Ok(HostedSlackConversationKindV1::PrivateChannel)
+            } else {
+                Ok(HostedSlackConversationKindV1::PublicChannel)
+            }
+        }
+        Some(b'D') => Ok(HostedSlackConversationKindV1::Im),
+        _ => Err(HostedSlackProviderError::InvalidResponse(
+            "conversation kind",
+        )),
+    }
+}
+
+fn hosted_conversation_name(
+    channel: &ChannelAuthorityWire,
+    conversation_kind: HostedSlackConversationKindV1,
+) -> Result<String, HostedSlackProviderError> {
+    if let Some(name) = &channel.name {
+        return Ok(name.clone());
+    }
+    match conversation_kind {
+        HostedSlackConversationKindV1::PublicChannel
+        | HostedSlackConversationKindV1::PrivateChannel => {
+            Err(HostedSlackProviderError::InvalidResponse("channel name"))
+        }
+        HostedSlackConversationKindV1::Im => {
+            let user_id =
+                channel
+                    .user
+                    .as_deref()
+                    .ok_or(HostedSlackProviderError::InvalidResponse(
+                        "conversation user",
+                    ))?;
+            validate_slack_id("provider.conversation.user", user_id, b"UW")?;
+            Ok(format!("dm-{user_id}"))
+        }
+        HostedSlackConversationKindV1::Mpim => Ok(format!("mpim-{}", channel.id)),
+    }
+}
+
+fn estimated_hosted_slack_user_markdown_row_bytes(user: &HostedSlackUser) -> usize {
+    "|  |  |  | false | false |\n".len()
+        + markdown_table_cell_bytes(user.user_id())
+        + markdown_table_cell_bytes(user.name())
+        + markdown_table_cell_bytes(hosted_user_display_name(user))
+}
+
+fn markdown_table_cell_bytes(value: &str) -> usize {
+    value
+        .chars()
+        .map(|character| match character {
+            '|' => 2,
+            '\r' | '\n' | '\t' => 1,
+            character => character.len_utf8(),
+        })
+        .sum()
+}
+
+fn hosted_user_display_name(user: &HostedSlackUser) -> &str {
+    [user.display_name(), user.real_name(), user.name()]
+        .into_iter()
+        .find(|name| !name.trim().is_empty())
+        .unwrap_or(user.user_id())
 }
 
 fn validate_discovered_channel_authority(
@@ -2492,10 +2841,18 @@ fn provider_user(
     let user = response
         .user
         .ok_or(HostedSlackProviderError::InvalidResponse("user"))?;
-    if user.id != expected_user_id {
+    provider_user_wire(user, Some(expected_user_id), team_id)
+}
+
+fn provider_user_wire(
+    user: UserWire,
+    expected_user_id: Option<&str>,
+    team_id: &str,
+) -> Result<RawHostedSlackUser, HostedSlackProviderError> {
+    if expected_user_id.is_some_and(|expected_user_id| user.id != expected_user_id) {
         return Err(HostedSlackProviderError::IdentityMismatch("user_id"));
     }
-    Ok(RawHostedSlackUser {
+    let raw = RawHostedSlackUser {
         team_id: team_id.to_string(),
         id: user.id,
         name: user.name.unwrap_or_default(),
@@ -2512,7 +2869,9 @@ fn provider_user(
         is_bot: user.is_bot,
         deleted: user.deleted,
         updated_ts: user.updated.map(epoch_seconds_timestamp),
-    })
+    };
+    HostedSlackUser::try_from(raw.clone())?;
+    Ok(raw)
 }
 
 fn provider_file(
@@ -2873,6 +3232,7 @@ fn operation_network_config(operation: HostedSlackProviderOperationV1) -> Connec
         HostedSlackProviderOperationV1::ConversationsReplies => {
             ("slack-hosted-conversations-replies-v1", 1.0 / 60.0, 1.0, 1)
         }
+        HostedSlackProviderOperationV1::UsersList => ("slack-users-list", 1.0, 2.0, 2),
         HostedSlackProviderOperationV1::UsersInfo => ("slack-users-info", 1.0, 2.0, 2),
         HostedSlackProviderOperationV1::FilesInfo => ("slack-files-info", 1.0, 2.0, 2),
     };
@@ -2890,6 +3250,7 @@ mod tests {
     use std::sync::mpsc::{self, Receiver};
     use std::thread::{self, JoinHandle};
 
+    use super::super::native::HostedSlackConversationKindV1;
     use super::*;
     use crate::portable::hosted::HostedSlackPollKindV1;
 
@@ -2917,6 +3278,8 @@ mod tests {
     struct StubDiscoveryProvider {
         pages: Mutex<VecDeque<Result<HostedSlackChannelDiscoveryPageV1, HostedSlackProviderError>>>,
         requests: Mutex<Vec<HostedSlackChannelDiscoveryRequestV1>>,
+        user_pages: Mutex<VecDeque<Result<HostedSlackUsersPageV1, HostedSlackProviderError>>>,
+        user_requests: Mutex<Vec<Option<String>>>,
     }
 
     impl StubDiscoveryProvider {
@@ -2928,6 +3291,19 @@ mod tests {
             Self {
                 pages: Mutex::new(pages.into_iter().collect()),
                 requests: Mutex::new(Vec::new()),
+                user_pages: Mutex::new(VecDeque::new()),
+                user_requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn new_users(
+            pages: impl IntoIterator<Item = Result<HostedSlackUsersPageV1, HostedSlackProviderError>>,
+        ) -> Self {
+            Self {
+                pages: Mutex::new(VecDeque::new()),
+                requests: Mutex::new(Vec::new()),
+                user_pages: Mutex::new(pages.into_iter().collect()),
+                user_requests: Mutex::new(Vec::new()),
             }
         }
     }
@@ -2990,6 +3366,20 @@ mod tests {
                     .expect("missing discovery page")
             })
         }
+
+        fn users_list(
+            &self,
+            cursor: Option<String>,
+        ) -> HostedSlackProviderFuture<'_, HostedSlackUsersPageV1> {
+            Box::pin(async move {
+                self.user_requests.lock().unwrap().push(cursor);
+                self.user_pages
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("missing users page")
+            })
+        }
     }
 
     fn observed_identity() -> HostedSlackObservedInstallationIdentity {
@@ -3025,6 +3415,7 @@ mod tests {
             channel: RawHostedSlackChannel {
                 team_id: team_id.to_string(),
                 id: "C08ENGINEER1".to_string(),
+                conversation_kind: HostedSlackConversationKindV1::PrivateChannel,
                 name: "engineering".to_string(),
                 topic: Some("Build safely".to_string()),
                 purpose: Some("Engineering".to_string()),
@@ -3037,11 +3428,47 @@ mod tests {
         }
     }
 
+    fn discovered_channel_wire(
+        id: &str,
+        is_channel: bool,
+        is_group: bool,
+        is_im: bool,
+        is_mpim: bool,
+    ) -> ChannelAuthorityWire {
+        ChannelAuthorityWire {
+            id: id.to_string(),
+            context_team_id: Some("T08LOCALITY1".to_string()),
+            team_id: Some("T08LOCALITY1".to_string()),
+            is_channel: Some(is_channel),
+            is_group: Some(is_group),
+            is_im: Some(is_im),
+            is_mpim: Some(is_mpim),
+            is_private: Some(is_group || is_im || is_mpim),
+            is_shared: Some(false),
+            is_ext_shared: Some(false),
+            is_org_shared: Some(false),
+            is_member: Some(true),
+            shared_team_ids: Vec::new(),
+            name: Some("conversation".to_string()),
+            user: None,
+            topic: Some(ConversationTextWire {
+                value: "topic".to_string(),
+            }),
+            purpose: Some(ConversationTextWire {
+                value: "purpose".to_string(),
+            }),
+            created: Some(1780000000),
+            updated: Some(1780000010123),
+            is_archived: false,
+        }
+    }
+
     fn indexed_discovered_channel(index: usize) -> HostedSlackDiscoveredChannelV1 {
         HostedSlackDiscoveredChannelV1 {
             channel: RawHostedSlackChannel {
                 team_id: "T08LOCALITY1".to_string(),
                 id: format!("C{index:011}"),
+                conversation_kind: HostedSlackConversationKindV1::PublicChannel,
                 name: format!("channel-{index}"),
                 topic: None,
                 purpose: None,
@@ -3054,6 +3481,19 @@ mod tests {
         }
     }
 
+    fn indexed_user(index: usize) -> RawHostedSlackUser {
+        RawHostedSlackUser {
+            team_id: "T08LOCALITY1".to_string(),
+            id: format!("U{index:011}"),
+            name: format!("user-{index}"),
+            display_name: format!("User {index:04}"),
+            real_name: format!("User {index:04} Example"),
+            is_bot: false,
+            deleted: false,
+            updated_ts: None,
+        }
+    }
+
     fn discovery_page(
         channels: Vec<HostedSlackDiscoveredChannelV1>,
         next_cursor: Option<String>,
@@ -3062,6 +3502,17 @@ mod tests {
             observed_at: "2026-06-01T00:00:00Z".to_string(),
             next_cursor,
             channels,
+        }
+    }
+
+    fn users_page(
+        users: Vec<RawHostedSlackUser>,
+        next_cursor: Option<String>,
+    ) -> HostedSlackUsersPageV1 {
+        HostedSlackUsersPageV1 {
+            observed_at: "2026-06-01T00:00:00Z".to_string(),
+            next_cursor,
+            users,
         }
     }
 
@@ -3080,6 +3531,7 @@ mod tests {
         HostedSlackProviderGates {
             verify_installation: test_gate(HostedSlackProviderOperationV1::VerifyInstallation, 2),
             conversations_list: test_gate(HostedSlackProviderOperationV1::ConversationsList, 1),
+            users_list: test_gate(HostedSlackProviderOperationV1::UsersList, 2),
             conversations_info: test_gate(HostedSlackProviderOperationV1::ConversationsInfo, 1),
             conversations_history: test_gate(
                 HostedSlackProviderOperationV1::ConversationsHistory,
@@ -3464,6 +3916,10 @@ mod tests {
                 "channel": {
                     "id": "C08ENGINEER1",
                     "context_team_id": "T08LOCALITY1",
+                    "is_channel": true,
+                    "is_group": false,
+                    "is_im": false,
+                    "is_mpim": false,
                     "is_private": true,
                     "is_shared": true,
                     "is_ext_shared": true,
@@ -3479,6 +3935,229 @@ mod tests {
                 "channel is_member"
             ))
         );
+    }
+
+    #[test]
+    fn hosted_conversation_kind_classifies_exactly() {
+        assert_eq!(
+            hosted_conversation_kind(true, false, false, false, false),
+            Ok(HostedSlackConversationKindV1::PublicChannel)
+        );
+        assert_eq!(
+            hosted_conversation_kind(false, true, false, false, true),
+            Ok(HostedSlackConversationKindV1::PrivateChannel)
+        );
+        assert_eq!(
+            hosted_conversation_kind(true, false, false, false, true),
+            Ok(HostedSlackConversationKindV1::PrivateChannel)
+        );
+        assert_eq!(
+            hosted_conversation_kind(false, false, true, false, true),
+            Ok(HostedSlackConversationKindV1::Im)
+        );
+        assert_eq!(
+            hosted_conversation_kind(false, false, false, true, true),
+            Ok(HostedSlackConversationKindV1::Mpim)
+        );
+        assert_eq!(
+            hosted_conversation_kind(false, false, false, false, false),
+            Err(HostedSlackProviderError::InvalidResponse(
+                "conversation kind"
+            ))
+        );
+        assert_eq!(
+            hosted_conversation_kind(true, true, false, false, true),
+            Ok(HostedSlackConversationKindV1::PrivateChannel)
+        );
+        assert_eq!(
+            hosted_conversation_kind(true, true, false, false, false),
+            Err(HostedSlackProviderError::InvalidResponse(
+                "conversation kind"
+            ))
+        );
+    }
+
+    #[test]
+    fn provider_scope_validation_accepts_dm_conversation_ids() {
+        let installation_id: SlackInstallationId =
+            serde_json::from_str(r#""0198f3c2-7d4e-7a61-8b25-4f9c8d7e6a10""#).unwrap();
+        let history = HostedSlackHistoryRequestV1 {
+            installation_id: installation_id.clone(),
+            team_id: "T08LOCALITY1".to_string(),
+            channel_id: "D08DIRECT1".to_string(),
+            phase: HostedSlackPollPhaseV1::HistoricalHistory,
+            oldest: "1767225599.999999".to_string(),
+            latest: "1780272000.000000".to_string(),
+            inclusive: false,
+            cursor: None,
+            limit: HOSTED_SLACK_PROVIDER_PAGE_LIMIT_V1,
+        };
+        validate_history_request(&history).expect("valid DM history request");
+
+        let replies = HostedSlackRepliesRequestV1 {
+            installation_id,
+            team_id: "T08LOCALITY1".to_string(),
+            channel_id: "D08DIRECT1".to_string(),
+            phase: HostedSlackPollPhaseV1::HistoricalReplies,
+            root_message_id: "1780000000.000100".to_string(),
+            latest: "1780272000.000000".to_string(),
+            inclusive: false,
+            cursor: None,
+            limit: HOSTED_SLACK_PROVIDER_PAGE_LIMIT_V1,
+        };
+        validate_replies_request(&replies).expect("valid DM replies request");
+
+        let authority = provider_channel_authority(
+            ConversationInfoResponse {
+                ok: true,
+                error: None,
+                channel: Some(ChannelAuthorityWire {
+                    id: "D08DIRECT1".to_string(),
+                    context_team_id: Some("T08LOCALITY1".to_string()),
+                    team_id: None,
+                    is_channel: Some(false),
+                    is_group: Some(false),
+                    is_im: Some(true),
+                    is_mpim: Some(false),
+                    is_private: Some(false),
+                    is_shared: Some(false),
+                    is_ext_shared: Some(false),
+                    is_org_shared: Some(false),
+                    is_member: Some(true),
+                    shared_team_ids: Vec::new(),
+                    name: Some("Ada".to_string()),
+                    user: Some("U08ADA00001".to_string()),
+                    topic: None,
+                    purpose: None,
+                    created: Some(1_780_000_000),
+                    updated: None,
+                    is_archived: false,
+                }),
+            },
+            "D08DIRECT1",
+        )
+        .expect("valid DM authority");
+        assert_eq!(authority.channel_id, "D08DIRECT1");
+    }
+
+    #[test]
+    fn provider_discovered_channel_classifies_all_hosted_conversation_kinds() {
+        for (id, flags, kind) in [
+            (
+                "C08PUBLIC01",
+                (true, false, false, false),
+                HostedSlackConversationKindV1::PublicChannel,
+            ),
+            (
+                "G08PRIVATE1",
+                (false, true, false, false),
+                HostedSlackConversationKindV1::PrivateChannel,
+            ),
+            (
+                "D08DIRECT01",
+                (false, false, true, false),
+                HostedSlackConversationKindV1::Im,
+            ),
+            (
+                "G08GROUPDM1",
+                (false, false, false, true),
+                HostedSlackConversationKindV1::Mpim,
+            ),
+        ] {
+            let (is_channel, is_group, is_im, is_mpim) = flags;
+            let discovered = provider_discovered_channel(
+                discovered_channel_wire(id, is_channel, is_group, is_im, is_mpim),
+                "T08LOCALITY1",
+            )
+            .expect("discovered conversation");
+            assert_eq!(discovered.channel.conversation_kind, kind);
+        }
+    }
+
+    #[test]
+    fn provider_discovered_channel_classifies_private_channel_flag() {
+        let mut wire = discovered_channel_wire("C08PRIVATE1", true, false, false, false);
+        wire.is_private = Some(true);
+        let discovered =
+            provider_discovered_channel(wire, "T08LOCALITY1").expect("private channel discovery");
+        assert_eq!(
+            discovered.channel.conversation_kind,
+            HostedSlackConversationKindV1::PrivateChannel
+        );
+    }
+
+    #[test]
+    fn provider_discovered_im_accepts_sparse_direct_message_wire() {
+        let discovered = provider_discovered_channel(
+            ChannelAuthorityWire {
+                id: "D08DIRECT01".to_string(),
+                context_team_id: Some("T08LOCALITY1".to_string()),
+                team_id: None,
+                is_channel: None,
+                is_group: None,
+                is_im: Some(true),
+                is_mpim: None,
+                is_private: None,
+                is_shared: None,
+                is_ext_shared: None,
+                is_org_shared: None,
+                is_member: None,
+                shared_team_ids: Vec::new(),
+                name: None,
+                user: Some("U08ADA00001".to_string()),
+                topic: None,
+                purpose: None,
+                created: Some(1_780_000_000),
+                updated: None,
+                is_archived: false,
+            },
+            "T08LOCALITY1",
+        )
+        .expect("sparse IM discovery");
+
+        assert_eq!(
+            discovered.channel.conversation_kind,
+            HostedSlackConversationKindV1::Im
+        );
+        assert_eq!(discovered.channel.name, "dm-U08ADA00001");
+        assert_eq!(
+            discovered.channel.sharing,
+            SlackChannelSharingClassification::Private
+        );
+        assert!(discovered.is_member);
+
+        let mpim = provider_discovered_channel(
+            ChannelAuthorityWire {
+                id: "G08GROUPDM1".to_string(),
+                context_team_id: Some("T08LOCALITY1".to_string()),
+                team_id: None,
+                is_channel: None,
+                is_group: None,
+                is_im: None,
+                is_mpim: Some(true),
+                is_private: None,
+                is_shared: None,
+                is_ext_shared: None,
+                is_org_shared: None,
+                is_member: None,
+                shared_team_ids: Vec::new(),
+                name: None,
+                user: None,
+                topic: None,
+                purpose: None,
+                created: Some(1_780_000_000),
+                updated: None,
+                is_archived: false,
+            },
+            "T08LOCALITY1",
+        )
+        .expect("sparse MPIM discovery");
+        assert_eq!(
+            mpim.channel.conversation_kind,
+            HostedSlackConversationKindV1::Mpim
+        );
+        assert_eq!(mpim.channel.name, "mpim-G08GROUPDM1");
+        assert!(mpim.is_member);
     }
 
     #[test]
@@ -3670,16 +4349,164 @@ mod tests {
         assert_eq!(
             requests.recv().unwrap().lines().next(),
             Some(
-                "GET /conversations.list?types=public_channel%2Cprivate_channel&exclude_archived=false&limit=100 HTTP/1.1"
+                "GET /conversations.list?types=public_channel%2Cprivate_channel%2Cim%2Cmpim&exclude_archived=false&limit=100 HTTP/1.1"
             )
         );
         assert_eq!(
             requests.recv().unwrap().lines().next(),
             Some(
-                "GET /conversations.list?types=public_channel%2Cprivate_channel&exclude_archived=false&limit=100&cursor=page-two HTTP/1.1"
+                "GET /conversations.list?types=public_channel%2Cprivate_channel%2Cim%2Cmpim&exclude_archived=false&limit=100&cursor=page-two HTTP/1.1"
             )
         );
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn users_list_http_uses_exact_bounded_queries_and_sanitizes_members() {
+        let first = r#"{
+            "ok": true,
+            "members": [{
+                "id": "U08ADA00001",
+                "name": "ada",
+                "real_name": "Ada Lovelace",
+                "profile": {
+                    "display_name": "Ada",
+                    "real_name": "Ada Lovelace",
+                    "email": "ada-secret@example.invalid"
+                },
+                "is_bot": false,
+                "deleted": false,
+                "updated": 1780000200
+            }],
+            "response_metadata": {"next_cursor": "page-two"}
+        }"#;
+        let second = r#"{"ok": true, "members": [], "response_metadata": {"next_cursor": ""}}"#;
+        let (base_url, requests, server) = spawn_stub_server(vec![
+            StubResponse {
+                status: "200 OK",
+                headers: Vec::new(),
+                body: first,
+            },
+            StubResponse {
+                status: "200 OK",
+                headers: Vec::new(),
+                body: second,
+            },
+        ]);
+        let provider = test_provider(base_url);
+
+        let page = provider.users_list(None).await.unwrap();
+        assert_eq!(page.next_cursor.as_deref(), Some("page-two"));
+        assert_eq!(
+            page.users,
+            vec![RawHostedSlackUser {
+                team_id: "T08LOCALITY1".to_string(),
+                id: "U08ADA00001".to_string(),
+                name: "ada".to_string(),
+                display_name: "Ada".to_string(),
+                real_name: "Ada Lovelace".to_string(),
+                is_bot: false,
+                deleted: false,
+                updated_ts: Some("1780000200.000000".to_string()),
+            }]
+        );
+        let sanitized = serde_json::to_string(&page).unwrap();
+        assert!(!sanitized.contains("email"));
+        assert!(!sanitized.contains("ada-secret"));
+
+        provider
+            .users_list(Some("page-two".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            requests.recv().unwrap().lines().next(),
+            Some("GET /users.list?limit=200 HTTP/1.1")
+        );
+        assert_eq!(
+            requests.recv().unwrap().lines().next(),
+            Some("GET /users.list?limit=200&cursor=page-two HTTP/1.1")
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn users_discovery_rejects_repeated_cursors_and_over_limit_pages() {
+        let repeated_cursor = StubDiscoveryProvider::new_users([
+            Ok(users_page(
+                vec![indexed_user(1)],
+                Some("same-cursor".to_string()),
+            )),
+            Ok(users_page(
+                vec![indexed_user(2)],
+                Some("same-cursor".to_string()),
+            )),
+        ]);
+        assert_eq!(
+            discover_hosted_slack_users_v1(
+                &repeated_cursor,
+                &installation_binding(),
+                &HostedSlackDriveControlV1::new(
+                    Instant::now() + Duration::from_secs(10),
+                    HostedSlackCancellationToken::new(),
+                    None,
+                ),
+            )
+            .await,
+            Err(HostedSlackProviderError::InvalidResponse(
+                "repeated users cursor"
+            ))
+        );
+        assert_eq!(
+            repeated_cursor.user_requests.lock().unwrap().as_slice(),
+            [None, Some("same-cursor".to_string())]
+        );
+
+        let oversized_page = StubDiscoveryProvider::new_users([Ok(users_page(
+            (0..=HOSTED_SLACK_USERS_LIST_PAGE_LIMIT_V1 as usize)
+                .map(indexed_user)
+                .collect(),
+            None,
+        ))]);
+        assert_eq!(
+            discover_hosted_slack_users_v1(
+                &oversized_page,
+                &installation_binding(),
+                &HostedSlackDriveControlV1::new(
+                    Instant::now() + Duration::from_secs(10),
+                    HostedSlackCancellationToken::new(),
+                    None,
+                ),
+            )
+            .await,
+            Err(HostedSlackProviderError::LimitExceeded("users page users"))
+        );
+
+        let rendered_oversized_page = StubDiscoveryProvider::new_users([Ok(users_page(
+            (0..150)
+                .map(|index| {
+                    let mut user = indexed_user(index);
+                    user.name = "n".repeat(512);
+                    user.display_name = "d".repeat(512);
+                    user
+                })
+                .collect(),
+            None,
+        ))]);
+        assert_eq!(
+            discover_hosted_slack_users_v1(
+                &rendered_oversized_page,
+                &installation_binding(),
+                &HostedSlackDriveControlV1::new(
+                    Instant::now() + Duration::from_secs(10),
+                    HostedSlackCancellationToken::new(),
+                    None,
+                ),
+            )
+            .await,
+            Err(HostedSlackProviderError::LimitExceeded(
+                "users rendered document"
+            ))
+        );
     }
 
     #[tokio::test]

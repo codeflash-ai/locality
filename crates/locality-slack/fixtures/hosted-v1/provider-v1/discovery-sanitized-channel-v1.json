@@ -2,6 +2,7 @@
   "channel": {
     "team_id": "T08LOCALITY1",
     "id": "C08ENGINEER1",
+    "conversation_kind": "private_channel",
     "name": "engineering",
     "topic": "Build safely",
     "purpose": "Engineering",
