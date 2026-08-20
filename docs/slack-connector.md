@@ -11,11 +11,12 @@ loc connect slack
 loc mount slack ~/Locality/slack-main
 ```
 
-Locality requests Slack's `channels:join` scope. Mounts whose `--types` include
-`public_channel` join public channels before reading history by default. This
-mutates Slack membership for the connected app, and the manifest describes it
-separately as `membership_operations: ["join_public_channels"]`. It is not a
-content push operation and does not grant message or file write support.
+Desktop and local-brokered Locality requests Slack's `channels:join` scope.
+Mounts whose `--types` include `public_channel` join public channels before
+reading history by default. This mutates Slack membership for the connected app,
+and the manifest describes it separately as
+`membership_operations: ["join_public_channels"]`. It is not a content push
+operation and does not grant message or file write support.
 Private channels still require an explicit Slack invite.
 
 The default Slack connector settings are:
@@ -31,9 +32,9 @@ readable.
 
 ## OAuth scopes
 
-Locality requests bot scopes for channel metadata and history, public channel
-joining, users and team metadata, and file metadata. It does not request
-`chat:write`, admin scopes, search scopes, or user email scope.
+Desktop and local-brokered Locality requests bot scopes for channel metadata and
+history, public channel joining, users and team metadata, and file metadata. It
+does not request `chat:write`, admin scopes, search scopes, or user email scope.
 
 Hosted Locality requests the same read-only coverage as desktop except
 `channels:join`: public channel history, private channel history, DM history,

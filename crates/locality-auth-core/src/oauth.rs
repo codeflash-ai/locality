@@ -1058,7 +1058,7 @@ mod tests {
             .expect("hosted Slack profile");
         assert_eq!(
             scope_csv(profile.scopes),
-            "channels:history,channels:read,files:read,groups:history,groups:read,users:read"
+            "channels:read,channels:history,groups:read,groups:history,im:read,im:history,mpim:read,mpim:history,users:read,team:read,files:read"
         );
     }
 
