@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use locality_connector::ChildContainer;
 use locality_connector::hydration_budget::{
     InitialHydrationBudget, InitialHydrationError, InitialHydrationResult,
+    InitialHydrationScopeFailure,
 };
 use locality_core::freshness::{RemoteObservation, RemoteVersion};
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
@@ -723,7 +724,9 @@ impl BoundedExplicitRootSink<'_> {
         let key = explicit_root_identity_key(entry.remote_id.as_str());
         if let Some(existing_owner) = self.owners.insert(key, self.scope_root_remote_id.clone()) {
             let _ = existing_owner;
-            return Err(InitialHydrationError::ProviderResponseInvalid);
+            return Err(InitialHydrationError::InvalidScope {
+                reason: InitialHydrationScopeFailure::OverlappingRoots,
+            });
         }
         self.entries.push(ExplicitRootTreeEntry {
             entry,
