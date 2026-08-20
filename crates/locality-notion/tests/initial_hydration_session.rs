@@ -547,14 +547,14 @@ fn one_inventory_drains_many_pages_and_each_source_fetches_once() {
 }
 
 #[test]
-fn overlapping_parent_and_child_roots_return_a_redaction_safe_scope_failure() {
+fn overlapping_parent_and_child_roots_are_disjoint_bounded_scopes() {
     let api = Arc::new(FixtureApi::new(&[CHILD_1]));
     let connector =
         connector_with_api(api).with_root_ids([RemoteId::new(ROOT), RemoteId::new(CHILD_1)]);
     let session = connector
         .initial_hydration_session(CONNECTION_HASH, 10, limits(10_000))
         .expect("session");
-    let error = session
+    let batch = session
         .bootstrap_portable(PortableBootstrapRequest {
             source_connection_id: SourceConnectionId::new("connection"),
             scope: PortableSourceScope::explicit_roots([
@@ -564,14 +564,72 @@ fn overlapping_parent_and_child_roots_return_a_redaction_safe_scope_failure() {
             checkpoint: None,
             max_changes: 10,
         })
-        .expect_err("overlapping roots must fail before publication");
+        .expect("overlapping roots partition without duplicate inventory");
 
+    assert_eq!(batch.changes.len(), 2);
     assert_eq!(
-        error.to_string(),
-        "invalid state: initial hydration scope is invalid: overlapping_roots"
+        batch
+            .changes
+            .iter()
+            .map(|change| (
+                change.source_object.remote_id.as_str(),
+                change.logical_path.as_ref().expect("path").as_str(),
+                change.source_object.edges[0].target_remote_id.as_str(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                CHILD_1,
+                "Untitled 111111/page.md",
+                "11111111111111111111111111111111",
+            ),
+            (
+                ROOT,
+                "Untitled aaaaaa/page.md",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ]
     );
-    assert!(!error.to_string().contains(ROOT));
-    assert!(!error.to_string().contains(CHILD_1));
+}
+
+#[test]
+fn overlapping_database_and_selected_row_are_disjoint_bounded_scopes() {
+    let api = Arc::new(DatabaseFixtureApi::new(Some(ParentDto {
+        kind: "data_source_id".to_string(),
+        data_source_id: Some(DATA_SOURCE.to_string()),
+        ..Default::default()
+    })));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone())
+        .with_root_ids([RemoteId::new(DATABASE_ROOT), RemoteId::new(DATABASE_ROW)]);
+    let session = connector
+        .initial_hydration_session(CONNECTION_HASH, 10, limits(10_000))
+        .expect("session");
+    let batch = session
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("connection"),
+            scope: PortableSourceScope::explicit_roots([
+                RemoteId::new(DATABASE_ROOT),
+                RemoteId::new(DATABASE_ROW),
+            ]),
+            checkpoint: None,
+            max_changes: 10,
+        })
+        .expect("database and selected row partition without duplicate inventory");
+
+    assert_eq!(batch.changes.len(), 2);
+    for change in &batch.changes {
+        assert_eq!(change.source_object.edges.len(), 1);
+        assert_eq!(
+            canonical(change.source_object.remote_id.as_str()),
+            canonical(change.source_object.edges[0].target_remote_id.as_str()),
+        );
+    }
+    assert_eq!(api.call_count("bounded:query:"), 1);
+    assert_eq!(
+        api.call_count(&format!("bounded:page:{DATABASE_ROW}")),
+        1,
+        "the selected row is read once as its own root, not again under the database",
+    );
 }
 
 #[test]

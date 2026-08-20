@@ -66,6 +66,7 @@ pub(crate) fn enumerate_explicit_root_trees(
         let scope_root_remote_id = RemoteId::new(projected.child.remote_id().to_string());
         let mut sink = ExplicitRootSink {
             scope_root_remote_id: &scope_root_remote_id,
+            configured_roots: root_page_ids,
             entries: &mut entries,
             owners: &mut owners,
         };
@@ -106,6 +107,7 @@ pub(crate) fn enumerate_explicit_root_trees_bounded(
         let scope_root_remote_id = RemoteId::new(projected.child.remote_id().to_string());
         let mut sink = BoundedExplicitRootSink {
             scope_root_remote_id: &scope_root_remote_id,
+            configured_roots: root_page_ids,
             entries: &mut entries,
             owners: &mut owners,
             budget,
@@ -659,6 +661,10 @@ fn push_projected_listing_entry(
 
 trait TreeEntrySink {
     fn push_entry(&mut self, entry: TreeEntry) -> LocalityResult<()>;
+
+    fn is_foreign_explicit_root(&self, _remote_id: &str) -> bool {
+        false
+    }
 }
 
 impl TreeEntrySink for Vec<TreeEntry> {
@@ -670,6 +676,7 @@ impl TreeEntrySink for Vec<TreeEntry> {
 
 struct ExplicitRootSink<'a> {
     scope_root_remote_id: &'a RemoteId,
+    configured_roots: &'a [RemoteId],
     entries: &'a mut Vec<ExplicitRootTreeEntry>,
     owners: &'a mut BTreeMap<String, RemoteId>,
 }
@@ -691,10 +698,19 @@ impl TreeEntrySink for ExplicitRootSink<'_> {
         });
         Ok(())
     }
+
+    fn is_foreign_explicit_root(&self, remote_id: &str) -> bool {
+        !explicit_root_ids_equal(self.scope_root_remote_id.as_str(), remote_id)
+            && self
+                .configured_roots
+                .iter()
+                .any(|root| explicit_root_ids_equal(root.as_str(), remote_id))
+    }
 }
 
 struct BoundedExplicitRootSink<'a> {
     scope_root_remote_id: &'a RemoteId,
+    configured_roots: &'a [RemoteId],
     entries: &'a mut Vec<ExplicitRootTreeEntry>,
     owners: &'a mut BTreeMap<String, RemoteId>,
     budget: &'a InitialHydrationBudget,
@@ -702,6 +718,14 @@ struct BoundedExplicitRootSink<'a> {
 }
 
 impl BoundedExplicitRootSink<'_> {
+    fn is_foreign_explicit_root(&self, remote_id: &str) -> bool {
+        !explicit_root_ids_equal(self.scope_root_remote_id.as_str(), remote_id)
+            && self
+                .configured_roots
+                .iter()
+                .any(|root| explicit_root_ids_equal(root.as_str(), remote_id))
+    }
+
     fn push_entry(&mut self, entry: TreeEntry) -> InitialHydrationResult<()> {
         let canonical_key_bytes = entry
             .remote_id
@@ -754,6 +778,10 @@ fn compare_explicit_root_identity(left: &str, right: &str) -> std::cmp::Ordering
                 .filter(|byte| *byte != b'-')
                 .map(|byte| byte.to_ascii_lowercase()),
         )
+}
+
+fn explicit_root_ids_equal(left: &str, right: &str) -> bool {
+    compare_explicit_root_identity(left, right).is_eq()
 }
 
 fn push_projected_tree_entry<S: TreeEntrySink>(
@@ -869,7 +897,8 @@ fn enumerate_page_children_bounded(
     let child_depth = parent_depth
         .checked_add(1)
         .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
-    let children = collect_page_child_projections_bounded(api, block_id, child_depth, budget)?;
+    let children =
+        collect_page_child_projections_bounded(api, block_id, child_depth, entries, budget)?;
     for projected in allocate_child_paths_bounded(&parent_dir, children, used_paths, budget)? {
         push_projected_tree_entry_bounded(
             api,
@@ -888,6 +917,7 @@ fn collect_page_child_projections_bounded(
     api: &dyn NotionApi,
     block_id: &str,
     depth: usize,
+    entries: &BoundedExplicitRootSink<'_>,
     budget: &InitialHydrationBudget,
 ) -> InitialHydrationResult<Vec<ProjectedChild>> {
     let mut cursors = Vec::new();
@@ -905,7 +935,14 @@ fn collect_page_child_projections_bounded(
         for block in page.results {
             let block_bytes = encoded_len(&block)?;
             budget.visit_traversal_node(depth)?;
-            collect_child_block_projection_bounded(api, block, depth, &mut children, budget)?;
+            collect_child_block_projection_bounded(
+                api,
+                block,
+                depth,
+                &mut children,
+                entries,
+                budget,
+            )?;
             budget.release_retained_bytes(block_bytes)?;
             released_item_bytes = released_item_bytes
                 .checked_add(block_bytes)
@@ -938,8 +975,14 @@ fn collect_child_block_projection_bounded(
     block: BlockDto,
     depth: usize,
     children: &mut Vec<ProjectedChild>,
+    entries: &BoundedExplicitRootSink<'_>,
     budget: &InitialHydrationBudget,
 ) -> InitialHydrationResult<()> {
+    if entries.is_foreign_explicit_root(&block.id)
+        && matches!(block.kind.as_str(), "child_page" | "child_database")
+    {
+        return Ok(());
+    }
     match block.kind.as_str() {
         "child_page" => {
             let child_depth = depth
@@ -997,6 +1040,7 @@ fn collect_child_block_projection_bounded(
                 api,
                 &block.id,
                 child_depth,
+                entries,
                 budget,
             )?);
         }
@@ -1019,7 +1063,7 @@ fn enumerate_database_rows_bounded(
     let row_depth = parent_depth
         .checked_add(1)
         .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
-    let rows = collect_database_row_projections_bounded(api, database, row_depth, budget)?;
+    let rows = collect_database_row_projections_bounded(api, database, row_depth, entries, budget)?;
     for projected in allocate_child_paths_bounded(database_dir, rows, used_paths, budget)? {
         if matches!(projected.child, ProjectedChild::Page { .. }) {
             push_projected_tree_entry_bounded(
@@ -1034,6 +1078,7 @@ fn collect_database_row_projections_bounded(
     api: &dyn NotionApi,
     database: &DatabaseDto,
     depth: usize,
+    entries: &BoundedExplicitRootSink<'_>,
     budget: &InitialHydrationBudget,
 ) -> InitialHydrationResult<Vec<ProjectedChild>> {
     let mut rows = Vec::new();
@@ -1053,6 +1098,9 @@ fn collect_database_row_projections_bounded(
                 let row_bytes = encoded_len(&row)?;
                 budget.visit_traversal_node(depth)?;
                 validate_bounded_database_row_parent(&row, database, &data_source.id)?;
+                if entries.is_foreign_explicit_root(&row.id) {
+                    continue;
+                }
                 retained_item_bytes = retained_item_bytes
                     .checked_add(row_bytes)
                     .ok_or(InitialHydrationError::ProviderResponseInvalid)?;
@@ -1258,7 +1306,7 @@ fn list_page_children(
 ) -> LocalityResult<Vec<TreeEntry>> {
     let mut entries = Vec::new();
     let mut used_paths = BTreeSet::new();
-    let children = collect_page_child_projections(api, block_id)?;
+    let children = collect_page_child_projections(api, block_id, &entries)?;
     for projected in allocate_child_paths(parent_dir, children, &mut used_paths) {
         push_projected_listing_entry(mount_id, projected, &mut entries);
     }
@@ -1266,9 +1314,10 @@ fn list_page_children(
     Ok(entries)
 }
 
-fn collect_page_child_projections(
+fn collect_page_child_projections<S: TreeEntrySink>(
     api: &dyn NotionApi,
     block_id: &str,
+    entries: &S,
 ) -> LocalityResult<Vec<ProjectedChild>> {
     let mut cursor = None;
     let mut children = Vec::new();
@@ -1276,7 +1325,7 @@ fn collect_page_child_projections(
     loop {
         let page = api.retrieve_block_children(block_id, cursor.as_deref())?;
         for block in page.results {
-            collect_child_block_projection(api, block, &mut children)?;
+            collect_child_block_projection(api, block, &mut children, entries)?;
         }
 
         if !page.has_more {
@@ -1293,11 +1342,17 @@ fn collect_page_child_projections(
     Ok(children)
 }
 
-fn collect_child_block_projection(
+fn collect_child_block_projection<S: TreeEntrySink>(
     api: &dyn NotionApi,
     block: BlockDto,
     children: &mut Vec<ProjectedChild>,
+    entries: &S,
 ) -> LocalityResult<()> {
+    if entries.is_foreign_explicit_root(&block.id)
+        && matches!(block.kind.as_str(), "child_page" | "child_database")
+    {
+        return Ok(());
+    }
     match block.kind.as_str() {
         "child_page" => {
             let page = api.retrieve_page(block.id.as_str())?;
@@ -1321,7 +1376,11 @@ fn collect_child_block_projection(
             children.push(ProjectedChild::Database { database, title });
         }
         _ if block.has_children => {
-            children.extend(collect_page_child_projections(api, block.id.as_str())?);
+            children.extend(collect_page_child_projections(
+                api,
+                block.id.as_str(),
+                entries,
+            )?);
         }
         _ => {}
     }
@@ -1337,7 +1396,7 @@ fn list_database_rows(
 ) -> LocalityResult<Vec<TreeEntry>> {
     let mut entries = Vec::new();
     let mut used_paths = BTreeSet::new();
-    let rows = collect_database_row_projections(api, database)?;
+    let rows = collect_database_row_projections(api, database, &entries)?;
     for projected in allocate_child_paths(database_dir, rows, &mut used_paths) {
         push_projected_listing_entry(mount_id, projected, &mut entries);
     }
@@ -1353,7 +1412,7 @@ fn enumerate_page_children<S: TreeEntrySink>(
     used_paths: &mut BTreeSet<PathBuf>,
     entries: &mut S,
 ) -> LocalityResult<()> {
-    let children = collect_page_child_projections(api, block_id)?;
+    let children = collect_page_child_projections(api, block_id, entries)?;
     for projected in allocate_child_paths(&parent_dir, children, used_paths) {
         push_projected_tree_entry(api, mount_id, projected, used_paths, entries)?;
     }
@@ -1369,7 +1428,7 @@ fn enumerate_database_rows<S: TreeEntrySink>(
     used_paths: &mut BTreeSet<PathBuf>,
     entries: &mut S,
 ) -> LocalityResult<()> {
-    let rows = collect_database_row_projections(api, database)?;
+    let rows = collect_database_row_projections(api, database, entries)?;
     for projected in allocate_child_paths(database_dir, rows, used_paths) {
         if let ProjectedChild::Page { page, title } = projected.child {
             entries.push_entry(page_entry(
@@ -1392,9 +1451,10 @@ fn enumerate_database_rows<S: TreeEntrySink>(
     Ok(())
 }
 
-fn collect_database_row_projections(
+fn collect_database_row_projections<S: TreeEntrySink>(
     api: &dyn NotionApi,
     database: &DatabaseDto,
+    entries: &S,
 ) -> LocalityResult<Vec<ProjectedChild>> {
     let mut rows = Vec::new();
     let data_source_ids = database
@@ -1409,6 +1469,9 @@ fn collect_database_row_projections(
             let page = api.query_data_source(&data_source.id, cursor.as_deref())?;
             for row in page.results {
                 if !is_database_row_for_database(&row, database, &data_source_ids) {
+                    continue;
+                }
+                if entries.is_foreign_explicit_root(&row.id) {
                     continue;
                 }
                 let title = page_title(&row);
@@ -2261,6 +2324,7 @@ mod tests {
     };
     use locality_connector::hydration_budget::{
         HydrationResource, InitialHydrationBudget, InitialHydrationError, InitialHydrationLimits,
+        InitialHydrationScopeFailure,
     };
     use locality_core::model::{EntityKind, MountId, RemoteId};
     use locality_core::model::{HydrationState, TreeEntry};
@@ -2347,6 +2411,7 @@ mod tests {
         let exact_budget = InitialHydrationBudget::new(test_limits(exact as u64)).expect("budget");
         BoundedExplicitRootSink {
             scope_root_remote_id: &root,
+            configured_roots: std::slice::from_ref(&root),
             entries: &mut exact_entries,
             owners: &mut exact_owners,
             budget: &exact_budget,
@@ -2359,6 +2424,7 @@ mod tests {
             InitialHydrationBudget::new(test_limits(exact as u64 - 1)).expect("budget");
         let error = BoundedExplicitRootSink {
             scope_root_remote_id: &root,
+            configured_roots: std::slice::from_ref(&root),
             entries: &mut Vec::new(),
             owners: &mut BTreeMap::new(),
             budget: &short_budget,
@@ -2370,6 +2436,57 @@ mod tests {
             error,
             InitialHydrationError::LimitExceeded {
                 resource: HydrationResource::RetainedBytes
+            }
+        );
+    }
+
+    #[test]
+    fn bounded_owner_index_rejects_ambiguous_cross_root_ownership() {
+        let first_root = RemoteId::new("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        let second_root = RemoteId::new("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        let configured_roots = [first_root.clone(), second_root.clone()];
+        let shared_entry = TreeEntry {
+            mount_id: MountId::new("mount"),
+            remote_id: RemoteId::new("cccccccc-cccc-cccc-cccc-cccccccccccc"),
+            kind: EntityKind::Page,
+            title: "Shared page".to_string(),
+            path: "Shared page/_page.md".into(),
+            hydration: HydrationState::Stub,
+            content_hash: None,
+            remote_edited_at: None,
+            stub_frontmatter: None,
+        };
+        let budget = InitialHydrationBudget::new(test_limits(1_000_000)).expect("budget");
+        let mut entries = Vec::new();
+        let mut owners = BTreeMap::new();
+        let mut owner_map_retained_bytes = 0;
+
+        BoundedExplicitRootSink {
+            scope_root_remote_id: &first_root,
+            configured_roots: &configured_roots,
+            entries: &mut entries,
+            owners: &mut owners,
+            budget: &budget,
+            owner_map_retained_bytes: &mut owner_map_retained_bytes,
+        }
+        .push_entry(shared_entry.clone())
+        .expect("first root owns the shared object");
+
+        let error = BoundedExplicitRootSink {
+            scope_root_remote_id: &second_root,
+            configured_roots: &configured_roots,
+            entries: &mut entries,
+            owners: &mut owners,
+            budget: &budget,
+            owner_map_retained_bytes: &mut owner_map_retained_bytes,
+        }
+        .push_entry(shared_entry)
+        .expect_err("unrelated roots must not silently share ownership");
+
+        assert_eq!(
+            error,
+            InitialHydrationError::InvalidScope {
+                reason: InitialHydrationScopeFailure::OverlappingRoots,
             }
         );
     }

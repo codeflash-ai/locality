@@ -2266,21 +2266,74 @@ fn explicit_multi_root_paths_match_workspace_projection_and_are_order_invariant(
 }
 
 #[test]
-fn explicit_multi_root_rejects_overlap_duplicates_empty_and_scope_mismatch() {
+fn explicit_multi_root_partitions_overlap_and_rejects_duplicates_empty_and_scope_mismatch() {
     let first_root = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let nested_root = RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     let overlapping = NotionConnector::with_api(
         NotionConfig::default(),
         Arc::new(NoSearchNotionApi(FixtureNotionApi::multi_root_workspace())),
     )
-    .with_root_ids([first_root.clone(), nested_root]);
-    let overlap_error = overlapping
+    .with_root_ids([first_root.clone(), nested_root.clone()]);
+    let entries = overlapping
         .enumerate(EnumerateRequest {
             mount_id: MountId::new("notion-main"),
             cursor: None,
         })
-        .expect_err("nested roots must be rejected");
-    assert!(overlap_error.to_string().contains("overlap"));
+        .expect("nested roots are disjoint traversal boundaries");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (entry.remote_id.as_str(), entry.path.as_path()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                Path::new("Roadmap/page.md"),
+            ),
+            (
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                Path::new("Notes/page.md"),
+            ),
+        ]
+    );
+    let batch = overlapping
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([first_root.clone(), nested_root.clone()]),
+            checkpoint: None,
+            max_changes: 10,
+        })
+        .expect("partitioned portable bootstrap");
+    assert_eq!(batch.changes.len(), 2);
+    assert_eq!(
+        batch
+            .changes
+            .iter()
+            .map(|change| (
+                change.source_object.remote_id.as_str(),
+                change.logical_path.as_ref().expect("path").as_str(),
+                change.source_object.edges.clone(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "Roadmap/page.md",
+                vec![SourceEdge {
+                    relationship: PORTABLE_SCOPE_ROOT_RELATIONSHIP.to_string(),
+                    target_remote_id: first_root.clone(),
+                }],
+            ),
+            (
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "Notes/page.md",
+                vec![SourceEdge {
+                    relationship: PORTABLE_SCOPE_ROOT_RELATIONSHIP.to_string(),
+                    target_remote_id: nested_root.clone(),
+                }],
+            ),
+        ]
+    );
 
     let duplicate = NotionConnector::with_api(
         NotionConfig::default(),
