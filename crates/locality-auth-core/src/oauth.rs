@@ -278,12 +278,17 @@ pub const SLACK_LOCAL_BROKER_SCOPES: &[&str] = &[
     SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE,
 ];
 pub const SLACK_HOSTED_ADMIN_SCOPES: &[&str] = &[
-    "channels:history",
     "channels:read",
-    "files:read",
-    "groups:history",
+    "channels:history",
     "groups:read",
+    "groups:history",
+    "im:read",
+    "im:history",
+    "mpim:read",
+    "mpim:history",
     "users:read",
+    "team:read",
+    "files:read",
 ];
 
 pub const fn oauth_profile(connector: OAuthConnector, host: OAuthHostMode) -> Option<OAuthProfile> {
@@ -707,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_slack_profile_is_reduced_from_local_slack_profile() {
+    fn hosted_slack_profile_matches_read_only_desktop_coverage_without_auto_join() {
         let hosted = oauth_profile(OAuthConnector::Slack, OAuthHostMode::HostedAdmin)
             .expect("hosted Slack profile");
         assert_eq!(
@@ -717,17 +722,19 @@ mod tests {
         assert_eq!(
             hosted.scopes,
             &[
-                "channels:history",
                 "channels:read",
-                "files:read",
-                "groups:history",
+                "channels:history",
                 "groups:read",
+                "groups:history",
+                "im:read",
+                "im:history",
+                "mpim:read",
+                "mpim:history",
                 "users:read",
+                "team:read",
+                "files:read",
             ]
         );
-        assert!(!hosted.scopes.contains(&"im:read"));
-        assert!(!hosted.scopes.contains(&"mpim:read"));
-        assert!(!hosted.scopes.contains(&"team:read"));
         assert!(!hosted.scopes.contains(&"channels:join"));
     }
 

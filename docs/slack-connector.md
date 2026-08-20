@@ -35,6 +35,12 @@ Locality requests bot scopes for channel metadata and history, public channel
 joining, users and team metadata, and file metadata. It does not request
 `chat:write`, admin scopes, search scopes, or user email scope.
 
+Hosted Locality requests the same read-only coverage as desktop except
+`channels:join`: public channel history, private channel history, DM history,
+group DM history, users/team metadata, and file metadata. Hosted Locality does
+not auto-join public channels by default because that mutates a customer
+workspace from a server-side admin connector.
+
 ## Filesystem contract
 
 ```text
