@@ -213,12 +213,15 @@ impl TryFrom<RawHostedSlackChannel> for HostedSlackChannel {
     fn try_from(raw: RawHostedSlackChannel) -> Result<Self, Self::Error> {
         validate_slack_id("channel.team_id", &raw.team_id, b"T")?;
         let channel_id_prefixes: &[u8] = match raw.conversation_kind {
-            HostedSlackConversationKindV1::PublicChannel
-            | HostedSlackConversationKindV1::PrivateChannel => b"CG",
+            HostedSlackConversationKindV1::PublicChannel => b"C",
+            HostedSlackConversationKindV1::PrivateChannel => b"CG",
             HostedSlackConversationKindV1::Im => b"D",
             HostedSlackConversationKindV1::Mpim => b"G",
         };
         validate_slack_id("channel.id", &raw.id, channel_id_prefixes)?;
+        if !conversation_kind_matches_sharing(raw.conversation_kind, raw.sharing) {
+            return Err(HostedSlackPortableError::InvalidSlackId("channel.sharing"));
+        }
         validate_bounded_metadata_text("channel.name", &raw.name, MAX_HOSTED_SLACK_NAME_BYTES)?;
         validate_optional_metadata_text(
             "channel.topic",
@@ -247,6 +250,23 @@ impl TryFrom<RawHostedSlackChannel> for HostedSlackChannel {
             updated_at,
             sharing: raw.sharing,
         })
+    }
+}
+
+fn conversation_kind_matches_sharing(
+    conversation_kind: HostedSlackConversationKindV1,
+    sharing: SlackChannelSharingClassification,
+) -> bool {
+    match conversation_kind {
+        HostedSlackConversationKindV1::PublicChannel => true,
+        HostedSlackConversationKindV1::PrivateChannel => matches!(
+            sharing,
+            SlackChannelSharingClassification::Private
+                | SlackChannelSharingClassification::ExternallySharedPrivate
+        ),
+        HostedSlackConversationKindV1::Im | HostedSlackConversationKindV1::Mpim => {
+            sharing == SlackChannelSharingClassification::Private
+        }
     }
 }
 

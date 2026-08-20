@@ -1,4 +1,4 @@
-use locality_protocol::SlackInstallationId;
+use locality_protocol::{SlackChannelSharingClassification, SlackInstallationId};
 use locality_slack::portable::hosted::{
     HostedSlackConversationKindV1, HostedSlackInstallationBinding, HostedSlackNativeSnapshot,
     HostedSlackObservedInstallationIdentity, HostedSlackPortableError,
@@ -288,15 +288,32 @@ fn hosted_conversation_kind_defaults_for_legacy_raw_and_validates_channel_ids() 
         HostedSlackConversationKindV1::PublicChannel
     );
 
-    for (kind, valid_id) in [
-        (HostedSlackConversationKindV1::PublicChannel, "C08PUBLIC01"),
-        (HostedSlackConversationKindV1::PrivateChannel, "G08PRIVATE1"),
-        (HostedSlackConversationKindV1::Im, "D08DIRECT01"),
-        (HostedSlackConversationKindV1::Mpim, "G08GROUPDM1"),
+    for (kind, valid_id, sharing) in [
+        (
+            HostedSlackConversationKindV1::PublicChannel,
+            "C08PUBLIC01",
+            SlackChannelSharingClassification::Public,
+        ),
+        (
+            HostedSlackConversationKindV1::PrivateChannel,
+            "G08PRIVATE1",
+            SlackChannelSharingClassification::Private,
+        ),
+        (
+            HostedSlackConversationKindV1::Im,
+            "D08DIRECT01",
+            SlackChannelSharingClassification::Private,
+        ),
+        (
+            HostedSlackConversationKindV1::Mpim,
+            "G08GROUPDM1",
+            SlackChannelSharingClassification::Private,
+        ),
     ] {
         let mut raw = raw_snapshot();
         raw.channel.conversation_kind = kind;
         raw.channel.id = valid_id.to_string();
+        raw.channel.sharing = sharing;
         for message in &mut raw.messages {
             message.channel_id = valid_id.to_string();
         }

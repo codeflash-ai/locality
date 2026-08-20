@@ -1,6 +1,7 @@
 use locality_core::portable::LogicalPath;
 use locality_protocol::{
     HostedSlackChannelSelector, ProviderSourceScopeSelector, ReplicaFreshnessState,
+    SlackChannelSharingClassification,
 };
 use locality_slack::portable::hosted::{
     HostedSlackConversationKindV1, HostedSlackDocumentKindV1, HostedSlackNativeSnapshot,
@@ -154,27 +155,36 @@ fn generated_paths_are_portable_bounded_and_authority_suffixed() {
 
 #[test]
 fn hosted_paths_use_desktop_roots_for_each_conversation_kind() {
-    for (conversation_kind, channel_id, root_folder) in [
+    for (conversation_kind, channel_id, sharing, root_folder) in [
         (
             HostedSlackConversationKindV1::PublicChannel,
             "C08PUBLIC01",
+            SlackChannelSharingClassification::Public,
             "channels",
         ),
         (
             HostedSlackConversationKindV1::PrivateChannel,
             "G08PRIVATE1",
+            SlackChannelSharingClassification::Private,
             "private-channels",
         ),
-        (HostedSlackConversationKindV1::Im, "D08DIRECT01", "dms"),
+        (
+            HostedSlackConversationKindV1::Im,
+            "D08DIRECT01",
+            SlackChannelSharingClassification::Private,
+            "dms",
+        ),
         (
             HostedSlackConversationKindV1::Mpim,
             "G08GROUPDM1",
+            SlackChannelSharingClassification::Private,
             "group-dms",
         ),
     ] {
         let mut raw = raw_snapshot();
         raw.channel.conversation_kind = conversation_kind;
         raw.channel.id = channel_id.to_string();
+        raw.channel.sharing = sharing;
         for message in &mut raw.messages {
             message.channel_id = channel_id.to_string();
         }
