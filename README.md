@@ -231,34 +231,32 @@ remote drift that needs a decision, it pauses and asks for review instead of gue
 
 ### `loc`: a command line for agents and scripts
 
-The desktop app is the easiest way to connect sources and manage a workspace.
-The `loc` command-line tool exposes the same Locality mounts and sync engine to
-agents, scripts, terminals, and automated workflows.
+The `loc` command-line tool lets agents, scripts, and automated workflows interact
+with Locality mounts using the same sync and safety guardrails as the desktop app.
+See the [CLI reference](docs/cli.md) for the complete command surface.
 
-Agents and scripts can use `loc` to:
+## Locality Cloud for production agents
 
-- locate mounted content from an app URL, title, path fragment, or remote ID;
-- refresh a workspace, folder, or individual file from its source app;
-- inspect local changes, remote drift, conflicts, and planned operations;
-- safely push supported edits back to the source app;
-- restore local content and review journaled change history;
-- manage Live Mode and diagnose connection or mount health.
+**Locality Cloud is a separate product from Locality Desktop.** It maintains a
+pre-synced, cached state of approved company knowledge and mounts it into an agent
+sandbox immediately when a sandbox starts. Agents get the same filesystem-native
+experience without waiting for source APIs, while teams get centralized,
+fine-grained access control and keep provider credentials out of the sandbox.
 
-This gives automation a stable command-line interface without bypassing Locality's
-validation, conflict detection, review, and synchronization guardrails. See the
-[CLI reference](docs/cli.md) for the complete command surface.
+If you are building production agents and want to use Locality Cloud,
+[contact us](https://www.locality.dev/contact).
 
 ## Connected apps
 
 | Source | Local workspace | Write support |
 | --- | --- | --- |
-| **Notion** | Pages, databases, properties, and supported media | Conservative page, block, property, and database-row updates |
-| **Google Docs** | Documents and Drive-backed structure | Conservative document updates |
-| **Google Calendar** | Primary-calendar events | Reviewed event-draft creation |
-| **Gmail** | Messages and threads | Reviewed Gmail-draft creation |
-| **Linear** | Teams, issues, and issue context | Supported issue edits |
-| **Slack** | Channels, private channels, DMs, group DMs, and users | Read-only |
-| **Granola** | Meeting summaries and transcripts | Read-only |
+| <img src="apps/desktop/src/assets/connectors/notion.svg" alt="" width="18" height="18"> &nbsp; **Notion** | Pages, databases, properties, and supported media | Conservative page, block, property, and database-row updates |
+| <img src="apps/desktop/src/assets/connectors/google-docs.svg" alt="" width="18" height="18"> &nbsp; **Google Docs** | Documents and Drive-backed structure | Conservative document updates |
+| <img src="apps/desktop/src/assets/connectors/google-calendar.svg" alt="" width="18" height="18"> &nbsp; **Google Calendar** | Primary-calendar events | Reviewed event-draft creation |
+| <img src="apps/desktop/src/assets/connectors/gmail.svg" alt="" width="18" height="18"> &nbsp; **Gmail** | Messages and threads | Reviewed Gmail-draft creation |
+| <img src="apps/desktop/src/assets/connectors/linear.svg" alt="" width="18" height="18"> &nbsp; **Linear** | Teams, issues, and issue context | Supported issue edits |
+| <img src="apps/desktop/src/assets/connectors/slack.svg" alt="" width="18" height="18"> &nbsp; **Slack** | Channels, private channels, DMs, group DMs, and users | Read-only |
+| <img src="apps/desktop/src/assets/connectors/granola.svg" alt="" width="18" height="18"> &nbsp; **Granola** | Meeting summaries and transcripts | Read-only |
 
 Connector capabilities are intentionally explicit. Locality does not pretend every
 shape in every source can be edited safely. Unsupported or lossy operations pause
