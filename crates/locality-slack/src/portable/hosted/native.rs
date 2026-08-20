@@ -54,6 +54,10 @@ impl Default for HostedSlackConversationKindV1 {
     }
 }
 
+fn is_default_hosted_slack_conversation_kind(value: &HostedSlackConversationKindV1) -> bool {
+    *value == HostedSlackConversationKindV1::PublicChannel
+}
+
 pub fn decode_and_sanitize_hosted_slack_native_snapshot(
     bytes: &[u8],
 ) -> Result<HostedSlackNativeSnapshot, HostedSlackPortableError> {
@@ -73,7 +77,10 @@ pub fn decode_and_sanitize_hosted_slack_native_snapshot(
 pub struct RawHostedSlackChannel {
     pub team_id: String,
     pub id: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_hosted_slack_conversation_kind"
+    )]
     pub conversation_kind: HostedSlackConversationKindV1,
     pub name: String,
     pub topic: Option<String>,

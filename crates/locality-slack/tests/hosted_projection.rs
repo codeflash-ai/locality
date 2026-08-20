@@ -8,6 +8,7 @@ use locality_slack::portable::hosted::{
     MAX_HOSTED_SLACK_RENDERED_DOCUMENT_BYTES_V1, MAX_HOSTED_SLACK_RENDERED_PROJECTION_BYTES_V1,
     RawHostedSlackNativeSnapshot, build_hosted_slack_logical_paths_v1,
     decode_and_sanitize_hosted_slack_native_snapshot, render_hosted_slack_projection_v1,
+    render_hosted_slack_users_v1,
 };
 use serde::Serialize;
 
@@ -99,6 +100,23 @@ fn hosted_projection_paths_and_markdown_are_exact_v1_bytes() {
         assert_eq!(document.bytes(), bytes);
         assert!(!document.bytes().contains(&b'\r'));
     }
+}
+
+#[test]
+fn hosted_users_markdown_matches_desktop_users_shape() {
+    let snapshot = snapshot();
+    let document = render_hosted_slack_users_v1(snapshot.users()).expect("render hosted users.md");
+    assert_eq!(document.kind(), HostedSlackDocumentKindV1::Users);
+    assert_eq!(document.logical_path().as_str(), "users.md");
+
+    let markdown = String::from_utf8(document.bytes().to_vec()).expect("users Markdown UTF-8");
+    assert!(markdown.contains("connector: slack"));
+    assert!(markdown.contains("rendered_kind: users"));
+    assert!(markdown.contains("| User ID | Name | Display Name | Bot | Deleted |"));
+
+    let ada = markdown.find("| U08ADA00001 |").expect("Ada row");
+    let grace = markdown.find("| U08GRACE001 |").expect("Grace row");
+    assert!(ada < grace, "{markdown}");
 }
 
 #[test]
