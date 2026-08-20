@@ -269,7 +269,8 @@ the desktop workspace view, including title collision suffixes. The configured
 and requested root sets must match exactly; empty, duplicate, or ambiguous
 roots fail closed. Nested selected roots are disjoint traversal boundaries: a
 parent traversal stops before a selected child page, database, or database row,
-and that child owns its separately projected subtree. This retains the union of
+and that child owns its separately projected subtree. Full enumeration and lazy
+filesystem child listings enforce the same boundary. This retains the union of
 selected content without duplicate provider reads, paths, or scope ownership.
 Every set-mode source change carries exactly one
 `SourceObject.edges` entry with relationship `locality_scope_root`. Recursive

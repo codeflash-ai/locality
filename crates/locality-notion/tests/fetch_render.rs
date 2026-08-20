@@ -4659,6 +4659,83 @@ fn list_children_fetches_one_page_container_without_hydrating_descendants() {
 }
 
 #[test]
+fn lazy_listings_preserve_nested_explicit_root_boundaries() {
+    let parent_root = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let nested_root = RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let connector = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::multi_root_workspace())),
+    )
+    .with_root_ids([parent_root.clone(), nested_root.clone()]);
+
+    let roots = connector
+        .list_children(ListChildrenRequest {
+            mount_id: MountId::new("notion-main"),
+            container: ChildContainer::Root,
+            parent_path: Path::new("").to_path_buf(),
+        })
+        .expect("list configured roots without search");
+    assert_eq!(
+        roots
+            .entries
+            .iter()
+            .map(|entry| (entry.remote_id.as_str(), entry.path.as_path()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                Path::new("Roadmap/page.md"),
+            ),
+            (
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                Path::new("Notes/page.md"),
+            ),
+        ]
+    );
+
+    let parent_children = connector
+        .list_children(ListChildrenRequest {
+            mount_id: MountId::new("notion-main"),
+            container: ChildContainer::PageChildren(parent_root),
+            parent_path: Path::new("Roadmap").to_path_buf(),
+        })
+        .expect("list parent root children");
+    assert_eq!(parent_children.entries, Vec::new());
+
+    let nested_children = connector
+        .list_children(ListChildrenRequest {
+            mount_id: MountId::new("notion-main"),
+            container: ChildContainer::PageChildren(nested_root),
+            parent_path: Path::new("Notes").to_path_buf(),
+        })
+        .expect("list nested root children");
+    assert_eq!(nested_children.entries, Vec::new());
+}
+
+#[test]
+fn lazy_database_rows_preserve_explicit_root_boundaries() {
+    let parent_root = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let row_root = RemoteId::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+    let connector = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(FixtureNotionApi::tree(parent_root.as_str())),
+    )
+    .with_root_ids([parent_root, row_root]);
+
+    let rows = connector
+        .list_children(ListChildrenRequest {
+            mount_id: MountId::new("notion-main"),
+            container: ChildContainer::DatabaseRows(RemoteId::new(
+                "cccccccccccccccccccccccccccccccc",
+            )),
+            parent_path: Path::new("Roadmap/Tasks").to_path_buf(),
+        })
+        .expect("list database rows");
+
+    assert_eq!(rows.entries, Vec::new());
+}
+
+#[test]
 fn list_children_fetches_database_rows_under_database_directory() {
     let root_page_id = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let api = FixtureNotionApi::tree(root_page_id.as_str());

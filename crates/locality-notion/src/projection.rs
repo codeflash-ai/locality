@@ -342,18 +342,22 @@ pub fn enumerate_shared_pages(
 pub fn list_container_children(
     api: &dyn NotionApi,
     mount_id: MountId,
-    root_page_id: Option<&RemoteId>,
+    configured_roots: &[RemoteId],
     container: ChildContainer,
     parent_path: &Path,
 ) -> LocalityResult<Vec<TreeEntry>> {
     match container {
-        ChildContainer::Root => list_root_children(api, mount_id, root_page_id, parent_path),
-        ChildContainer::PageChildren(page_id) => {
-            list_page_children(api, &mount_id, page_id.as_str(), parent_path)
-        }
+        ChildContainer::Root => list_root_children(api, mount_id, configured_roots, parent_path),
+        ChildContainer::PageChildren(page_id) => list_page_children(
+            api,
+            &mount_id,
+            page_id.as_str(),
+            parent_path,
+            configured_roots,
+        ),
         ChildContainer::DatabaseRows(database_id) => {
             let database = api.retrieve_database(database_id.as_str())?;
-            list_database_rows(api, &mount_id, &database, parent_path)
+            list_database_rows(api, &mount_id, &database, parent_path, configured_roots)
         }
         ChildContainer::DirectoryChildren(_) => Err(LocalityError::Unsupported(
             "listing directory children with the Notion connector",
@@ -589,19 +593,31 @@ impl ExactPathResolver<'_> {
             ParentListing::Root(parent_path) => list_root_children(
                 self.api,
                 self.mount_id.clone(),
-                self.root_page_id,
+                self.root_page_id.map_or(&[], std::slice::from_ref),
                 &parent_path,
             )?,
             ParentListing::PageChildren {
                 page_id,
                 parent_path,
-            } => list_page_children(self.api, &self.mount_id, page_id.as_str(), &parent_path)?,
+            } => list_page_children(
+                self.api,
+                &self.mount_id,
+                page_id.as_str(),
+                &parent_path,
+                self.root_page_id.map_or(&[], std::slice::from_ref),
+            )?,
             ParentListing::DatabaseRows {
                 database_id,
                 parent_path,
             } => {
                 let database = self.api.retrieve_database(database_id.as_str())?;
-                list_database_rows(self.api, &self.mount_id, &database, &parent_path)?
+                list_database_rows(
+                    self.api,
+                    &self.mount_id,
+                    &database,
+                    &parent_path,
+                    self.root_page_id.map_or(&[], std::slice::from_ref),
+                )?
             }
         };
 
@@ -659,13 +675,17 @@ fn push_projected_listing_entry(
     }
 }
 
-trait TreeEntrySink {
-    fn push_entry(&mut self, entry: TreeEntry) -> LocalityResult<()>;
-
+trait ExplicitRootBoundary {
     fn is_foreign_explicit_root(&self, _remote_id: &str) -> bool {
         false
     }
 }
+
+trait TreeEntrySink: ExplicitRootBoundary {
+    fn push_entry(&mut self, entry: TreeEntry) -> LocalityResult<()>;
+}
+
+impl ExplicitRootBoundary for Vec<TreeEntry> {}
 
 impl TreeEntrySink for Vec<TreeEntry> {
     fn push_entry(&mut self, entry: TreeEntry) -> LocalityResult<()> {
@@ -674,11 +694,36 @@ impl TreeEntrySink for Vec<TreeEntry> {
     }
 }
 
+struct ExplicitRootListingBoundary<'a> {
+    current_owner_remote_id: &'a str,
+    configured_roots: &'a [RemoteId],
+}
+
+impl ExplicitRootBoundary for ExplicitRootListingBoundary<'_> {
+    fn is_foreign_explicit_root(&self, remote_id: &str) -> bool {
+        !explicit_root_ids_equal(self.current_owner_remote_id, remote_id)
+            && self
+                .configured_roots
+                .iter()
+                .any(|root| explicit_root_ids_equal(root.as_str(), remote_id))
+    }
+}
+
 struct ExplicitRootSink<'a> {
     scope_root_remote_id: &'a RemoteId,
     configured_roots: &'a [RemoteId],
     entries: &'a mut Vec<ExplicitRootTreeEntry>,
     owners: &'a mut BTreeMap<String, RemoteId>,
+}
+
+impl ExplicitRootBoundary for ExplicitRootSink<'_> {
+    fn is_foreign_explicit_root(&self, remote_id: &str) -> bool {
+        !explicit_root_ids_equal(self.scope_root_remote_id.as_str(), remote_id)
+            && self
+                .configured_roots
+                .iter()
+                .any(|root| explicit_root_ids_equal(root.as_str(), remote_id))
+    }
 }
 
 impl TreeEntrySink for ExplicitRootSink<'_> {
@@ -697,14 +742,6 @@ impl TreeEntrySink for ExplicitRootSink<'_> {
             scope_root_remote_id: self.scope_root_remote_id.clone(),
         });
         Ok(())
-    }
-
-    fn is_foreign_explicit_root(&self, remote_id: &str) -> bool {
-        !explicit_root_ids_equal(self.scope_root_remote_id.as_str(), remote_id)
-            && self
-                .configured_roots
-                .iter()
-                .any(|root| explicit_root_ids_equal(root.as_str(), remote_id))
     }
 }
 
@@ -1134,15 +1171,23 @@ fn collect_database_row_projections_bounded(
 fn list_root_children(
     api: &dyn NotionApi,
     mount_id: MountId,
-    root_page_id: Option<&RemoteId>,
+    configured_roots: &[RemoteId],
     parent_path: &Path,
 ) -> LocalityResult<Vec<TreeEntry>> {
     let mut used_paths = BTreeSet::new();
-    if let Some(root_page_id) = root_page_id {
-        let page = api.retrieve_page(root_page_id.as_str())?;
-        let title = page_title(&page);
-        let path = allocate_page_path(parent_path, &title, &page.id, &mut used_paths);
-        return Ok(vec![page_entry(mount_id, &page, title, path)]);
+    if !configured_roots.is_empty() {
+        let mut root_children = configured_roots
+            .iter()
+            .map(|root_id| retrieve_explicit_root(api, root_id))
+            .collect::<LocalityResult<Vec<_>>>()?;
+        root_children.sort_by(|left, right| {
+            compare_explicit_root_identity(left.remote_id(), right.remote_id())
+        });
+        let mut entries = Vec::new();
+        for projected in allocate_child_paths(parent_path, root_children, &mut used_paths) {
+            push_projected_listing_entry(&mount_id, projected, &mut entries);
+        }
+        return Ok(entries);
     }
 
     let pages = search_all_pages(api)?;
@@ -1303,10 +1348,15 @@ fn list_page_children(
     mount_id: &MountId,
     block_id: &str,
     parent_dir: &Path,
+    configured_roots: &[RemoteId],
 ) -> LocalityResult<Vec<TreeEntry>> {
     let mut entries = Vec::new();
     let mut used_paths = BTreeSet::new();
-    let children = collect_page_child_projections(api, block_id, &entries)?;
+    let boundary = ExplicitRootListingBoundary {
+        current_owner_remote_id: block_id,
+        configured_roots,
+    };
+    let children = collect_page_child_projections(api, block_id, &boundary)?;
     for projected in allocate_child_paths(parent_dir, children, &mut used_paths) {
         push_projected_listing_entry(mount_id, projected, &mut entries);
     }
@@ -1314,7 +1364,7 @@ fn list_page_children(
     Ok(entries)
 }
 
-fn collect_page_child_projections<S: TreeEntrySink>(
+fn collect_page_child_projections<S: ExplicitRootBoundary>(
     api: &dyn NotionApi,
     block_id: &str,
     entries: &S,
@@ -1342,7 +1392,7 @@ fn collect_page_child_projections<S: TreeEntrySink>(
     Ok(children)
 }
 
-fn collect_child_block_projection<S: TreeEntrySink>(
+fn collect_child_block_projection<S: ExplicitRootBoundary>(
     api: &dyn NotionApi,
     block: BlockDto,
     children: &mut Vec<ProjectedChild>,
@@ -1393,10 +1443,15 @@ fn list_database_rows(
     mount_id: &MountId,
     database: &DatabaseDto,
     database_dir: &Path,
+    configured_roots: &[RemoteId],
 ) -> LocalityResult<Vec<TreeEntry>> {
     let mut entries = Vec::new();
     let mut used_paths = BTreeSet::new();
-    let rows = collect_database_row_projections(api, database, &entries)?;
+    let boundary = ExplicitRootListingBoundary {
+        current_owner_remote_id: database.id.as_str(),
+        configured_roots,
+    };
+    let rows = collect_database_row_projections(api, database, &boundary)?;
     for projected in allocate_child_paths(database_dir, rows, &mut used_paths) {
         push_projected_listing_entry(mount_id, projected, &mut entries);
     }
@@ -1451,7 +1506,7 @@ fn enumerate_database_rows<S: TreeEntrySink>(
     Ok(())
 }
 
-fn collect_database_row_projections<S: TreeEntrySink>(
+fn collect_database_row_projections<S: ExplicitRootBoundary>(
     api: &dyn NotionApi,
     database: &DatabaseDto,
     entries: &S,
