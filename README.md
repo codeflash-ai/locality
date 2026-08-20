@@ -210,6 +210,7 @@ local tools can access the resulting workspace.
 | Feature | What it means |
 | --- | --- |
 | **Live Mode** | Keeps active files fresh, automatically synchronizes safe edits, and pauses when human review is needed. |
+| **`loc` command-line tool** | Lets agents, scripts, and terminal workflows locate, inspect, refresh, review, and safely update mounted content. |
 | **A filesystem for every app** | Work with one familiar interface instead of learning a new API or agent tool schema for each source. |
 | **Two-way synchronization** | Supported edits can flow back to the source app while remote updates flow into clean local files. |
 | **Conflict-aware writes** | Locality compares local, remote, and last-synced state before applying mutations. |
@@ -227,6 +228,25 @@ workspace.
 When a change is clearly safe, Live Mode can synchronize it automatically. When
 Locality detects concurrent edits, unsupported operations, destructive changes, or
 remote drift that needs a decision, it pauses and asks for review instead of guessing.
+
+### `loc`: a command line for agents and scripts
+
+The desktop app is the easiest way to connect sources and manage a workspace.
+The `loc` command-line tool exposes the same Locality mounts and sync engine to
+agents, scripts, terminals, and automated workflows.
+
+Agents and scripts can use `loc` to:
+
+- locate mounted content from an app URL, title, path fragment, or remote ID;
+- refresh a workspace, folder, or individual file from its source app;
+- inspect local changes, remote drift, conflicts, and planned operations;
+- safely push supported edits back to the source app;
+- restore local content and review journaled change history;
+- manage Live Mode and diagnose connection or mount health.
+
+This gives automation a stable command-line interface without bypassing Locality's
+validation, conflict detection, review, and synchronization guardrails. See the
+[CLI reference](docs/cli.md) for the complete command surface.
 
 ## Connected apps
 
