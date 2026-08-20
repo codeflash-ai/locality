@@ -37,6 +37,7 @@ use super::poll::{
     HostedSlackHistoryPageV2, HostedSlackPollOutputV1, HostedSlackRepliesPageV2,
     hosted_slack_history_page_reference_closure_v2, hosted_slack_replies_page_reference_closure_v2,
 };
+use super::render::MAX_HOSTED_SLACK_RENDERED_DOCUMENT_BYTES_V1;
 
 pub const HOSTED_SLACK_PROVIDER_PAGE_LIMIT_V1: u32 = 15;
 pub const MAX_HOSTED_SLACK_PROVIDER_RESPONSE_BYTES_V1: usize = 512 * 1024;
@@ -53,6 +54,7 @@ pub const HOSTED_SLACK_USERS_LIST_PAGE_LIMIT_V1: u32 = 200;
 pub const MAX_HOSTED_SLACK_USERS_LIST_PAGES_V1: usize = 10;
 pub const MAX_HOSTED_SLACK_USERS_LIST_USERS_V1: usize = 2_000;
 pub const MAX_HOSTED_SLACK_USERS_LIST_CURSOR_BYTES_V1: usize = 512;
+const HOSTED_SLACK_USERS_MARKDOWN_FIXED_BYTES_V1: usize = 512;
 
 const HOSTED_SLACK_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const HOSTED_SLACK_MAX_RETRIES: usize = 4;
@@ -563,6 +565,7 @@ where
     let mut observed_at = None;
     let mut user_ids = BTreeSet::new();
     let mut cursors = BTreeSet::new();
+    let mut rendered_user_bytes = HOSTED_SLACK_USERS_MARKDOWN_FIXED_BYTES_V1;
     for _ in 0..MAX_HOSTED_SLACK_USERS_LIST_PAGES_V1 {
         let page = call_with_retry(
             control,
@@ -583,6 +586,13 @@ where
             }
             if !user_ids.insert(hosted.user_id().to_owned()) {
                 return Err(HostedSlackProviderError::InvalidResponse("duplicate user"));
+            }
+            rendered_user_bytes = rendered_user_bytes
+                .saturating_add(estimated_hosted_slack_user_markdown_row_bytes(&hosted));
+            if rendered_user_bytes > MAX_HOSTED_SLACK_RENDERED_DOCUMENT_BYTES_V1 {
+                return Err(HostedSlackProviderError::LimitExceeded(
+                    "users rendered document",
+                ));
             }
             users.push(user);
             if users.len() > MAX_HOSTED_SLACK_USERS_LIST_USERS_V1 {
@@ -2665,26 +2675,10 @@ fn hosted_conversation_kind_from_wire(
     channel: &ChannelAuthorityWire,
 ) -> Result<HostedSlackConversationKindV1, HostedSlackProviderError> {
     hosted_conversation_kind(
-        channel
-            .is_channel
-            .ok_or(HostedSlackProviderError::InvalidResponse(
-                "conversation kind",
-            ))?,
-        channel
-            .is_group
-            .ok_or(HostedSlackProviderError::InvalidResponse(
-                "conversation kind",
-            ))?,
-        channel
-            .is_im
-            .ok_or(HostedSlackProviderError::InvalidResponse(
-                "conversation kind",
-            ))?,
-        channel
-            .is_mpim
-            .ok_or(HostedSlackProviderError::InvalidResponse(
-                "conversation kind",
-            ))?,
+        channel.is_channel.unwrap_or(false),
+        channel.is_group.unwrap_or(false),
+        channel.is_im.unwrap_or(false),
+        channel.is_mpim.unwrap_or(false),
     )
 }
 
@@ -2738,6 +2732,31 @@ fn hosted_conversation_name(
         }
         HostedSlackConversationKindV1::Mpim => Ok(format!("mpim-{}", channel.id)),
     }
+}
+
+fn estimated_hosted_slack_user_markdown_row_bytes(user: &HostedSlackUser) -> usize {
+    "|  |  |  | false | false |\n".len()
+        + markdown_table_cell_bytes(user.user_id())
+        + markdown_table_cell_bytes(user.name())
+        + markdown_table_cell_bytes(hosted_user_display_name(user))
+}
+
+fn markdown_table_cell_bytes(value: &str) -> usize {
+    value
+        .chars()
+        .map(|character| match character {
+            '|' => 2,
+            '\r' | '\n' | '\t' => 1,
+            character => character.len_utf8(),
+        })
+        .sum()
+}
+
+fn hosted_user_display_name(user: &HostedSlackUser) -> &str {
+    [user.display_name(), user.real_name(), user.name()]
+        .into_iter()
+        .find(|name| !name.trim().is_empty())
+        .unwrap_or(user.user_id())
 }
 
 fn validate_discovered_channel_authority(
@@ -4050,10 +4069,10 @@ mod tests {
                 id: "D08DIRECT01".to_string(),
                 context_team_id: Some("T08LOCALITY1".to_string()),
                 team_id: None,
-                is_channel: Some(false),
-                is_group: Some(false),
+                is_channel: None,
+                is_group: None,
                 is_im: Some(true),
-                is_mpim: Some(false),
+                is_mpim: None,
                 is_private: None,
                 is_shared: None,
                 is_ext_shared: None,
@@ -4082,6 +4101,39 @@ mod tests {
             SlackChannelSharingClassification::Private
         );
         assert!(discovered.is_member);
+
+        let mpim = provider_discovered_channel(
+            ChannelAuthorityWire {
+                id: "G08GROUPDM1".to_string(),
+                context_team_id: Some("T08LOCALITY1".to_string()),
+                team_id: None,
+                is_channel: None,
+                is_group: None,
+                is_im: None,
+                is_mpim: Some(true),
+                is_private: None,
+                is_shared: None,
+                is_ext_shared: None,
+                is_org_shared: None,
+                is_member: None,
+                shared_team_ids: Vec::new(),
+                name: None,
+                user: None,
+                topic: None,
+                purpose: None,
+                created: Some(1_780_000_000),
+                updated: None,
+                is_archived: false,
+            },
+            "T08LOCALITY1",
+        )
+        .expect("sparse MPIM discovery");
+        assert_eq!(
+            mpim.channel.conversation_kind,
+            HostedSlackConversationKindV1::Mpim
+        );
+        assert_eq!(mpim.channel.name, "mpim-G08GROUPDM1");
+        assert!(mpim.is_member);
     }
 
     #[test]
@@ -4403,6 +4455,33 @@ mod tests {
             )
             .await,
             Err(HostedSlackProviderError::LimitExceeded("users page users"))
+        );
+
+        let rendered_oversized_page = StubDiscoveryProvider::new_users([Ok(users_page(
+            (0..150)
+                .map(|index| {
+                    let mut user = indexed_user(index);
+                    user.name = "n".repeat(512);
+                    user.display_name = "d".repeat(512);
+                    user
+                })
+                .collect(),
+            None,
+        ))]);
+        assert_eq!(
+            discover_hosted_slack_users_v1(
+                &rendered_oversized_page,
+                &installation_binding(),
+                &HostedSlackDriveControlV1::new(
+                    Instant::now() + Duration::from_secs(10),
+                    HostedSlackCancellationToken::new(),
+                    None,
+                ),
+            )
+            .await,
+            Err(HostedSlackProviderError::LimitExceeded(
+                "users rendered document"
+            ))
         );
     }
 

@@ -540,6 +540,15 @@ impl HostedSlackPollCheckpointV1 {
         {
             return Err(HostedSlackPollError::InvalidIdentity("candidate.channel"));
         }
+        if channel.conversation_kind() != HostedSlackConversationKindV1::PublicChannel
+            && self.checkpoint_format_version < HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5
+        {
+            return Err(HostedSlackPollError::ReaderUpdateRequired {
+                format_version: HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5,
+                minimum_reader_version: HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V5,
+                supported_reader_version: self.minimum_reader_version,
+            });
+        }
 
         let history_start = parse_canonical_utc_timestamp(
             "authorized_history_start_at",
@@ -746,8 +755,9 @@ fn decode_hosted_slack_poll_checkpoint_for_reader(
         supported_format_version,
         supported_reader_version,
     )?;
-    let checkpoint = serde_json::from_slice::<HostedSlackPollCheckpointV1>(bytes)
+    let wire = serde_json::from_slice::<HostedSlackPollCheckpointWireV1>(bytes)
         .map_err(|_| HostedSlackPollError::InvalidJson("checkpoint"))?;
+    let checkpoint = HostedSlackPollCheckpointV1::from(wire);
     checkpoint.validate()?;
     Ok(checkpoint)
 }
@@ -1565,6 +1575,23 @@ mod compatibility_tests {
         assert_eq!(
             decode_hosted_slack_poll_checkpoint_v4(&encoded),
             Ok(checkpoint)
+        );
+
+        let mut forged_v4_incremental = value;
+        forged_v4_incremental["checkpoint_format_version"] =
+            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4.into();
+        forged_v4_incremental["minimum_reader_version"] =
+            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4.into();
+        forged_v4_incremental["poll_kind"] = serde_json::json!("incremental");
+        assert_eq!(
+            decode_hosted_slack_poll_checkpoint_v3(
+                &serde_json::to_vec(&forged_v4_incremental).unwrap()
+            ),
+            Err(HostedSlackPollError::ReaderUpdateRequired {
+                format_version: HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5,
+                minimum_reader_version: HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V5,
+                supported_reader_version: HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4,
+            })
         );
     }
 

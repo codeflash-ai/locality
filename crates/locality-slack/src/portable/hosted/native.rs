@@ -159,6 +159,7 @@ pub struct RawHostedSlackNativeSnapshot {
 pub struct HostedSlackChannel {
     team_id: String,
     channel_id: String,
+    #[serde(skip_serializing_if = "is_default_hosted_slack_conversation_kind")]
     conversation_kind: HostedSlackConversationKindV1,
     name: String,
     topic: Option<String>,

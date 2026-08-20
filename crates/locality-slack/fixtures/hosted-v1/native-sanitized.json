@@ -3,7 +3,6 @@
   "channel": {
     "team_id": "T08LOCALITY1",
     "channel_id": "C08ENGINEER1",
-    "conversation_kind": "public_channel",
     "name": "engineering",
     "topic": "Build deterministic Locality exports",
     "purpose": "Engineering coordination",
