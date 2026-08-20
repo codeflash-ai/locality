@@ -3,11 +3,11 @@ use locality_protocol::{
     HostedSlackChannelSelector, ProviderSourceScopeSelector, ReplicaFreshnessState,
 };
 use locality_slack::portable::hosted::{
-    HostedSlackDocumentKindV1, HostedSlackNativeSnapshot, HostedSlackOperationalStatusV1,
-    HostedSlackPortableError, HostedSlackRenderError, MAX_HOSTED_SLACK_RENDERED_DOCUMENT_BYTES_V1,
-    MAX_HOSTED_SLACK_RENDERED_PROJECTION_BYTES_V1, RawHostedSlackNativeSnapshot,
-    build_hosted_slack_logical_paths_v1, decode_and_sanitize_hosted_slack_native_snapshot,
-    render_hosted_slack_projection_v1,
+    HostedSlackConversationKindV1, HostedSlackDocumentKindV1, HostedSlackNativeSnapshot,
+    HostedSlackOperationalStatusV1, HostedSlackPortableError, HostedSlackRenderError,
+    MAX_HOSTED_SLACK_RENDERED_DOCUMENT_BYTES_V1, MAX_HOSTED_SLACK_RENDERED_PROJECTION_BYTES_V1,
+    RawHostedSlackNativeSnapshot, build_hosted_slack_logical_paths_v1,
+    decode_and_sanitize_hosted_slack_native_snapshot, render_hosted_slack_projection_v1,
 };
 use serde::Serialize;
 
@@ -131,6 +131,63 @@ fn generated_paths_are_portable_bounded_and_authority_suffixed() {
     );
     for file in &paths.files {
         assert!(file.logical_path.as_str().contains(&file.file_id));
+    }
+}
+
+#[test]
+fn hosted_paths_use_desktop_roots_for_each_conversation_kind() {
+    for (conversation_kind, channel_id, root_folder) in [
+        (
+            HostedSlackConversationKindV1::PublicChannel,
+            "C08PUBLIC01",
+            "channels",
+        ),
+        (
+            HostedSlackConversationKindV1::PrivateChannel,
+            "G08PRIVATE1",
+            "private-channels",
+        ),
+        (HostedSlackConversationKindV1::Im, "D08DIRECT01", "dms"),
+        (
+            HostedSlackConversationKindV1::Mpim,
+            "G08GROUPDM1",
+            "group-dms",
+        ),
+    ] {
+        let mut raw = raw_snapshot();
+        raw.channel.conversation_kind = conversation_kind;
+        raw.channel.id = channel_id.to_string();
+        raw.messages.clear();
+        raw.threads.clear();
+        raw.files.clear();
+
+        let snapshot = HostedSlackNativeSnapshot::try_from(raw).expect("snapshot");
+        let paths = build_hosted_slack_logical_paths_v1(&snapshot).expect("logical paths");
+        let expected_prefix = format!("{root_folder}/engineering-{channel_id}/");
+
+        assert!(
+            paths.channel.as_str().starts_with(&expected_prefix),
+            "{}",
+            paths.channel.as_str()
+        );
+        assert_eq!(
+            paths.channel_directory(),
+            format!("{root_folder}/engineering-{channel_id}")
+        );
+        for thread in &paths.threads {
+            assert!(
+                thread.logical_path.as_str().starts_with(&expected_prefix),
+                "{}",
+                thread.logical_path.as_str()
+            );
+        }
+        for file in &paths.files {
+            assert!(
+                file.logical_path.as_str().starts_with(&expected_prefix),
+                "{}",
+                file.logical_path.as_str()
+            );
+        }
     }
 }
 
