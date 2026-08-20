@@ -157,9 +157,15 @@ fn hosted_paths_use_desktop_roots_for_each_conversation_kind() {
         let mut raw = raw_snapshot();
         raw.channel.conversation_kind = conversation_kind;
         raw.channel.id = channel_id.to_string();
-        raw.messages.clear();
-        raw.threads.clear();
-        raw.files.clear();
+        for message in &mut raw.messages {
+            message.channel_id = channel_id.to_string();
+        }
+        for thread in &mut raw.threads {
+            thread.channel_id = channel_id.to_string();
+        }
+        for file in &mut raw.files {
+            file.channel_id = channel_id.to_string();
+        }
 
         let snapshot = HostedSlackNativeSnapshot::try_from(raw).expect("snapshot");
         let paths = build_hosted_slack_logical_paths_v1(&snapshot).expect("logical paths");
