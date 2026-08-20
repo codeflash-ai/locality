@@ -25,9 +25,9 @@ use super::identity::{
     HostedSlackPortableError, validate_slack_id,
 };
 use super::native::{
-    HostedSlackFileMetadata, HostedSlackUser, MAX_HOSTED_SLACK_MESSAGE_FILES,
-    MAX_HOSTED_SLACK_MESSAGE_TEXT_BYTES, RawHostedSlackChannel, RawHostedSlackFileMetadata,
-    RawHostedSlackMessage, RawHostedSlackUser,
+    HostedSlackConversationKindV1, HostedSlackFileMetadata, HostedSlackUser,
+    MAX_HOSTED_SLACK_MESSAGE_FILES, MAX_HOSTED_SLACK_MESSAGE_TEXT_BYTES, RawHostedSlackChannel,
+    RawHostedSlackFileMetadata, RawHostedSlackMessage, RawHostedSlackUser,
 };
 use super::poll::{
     HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1, HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
@@ -1969,7 +1969,7 @@ impl HostedSlackDiscoveryProviderPort for HttpHostedSlackProvider {
                 ));
             }
             let mut query = vec![
-                ("types", "public_channel,private_channel".to_owned()),
+                ("types", "public_channel,private_channel,im,mpim".to_owned()),
                 ("exclude_archived", "false".to_owned()),
                 ("limit", request.limit.to_string()),
             ];
@@ -2059,6 +2059,14 @@ struct ChannelAuthorityWire {
     context_team_id: Option<String>,
     #[serde(default)]
     team_id: Option<String>,
+    #[serde(default)]
+    is_channel: Option<bool>,
+    #[serde(default)]
+    is_group: Option<bool>,
+    #[serde(default)]
+    is_im: Option<bool>,
+    #[serde(default)]
+    is_mpim: Option<bool>,
     #[serde(default)]
     is_private: Option<bool>,
     #[serde(default)]
@@ -2372,6 +2380,28 @@ fn provider_discovered_channel(
     expected_team_id: &str,
 ) -> Result<HostedSlackDiscoveredChannelV1, HostedSlackProviderError> {
     let channel_id = channel.id.clone();
+    let conversation_kind = hosted_conversation_kind(
+        channel
+            .is_channel
+            .ok_or(HostedSlackProviderError::InvalidResponse(
+                "conversation kind",
+            ))?,
+        channel
+            .is_group
+            .ok_or(HostedSlackProviderError::InvalidResponse(
+                "conversation kind",
+            ))?,
+        channel
+            .is_im
+            .ok_or(HostedSlackProviderError::InvalidResponse(
+                "conversation kind",
+            ))?,
+        channel
+            .is_mpim
+            .ok_or(HostedSlackProviderError::InvalidResponse(
+                "conversation kind",
+            ))?,
+    )?;
     let name = channel
         .name
         .clone()
@@ -2399,6 +2429,7 @@ fn provider_discovered_channel(
     let raw = RawHostedSlackChannel {
         team_id: authority.team_id,
         id: authority.channel_id,
+        conversation_kind,
         name,
         topic,
         purpose,
@@ -2412,6 +2443,23 @@ fn provider_discovered_channel(
         is_member: authority.is_member,
         is_archived,
     })
+}
+
+fn hosted_conversation_kind(
+    is_channel: bool,
+    is_group: bool,
+    is_im: bool,
+    is_mpim: bool,
+) -> Result<HostedSlackConversationKindV1, HostedSlackProviderError> {
+    match (is_channel, is_group, is_im, is_mpim) {
+        (true, false, false, false) => Ok(HostedSlackConversationKindV1::PublicChannel),
+        (false, true, false, false) => Ok(HostedSlackConversationKindV1::PrivateChannel),
+        (false, false, true, false) => Ok(HostedSlackConversationKindV1::Im),
+        (false, false, false, true) => Ok(HostedSlackConversationKindV1::Mpim),
+        _ => Err(HostedSlackProviderError::InvalidResponse(
+            "conversation kind",
+        )),
+    }
 }
 
 fn validate_discovered_channel_authority(
@@ -2890,6 +2938,7 @@ mod tests {
     use std::sync::mpsc::{self, Receiver};
     use std::thread::{self, JoinHandle};
 
+    use super::super::native::HostedSlackConversationKindV1;
     use super::*;
     use crate::portable::hosted::HostedSlackPollKindV1;
 
@@ -3025,6 +3074,7 @@ mod tests {
             channel: RawHostedSlackChannel {
                 team_id: team_id.to_string(),
                 id: "C08ENGINEER1".to_string(),
+                conversation_kind: HostedSlackConversationKindV1::PrivateChannel,
                 name: "engineering".to_string(),
                 topic: Some("Build safely".to_string()),
                 purpose: Some("Engineering".to_string()),
@@ -3037,11 +3087,46 @@ mod tests {
         }
     }
 
+    fn discovered_channel_wire(
+        id: &str,
+        is_channel: bool,
+        is_group: bool,
+        is_im: bool,
+        is_mpim: bool,
+    ) -> ChannelAuthorityWire {
+        ChannelAuthorityWire {
+            id: id.to_string(),
+            context_team_id: Some("T08LOCALITY1".to_string()),
+            team_id: Some("T08LOCALITY1".to_string()),
+            is_channel: Some(is_channel),
+            is_group: Some(is_group),
+            is_im: Some(is_im),
+            is_mpim: Some(is_mpim),
+            is_private: Some(is_group || is_im || is_mpim),
+            is_shared: Some(false),
+            is_ext_shared: Some(false),
+            is_org_shared: Some(false),
+            is_member: Some(true),
+            shared_team_ids: Vec::new(),
+            name: Some("conversation".to_string()),
+            topic: Some(ConversationTextWire {
+                value: "topic".to_string(),
+            }),
+            purpose: Some(ConversationTextWire {
+                value: "purpose".to_string(),
+            }),
+            created: Some(1780000000),
+            updated: Some(1780000010123),
+            is_archived: false,
+        }
+    }
+
     fn indexed_discovered_channel(index: usize) -> HostedSlackDiscoveredChannelV1 {
         HostedSlackDiscoveredChannelV1 {
             channel: RawHostedSlackChannel {
                 team_id: "T08LOCALITY1".to_string(),
                 id: format!("C{index:011}"),
+                conversation_kind: HostedSlackConversationKindV1::PublicChannel,
                 name: format!("channel-{index}"),
                 topic: None,
                 purpose: None,
@@ -3482,6 +3567,72 @@ mod tests {
     }
 
     #[test]
+    fn hosted_conversation_kind_classifies_exactly() {
+        assert_eq!(
+            hosted_conversation_kind(true, false, false, false),
+            Ok(HostedSlackConversationKindV1::PublicChannel)
+        );
+        assert_eq!(
+            hosted_conversation_kind(false, true, false, false),
+            Ok(HostedSlackConversationKindV1::PrivateChannel)
+        );
+        assert_eq!(
+            hosted_conversation_kind(false, false, true, false),
+            Ok(HostedSlackConversationKindV1::Im)
+        );
+        assert_eq!(
+            hosted_conversation_kind(false, false, false, true),
+            Ok(HostedSlackConversationKindV1::Mpim)
+        );
+        assert_eq!(
+            hosted_conversation_kind(false, false, false, false),
+            Err(HostedSlackProviderError::InvalidResponse(
+                "conversation kind"
+            ))
+        );
+        assert_eq!(
+            hosted_conversation_kind(true, true, false, false),
+            Err(HostedSlackProviderError::InvalidResponse(
+                "conversation kind"
+            ))
+        );
+    }
+
+    #[test]
+    fn provider_discovered_channel_classifies_all_hosted_conversation_kinds() {
+        for (id, flags, kind) in [
+            (
+                "C08PUBLIC01",
+                (true, false, false, false),
+                HostedSlackConversationKindV1::PublicChannel,
+            ),
+            (
+                "G08PRIVATE1",
+                (false, true, false, false),
+                HostedSlackConversationKindV1::PrivateChannel,
+            ),
+            (
+                "D08DIRECT01",
+                (false, false, true, false),
+                HostedSlackConversationKindV1::Im,
+            ),
+            (
+                "G08GROUPDM1",
+                (false, false, false, true),
+                HostedSlackConversationKindV1::Mpim,
+            ),
+        ] {
+            let (is_channel, is_group, is_im, is_mpim) = flags;
+            let discovered = provider_discovered_channel(
+                discovered_channel_wire(id, is_channel, is_group, is_im, is_mpim),
+                "T08LOCALITY1",
+            )
+            .expect("discovered conversation");
+            assert_eq!(discovered.channel.conversation_kind, kind);
+        }
+    }
+
+    #[test]
     fn initial_channel_descriptor_is_authoritative_and_rejects_unreadable_candidates() {
         let binding = installation_binding();
         let descriptor = HostedSlackInitialChannelDescriptorV1::new(
@@ -3670,13 +3821,13 @@ mod tests {
         assert_eq!(
             requests.recv().unwrap().lines().next(),
             Some(
-                "GET /conversations.list?types=public_channel%2Cprivate_channel&exclude_archived=false&limit=100 HTTP/1.1"
+                "GET /conversations.list?types=public_channel%2Cprivate_channel%2Cim%2Cmpim&exclude_archived=false&limit=100 HTTP/1.1"
             )
         );
         assert_eq!(
             requests.recv().unwrap().lines().next(),
             Some(
-                "GET /conversations.list?types=public_channel%2Cprivate_channel&exclude_archived=false&limit=100&cursor=page-two HTTP/1.1"
+                "GET /conversations.list?types=public_channel%2Cprivate_channel%2Cim%2Cmpim&exclude_archived=false&limit=100&cursor=page-two HTTP/1.1"
             )
         );
         server.join().unwrap();
