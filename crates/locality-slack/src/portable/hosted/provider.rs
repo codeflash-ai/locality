@@ -2659,12 +2659,15 @@ fn hosted_conversation_kind(
     is_group: bool,
     is_im: bool,
     is_mpim: bool,
+    is_private: bool,
 ) -> Result<HostedSlackConversationKindV1, HostedSlackProviderError> {
-    match (is_channel, is_group, is_im, is_mpim) {
-        (true, false, false, false) => Ok(HostedSlackConversationKindV1::PublicChannel),
-        (false, true, false, false) => Ok(HostedSlackConversationKindV1::PrivateChannel),
-        (false, false, true, false) => Ok(HostedSlackConversationKindV1::Im),
-        (false, false, false, true) => Ok(HostedSlackConversationKindV1::Mpim),
+    match (is_channel, is_group, is_im, is_mpim, is_private) {
+        (false, false, true, false, _) => Ok(HostedSlackConversationKindV1::Im),
+        (false, false, false, true, _) => Ok(HostedSlackConversationKindV1::Mpim),
+        (_, true, false, false, true) | (true, false, false, false, true) => {
+            Ok(HostedSlackConversationKindV1::PrivateChannel)
+        }
+        (true, false, false, false, false) => Ok(HostedSlackConversationKindV1::PublicChannel),
         _ => Err(HostedSlackProviderError::InvalidResponse(
             "conversation kind",
         )),
@@ -2679,6 +2682,7 @@ fn hosted_conversation_kind_from_wire(
         channel.is_group.unwrap_or(false),
         channel.is_im.unwrap_or(false),
         channel.is_mpim.unwrap_or(false),
+        channel.is_private.unwrap_or(false),
     )
 }
 
@@ -3936,29 +3940,37 @@ mod tests {
     #[test]
     fn hosted_conversation_kind_classifies_exactly() {
         assert_eq!(
-            hosted_conversation_kind(true, false, false, false),
+            hosted_conversation_kind(true, false, false, false, false),
             Ok(HostedSlackConversationKindV1::PublicChannel)
         );
         assert_eq!(
-            hosted_conversation_kind(false, true, false, false),
+            hosted_conversation_kind(false, true, false, false, true),
             Ok(HostedSlackConversationKindV1::PrivateChannel)
         );
         assert_eq!(
-            hosted_conversation_kind(false, false, true, false),
+            hosted_conversation_kind(true, false, false, false, true),
+            Ok(HostedSlackConversationKindV1::PrivateChannel)
+        );
+        assert_eq!(
+            hosted_conversation_kind(false, false, true, false, true),
             Ok(HostedSlackConversationKindV1::Im)
         );
         assert_eq!(
-            hosted_conversation_kind(false, false, false, true),
+            hosted_conversation_kind(false, false, false, true, true),
             Ok(HostedSlackConversationKindV1::Mpim)
         );
         assert_eq!(
-            hosted_conversation_kind(false, false, false, false),
+            hosted_conversation_kind(false, false, false, false, false),
             Err(HostedSlackProviderError::InvalidResponse(
                 "conversation kind"
             ))
         );
         assert_eq!(
-            hosted_conversation_kind(true, true, false, false),
+            hosted_conversation_kind(true, true, false, false, true),
+            Ok(HostedSlackConversationKindV1::PrivateChannel)
+        );
+        assert_eq!(
+            hosted_conversation_kind(true, true, false, false, false),
             Err(HostedSlackProviderError::InvalidResponse(
                 "conversation kind"
             ))
@@ -4060,6 +4072,18 @@ mod tests {
             .expect("discovered conversation");
             assert_eq!(discovered.channel.conversation_kind, kind);
         }
+    }
+
+    #[test]
+    fn provider_discovered_channel_classifies_private_channel_flag() {
+        let mut wire = discovered_channel_wire("C08PRIVATE1", true, false, false, false);
+        wire.is_private = Some(true);
+        let discovered =
+            provider_discovered_channel(wire, "T08LOCALITY1").expect("private channel discovery");
+        assert_eq!(
+            discovered.channel.conversation_kind,
+            HostedSlackConversationKindV1::PrivateChannel
+        );
     }
 
     #[test]
