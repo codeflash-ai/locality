@@ -133,7 +133,11 @@ fn hosted_slack_ids_are_bounded_and_canonical() {
             "accepted malformed team ID {malformed}"
         );
     }
-    for malformed in ["D08DIRECT1", "c08ENGINEER1", "C08-engineer", "G CHANNEL"] {
+    let mut selector = hosted_selector();
+    selector.channel_id = "D08DIRECT1".to_string();
+    selector.validate().expect("valid hosted Slack DM selector");
+
+    for malformed in ["E08LOCALITY1", "c08ENGINEER1", "C08-engineer", "G CHANNEL"] {
         let mut selector = hosted_selector();
         selector.channel_id = malformed.to_string();
         assert_eq!(

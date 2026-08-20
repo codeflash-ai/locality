@@ -546,7 +546,7 @@ impl HostedSlackChannelSelector {
         validate_canonical_slack_id(
             "channel_id",
             &self.channel_id,
-            b"CG",
+            b"CGD",
             MAX_SLACK_CHANNEL_ID_BYTES,
         )?;
         validate_canonical_utc_timestamp(

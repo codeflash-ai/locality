@@ -5,8 +5,9 @@ use locality_protocol::{SlackChannelSharingClassification, SlackInstallationId};
 use serde::{Deserialize, Serialize};
 
 use super::identity::{
-    HostedSlackPortableError, validate_bounded_metadata_text, validate_bounded_text,
-    validate_collection_len, validate_slack_id,
+    HOSTED_SLACK_CONVERSATION_ID_PREFIXES, HostedSlackPortableError,
+    validate_bounded_metadata_text, validate_bounded_text, validate_collection_len,
+    validate_slack_id,
 };
 
 pub const MAX_HOSTED_SLACK_NAME_BYTES: usize = 512;
@@ -365,7 +366,11 @@ impl TryFrom<RawHostedSlackMessage> for HostedSlackMessage {
     type Error = HostedSlackPortableError;
 
     fn try_from(raw: RawHostedSlackMessage) -> Result<Self, Self::Error> {
-        validate_slack_id("message.channel_id", &raw.channel_id, b"CG")?;
+        validate_slack_id(
+            "message.channel_id",
+            &raw.channel_id,
+            HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+        )?;
         validate_slack_timestamp("message.ts", &raw.ts)?;
         if let Some(thread_ts) = &raw.thread_ts {
             validate_slack_timestamp("message.thread_ts", thread_ts)?;
@@ -425,7 +430,11 @@ impl TryFrom<RawHostedSlackThread> for HostedSlackThread {
     type Error = HostedSlackPortableError;
 
     fn try_from(raw: RawHostedSlackThread) -> Result<Self, Self::Error> {
-        validate_slack_id("thread.channel_id", &raw.channel_id, b"CG")?;
+        validate_slack_id(
+            "thread.channel_id",
+            &raw.channel_id,
+            HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+        )?;
         validate_slack_timestamp("thread.root_ts", &raw.root_ts)?;
         validate_collection_len(
             "thread.reply_ts",
@@ -525,7 +534,11 @@ impl TryFrom<RawHostedSlackFileMetadata> for HostedSlackFileMetadata {
     type Error = HostedSlackPortableError;
 
     fn try_from(raw: RawHostedSlackFileMetadata) -> Result<Self, Self::Error> {
-        validate_slack_id("file.channel_id", &raw.channel_id, b"CG")?;
+        validate_slack_id(
+            "file.channel_id",
+            &raw.channel_id,
+            HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+        )?;
         validate_slack_id("file.id", &raw.id, b"F")?;
         if let Some(user_id) = &raw.user_id {
             validate_slack_id("file.user_id", user_id, b"UW")?;

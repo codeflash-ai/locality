@@ -4,6 +4,7 @@ use locality_protocol::SlackInstallationId;
 use serde::{Deserialize, Serialize};
 
 pub const MAX_HOSTED_SLACK_ID_BYTES: usize = 32;
+pub(crate) const HOSTED_SLACK_CONVERSATION_ID_PREFIXES: &[u8] = b"CGD";
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

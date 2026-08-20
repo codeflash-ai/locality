@@ -21,8 +21,8 @@ use super::checkpoint::{
     HostedSlackPollPhaseV1,
 };
 use super::identity::{
-    HostedSlackInstallationBinding, HostedSlackObservedInstallationIdentity,
-    HostedSlackPortableError, validate_slack_id,
+    HOSTED_SLACK_CONVERSATION_ID_PREFIXES, HostedSlackInstallationBinding,
+    HostedSlackObservedInstallationIdentity, HostedSlackPortableError, validate_slack_id,
 };
 use super::native::{
     HostedSlackConversationKindV1, HostedSlackFileMetadata, HostedSlackUser,
@@ -756,7 +756,11 @@ fn verify_channel_authority(
     authority: &HostedSlackObservedChannelAuthorityV1,
 ) -> Result<(), HostedSlackProviderError> {
     validate_slack_id("provider.channel.team_id", &authority.team_id, b"T")?;
-    validate_slack_id("provider.channel.channel_id", &authority.channel_id, b"CG")?;
+    validate_slack_id(
+        "provider.channel.channel_id",
+        &authority.channel_id,
+        HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+    )?;
     if authority.shared_team_ids.len() > MAX_HOSTED_SLACK_PROVIDER_METADATA_IDS_V1 {
         return Err(HostedSlackProviderError::LimitExceeded(
             "channel shared team ids",
@@ -1852,7 +1856,11 @@ impl HostedSlackProviderPort for HttpHostedSlackProvider {
         channel_id: String,
     ) -> HostedSlackProviderFuture<'_, HostedSlackObservedChannelAuthorityV1> {
         Box::pin(async move {
-            validate_slack_id("provider.channel_id", &channel_id, b"CG")?;
+            validate_slack_id(
+                "provider.channel_id",
+                &channel_id,
+                HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+            )?;
             let response = self
                 .request::<ConversationInfoResponse>(
                     Method::GET,
@@ -2278,7 +2286,11 @@ fn validate_history_request(
         ));
     }
     validate_slack_id("provider.history.team_id", &request.team_id, b"T")?;
-    validate_slack_id("provider.history.channel_id", &request.channel_id, b"CG")?;
+    validate_slack_id(
+        "provider.history.channel_id",
+        &request.channel_id,
+        HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+    )?;
     let oldest =
         super::checkpoint::parse_slack_timestamp("provider.history.oldest", &request.oldest)?;
     let latest =
@@ -2302,7 +2314,11 @@ fn validate_replies_request(
         ));
     }
     validate_slack_id("provider.replies.team_id", &request.team_id, b"T")?;
-    validate_slack_id("provider.replies.channel_id", &request.channel_id, b"CG")?;
+    validate_slack_id(
+        "provider.replies.channel_id",
+        &request.channel_id,
+        HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+    )?;
     super::checkpoint::parse_slack_timestamp(
         "provider.replies.root_message_id",
         &request.root_message_id,
@@ -3596,6 +3612,68 @@ mod tests {
                 "conversation kind"
             ))
         );
+    }
+
+    #[test]
+    fn provider_scope_validation_accepts_dm_conversation_ids() {
+        let installation_id: SlackInstallationId =
+            serde_json::from_str(r#""0198f3c2-7d4e-7a61-8b25-4f9c8d7e6a10""#).unwrap();
+        let history = HostedSlackHistoryRequestV1 {
+            installation_id: installation_id.clone(),
+            team_id: "T08LOCALITY1".to_string(),
+            channel_id: "D08DIRECT1".to_string(),
+            phase: HostedSlackPollPhaseV1::HistoricalHistory,
+            oldest: "1767225599.999999".to_string(),
+            latest: "1780272000.000000".to_string(),
+            inclusive: false,
+            cursor: None,
+            limit: HOSTED_SLACK_PROVIDER_PAGE_LIMIT_V1,
+        };
+        validate_history_request(&history).expect("valid DM history request");
+
+        let replies = HostedSlackRepliesRequestV1 {
+            installation_id,
+            team_id: "T08LOCALITY1".to_string(),
+            channel_id: "D08DIRECT1".to_string(),
+            phase: HostedSlackPollPhaseV1::HistoricalReplies,
+            root_message_id: "1780000000.000100".to_string(),
+            latest: "1780272000.000000".to_string(),
+            inclusive: false,
+            cursor: None,
+            limit: HOSTED_SLACK_PROVIDER_PAGE_LIMIT_V1,
+        };
+        validate_replies_request(&replies).expect("valid DM replies request");
+
+        let authority = provider_channel_authority(
+            ConversationInfoResponse {
+                ok: true,
+                error: None,
+                channel: Some(ChannelAuthorityWire {
+                    id: "D08DIRECT1".to_string(),
+                    context_team_id: Some("T08LOCALITY1".to_string()),
+                    team_id: None,
+                    is_channel: Some(false),
+                    is_group: Some(false),
+                    is_im: Some(true),
+                    is_mpim: Some(false),
+                    is_private: Some(false),
+                    is_shared: Some(false),
+                    is_ext_shared: Some(false),
+                    is_org_shared: Some(false),
+                    is_member: Some(true),
+                    shared_team_ids: Vec::new(),
+                    name: Some("Ada".to_string()),
+                    topic: None,
+                    purpose: None,
+                    created: Some(1_780_000_000),
+                    updated: None,
+                    is_archived: false,
+                }),
+            },
+            "D08DIRECT1",
+        )
+        .expect("valid DM authority");
+        assert_eq!(authority.channel_id, "D08DIRECT1");
     }
 
     #[test]

@@ -297,9 +297,15 @@ fn hosted_conversation_kind_defaults_for_legacy_raw_and_validates_channel_ids() 
         let mut raw = raw_snapshot();
         raw.channel.conversation_kind = kind;
         raw.channel.id = valid_id.to_string();
-        raw.messages.clear();
-        raw.threads.clear();
-        raw.files.clear();
+        for message in &mut raw.messages {
+            message.channel_id = valid_id.to_string();
+        }
+        for thread in &mut raw.threads {
+            thread.channel_id = valid_id.to_string();
+        }
+        for file in &mut raw.files {
+            file.channel_id = valid_id.to_string();
+        }
         let snapshot = HostedSlackNativeSnapshot::try_from(raw).expect("valid conversation kind");
         assert_eq!(snapshot.channel().conversation_kind(), kind);
     }
