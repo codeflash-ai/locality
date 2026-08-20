@@ -547,6 +547,34 @@ fn one_inventory_drains_many_pages_and_each_source_fetches_once() {
 }
 
 #[test]
+fn overlapping_parent_and_child_roots_return_a_redaction_safe_scope_failure() {
+    let api = Arc::new(FixtureApi::new(&[CHILD_1]));
+    let connector =
+        connector_with_api(api).with_root_ids([RemoteId::new(ROOT), RemoteId::new(CHILD_1)]);
+    let session = connector
+        .initial_hydration_session(CONNECTION_HASH, 10, limits(10_000))
+        .expect("session");
+    let error = session
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("connection"),
+            scope: PortableSourceScope::explicit_roots([
+                RemoteId::new(ROOT),
+                RemoteId::new(CHILD_1),
+            ]),
+            checkpoint: None,
+            max_changes: 10,
+        })
+        .expect_err("overlapping roots must fail before publication");
+
+    assert_eq!(
+        error.to_string(),
+        "invalid state: initial hydration scope is invalid: overlapping_roots"
+    );
+    assert!(!error.to_string().contains(ROOT));
+    assert!(!error.to_string().contains(CHILD_1));
+}
+
+#[test]
 fn checkpoints_are_session_bound_ordered_redacted_and_rejected_by_base_connector() {
     let api = Arc::new(FixtureApi::new(&[CHILD_1, CHILD_2]));
     let connector = connector(api);

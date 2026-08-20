@@ -134,6 +134,28 @@ pub enum InitialHydrationError {
     ProviderNotFound,
     ProviderUnavailable,
     ProviderResponseInvalid,
+    InvalidScope {
+        reason: InitialHydrationScopeFailure,
+    },
+}
+
+/// A stable, redaction-safe reason that connector scope cannot be hydrated.
+///
+/// Scope failures describe trusted configuration rather than provider payloads.
+/// Keeping them separate from [`InitialHydrationError::ProviderResponseInvalid`]
+/// lets a host offer recovery without logging root identities or content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialHydrationScopeFailure {
+    OverlappingRoots,
+}
+
+impl InitialHydrationScopeFailure {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::OverlappingRoots => "overlapping_roots",
+        }
+    }
 }
 
 impl InitialHydrationError {
@@ -189,6 +211,9 @@ impl Display for InitialHydrationError {
             Self::ProviderUnavailable => write!(f, "initial hydration provider is unavailable"),
             Self::ProviderResponseInvalid => {
                 write!(f, "initial hydration provider response is invalid")
+            }
+            Self::InvalidScope { reason } => {
+                write!(f, "initial hydration scope is invalid: {}", reason.code())
             }
         }
     }
