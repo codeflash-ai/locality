@@ -2,6 +2,7 @@
 
 live_connector_common_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 live_connector_repo_root="$(cd "$live_connector_common_dir/.." && pwd)"
+live_connector_matrix="$live_connector_common_dir/live_connector_scenarios.json"
 
 live_fail() {
   echo "$*" >&2
@@ -233,6 +234,12 @@ emit_live_debug_diagnostics() {
     pull_after_delete_report \
     restore_diff_report \
     restore_push_report \
+    remote_drift_push_report \
+    remote_drift_pull_report \
+    remote_drift_restore_report \
+    remote_draft_drift_push_report \
+    remote_draft_drift_pull_report \
+    remote_draft_drift_restore_report \
     cleanup_diff_report \
     cleanup_push_report \
     cleanup_pull_report \
@@ -264,6 +271,118 @@ require_live_env() {
       return 1
     fi
   done
+}
+
+live_scenario_field() {
+  if [[ $# -ne 2 ]]; then
+    live_fail "live_scenario_field requires a connector and field"
+    return 1
+  fi
+  python3 "$live_connector_common_dir/live_connector_matrix.py" get "$1" "$2"
+}
+
+assert_live_scenario_contract() {
+  local connector="${1:-}"
+  local platform="${2:-}"
+  local expected_script="${3:-}"
+  local configured_script
+
+  case "$platform" in
+    linux-fuse | macos-file-provider | windows-cloud-files) ;;
+    *)
+      live_fail "unsupported live connector platform: $platform"
+      return 1
+      ;;
+  esac
+  configured_script="$(live_scenario_field "$connector" "scenarios.$platform")" || return 1
+  if [[ -n "$expected_script" && "$configured_script" != "$expected_script" ]]; then
+    live_fail "$connector/$platform matrix script is $configured_script, expected $expected_script"
+    return 1
+  fi
+}
+
+require_live_scenario_env() {
+  local connector="${1:-}"
+  local credential_env
+  local fixture_env
+
+  credential_env="$(live_scenario_field "$connector" "credential.environment")" || return 1
+  require_live_env "$credential_env" || return 1
+  while IFS= read -r fixture_env; do
+    [[ -n "$fixture_env" ]] || continue
+    # Optional fixture selectors are represented by the conventional TYPES
+    # suffix; every identity-bearing fixture remains mandatory.
+    if [[ "$fixture_env" != *_TYPES ]]; then
+      require_live_env "$fixture_env" || return 1
+    fi
+  done < <(python3 - "$live_connector_matrix" "$connector" <<'PY'
+import json
+import pathlib
+import sys
+
+matrix = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+for value in matrix["connectors"][sys.argv[2]]["fixtures"].values():
+    print(value)
+PY
+  )
+}
+
+live_mutation_state_fingerprint() {
+  local state_root="${1:-}"
+  python3 - "$state_root/state.sqlite3" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import sqlite3
+import sys
+
+path = pathlib.Path(sys.argv[1])
+connection = sqlite3.connect(path)
+try:
+    tables = {}
+    for table in ("entities", "shadows", "journals", "virtual_mutations", "content_cache"):
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        if not exists:
+            tables[table] = None
+            continue
+        columns = [row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')]
+        rows = []
+        for row in connection.execute(f'SELECT * FROM "{table}"'):
+            normalized = []
+            for value in row:
+                if isinstance(value, bytes):
+                    normalized.append(
+                        {"blob_sha256": hashlib.sha256(value).hexdigest(), "length": len(value)}
+                    )
+                else:
+                    normalized.append(value)
+            rows.append(normalized)
+        rows.sort(key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")))
+        tables[table] = {"columns": columns, "rows": rows}
+finally:
+    connection.close()
+
+content_root = path.parent / "content"
+cache_files = []
+if content_root.exists():
+    for item in sorted(content_root.rglob("*")):
+        relative = item.relative_to(content_root).as_posix()
+        if item.is_symlink():
+            cache_files.append((relative, "symlink", os.readlink(item)))
+        elif item.is_file():
+            cache_files.append(
+                (relative, "file", hashlib.sha256(item.read_bytes()).hexdigest())
+            )
+payload = {"tables": tables, "content_cache": cache_files}
+print(
+    hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+)
+PY
 }
 
 require_linux_fuse() {

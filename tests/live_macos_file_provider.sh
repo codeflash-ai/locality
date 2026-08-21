@@ -200,7 +200,13 @@ PY
 tmp_root="$(create_short_tmp_root)"
 state_root="$tmp_root/state"
 retired_state_root="$tmp_root/retired-state"
+# The dedicated runner has no interactive login keychain. Keep live-test
+# credentials inside the isolated state root, matching the connector provider
+# harness, and remove them during strict cleanup.
+export LOCALITY_CREDENTIAL_STORE=file
 domain_report="$tmp_root/domain.json"
+connect_report="$tmp_root/connect.json"
+mount_report="$tmp_root/mount.json"
 daemon_start_report="$tmp_root/daemon-start.json"
 daemon_start_error="$tmp_root/daemon-start.stderr"
 daemon_status_report="$tmp_root/daemon-status.json"
@@ -542,16 +548,39 @@ PY
 archive_page() {
   local page_id="$1"
   [[ -n "$page_id" ]] || return 0
-  local body="$tmp_root/archive-${page_id//-/}.json"
-  printf '{"archived":true}\n' >"$body"
-  notion_api PATCH "pages/$page_id" "$body" >/dev/null
+  notion_api DELETE "blocks/$page_id" >/dev/null
 }
 
 archive_page_best_effort() {
   local page_id="$1"
   [[ -n "$page_id" ]] || return 0
   archive_page "$page_id" >/dev/null 2>&1 \
-    || printf 'warning: failed to archive scratch Notion page %s during cleanup\n' "$page_id" >&2
+    || printf 'warning: failed to archive a scratch Notion page during cleanup\n' >&2
+}
+
+cleanup_stale_scratch_pages() {
+  local report="$tmp_root/stale-scratch-children.json"
+  local ids="$tmp_root/stale-scratch-ids.txt"
+  notion_api GET "blocks/$parent_page_id/children?page_size=100" >"$report"
+  python3 - "$report" >"$ids" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+prefix = "Locality macOS File Provider scratch "
+for block in report.get("results") or []:
+    if block.get("type") != "child_page":
+        continue
+    title = (block.get("child_page") or {}).get("title") or ""
+    if title.startswith(prefix) and block.get("id"):
+        print(block["id"])
+PY
+  local stale_page_id
+  while IFS= read -r stale_page_id; do
+    [[ -n "$stale_page_id" ]] || continue
+    notion_api DELETE "blocks/$stale_page_id" >/dev/null
+  done <"$ids"
 }
 
 created_remote_id_from_push() {
@@ -684,6 +713,38 @@ emit_diagnostics() {
   done < <(find "$state_root/logs" -type f -name '*.log' -print 2>/dev/null | sort)
 }
 
+emit_safe_command_failure() {
+  local command="$1"
+  local report_path="$2"
+  [[ -s "$report_path" ]] || return 0
+  LOCALITY_E2E_REDACT_TOKEN="$notion_token" python3 - "$command" "$report_path" <<'PY' >&2
+import json
+import os
+import pathlib
+import re
+import sys
+
+try:
+    report = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    print(f"loc {sys.argv[1]} failed without a valid JSON diagnostic")
+    raise SystemExit(0)
+
+code = str(report.get("code") or "unknown_error")
+message = str(report.get("message") or "no diagnostic message")
+token = os.environ.get("LOCALITY_E2E_REDACT_TOKEN", "")
+if token:
+    message = message.replace(token, "[REDACTED]")
+message = re.sub(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+    "[redacted-id]",
+    message,
+)
+message = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[redacted-email]", message)
+print(f"loc {sys.argv[1]} failed ({code}): {message}")
+PY
+}
+
 on_error() {
   local status="$?"
   (set +e; emit_diagnostics || true)
@@ -785,25 +846,33 @@ then
 fi
 
 parent_page_id="$(normalize_notion_page_id "$parent_page_id")"
+step="cleaning stale scratch Notion pages"
+cleanup_stale_scratch_pages
 step="creating a scratch Notion page"
 scratch_page_id="$(create_scratch_page)"
 
 step="creating isolated Locality state"
 mkdir -p "$state_root"
 connection_created=1
-printf '%s' "$notion_token" | env -u NOTION_TOKEN -u NOTION_AT \
+if ! printf '%s' "$notion_token" | env -u NOTION_TOKEN -u NOTION_AT \
   LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 \
-  "$loc_bin" connect notion --name "$connection_id" --token-stdin --json >/dev/null
+  "$loc_bin" connect notion --name "$connection_id" --token-stdin --json >"$connect_report"; then
+  emit_safe_command_failure connect "$connect_report"
+  false
+fi
 
 step="registering the isolated macOS File Provider mount"
-env -u NOTION_TOKEN -u NOTION_AT \
+if ! env -u NOTION_TOKEN -u NOTION_AT \
   LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 \
   "$loc_bin" mount notion "$mount_root" \
     --root-page "$scratch_page_id" \
     --connection "$connection_id" \
     --mount-id "$mount_id" \
     --projection macos-file-provider \
-    --json >/dev/null
+    --json >"$mount_report"; then
+  emit_safe_command_failure mount "$mount_report"
+  false
+fi
 mount_registered=1
 
 step="starting the isolated packaged daemon"

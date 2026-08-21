@@ -7,7 +7,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-file-provider-live-e2e
+  # Shared with connector-live-e2e to serialize every Slack OAuth consumer.
+  group: locality-live-secret-consumers
   cancel-in-progress: false
 
 jobs:
@@ -16,6 +17,9 @@ jobs:
     runs-on: [self-hosted, macOS, locality-file-provider]
     timeout-minutes: 45
     environment: notion-live-e2e
+    outputs:
+      app_path: ${{ steps.provider-config.outputs.app_path }}
+      bundle_id: ${{ steps.provider-config.outputs.bundle_id }}
     env:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       LOCALITY_NOTION_LIVE_PARENT_PAGE: ${{ secrets.LOCALITY_NOTION_LIVE_PARENT_PAGE || secrets.AFS_NOTION_LIVE_PARENT_PAGE }}
@@ -79,6 +83,13 @@ jobs:
             exit 1
           fi
           bash -n tests/live_macos_file_provider.sh
+          bash -n tests/live_macos_connector_file_provider.sh
+          python3 tests/live_connector_matrix.py validate
+      - name: Export installed provider configuration
+        id: provider-config
+        run: |
+          echo "app_path=$LOCALITY_MACOS_FILE_PROVIDER_APP" >> "$GITHUB_OUTPUT"
+          echo "bundle_id=$LOCALITY_MACOS_FILE_PROVIDER_EXPECTED_BUNDLE_ID" >> "$GITHUB_OUTPUT"
       - name: Install desktop dependencies
         run: npm ci
         working-directory: apps/desktop
@@ -100,3 +111,90 @@ jobs:
           if [ -n "${LOCALITY_SIGNING_KEYCHAIN:-}" ]; then
             security delete-keychain "$LOCALITY_SIGNING_KEYCHAIN" 2>/dev/null || true
           fi
+
+  connector-file-provider-live:
+    name: Signed macOS Gmail and Linear File Provider live e2e
+    needs: file-provider-live
+    runs-on: [self-hosted, macOS, locality-file-provider]
+    timeout-minutes: 45
+    environment: connector-live-e2e
+    env:
+      LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON }}
+      LOCALITY_GMAIL_LIVE_TO_EMAIL: ${{ secrets.LOCALITY_GMAIL_LIVE_TO_EMAIL }}
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+      LOCALITY_LINEAR_LIVE_ISSUE_ID: ${{ secrets.LOCALITY_LINEAR_LIVE_ISSUE_ID }}
+      LOCALITY_MACOS_FILE_PROVIDER_APP: ${{ needs.file-provider-live.outputs.app_path }}
+      LOCALITY_MACOS_FILE_PROVIDER_EXPECTED_BUNDLE_ID: ${{ needs.file-provider-live.outputs.bundle_id }}
+      LOCALITY_MACOS_CONNECTOR_FILE_PROVIDER_LIVE: "1"
+      LOCALITY_MACOS_FILE_PROVIDER_DEDICATED_HOST: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run real Gmail File Provider draft scenario
+        env:
+          LOCALITY_LIVE_CONNECTOR: gmail
+        run: tests/live_macos_connector_file_provider.sh
+      - name: Run real Linear File Provider edit and restore scenario
+        env:
+          LOCALITY_LIVE_CONNECTOR: linear
+        run: tests/live_macos_connector_file_provider.sh
+
+  slack-file-provider-live:
+    name: Signed macOS Slack File Provider live e2e
+    needs: [file-provider-live, connector-file-provider-live]
+    runs-on: [self-hosted, macOS, locality-file-provider]
+    timeout-minutes: 30
+    environment: connector-live-e2e
+    env:
+      LOCALITY_SLACK_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_SLACK_LIVE_CREDENTIAL_JSON }}
+      LOCALITY_SLACK_LIVE_CONVERSATION_ID: ${{ secrets.LOCALITY_SLACK_LIVE_CONVERSATION_ID }}
+      LOCALITY_SLACK_LIVE_TYPES: ${{ secrets.LOCALITY_SLACK_LIVE_TYPES }}
+      LOCALITY_LIVE_CONNECTOR: slack
+      LOCALITY_LIVE_FORCE_OAUTH_REFRESH: "1"
+      LOCALITY_MACOS_FILE_PROVIDER_APP: ${{ needs.file-provider-live.outputs.app_path }}
+      LOCALITY_MACOS_FILE_PROVIDER_EXPECTED_BUNDLE_ID: ${{ needs.file-provider-live.outputs.bundle_id }}
+      LOCALITY_MACOS_CONNECTOR_FILE_PROVIDER_LIVE: "1"
+      LOCALITY_MACOS_FILE_PROVIDER_DEDICATED_HOST: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize Slack credential rotation path
+        run: echo "LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT=$RUNNER_TEMP/locality-slack-macos-credential.json" >> "$GITHUB_ENV"
+      - name: Preflight Slack credential rotation
+        env:
+          GH_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
+        run: |
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::LOCALITY_SECRET_ROTATOR_TOKEN is required"; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/environments/connector-live-e2e/secrets/public-key" >/dev/null
+      - name: Run real Slack File Provider read-only scenario
+        run: tests/live_macos_connector_file_provider.sh
+      - name: Persist refreshed Slack credential after macOS consumer
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
+        run: |
+          ROTATED_CREDENTIAL_PATH="${LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT:-}"
+          trap 'rm -f "$ROTATED_CREDENTIAL_PATH"' EXIT
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::LOCALITY_SECRET_ROTATOR_TOKEN is required"; exit 1; }
+          [ -s "$ROTATED_CREDENTIAL_PATH" ] || { echo "::error::refreshed Slack credential was not exported"; exit 1; }
+          gh secret set LOCALITY_SLACK_LIVE_CREDENTIAL_JSON \
+            --repo "$GITHUB_REPOSITORY" \
+            --env connector-live-e2e \
+            < "$ROTATED_CREDENTIAL_PATH"
+
+  granola-file-provider-live:
+    name: Signed macOS Granola File Provider live e2e
+    needs: [file-provider-live, slack-file-provider-live]
+    runs-on: [self-hosted, macOS, locality-file-provider]
+    timeout-minutes: 30
+    environment: granola-live-e2e
+    env:
+      GRANOLA_API_KEY: ${{ secrets.GRANOLA_API_KEY }}
+      LOCALITY_GRANOLA_LIVE_NOTE_ID: ${{ secrets.LOCALITY_GRANOLA_LIVE_NOTE_ID }}
+      LOCALITY_LIVE_CONNECTOR: granola
+      LOCALITY_MACOS_FILE_PROVIDER_APP: ${{ needs.file-provider-live.outputs.app_path }}
+      LOCALITY_MACOS_FILE_PROVIDER_EXPECTED_BUNDLE_ID: ${{ needs.file-provider-live.outputs.bundle_id }}
+      LOCALITY_MACOS_CONNECTOR_FILE_PROVIDER_LIVE: "1"
+      LOCALITY_MACOS_FILE_PROVIDER_DEDICATED_HOST: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run real Granola File Provider read-only scenario
+        run: tests/live_macos_connector_file_provider.sh

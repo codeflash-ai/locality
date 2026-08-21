@@ -12,6 +12,17 @@ repo_root="$(cd "$script_dir/.." && pwd)"
 # shellcheck source=tests/live_connector_common.sh
 source "$script_dir/live_connector_common.sh"
 
+python3 "$script_dir/live_connector_matrix.py" validate >/dev/null
+python3 "$script_dir/live_connector_matrix_selftest.py" >/dev/null
+for connector in gmail slack linear granola; do
+  assert_live_scenario_contract "$connector" "linux-fuse"
+  assert_live_scenario_contract "$connector" "macos-file-provider" \
+    "tests/live_macos_connector_file_provider.sh"
+  assert_live_scenario_contract "$connector" "windows-cloud-files" \
+    "tests/windows_connector_cloud_files_live.ps1"
+
+done
+
 for command in sqlite3 python3; do
   if ! command -v "$command" >/dev/null 2>&1; then
     live_fail "missing required live connector dependency: $command"
@@ -39,6 +50,20 @@ cleanup() {
   rm -rf "$tmp_root"
 }
 trap cleanup EXIT
+
+for connector in gmail slack linear granola; do
+  credential_env="$(live_scenario_field "$connector" "credential.environment")"
+  missing_scenario_env_error="$tmp_root/missing-$connector-credential.err"
+  if env -u "$credential_env" bash -c \
+    'source "$1"; require_live_scenario_env "$2"' \
+    _ "$script_dir/live_connector_common.sh" "$connector" \
+    2>"$missing_scenario_env_error"; then
+    live_fail "require_live_scenario_env accepted missing $connector credentials"
+  fi
+  if [[ "$(cat "$missing_scenario_env_error")" != "missing $credential_env" ]]; then
+    live_fail "require_live_scenario_env returned unexpected $connector credential diagnostics"
+  fi
+done
 
 assert_require_linux_fuse_fails_with_path() {
   local label="$1"
@@ -259,6 +284,40 @@ init_live_state "$loc_bin" "$state_root"
 seed_connector_credential "$loc_bin" "$state_root" "google-docs" "google-docs-live" "$credential_json"
 
 db="$state_root/state.sqlite3"
+mutation_fingerprint="$(live_mutation_state_fingerprint "$state_root")"
+if [[ ! "$mutation_fingerprint" =~ ^[0-9a-f]{64}$ ]]; then
+  live_fail "live_mutation_state_fingerprint did not return a SHA-256 digest"
+fi
+
+sqlite3 "$db" <<'SQL'
+INSERT INTO entities (
+  mount_id, remote_id, kind_json, title, path,
+  hydration_json, content_hash, remote_edited_at
+) VALUES (
+  'fingerprint-mount', 'fingerprint-remote', '"page"', 'before',
+  'fingerprint/page.md', '"hydrated"', 'content-hash', '2026-08-19T00:00:00Z'
+);
+SQL
+database_fingerprint_before="$(live_mutation_state_fingerprint "$state_root")"
+sqlite3 "$db" \
+  "UPDATE entities SET title = 'after' WHERE mount_id = 'fingerprint-mount' AND remote_id = 'fingerprint-remote';"
+database_fingerprint_after="$(live_mutation_state_fingerprint "$state_root")"
+if [[ "$database_fingerprint_before" == "$database_fingerprint_after" ]]; then
+  live_fail "live_mutation_state_fingerprint ignored an in-place entity update"
+fi
+sqlite3 "$db" \
+  "DELETE FROM entities WHERE mount_id = 'fingerprint-mount' AND remote_id = 'fingerprint-remote';"
+
+fingerprint_cache_file="$state_root/content/fingerprint-mount/files/page.md"
+mkdir -p "$(dirname "$fingerprint_cache_file")"
+printf 'before' >"$fingerprint_cache_file"
+cache_fingerprint_before="$(live_mutation_state_fingerprint "$state_root")"
+printf 'after!' >"$fingerprint_cache_file"
+cache_fingerprint_after="$(live_mutation_state_fingerprint "$state_root")"
+if [[ "$cache_fingerprint_before" == "$cache_fingerprint_after" ]]; then
+  live_fail "live_mutation_state_fingerprint ignored an in-place content-cache update"
+fi
+rm -rf "$state_root/content/fingerprint-mount"
 
 connection_count="$(
   sqlite3 "$db" \

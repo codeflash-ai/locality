@@ -62,6 +62,8 @@ assert_job_line ".github/workflows/ci.yml" "macos" \
 assert_job_line ".github/workflows/ci.yml" "macos" \
   "          bash -n tests/live_macos_file_provider.sh"
 assert_job_line ".github/workflows/ci.yml" "macos" \
+  "          bash -n tests/live_macos_connector_file_provider.sh"
+assert_job_line ".github/workflows/ci.yml" "macos" \
   "          self_test_output=\"\$(LOCALITY_MACOS_FILE_PROVIDER_HARNESS_SELF_TEST=1 tests/live_macos_file_provider.sh)\""
 
 assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "file-provider-live" \
@@ -70,6 +72,22 @@ assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "file-provi
   "            --no-reset-domain \\"
 assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "file-provider-live" \
   "        run: tests/live_macos_file_provider.sh"
+assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "connector-file-provider-live" \
+  "        run: tests/live_macos_connector_file_provider.sh"
+assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "slack-file-provider-live" \
+  "        run: tests/live_macos_connector_file_provider.sh"
+assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "slack-file-provider-live" \
+  '          gh api "repos/$GITHUB_REPOSITORY/environments/connector-live-e2e/secrets/public-key" >/dev/null'
+assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "slack-file-provider-live" \
+  '        run: echo "LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT=$RUNNER_TEMP/locality-slack-macos-credential.json" >> "$GITHUB_ENV"'
+assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "granola-file-provider-live" \
+  "        run: tests/live_macos_connector_file_provider.sh"
+grep -Fqx "export LOCALITY_CREDENTIAL_STORE=file" "$ROOT/tests/live_macos_file_provider.sh" ||
+  fail "macOS live harness must use its isolated file credential store"
+grep -Fqx "  group: locality-live-secret-consumers" "$ROOT/.github/workflows/macos-file-provider-live-e2e.yml" ||
+  fail "macOS provider workflow must serialize live secret consumers"
+grep -Fqx "  group: locality-live-secret-consumers" "$ROOT/.github/workflows/connector-live-e2e.yml" ||
+  fail "connector workflow must serialize live secret consumers"
 
 assert_job_line ".github/workflows/e2e.yml" "linux-fuse" "    runs-on: ubuntu-latest"
 assert_job_line ".github/workflows/e2e.yml" "linux-fuse" \
@@ -78,11 +96,19 @@ assert_job_line ".github/workflows/e2e.yml" "linux-fuse" \
 assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
   "          bash -n tests/live_connector_common.sh"
 assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
+  "        run: cargo build -p loc-cli -p localityd"
+assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
   "          bash -n tests/live_connector_common_selftest.sh"
 assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
   "          bash -n tests/live_google_docs_mutation_scenario.sh"
 assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
   "          bash -n tests/live_gmail_vfs_roundtrip.sh"
+assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
+  "          python3 tests/live_connector_matrix.py validate"
+assert_job_line ".github/workflows/connector-live-e2e.yml" "harness-selftest" \
+  "          python3 tests/live_provider_connector_scenario_selftest.py"
+assert_job_line ".github/workflows/connector-live-e2e.yml" "gmail-live" \
+  '          LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ runner.temp }}/locality-gmail-live-credential.json'
 
 assert_job_line ".github/workflows/notion-live-e2e.yml" "linux-fuse-live" "    runs-on: ubuntu-latest"
 assert_job_line ".github/workflows/notion-live-e2e.yml" "linux-fuse-live" \
@@ -91,6 +117,8 @@ assert_job_line ".github/workflows/notion-live-e2e.yml" "linux-fuse-live" \
 assert_job_line ".github/workflows/granola-live-e2e.yml" "linux-fuse-live" "    runs-on: ubuntu-latest"
 assert_job_line ".github/workflows/granola-live-e2e.yml" "linux-fuse-live" \
   "        run: tests/run_linux_fuse_ci.sh tests/live_granola_vfs_read.sh"
+assert_job_line ".github/workflows/granola-live-e2e.yml" "windows-cloud-files-live" \
+  "        run: ./tests/windows_connector_cloud_files_live.ps1 -Connector granola"
 
 connector_jobs=(
   "google-docs-live"
@@ -115,6 +143,24 @@ for index in "${!connector_jobs[@]}"; do
     "        run: tests/run_linux_fuse_ci.sh $script"
   assert_job_omits ".github/workflows/connector-live-e2e.yml" "$job" "continue-on-error"
 done
+assert_job_line ".github/workflows/connector-live-e2e.yml" "slack-windows-cloud-files-live" \
+  '          gh api "repos/$GITHUB_REPOSITORY/environments/connector-live-e2e/secrets/public-key" >/dev/null'
+assert_job_line ".github/workflows/connector-live-e2e.yml" "linear-windows-cloud-files-live" \
+  "    needs: linear-live"
+
+windows_connector_jobs=(
+  "gmail-windows-cloud-files-live:gmail"
+  "slack-windows-cloud-files-live:slack"
+  "linear-windows-cloud-files-live:linear"
+)
+for entry in "${windows_connector_jobs[@]}"; do
+  job="${entry%%:*}"
+  connector="${entry#*:}"
+  assert_job_line ".github/workflows/connector-live-e2e.yml" "$job" "    runs-on: windows-latest"
+  assert_job_line ".github/workflows/connector-live-e2e.yml" "$job" \
+    "        run: ./tests/windows_connector_cloud_files_live.ps1 -Connector $connector"
+  assert_job_omits ".github/workflows/connector-live-e2e.yml" "$job" "continue-on-error"
+done
 
 for workflow in \
   ".github/workflows/connector-live-e2e.yml" \
@@ -130,11 +176,37 @@ done
 
 for dependency in \
   '      - "tests/live_google_docs_mutation_scenario.sh"' \
+  '      - "tests/live_connector_scenarios.json"' \
+  '      - "tests/live_connector_matrix.py"' \
+  '      - "tests/live_provider_connector_scenario.py"' \
+  '      - "tests/live_provider_connector_scenario_selftest.py"' \
+  '      - "tests/windows_connector_cloud_files_live.ps1"' \
   '      - "tests/resolve_linear_live_issue.py"' \
   '      - "tests/resolve_linear_live_issue_selftest.sh"'; do
   grep -Fqx "$dependency" "$ROOT/.github/workflows/connector-live-e2e.yml" ||
     fail ".github/workflows/connector-live-e2e.yml push paths must include $dependency"
 done
+
+python3 "$ROOT/tests/live_connector_matrix.py" validate >/dev/null
+python3 "$ROOT/tests/live_connector_matrix_selftest.py" >/dev/null
+for connector in gmail slack linear granola; do
+  for platform in linux-fuse macos-file-provider windows-cloud-files; do
+    python3 "$ROOT/tests/live_connector_matrix.py" get "$connector" "scenarios.$platform" >/dev/null
+  done
+done
+if grep -Eq '"google-(docs|calendar)"[[:space:]]*:' "$ROOT/tests/live_connector_scenarios.json"; then
+  fail "shared parity matrix must exclude Google Docs and Google Calendar"
+fi
+grep -Fq "def cleanup(self)" "$ROOT/tests/live_provider_connector_scenario.py" ||
+  fail "provider runner must retain its strict cleanup hook"
+grep -Fq "def _sanitize(self" "$ROOT/tests/live_provider_connector_scenario.py" ||
+  fail "provider runner must retain privacy-safe diagnostics"
+grep -Fq "export_gmail_credential_if_requested" "$ROOT/tests/live_gmail_vfs_roundtrip.sh" ||
+  fail "Gmail FUSE live scenario must hand its current credential to later consumers"
+if grep -Fq "LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT requires LOCALITY_LIVE_FORCE_OAUTH_REFRESH=1" \
+  "$ROOT/tests/live_gmail_vfs_roundtrip.sh"; then
+  fail "Gmail FUSE credential handoff must also support transparent refresh"
+fi
 
 # Slack refresh tokens are single-use. Every live run must force refresh,
 # export the replacement, and persist it even if a later live assertion fails.
@@ -146,6 +218,8 @@ assert_job_line ".github/workflows/connector-live-e2e.yml" "slack-live" \
   '        if: ${{ always() }}'
 assert_job_line ".github/workflows/connector-live-e2e.yml" "slack-live" \
   "            gh api \"repos/\$GITHUB_REPOSITORY/environments/connector-live-e2e/secrets/public-key\" \\"
+assert_job_line ".github/workflows/connector-live-e2e.yml" "slack-windows-cloud-files-live" \
+  '        run: '\''"LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT=$env:RUNNER_TEMP\locality-slack-windows-credential.json" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'\'''
 
 grep -Fqx '  --privileged' "$ROOT/tests/run_linux_fuse_ci.sh" ||
   fail "Linux FUSE CI wrapper must keep Docker privileged mode enabled"

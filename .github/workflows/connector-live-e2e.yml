@@ -16,6 +16,12 @@ on:
       - "tests/run_linux_fuse_ci.sh"
       - "tests/live_connector_common.sh"
       - "tests/live_connector_common_selftest.sh"
+      - "tests/live_connector_scenarios.json"
+      - "tests/live_connector_matrix.py"
+      - "tests/live_connector_matrix_selftest.py"
+      - "tests/live_provider_connector_scenario.py"
+      - "tests/live_provider_connector_scenario_selftest.py"
+      - "tests/windows_connector_cloud_files_live.ps1"
       - "tests/live_google_docs_mutation_scenario.sh"
       - "tests/live_google_docs_vfs_roundtrip.sh"
       - "tests/live_google_calendar_vfs_roundtrip.sh"
@@ -39,7 +45,9 @@ on:
         type: boolean
 
 concurrency:
-  group: connector-live-e2e
+  # Shared with the manually dispatched macOS provider workflow so Slack's
+  # single-use refresh handle never has concurrent consumers.
+  group: locality-live-secret-consumers
   cancel-in-progress: false
 
 permissions:
@@ -54,6 +62,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Build harness binaries
+        run: cargo build -p loc-cli -p localityd
       - name: Install harness dependencies
         run: |
           sudo apt-get update
@@ -64,7 +74,15 @@ jobs:
           bash -n tests/live_connector_common_selftest.sh
           bash -n tests/live_google_docs_mutation_scenario.sh
           bash -n tests/live_gmail_vfs_roundtrip.sh
+          python3 -m py_compile \
+            tests/live_connector_matrix.py \
+            tests/live_connector_matrix_selftest.py \
+            tests/live_provider_connector_scenario.py \
+            tests/live_provider_connector_scenario_selftest.py
+          python3 tests/live_connector_matrix.py validate
+          python3 tests/live_connector_matrix_selftest.py
           LOCALITY_LIVE_COMMON_SELFTEST=1 tests/live_connector_common_selftest.sh
+          python3 tests/live_provider_connector_scenario_selftest.py
 
   google-docs-live:
     name: Google Docs Linux FUSE live e2e
@@ -278,8 +296,19 @@ jobs:
           LOCALITY_LIVE_GMAIL_VFS: "1"
           LOCALITY_LIVE_GMAIL_SEND: "1"
           LOCALITY_LIVE_FORCE_OAUTH_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
-          LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && format('{0}/locality-gmail-live-credential.json', runner.temp) || '' }}
+          LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ runner.temp }}/locality-gmail-live-credential.json
         run: tests/run_linux_fuse_ci.sh tests/live_gmail_vfs_roundtrip.sh
+      - name: Run Gmail connector live integrity
+        shell: bash
+        env:
+          LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON }}
+          ROTATED_CREDENTIAL_PATH: ${{ runner.temp }}/locality-gmail-live-credential.json
+        run: |
+          if [ -s "$ROTATED_CREDENTIAL_PATH" ]; then
+            LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON="$(cat "$ROTATED_CREDENTIAL_PATH")"
+            export LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON
+          fi
+          cargo test -p locality-gmail --test live_integrity -- --ignored --test-threads=1
       - name: Persist refreshed Gmail credential
         if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true }}
         shell: bash
@@ -357,6 +386,16 @@ jobs:
           LOCALITY_LIVE_FORCE_OAUTH_REFRESH: "1"
           LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ runner.temp }}/locality-slack-live-credential.json
         run: tests/run_linux_fuse_ci.sh tests/live_slack_vfs_read.sh
+      - name: Run Slack connector live integrity with refreshed credential
+        shell: bash
+        env:
+          ROTATED_CREDENTIAL_PATH: ${{ runner.temp }}/locality-slack-live-credential.json
+          LOCALITY_SLACK_LIVE_CONVERSATION_ID: ${{ secrets.LOCALITY_SLACK_LIVE_CONVERSATION_ID }}
+          LOCALITY_SLACK_LIVE_TYPES: ${{ secrets.LOCALITY_SLACK_LIVE_TYPES }}
+        run: |
+          [ -s "$ROTATED_CREDENTIAL_PATH" ] || { echo "::error::refreshed Slack credential is missing"; exit 1; }
+          LOCALITY_SLACK_LIVE_CREDENTIAL_JSON="$(cat "$ROTATED_CREDENTIAL_PATH")" \
+            cargo test -p locality-slack --test live_integrity -- --ignored --test-threads=1
       - name: Persist refreshed Slack credential
         if: ${{ always() }}
         shell: bash
@@ -433,3 +472,102 @@ jobs:
           LOCALITY_LINEAR_LIVE_ISSUE_ID: ${{ secrets.LOCALITY_LINEAR_LIVE_ISSUE_ID }}
           LOCALITY_LIVE_LINEAR_VFS: "1"
         run: tests/run_linux_fuse_ci.sh tests/live_linear_vfs_roundtrip.sh
+      - name: Run Linear connector live integrity
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          LOCALITY_LINEAR_LIVE_ISSUE_ID: ${{ secrets.LOCALITY_LINEAR_LIVE_ISSUE_ID }}
+        run: cargo test -p locality-linear --test live_integrity -- --ignored --test-threads=1
+
+  gmail-windows-cloud-files-live:
+    name: Gmail Windows Cloud Files live e2e
+    runs-on: windows-latest
+    timeout-minutes: 35
+    environment: connector-live-e2e
+    env:
+      LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON }}
+      LOCALITY_GMAIL_LIVE_TO_EMAIL: ${{ secrets.LOCALITY_GMAIL_LIVE_TO_EMAIL }}
+      LOCALITY_LIVE_CONNECTOR: gmail
+      LOCALITY_WINDOWS_CONNECTOR_CLOUD_FILES_LIVE: "1"
+      LOCALITY_WINDOWS_CLOUD_FILES_LIVE_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run Gmail real Cloud Files draft scenario
+        shell: pwsh
+        run: ./tests/windows_connector_cloud_files_live.ps1 -Connector gmail
+
+  linear-windows-cloud-files-live:
+    name: Linear Windows Cloud Files live e2e
+    needs: linear-live
+    runs-on: windows-latest
+    timeout-minutes: 35
+    environment: connector-live-e2e
+    env:
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+      LOCALITY_LINEAR_LIVE_ISSUE_ID: ${{ secrets.LOCALITY_LINEAR_LIVE_ISSUE_ID }}
+      LOCALITY_LIVE_CONNECTOR: linear
+      LOCALITY_WINDOWS_CONNECTOR_CLOUD_FILES_LIVE: "1"
+      LOCALITY_WINDOWS_CLOUD_FILES_LIVE_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run Linear real Cloud Files edit and restore scenario
+        shell: pwsh
+        run: ./tests/windows_connector_cloud_files_live.ps1 -Connector linear
+
+  slack-windows-cloud-files-live:
+    name: Slack Windows Cloud Files live e2e
+    needs: slack-live
+    runs-on: windows-latest
+    timeout-minutes: 35
+    environment: connector-live-e2e
+    env:
+      LOCALITY_SLACK_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_SLACK_LIVE_CREDENTIAL_JSON }}
+      LOCALITY_SLACK_LIVE_CONVERSATION_ID: ${{ secrets.LOCALITY_SLACK_LIVE_CONVERSATION_ID }}
+      LOCALITY_SLACK_LIVE_TYPES: ${{ secrets.LOCALITY_SLACK_LIVE_TYPES }}
+      LOCALITY_LIVE_CONNECTOR: slack
+      LOCALITY_LIVE_FORCE_OAUTH_REFRESH: "1"
+      LOCALITY_WINDOWS_CONNECTOR_CLOUD_FILES_LIVE: "1"
+      LOCALITY_WINDOWS_CLOUD_FILES_LIVE_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize Slack credential rotation path
+        shell: pwsh
+        run: '"LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT=$env:RUNNER_TEMP\locality-slack-windows-credential.json" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Preflight Slack credential rotation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
+        run: |
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::LOCALITY_SECRET_ROTATOR_TOKEN is required"; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/environments/connector-live-e2e/secrets/public-key" >/dev/null
+      - name: Run Slack real Cloud Files read-only scenario
+        shell: pwsh
+        run: ./tests/windows_connector_cloud_files_live.ps1 -Connector slack
+      - name: Persist refreshed Slack credential after Windows consumer
+        if: ${{ always() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
+        run: |
+          ROTATED_CREDENTIAL_PATH="${LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT:-}"
+          trap 'rm -f "$ROTATED_CREDENTIAL_PATH"' EXIT
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::LOCALITY_SECRET_ROTATOR_TOKEN is required"; exit 1; }
+          [ -s "$ROTATED_CREDENTIAL_PATH" ] || { echo "::error::refreshed Slack credential was not exported"; exit 1; }
+          gh secret set LOCALITY_SLACK_LIVE_CREDENTIAL_JSON \
+            --repo "$GITHUB_REPOSITORY" \
+            --env connector-live-e2e \
+            < "$ROTATED_CREDENTIAL_PATH"
