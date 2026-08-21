@@ -1750,10 +1750,18 @@ fn sandbox_init(options: SandboxInitArgs, json: bool) -> i32 {
             crate::sandbox::SandboxInitError::AmbiguousSandboxCredential,
         );
     }
-    // An explicit stdin flag selects the credential kind. Unrelated ambient
-    // credentials must not prevent a caller from supplying that explicit
-    // source, while the selected resolver still rejects its matching
-    // environment variable as a second source for the same credential.
+    // An explicit stdin flag selects the credential kind and source. Ignore
+    // ambient credentials, including the matching environment variable, so a
+    // caller can safely pipe an exported credential through stdin.
+    let bootstrap_environment = (!options.bootstrap_token_stdin)
+        .then_some(bootstrap_environment)
+        .flatten();
+    let profile_key_environment = (!options.profile_key_stdin)
+        .then_some(profile_key_environment)
+        .flatten();
+    let session_credential_environment = (!options.session_credential_stdin)
+        .then_some(session_credential_environment)
+        .flatten();
     let uses_profile_key =
         options.profile_key_stdin || (explicit_sources == 0 && profile_key_environment.is_some());
     let uses_session_credential = options.session_credential_stdin
