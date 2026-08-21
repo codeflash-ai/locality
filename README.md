@@ -105,6 +105,12 @@ credentials inside the agent sandbox.
   </tr>
 </table>
 
+<p align="center">
+  <img src="docs-site/images/locality-install-claude-demo.gif" alt="Install Locality, connect a Notion workspace, and use it directly from Claude" width="900">
+  <br>
+  <sub>Install Locality, connect your workspace, and use it directly from Claude.</sub>
+</p>
+
 ## One knowledge layer for you and your agents
 
 <table>
