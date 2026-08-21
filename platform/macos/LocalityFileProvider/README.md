@@ -71,7 +71,9 @@ Finder must enter the File Provider domain so directory listings call
 
 Mount activation signals the working-set enumerator after adding a source
 because macOS can ignore a root-container signal when no root enumerator is
-active. The working set recursively reads every already-known item from local
+active. It then resolves the new mount-point identifier so macOS materializes
+that source folder even when the root signal was dropped. The working set
+recursively reads every already-known item from local
 daemon state, without calling connector APIs, so macOS can ingest cached nested
 directories before Finder opens them. Compact sync anchors reference
 rebuildable item-version snapshots in the File Provider app-group cache;
@@ -99,6 +101,10 @@ state directory and a scratch Notion page, then verifies File Provider
 enumeration, hydration, an atomic `page.md.tmp.*` replacement, push, child-page
 create, rename, and delete. Cleanup archives scratch Notion content and refreshes
 the shared domain against an empty temporary state so the test mount disappears.
+The harness creates its isolated tree directly under short `/tmp` instead of
+Darwin's long per-user `TMPDIR`, and validates that `localityd.sock` fits the
+Darwin Unix-domain socket limit before registering a mount. Both primary and
+cleanup-daemon readiness failures emit redacted start, status, and log tails.
 
 The test deliberately does not register, unregister, or reset the shared `loc`
 domain. Run it only in a dedicated macOS user session with a signed test app

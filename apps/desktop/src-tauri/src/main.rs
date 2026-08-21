@@ -2421,7 +2421,7 @@ async fn push_notion_file(
 }
 
 #[tauri::command]
-async fn pull_notion_file(app: AppHandle, path: String) -> ActionReport {
+async fn pull_source(app: AppHandle, path: String) -> ActionReport {
     let report = match tauri::async_runtime::spawn_blocking(move || {
         let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
         match pull_target_direct(&target) {
@@ -10471,12 +10471,15 @@ fn running_daemon_build(state_root: &Path) -> Option<DaemonBuildInfo> {
 enum VirtualProjectionRefreshAction {
     Signal(String),
     ReimportThenSignal(String),
+    Resolve(String),
 }
 
 impl VirtualProjectionRefreshAction {
     fn identifier(&self) -> &str {
         match self {
-            Self::Signal(identifier) | Self::ReimportThenSignal(identifier) => identifier,
+            Self::Signal(identifier)
+            | Self::ReimportThenSignal(identifier)
+            | Self::Resolve(identifier) => identifier,
         }
     }
 }
@@ -10503,7 +10506,7 @@ fn run_virtual_projection_refresh_action(
             "warn",
             "file_provider.signal_failed",
             format!(
-                "could not signal {}:{} refresh: {error}",
+                "could not refresh {}:{}: {error}",
                 mount.mount_id.0,
                 action.identifier()
             ),
@@ -10533,6 +10536,7 @@ fn virtual_projection_mount_activation_refresh_actions(
             VirtualProjectionRefreshAction::Signal(ROOT_CONTAINER_IDENTIFIER.to_string()),
             VirtualProjectionRefreshAction::ReimportThenSignal(mount_point_identifier(mount)),
             VirtualProjectionRefreshAction::Signal("working-set".to_string()),
+            VirtualProjectionRefreshAction::Resolve(mount_point_identifier(mount)),
         ];
     }
     virtual_projection_refresh_actions(mount)
@@ -10565,7 +10569,23 @@ fn refresh_macos_virtual_projection(
             reimport_macos_virtual_projection(mount_id, identifier)
                 .or_else(|_| signal_macos_virtual_projection(mount_id, identifier))
         }
+        VirtualProjectionRefreshAction::Resolve(identifier) => {
+            resolve_macos_virtual_projection(mount_id, identifier)
+        }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_virtual_projection(mount_id: &str, identifier: &str) -> Result<(), String> {
+    let provider_identifier =
+        daemon_file_provider::macos_file_provider_item_identifier(mount_id, identifier);
+    run_macos_file_provider_refresh_action("resolve", &provider_identifier).map_err(
+        |resolve_error| {
+            format!(
+                "Could not materialize macOS File Provider item `{identifier}`: resolve failed: {resolve_error}"
+            )
+        },
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -14006,23 +14026,23 @@ fn pull_error_message(message: &str) -> String {
 
 fn pull_report_message(report: &PullReport) -> String {
     if !report.conflicts.is_empty() {
-        return "Pulled the latest Notion version and wrote conflict markers into the local file. Open the file, resolve the markers, then push again.".to_string();
+        return "Pulled the latest remote version and wrote conflict markers into the local file. Open the file, resolve the markers, then push again.".to_string();
     }
     if report.skipped_dirty > 0
         && (report.hydrated > 0 || report.enumerated > 0 || report.stubbed > 0)
     {
-        return "Synced available Notion updates and kept pending local edits unchanged. Use Push or Reset to remote for the pending files.".to_string();
+        return "Synced available remote updates and kept pending local edits unchanged. Use Push or Reset to remote for the pending files.".to_string();
     }
     if report.hydrated > 0 {
-        return "Synced the latest Notion version for this file.".to_string();
+        return "Synced the latest remote version for this file.".to_string();
     }
     if report.skipped_dirty > 0 {
         return "Locality kept your local edits because the file is still dirty. Review the diff, then push or reset the file to remote.".to_string();
     }
     if report.enumerated > 0 || report.stubbed > 0 {
-        return "Synced the latest Notion index for this mount.".to_string();
+        return "Synced the latest remote index for this source.".to_string();
     }
-    "Pulled the latest Notion content.".to_string()
+    "Pulled the latest remote content.".to_string()
 }
 
 fn reset_to_remote_message(report: &PullReport) -> String {
@@ -17372,7 +17392,7 @@ mod tests {
     }
 
     #[test]
-    fn macos_file_provider_mount_activation_uses_delta_aware_working_set() {
+    fn macos_file_provider_mount_activation_materializes_the_new_mount_point() {
         let mount = MountConfig::new(
             MountId::new("google-calendar-main"),
             "google-calendar",
@@ -17388,6 +17408,7 @@ mod tests {
                     "mount:google-calendar-main".to_string(),
                 ),
                 VirtualProjectionRefreshAction::Signal("working-set".to_string()),
+                VirtualProjectionRefreshAction::Resolve("mount:google-calendar-main".to_string(),),
             ]
         );
     }
@@ -20066,7 +20087,10 @@ mod tests {
             }],
         };
 
-        assert!(pull_report_message(&report).contains("conflict markers"));
+        assert_eq!(
+            pull_report_message(&report),
+            "Pulled the latest remote version and wrote conflict markers into the local file. Open the file, resolve the markers, then push again."
+        );
     }
 
     #[test]
@@ -20087,8 +20111,10 @@ mod tests {
 
         let message = pull_report_message(&report);
 
-        assert!(message.contains("Synced available Notion updates"));
-        assert!(message.contains("Reset to remote"));
+        assert_eq!(
+            message,
+            "Synced available remote updates and kept pending local edits unchanged. Use Push or Reset to remote for the pending files."
+        );
     }
 
     #[test]
@@ -22189,7 +22215,7 @@ fn main() {
             review_push_plan,
             push_to_notion,
             push_notion_file,
-            pull_notion_file,
+            pull_source,
             check_notion_file,
             keep_notion_file_as_draft,
             reset_notion_file_to_remote,

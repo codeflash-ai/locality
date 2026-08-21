@@ -533,10 +533,13 @@ impl Connector for NotionConnector {
     }
 
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {
+        if self.explicit_root_set || !self.explicit_root_page_ids.is_empty() {
+            portable::validate_configured_roots(&self.explicit_root_page_ids)?;
+        }
         let entries = list_container_children(
             self.api.as_ref(),
             request.mount_id,
-            self.config.root_page_id.as_ref(),
+            &self.explicit_root_page_ids,
             request.container,
             &request.parent_path,
         )?;

@@ -117,6 +117,10 @@ export function mountAccessLabel(mount: MountSummary): string {
   return mount.readOnly ? "Read only" : "Edit enabled";
 }
 
+export function mountManualSyncAvailable(mount: MountSummary): boolean {
+  return mount.localPath.trim().length > 0;
+}
+
 export function mountStatusLabel(mount: MountSummary): string {
   if (!isReadyStatus(mount.status)) {
     return titleFromStatus(mount.status);

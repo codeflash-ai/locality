@@ -63,6 +63,8 @@ assert_job_line ".github/workflows/ci.yml" "macos" \
   "          bash -n tests/live_macos_file_provider.sh"
 assert_job_line ".github/workflows/ci.yml" "macos" \
   "          bash -n tests/live_macos_connector_file_provider.sh"
+assert_job_line ".github/workflows/ci.yml" "macos" \
+  "          self_test_output=\"\$(LOCALITY_MACOS_FILE_PROVIDER_HARNESS_SELF_TEST=1 tests/live_macos_file_provider.sh)\""
 
 assert_job_line ".github/workflows/macos-file-provider-live-e2e.yml" "file-provider-live" \
   "    runs-on: [self-hosted, macOS, locality-file-provider]"

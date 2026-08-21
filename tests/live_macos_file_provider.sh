@@ -1,6 +1,109 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+darwin_socket_path_max_bytes=103
+
+create_short_tmp_root() {
+  # Darwin's per-user TMPDIR is long enough to overflow sockaddr_un.sun_path
+  # once localityd.sock is appended. /tmp is stable, private to this random
+  # directory, and leaves ample room for both the primary and repair daemons.
+  mktemp -d /tmp/loc-fp-live.XXXXXX
+}
+
+validate_daemon_socket_path() {
+  local state_dir="$1"
+  python3 - "$state_dir" "$darwin_socket_path_max_bytes" <<'PY'
+import os
+import pathlib
+import sys
+
+socket_path = pathlib.Path(sys.argv[1]) / "localityd.sock"
+actual = len(os.fsencode(socket_path))
+maximum = int(sys.argv[2])
+if actual > maximum:
+    print(
+        f"daemon socket path is {actual} bytes, exceeding Darwin's {maximum}-byte limit: "
+        f"{socket_path}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+}
+
+sanitize_diagnostic_file() {
+  local path="$1"
+  python3 - "$path" <<'PY'
+import os
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+token = os.environ.get("LOCALITY_E2E_REDACT_TOKEN", "")
+if token:
+    text = text.replace(token, "[REDACTED]")
+text = re.sub(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+    "[redacted-id]",
+    text,
+)
+text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[redacted-email]", text)
+print("\n".join(text.splitlines()[-160:]))
+PY
+}
+
+run_harness_self_test() {
+  command -v python3 >/dev/null 2>&1 || {
+    echo "live macOS File Provider harness self-test: missing required command: python3" >&2
+    return 1
+  }
+
+  local tmp_root boundary_root overlong_root diagnostic sanitized
+  tmp_root="$(create_short_tmp_root)"
+  case "$tmp_root" in
+    /tmp/loc-fp-live.*) ;;
+    *)
+      echo "live macOS File Provider harness self-test: allocator returned a non-short path" >&2
+      return 1
+      ;;
+  esac
+  validate_daemon_socket_path "$tmp_root/state"
+
+  boundary_root="$(python3 - "$darwin_socket_path_max_bytes" <<'PY'
+import sys
+
+maximum = int(sys.argv[1])
+suffix = "/localityd.sock"
+print("/" + "a" * (maximum - len(suffix) - 1))
+PY
+)"
+  overlong_root="${boundary_root}a"
+  validate_daemon_socket_path "$boundary_root"
+  if validate_daemon_socket_path "$overlong_root" 2>/dev/null; then
+    echo "live macOS File Provider harness self-test: accepted an overlong daemon socket" >&2
+    return 1
+  fi
+
+  diagnostic="$tmp_root/daemon.log"
+  printf '%s\n' \
+    'daemon failed for secret-token, user@example.com, 123e4567-e89b-12d3-a456-426614174000' \
+    >"$diagnostic"
+  sanitized="$(LOCALITY_E2E_REDACT_TOKEN=secret-token sanitize_diagnostic_file "$diagnostic")"
+  [[ "$sanitized" == 'daemon failed for [REDACTED], [redacted-email], [redacted-id]' ]] || {
+    echo "live macOS File Provider harness self-test: daemon diagnostic redaction failed" >&2
+    return 1
+  }
+  rm "$diagnostic"
+  rmdir "$tmp_root"
+
+  echo "ok: live macOS File Provider harness enforces short daemon socket paths"
+}
+
+if [[ "${LOCALITY_MACOS_FILE_PROVIDER_HARNESS_SELF_TEST:-}" == "1" ]]; then
+  run_harness_self_test
+  exit 0
+fi
+
 if [[ "${LOCALITY_MACOS_FILE_PROVIDER_LIVE:-}" != "1" ]]; then
   echo "skip: set LOCALITY_MACOS_FILE_PROVIDER_LIVE=1 to run the live macOS File Provider test"
   exit 0
@@ -94,7 +197,7 @@ if registered_version not in {short_version, build_version}:
     )
 PY
 
-tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-macos-file-provider-live.XXXXXX")"
+tmp_root="$(create_short_tmp_root)"
 state_root="$tmp_root/state"
 retired_state_root="$tmp_root/retired-state"
 # The dedicated runner has no interactive login keychain. Keep live-test
@@ -104,6 +207,10 @@ export LOCALITY_CREDENTIAL_STORE=file
 domain_report="$tmp_root/domain.json"
 connect_report="$tmp_root/connect.json"
 mount_report="$tmp_root/mount.json"
+daemon_start_report="$tmp_root/daemon-start.json"
+daemon_start_error="$tmp_root/daemon-start.stderr"
+daemon_status_report="$tmp_root/daemon-status.json"
+daemon_status_error="$tmp_root/daemon-status.stderr"
 pull_report="$tmp_root/pull.json"
 status_report="$tmp_root/status.json"
 push_report="$tmp_root/push.json"
@@ -289,8 +396,16 @@ PY
 }
 
 start_daemon() {
-  run_loc daemon start --session --state-dir "$state_root" --tcp-addr "$tcp_addr" \
-    --localityd-bin "$localityd_bin" --json >/dev/null
+  : >"$daemon_start_report"
+  : >"$daemon_start_error"
+  : >"$daemon_status_report"
+  : >"$daemon_status_error"
+  if ! run_loc daemon start --session --state-dir "$state_root" --tcp-addr "$tcp_addr" \
+    --localityd-bin "$localityd_bin" --json \
+    >"$daemon_start_report" 2>"$daemon_start_error"; then
+    emit_daemon_start_diagnostics
+    return 1
+  fi
   daemon_started=1
   local attempts="${LOCALITY_MACOS_FILE_PROVIDER_WAIT_ATTEMPTS:-120}"
   local index
@@ -298,11 +413,13 @@ start_daemon() {
     if run_with_timeout 10 env -u NOTION_TOKEN -u NOTION_AT \
       LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_TCP_ADDR="$tcp_addr" \
       "$loc_bin" daemon status --state-dir "$state_root" --tcp-addr "$tcp_addr" --json \
-      2>/dev/null | grep -Fq '"state": "running"'; then
+      >"$daemon_status_report" 2>"$daemon_status_error" \
+      && grep -Fq '"state": "running"' "$daemon_status_report"; then
       return 0
     fi
     sleep 0.5
   done
+  emit_daemon_start_diagnostics
   return 1
 }
 
@@ -566,24 +683,33 @@ raise SystemExit(0 if page.get("archived") or page.get("in_trash") else 1)
 PY
 }
 
+emit_sanitized_tail() {
+  local label="$1"
+  local path="$2"
+  [[ -s "$path" ]] || return 0
+  printf '%s: %s\n' "$label" "$path" >&2
+  LOCALITY_E2E_REDACT_TOKEN="$notion_token" sanitize_diagnostic_file "$path" >&2
+}
+
+emit_daemon_start_diagnostics() {
+  printf 'sanitized localityd readiness diagnostics for: %s\n' "$step" >&2
+  emit_sanitized_tail "daemon start report" "$daemon_start_report"
+  emit_sanitized_tail "daemon start stderr" "$daemon_start_error"
+  emit_sanitized_tail "last daemon status report" "$daemon_status_report"
+  emit_sanitized_tail "last daemon status stderr" "$daemon_status_error"
+  local log
+  while IFS= read -r log; do
+    emit_sanitized_tail "daemon log tail" "$log"
+  done < <(find "$state_root/logs" -type f -name '*.log' -print 2>/dev/null | sort)
+}
+
 emit_diagnostics() {
   printf 'live macOS File Provider test failed during: %s\n' "$step" >&2
   "$helper_bin" list --json >&2 || true
-  [[ ! -s "$status_report" ]] || { echo "last status report:" >&2; cat "$status_report" >&2; }
+  emit_sanitized_tail "last status report" "$status_report"
   local log
   while IFS= read -r log; do
-    echo "log tail: $log" >&2
-    LOCALITY_E2E_REDACT_TOKEN="$notion_token" python3 - "$log" <<'PY' >&2
-import os
-import pathlib
-import sys
-
-text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
-token = os.environ.get("LOCALITY_E2E_REDACT_TOKEN", "")
-if token:
-    text = text.replace(token, "[REDACTED]")
-print("\n".join(text.splitlines()[-160:]))
-PY
+    emit_sanitized_tail "log tail" "$log"
   done < <(find "$state_root/logs" -type f -name '*.log' -print 2>/dev/null | sort)
 }
 
@@ -692,6 +818,10 @@ cleanup() {
 }
 trap on_error ERR
 trap cleanup EXIT
+
+step="validating the isolated daemon socket path"
+validate_daemon_socket_path "$state_root" \
+  || fail "isolated state path cannot fit a Darwin localityd socket"
 
 step="checking the dedicated File Provider domain"
 "$helper_bin" list --json >"$domain_report"

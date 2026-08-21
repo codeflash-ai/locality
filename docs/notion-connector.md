@@ -266,8 +266,13 @@ Portable and direct enumeration can also use an explicit set of up to 16 page
 or full-page database roots. Those roots are retrieved by ID without search and
 are projected together by the same root allocator and recursive traversal as
 the desktop workspace view, including title collision suffixes. The configured
-and requested root sets must match exactly; empty, duplicate, overlapping, or
-ambiguous roots fail closed. Every set-mode source change carries exactly one
+and requested root sets must match exactly; empty, duplicate, or ambiguous
+roots fail closed. Nested selected roots are disjoint traversal boundaries: a
+parent traversal stops before a selected child page, database, or database row,
+and that child owns its separately projected subtree. Full enumeration and lazy
+filesystem child listings enforce the same boundary. This retains the union of
+selected content without duplicate provider reads, paths, or scope ownership.
+Every set-mode source change carries exactly one
 `SourceObject.edges` entry with relationship `locality_scope_root`. Recursive
 bootstrap uses the canonical owning root; portable V2 hint synchronization uses
 the exact root spelling from the request scope so host scope comparison remains
