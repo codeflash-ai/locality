@@ -294,9 +294,16 @@ enum SandboxCommand {
     Init(SandboxInitArgs),
 }
 
+const DEFAULT_SANDBOX_API_URL: &str = "https://api.dev.locality.dev";
+
 #[derive(Debug, Args)]
 struct SandboxInitArgs {
-    #[arg(long, value_name = "URL", help = "Locality backend API origin")]
+    #[arg(
+        long,
+        value_name = "URL",
+        default_value = DEFAULT_SANDBOX_API_URL,
+        help = "Locality backend API origin"
+    )]
     api_url: String,
     #[arg(
         long,
@@ -12067,6 +12074,19 @@ mod tests {
                 "--encoding",
                 "zstd",
                 "--bootstrap-token-stdin"
+            ]
+        );
+
+        let cli = parse_cli(["sandbox", "init", "--root", "/mnt/locality"]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "sandbox",
+                "init",
+                "--api-url",
+                super::DEFAULT_SANDBOX_API_URL,
+                "--root",
+                "/mnt/locality"
             ]
         );
 
