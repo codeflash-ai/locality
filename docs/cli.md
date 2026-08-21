@@ -73,10 +73,11 @@ Library callers cannot opt out accidentally: convenience sandbox, profile-key,
 session-credential, and generation-2 materialization APIs inspect the default
 state root, while `*_at_state_root` variants accept an explicit state root.
 
-An explicit sandbox credential stdin flag selects that credential kind even if
-the process has an unrelated sandbox credential environment variable. Multiple
-stdin flags, multiple environment-only credentials, or a stdin flag plus its
-matching environment variable remain usage errors.
+An explicit sandbox credential stdin flag selects that credential kind and
+takes precedence over all sandbox credential environment variables, including
+its matching variable. This lets callers pipe an exported credential through
+standard input without creating an ambiguous source. Multiple stdin flags and
+multiple environment-only credentials remain usage errors.
 
 For a remote Amika environment, the repository helper creates a fresh sandbox,
 checks out the current repository revision for scenario evidence, downloads the
