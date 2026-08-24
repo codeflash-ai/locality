@@ -788,7 +788,7 @@ fn google_docs_mount_guidance() -> String {
     format!(
         "{}\n\
 Google Docs facts:\n\
-- This mount uses Google Docs document access plus Google Drive `drive.file` and Drive metadata access.\n\
+- This mount uses Google Docs document access plus Google Drive `drive.file`; it does not request a Drive metadata scope.\n\
 - Pull enumerates Google Docs and Drive folders under the configured workspace folder, including Docs manually added inside the workspace folder.\n\
 - Non-Google-Docs Drive files are ignored by this connector in V1.\n",
         generic_mount_guidance("Google Docs")
