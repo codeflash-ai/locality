@@ -7,13 +7,11 @@
     "email",
     "profile",
     "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/drive.metadata.readonly"
+    "https://www.googleapis.com/auth/drive.file"
   ],
   "google_api_verification_scopes": [
     "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/drive.metadata.readonly"
+    "https://www.googleapis.com/auth/drive.file"
   ],
   "excluded_google_api_scopes": [
     "https://www.googleapis.com/auth/drive",
@@ -33,7 +31,6 @@
   "least_privilege_notes": [
     "documents is required because Locality reads Google Docs body content and applies body edits through the Google Docs API.",
     "drive.file is required because Locality creates Google Docs and mutates app-created or explicitly granted Drive files for rename, move, and trash workflows.",
-    "drive.metadata.readonly is required because Locality discovers the workspace folder, lists child folders and Docs files, and records Drive metadata such as names, parents, modified time, versions, and trash state.",
     "drive.metadata is not requested because writable Drive metadata access beyond app-created or explicitly granted files is not needed; app-file writes are covered by drive.file.",
     "Full Drive, Drive readonly, and Docs readonly scopes are not requested by the runtime OAuth profile and must not be submitted for Google Docs verification."
   ]
