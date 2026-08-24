@@ -306,6 +306,7 @@ fn google_docs_oauth_verification_scope_manifest_matches_runtime_profile() {
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/drive.readonly",
         "https://www.googleapis.com/auth/drive.metadata",
+        "https://www.googleapis.com/auth/drive.metadata.readonly",
         "https://www.googleapis.com/auth/documents.readonly",
     ] {
         assert!(

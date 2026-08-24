@@ -995,15 +995,23 @@ mod tests {
             ))
         );
 
-        let mut docs = hosted_scope_strings(OAuthConnector::GoogleDocs);
-        docs.push("https://www.googleapis.com/auth/drive.metadata.readonly".to_string());
+        for restricted_drive_scope in [
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/drive.metadata",
+            "https://www.googleapis.com/auth/drive.metadata.readonly",
+        ] {
+            let mut docs = hosted_scope_strings(OAuthConnector::GoogleDocs);
+            docs.push(restricted_drive_scope.to_string());
 
-        assert_eq!(
-            validate_google_oauth_scopes(OAuthConnector::GoogleDocs, &docs),
-            Err(GoogleOAuthScopeError::UnsupportedScope(
-                "https://www.googleapis.com/auth/drive.metadata.readonly".to_string()
-            ))
-        );
+            assert_eq!(
+                validate_google_oauth_scopes(OAuthConnector::GoogleDocs, &docs),
+                Err(GoogleOAuthScopeError::UnsupportedScope(
+                    restricted_drive_scope.to_string()
+                )),
+                "{restricted_drive_scope} must be rejected"
+            );
+        }
 
         let mut gmail = hosted_scope_strings(OAuthConnector::Gmail);
         gmail.push(GMAIL_FULL_MAILBOX_SCOPE.to_string());

@@ -29,13 +29,22 @@ The broker uses the shared `LOCALITY_GOOGLE_CLIENT_ID` and
 Gmail. The Google OAuth client must allow all Google connector localhost
 callbacks.
 
-`documents` is used for Google Docs body read/write. `drive.file` keeps write
-access limited to app-created or explicitly granted files. Locality does not
-request Drive metadata scopes beyond the app-file write access covered by
-`drive.file`.
+`documents` is used for Google Docs body read/write. `drive.file` keeps access
+limited to files Locality created or that the user explicitly granted. It does
+not allow arbitrary workspace-folder discovery or Drive metadata hydration.
 
-The connector still keeps enumeration scoped to the mount workspace folder. It
-does not expose arbitrary Drive traversal as a Locality mount.
+The current `--workspace-folder` mount is a legacy folder mount: it can operate
+only on app-created Docs or Docs explicitly granted by the user (for example,
+through Google Picker outside the current mount setup), and must not promise
+visibility of every file in that folder. A Picker-based selected-document
+migration is forthcoming; it is not part of the current mount setup.
+
+Google can return the canonical
+`https://www.googleapis.com/auth/userinfo.email` and
+`https://www.googleapis.com/auth/userinfo.profile` identity aliases in a broker
+response. Locality accepts those aliases while requiring `documents` and
+`drive.file`, and rejects restricted Drive scopes including
+`drive.metadata.readonly`.
 
 ## Google OAuth Verification
 
@@ -51,12 +60,11 @@ Do not submit full Drive, Drive readonly, writable Drive metadata, or Docs
 readonly scopes for this connector.
 
 The verification demo should show the OAuth consent screen with all requested
-permissions readable, then demonstrate the code-backed user workflows: mounting
-and enumerating the Drive workspace folder, reading a Google Doc body, editing
-an existing Doc body, creating a new Google Doc, renaming and moving a Doc if
-those workflows are exposed, and archiving or trashing a Doc if that workflow is
-enabled. For every write shown in Locality, show the resulting change in the
-user's Google Drive or Google Docs account.
+permissions readable, then demonstrate only Docs that Locality created or that
+the user explicitly granted: reading a body, editing an existing Doc, and
+creating a new Doc. Do not present the legacy folder mount as arbitrary Drive
+discovery or metadata hydration. For every write shown in Locality, show the
+resulting change in the user's Google Drive or Google Docs account.
 
 ## Projection
 
