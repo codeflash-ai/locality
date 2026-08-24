@@ -249,9 +249,9 @@ fn source_descriptors_match_manifest_defaults_and_projection_policy() {
 #[test]
 fn google_docs_oauth_verification_scope_manifest_matches_runtime_profile() {
     assert!(
-        GOOGLE_DOCS_OAUTH_SCOPES
+        !GOOGLE_DOCS_OAUTH_SCOPES
             .contains(&"https://www.googleapis.com/auth/drive.metadata.readonly"),
-        "Google Docs should request readonly Drive metadata for discovery"
+        "Google Docs must not request readonly Drive metadata"
     );
     assert!(
         !GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive.metadata"),
