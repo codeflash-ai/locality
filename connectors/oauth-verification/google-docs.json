@@ -22,10 +22,10 @@
   ],
   "demo_must_show": [
     "OAuth consent flow for Locality with all visible requested permissions expanded and readable.",
-    "Selecting only Google Docs that Locality created or that the user explicitly granted through Google Picker, then mounting that selected set.",
-    "Opening a selected Google Doc in Locality to show its body is read through the Google Docs API.",
-    "Editing a selected Google Doc body from Locality and showing the changed content in the user's Google Docs account.",
-    "Creating a Google Doc within the selected set and showing its new body content in the user's Google Docs account."
+    "Mounting a narrow Google Docs workspace through the existing workspace-folder flow, containing only a Doc that Locality created or that the user explicitly granted to the app.",
+    "Opening the mounted Google Doc in Locality to show its body is read through the Google Docs API.",
+    "Editing the mounted Google Doc body from Locality and showing the changed content in the user's Google Docs account.",
+    "Creating a Google Doc through Locality and showing its new body content in the user's Google Docs account."
   ],
   "least_privilege_notes": [
     "documents is required because Locality reads Google Docs body content and applies body edits through the Google Docs API.",
