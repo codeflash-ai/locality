@@ -22,12 +22,10 @@
   ],
   "demo_must_show": [
     "OAuth consent flow for Locality with all visible requested permissions expanded and readable.",
-    "Mounting a Google Docs workspace folder and showing Locality enumerating Drive folders and Google Docs files under that folder.",
-    "Opening a pulled Google Doc in Locality to show Drive metadata and Google Docs body content are read.",
-    "Editing an existing Google Doc body from Locality and showing the changed content in the user's Google Docs account.",
-    "Renaming and, if exposed in the recorded workflow, moving a Google Doc from Locality and showing the Drive title or parent-folder change in the user's Google Drive account.",
-    "Creating a new Google Doc from Locality and showing the new document and body content in the user's Google Drive or Google Docs account.",
-    "Archiving or deleting a Google Doc from Locality and showing the file moved to Google Drive Trash if that user-facing workflow is enabled in the recorded app."
+    "Selecting only Google Docs that Locality created or that the user explicitly granted through Google Picker, then mounting that selected set.",
+    "Opening a selected Google Doc in Locality to show its body is read through the Google Docs API.",
+    "Editing a selected Google Doc body from Locality and showing the changed content in the user's Google Docs account.",
+    "Creating a Google Doc within the selected set and showing its new body content in the user's Google Docs account."
   ],
   "least_privilege_notes": [
     "documents is required because Locality reads Google Docs body content and applies body edits through the Google Docs API.",
