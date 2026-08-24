@@ -91,6 +91,29 @@ fn replies_terminal_page() -> HostedSlackRepliesPageV1 {
     page
 }
 
+#[test]
+fn poll_pages_accept_dm_conversation_ids() {
+    let mut history = history_page();
+    history.channel_id = "D08DIRECT1".to_string();
+    for message in &mut history.messages {
+        message.message.channel_id = history.channel_id.clone();
+    }
+    for file in &mut history.files {
+        file.channel_id = history.channel_id.clone();
+    }
+    history.validate().expect("valid DM history page");
+
+    let mut replies = replies_page();
+    replies.channel_id = "D08DIRECT1".to_string();
+    for message in &mut replies.messages {
+        message.channel_id = replies.channel_id.clone();
+    }
+    for file in &mut replies.files {
+        file.channel_id = replies.channel_id.clone();
+    }
+    replies.validate().expect("valid DM replies page");
+}
+
 fn catch_up_page() -> HostedSlackHistoryPageV1 {
     let mut page = history_page();
     page.phase = HostedSlackPollPhaseV1::CatchUpHistory;

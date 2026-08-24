@@ -133,7 +133,27 @@ fn hosted_slack_ids_are_bounded_and_canonical() {
             "accepted malformed team ID {malformed}"
         );
     }
-    for malformed in ["D08DIRECT1", "c08ENGINEER1", "C08-engineer", "G CHANNEL"] {
+    let mut selector = hosted_selector();
+    selector.channel_id = "D08DIRECT1".to_string();
+    selector.sharing = SlackChannelSharingClassification::Private;
+    selector.validate().expect("valid hosted Slack DM selector");
+
+    for sharing in [
+        SlackChannelSharingClassification::Public,
+        SlackChannelSharingClassification::ExternallySharedPublic,
+        SlackChannelSharingClassification::ExternallySharedPrivate,
+    ] {
+        let mut selector = hosted_selector();
+        selector.channel_id = "D08DIRECT1".to_string();
+        selector.sharing = sharing;
+        assert_eq!(
+            selector.validate(),
+            Err(ScopeContractError::InvalidSlackId("channel_id")),
+            "accepted DM selector with {sharing:?} sharing"
+        );
+    }
+
+    for malformed in ["E08LOCALITY1", "c08ENGINEER1", "C08-engineer", "G CHANNEL"] {
         let mut selector = hosted_selector();
         selector.channel_id = malformed.to_string();
         assert_eq!(

@@ -1,6 +1,6 @@
-use locality_protocol::SlackInstallationId;
+use locality_protocol::{SlackChannelSharingClassification, SlackInstallationId};
 use locality_slack::portable::hosted::{
-    HostedSlackInstallationBinding, HostedSlackNativeSnapshot,
+    HostedSlackConversationKindV1, HostedSlackInstallationBinding, HostedSlackNativeSnapshot,
     HostedSlackObservedInstallationIdentity, HostedSlackPortableError,
     MAX_HOSTED_SLACK_MESSAGE_FILES, MAX_HOSTED_SLACK_MESSAGE_TEXT_BYTES,
     MAX_HOSTED_SLACK_RAW_JSON_BYTES, MAX_HOSTED_SLACK_SNAPSHOT_REFERENCES,
@@ -241,6 +241,104 @@ fn channel_rename_does_not_change_stable_identity() {
     assert_ne!(
         before.channel_identity(),
         other_installation.channel_identity()
+    );
+}
+
+#[test]
+fn hosted_conversation_kind_defaults_for_legacy_raw_and_validates_channel_ids() {
+    assert_eq!(
+        HostedSlackConversationKindV1::PublicChannel.root_folder(),
+        "channels"
+    );
+    assert_eq!(
+        HostedSlackConversationKindV1::PrivateChannel.root_folder(),
+        "private-channels"
+    );
+    assert_eq!(HostedSlackConversationKindV1::Im.root_folder(), "dms");
+    assert_eq!(
+        HostedSlackConversationKindV1::Mpim.root_folder(),
+        "group-dms"
+    );
+    assert_eq!(
+        HostedSlackConversationKindV1::PublicChannel.source_scope_kind(),
+        "slack_channel"
+    );
+    assert_eq!(
+        HostedSlackConversationKindV1::PrivateChannel.source_scope_kind(),
+        "slack_channel"
+    );
+    assert_eq!(
+        HostedSlackConversationKindV1::Im.source_scope_kind(),
+        "slack_dm"
+    );
+    assert_eq!(
+        HostedSlackConversationKindV1::Mpim.source_scope_kind(),
+        "slack_group_dm"
+    );
+
+    let legacy = decode_fixture::<RawHostedSlackNativeSnapshot>(NATIVE_RAW);
+    assert_eq!(
+        legacy.channel.conversation_kind,
+        HostedSlackConversationKindV1::PublicChannel
+    );
+    let legacy_snapshot =
+        HostedSlackNativeSnapshot::try_from(legacy).expect("legacy public channel fixture");
+    assert_eq!(
+        legacy_snapshot.channel().conversation_kind(),
+        HostedSlackConversationKindV1::PublicChannel
+    );
+
+    for (kind, valid_id, sharing) in [
+        (
+            HostedSlackConversationKindV1::PublicChannel,
+            "C08PUBLIC01",
+            SlackChannelSharingClassification::Public,
+        ),
+        (
+            HostedSlackConversationKindV1::PrivateChannel,
+            "G08PRIVATE1",
+            SlackChannelSharingClassification::Private,
+        ),
+        (
+            HostedSlackConversationKindV1::Im,
+            "D08DIRECT01",
+            SlackChannelSharingClassification::Private,
+        ),
+        (
+            HostedSlackConversationKindV1::Mpim,
+            "G08GROUPDM1",
+            SlackChannelSharingClassification::Private,
+        ),
+    ] {
+        let mut raw = raw_snapshot();
+        raw.channel.conversation_kind = kind;
+        raw.channel.id = valid_id.to_string();
+        raw.channel.sharing = sharing;
+        for message in &mut raw.messages {
+            message.channel_id = valid_id.to_string();
+        }
+        for thread in &mut raw.threads {
+            thread.channel_id = valid_id.to_string();
+        }
+        for file in &mut raw.files {
+            file.channel_id = valid_id.to_string();
+        }
+        let snapshot = HostedSlackNativeSnapshot::try_from(raw).expect("valid conversation kind");
+        assert_eq!(snapshot.channel().conversation_kind(), kind);
+    }
+
+    let mut dm_with_channel_id = raw_snapshot();
+    dm_with_channel_id.channel.conversation_kind = HostedSlackConversationKindV1::Im;
+    assert_eq!(
+        HostedSlackNativeSnapshot::try_from(dm_with_channel_id),
+        Err(HostedSlackPortableError::InvalidSlackId("channel.id"))
+    );
+
+    let mut channel_with_dm_id = raw_snapshot();
+    channel_with_dm_id.channel.id = "D08DIRECT01".to_string();
+    assert_eq!(
+        HostedSlackNativeSnapshot::try_from(channel_with_dm_id),
+        Err(HostedSlackPortableError::InvalidSlackId("channel.id"))
     );
 }
 

@@ -5,8 +5,9 @@ use locality_protocol::{SlackChannelSharingClassification, SlackInstallationId};
 use serde::{Deserialize, Serialize};
 
 use super::identity::{
-    HostedSlackPortableError, validate_bounded_metadata_text, validate_bounded_text,
-    validate_collection_len, validate_slack_id,
+    HOSTED_SLACK_CONVERSATION_ID_PREFIXES, HostedSlackPortableError,
+    validate_bounded_metadata_text, validate_bounded_text, validate_collection_len,
+    validate_slack_id,
 };
 
 pub const MAX_HOSTED_SLACK_NAME_BYTES: usize = 512;
@@ -18,6 +19,44 @@ pub const MAX_HOSTED_SLACK_THREAD_REPLIES: usize = 4 * 1024;
 pub const MAX_HOSTED_SLACK_RAW_JSON_BYTES: usize = 1024 * 1024;
 pub const MAX_HOSTED_SLACK_SNAPSHOT_STRING_BYTES: usize = 256 * 1024;
 pub const MAX_HOSTED_SLACK_SNAPSHOT_REFERENCES: usize = 2 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedSlackConversationKindV1 {
+    PublicChannel,
+    PrivateChannel,
+    Im,
+    Mpim,
+}
+
+impl HostedSlackConversationKindV1 {
+    pub const fn root_folder(self) -> &'static str {
+        match self {
+            Self::PublicChannel => "channels",
+            Self::PrivateChannel => "private-channels",
+            Self::Im => "dms",
+            Self::Mpim => "group-dms",
+        }
+    }
+
+    pub const fn source_scope_kind(self) -> &'static str {
+        match self {
+            Self::PublicChannel | Self::PrivateChannel => "slack_channel",
+            Self::Im => "slack_dm",
+            Self::Mpim => "slack_group_dm",
+        }
+    }
+}
+
+impl Default for HostedSlackConversationKindV1 {
+    fn default() -> Self {
+        Self::PublicChannel
+    }
+}
+
+fn is_default_hosted_slack_conversation_kind(value: &HostedSlackConversationKindV1) -> bool {
+    *value == HostedSlackConversationKindV1::PublicChannel
+}
 
 pub fn decode_and_sanitize_hosted_slack_native_snapshot(
     bytes: &[u8],
@@ -38,6 +77,11 @@ pub fn decode_and_sanitize_hosted_slack_native_snapshot(
 pub struct RawHostedSlackChannel {
     pub team_id: String,
     pub id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_hosted_slack_conversation_kind"
+    )]
+    pub conversation_kind: HostedSlackConversationKindV1,
     pub name: String,
     pub topic: Option<String>,
     pub purpose: Option<String>,
@@ -115,6 +159,8 @@ pub struct RawHostedSlackNativeSnapshot {
 pub struct HostedSlackChannel {
     team_id: String,
     channel_id: String,
+    #[serde(skip_serializing_if = "is_default_hosted_slack_conversation_kind")]
+    conversation_kind: HostedSlackConversationKindV1,
     name: String,
     topic: Option<String>,
     purpose: Option<String>,
@@ -130,6 +176,10 @@ impl HostedSlackChannel {
 
     pub fn channel_id(&self) -> &str {
         &self.channel_id
+    }
+
+    pub fn conversation_kind(&self) -> HostedSlackConversationKindV1 {
+        self.conversation_kind
     }
 
     pub fn name(&self) -> &str {
@@ -162,7 +212,16 @@ impl TryFrom<RawHostedSlackChannel> for HostedSlackChannel {
 
     fn try_from(raw: RawHostedSlackChannel) -> Result<Self, Self::Error> {
         validate_slack_id("channel.team_id", &raw.team_id, b"T")?;
-        validate_slack_id("channel.id", &raw.id, b"CG")?;
+        let channel_id_prefixes: &[u8] = match raw.conversation_kind {
+            HostedSlackConversationKindV1::PublicChannel => b"C",
+            HostedSlackConversationKindV1::PrivateChannel => b"CG",
+            HostedSlackConversationKindV1::Im => b"D",
+            HostedSlackConversationKindV1::Mpim => b"G",
+        };
+        validate_slack_id("channel.id", &raw.id, channel_id_prefixes)?;
+        if !conversation_kind_matches_sharing(raw.conversation_kind, raw.sharing) {
+            return Err(HostedSlackPortableError::InvalidSlackId("channel.sharing"));
+        }
         validate_bounded_metadata_text("channel.name", &raw.name, MAX_HOSTED_SLACK_NAME_BYTES)?;
         validate_optional_metadata_text(
             "channel.topic",
@@ -183,6 +242,7 @@ impl TryFrom<RawHostedSlackChannel> for HostedSlackChannel {
         Ok(Self {
             team_id: raw.team_id,
             channel_id: raw.id,
+            conversation_kind: raw.conversation_kind,
             name: raw.name,
             topic: raw.topic,
             purpose: raw.purpose,
@@ -190,6 +250,23 @@ impl TryFrom<RawHostedSlackChannel> for HostedSlackChannel {
             updated_at,
             sharing: raw.sharing,
         })
+    }
+}
+
+fn conversation_kind_matches_sharing(
+    conversation_kind: HostedSlackConversationKindV1,
+    sharing: SlackChannelSharingClassification,
+) -> bool {
+    match conversation_kind {
+        HostedSlackConversationKindV1::PublicChannel => true,
+        HostedSlackConversationKindV1::PrivateChannel => matches!(
+            sharing,
+            SlackChannelSharingClassification::Private
+                | SlackChannelSharingClassification::ExternallySharedPrivate
+        ),
+        HostedSlackConversationKindV1::Im | HostedSlackConversationKindV1::Mpim => {
+            sharing == SlackChannelSharingClassification::Private
+        }
     }
 }
 
@@ -317,7 +394,11 @@ impl TryFrom<RawHostedSlackMessage> for HostedSlackMessage {
     type Error = HostedSlackPortableError;
 
     fn try_from(raw: RawHostedSlackMessage) -> Result<Self, Self::Error> {
-        validate_slack_id("message.channel_id", &raw.channel_id, b"CG")?;
+        validate_slack_id(
+            "message.channel_id",
+            &raw.channel_id,
+            HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+        )?;
         validate_slack_timestamp("message.ts", &raw.ts)?;
         if let Some(thread_ts) = &raw.thread_ts {
             validate_slack_timestamp("message.thread_ts", thread_ts)?;
@@ -377,7 +458,11 @@ impl TryFrom<RawHostedSlackThread> for HostedSlackThread {
     type Error = HostedSlackPortableError;
 
     fn try_from(raw: RawHostedSlackThread) -> Result<Self, Self::Error> {
-        validate_slack_id("thread.channel_id", &raw.channel_id, b"CG")?;
+        validate_slack_id(
+            "thread.channel_id",
+            &raw.channel_id,
+            HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+        )?;
         validate_slack_timestamp("thread.root_ts", &raw.root_ts)?;
         validate_collection_len(
             "thread.reply_ts",
@@ -477,7 +562,11 @@ impl TryFrom<RawHostedSlackFileMetadata> for HostedSlackFileMetadata {
     type Error = HostedSlackPortableError;
 
     fn try_from(raw: RawHostedSlackFileMetadata) -> Result<Self, Self::Error> {
-        validate_slack_id("file.channel_id", &raw.channel_id, b"CG")?;
+        validate_slack_id(
+            "file.channel_id",
+            &raw.channel_id,
+            HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+        )?;
         validate_slack_id("file.id", &raw.id, b"F")?;
         if let Some(user_id) = &raw.user_id {
             validate_slack_id("file.user_id", user_id, b"UW")?;

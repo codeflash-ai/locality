@@ -149,6 +149,7 @@ pub enum HostedSlackDocumentKindV1 {
     Channel,
     Thread,
     FileMetadata,
+    Users,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -367,6 +368,21 @@ pub fn render_hosted_slack_projection_v1(
         paths,
         documents,
     })
+}
+
+pub fn render_hosted_slack_users_v1(
+    users: &[HostedSlackUser],
+) -> Result<HostedSlackRenderedDocumentV1, HostedSlackRenderError> {
+    let logical_path = LogicalPath::new("users.md").map_err(|_| {
+        HostedSlackRenderError::Path(HostedSlackPathError::UnsupportedLogicalPath(
+            "users.md".to_string(),
+        ))
+    })?;
+    rendered_document(
+        HostedSlackDocumentKindV1::Users,
+        logical_path,
+        render_users(users)?,
+    )
 }
 
 fn validate_scope_matches_snapshot(
@@ -807,6 +823,43 @@ fn render_file_metadata(
     Ok(markdown)
 }
 
+fn render_users(users: &[HostedSlackUser]) -> Result<String, HostedSlackRenderError> {
+    let mut users = users.iter().collect::<Vec<_>>();
+    users.sort_by(|left, right| {
+        hosted_user_display_name(left)
+            .cmp(hosted_user_display_name(right))
+            .then_with(|| left.user_id().cmp(right.user_id()))
+    });
+
+    let mut markdown = String::new();
+    markdown.push_str("---\n");
+    frontmatter_string(&mut markdown, "format", "locality.hosted_slack.users.v1")?;
+    frontmatter_number(
+        &mut markdown,
+        "format_version",
+        HOSTED_SLACK_MARKDOWN_FORMAT_VERSION_V1,
+    );
+    markdown.push_str("loc:\n  type: page\n  connector: slack\n");
+    frontmatter_string(&mut markdown, "title", "Slack users")?;
+    markdown.push_str("slack:\n  rendered_kind: users\n---\n\n");
+    markdown.push_str("| User ID | Name | Display Name | Bot | Deleted |\n");
+    markdown.push_str("| --- | --- | --- | --- | --- |\n");
+    for user in users {
+        markdown.push_str("| ");
+        markdown.push_str(&markdown_table_cell(user.user_id()));
+        markdown.push_str(" | ");
+        markdown.push_str(&markdown_table_cell(user.name()));
+        markdown.push_str(" | ");
+        markdown.push_str(&markdown_table_cell(hosted_user_display_name(user)));
+        markdown.push_str(" | ");
+        markdown.push_str(if user.is_bot() { "true" } else { "false" });
+        markdown.push_str(" | ");
+        markdown.push_str(if user.deleted() { "true" } else { "false" });
+        markdown.push_str(" |\n");
+    }
+    Ok(markdown)
+}
+
 fn frontmatter_string(
     output: &mut String,
     key: &str,
@@ -943,6 +996,18 @@ fn escape_markdown_inline(value: &str) -> String {
     output
 }
 
+fn markdown_table_cell(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '|' => output.push_str("\\|"),
+            '\r' | '\n' | '\t' => output.push(' '),
+            character => output.push(character),
+        }
+    }
+    output
+}
+
 fn freshness_state_label(state: ReplicaFreshnessState) -> &'static str {
     match state {
         ReplicaFreshnessState::Bootstrapping => "bootstrapping",
@@ -974,6 +1039,13 @@ fn message_author(
     } else {
         name.to_string()
     }
+}
+
+fn hosted_user_display_name(user: &HostedSlackUser) -> &str {
+    [user.display_name(), user.real_name(), user.name()]
+        .into_iter()
+        .find(|name| !name.trim().is_empty())
+        .unwrap_or(user.user_id())
 }
 
 fn message_summary(message: &HostedSlackMessage) -> String {

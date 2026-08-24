@@ -152,7 +152,11 @@ pub fn build_hosted_slack_logical_paths_v1(
         slug_v1(channel.name(), "channel"),
         channel.channel_id()
     );
-    let channel_directory = format!("channels/{channel_component}");
+    let channel_directory = format!(
+        "{}/{}",
+        channel.conversation_kind().root_folder(),
+        channel_component
+    );
     let channel_path = checked_logical_path([channel_directory.as_str(), "channel.md"])?;
 
     let messages = snapshot

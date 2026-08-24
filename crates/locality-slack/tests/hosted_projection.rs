@@ -1,13 +1,15 @@
 use locality_core::portable::LogicalPath;
 use locality_protocol::{
     HostedSlackChannelSelector, ProviderSourceScopeSelector, ReplicaFreshnessState,
+    SlackChannelSharingClassification,
 };
 use locality_slack::portable::hosted::{
-    HostedSlackDocumentKindV1, HostedSlackNativeSnapshot, HostedSlackOperationalStatusV1,
-    HostedSlackPortableError, HostedSlackRenderError, MAX_HOSTED_SLACK_RENDERED_DOCUMENT_BYTES_V1,
-    MAX_HOSTED_SLACK_RENDERED_PROJECTION_BYTES_V1, RawHostedSlackNativeSnapshot,
-    build_hosted_slack_logical_paths_v1, decode_and_sanitize_hosted_slack_native_snapshot,
-    render_hosted_slack_projection_v1,
+    HostedSlackConversationKindV1, HostedSlackDocumentKindV1, HostedSlackNativeSnapshot,
+    HostedSlackOperationalStatusV1, HostedSlackPortableError, HostedSlackRenderError,
+    MAX_HOSTED_SLACK_RENDERED_DOCUMENT_BYTES_V1, MAX_HOSTED_SLACK_RENDERED_PROJECTION_BYTES_V1,
+    RawHostedSlackNativeSnapshot, build_hosted_slack_logical_paths_v1,
+    decode_and_sanitize_hosted_slack_native_snapshot, render_hosted_slack_projection_v1,
+    render_hosted_slack_users_v1,
 };
 use serde::Serialize;
 
@@ -102,6 +104,23 @@ fn hosted_projection_paths_and_markdown_are_exact_v1_bytes() {
 }
 
 #[test]
+fn hosted_users_markdown_matches_desktop_users_shape() {
+    let snapshot = snapshot();
+    let document = render_hosted_slack_users_v1(snapshot.users()).expect("render hosted users.md");
+    assert_eq!(document.kind(), HostedSlackDocumentKindV1::Users);
+    assert_eq!(document.logical_path().as_str(), "users.md");
+
+    let markdown = String::from_utf8(document.bytes().to_vec()).expect("users Markdown UTF-8");
+    assert!(markdown.contains("connector: slack"));
+    assert!(markdown.contains("rendered_kind: users"));
+    assert!(markdown.contains("| User ID | Name | Display Name | Bot | Deleted |"));
+
+    let ada = markdown.find("| U08ADA00001 |").expect("Ada row");
+    let grace = markdown.find("| U08GRACE001 |").expect("Grace row");
+    assert!(ada < grace, "{markdown}");
+}
+
+#[test]
 fn generated_paths_are_portable_bounded_and_authority_suffixed() {
     let paths = build_hosted_slack_logical_paths_v1(&snapshot()).expect("logical paths");
     assert_eq!(
@@ -131,6 +150,78 @@ fn generated_paths_are_portable_bounded_and_authority_suffixed() {
     );
     for file in &paths.files {
         assert!(file.logical_path.as_str().contains(&file.file_id));
+    }
+}
+
+#[test]
+fn hosted_paths_use_desktop_roots_for_each_conversation_kind() {
+    for (conversation_kind, channel_id, sharing, root_folder) in [
+        (
+            HostedSlackConversationKindV1::PublicChannel,
+            "C08PUBLIC01",
+            SlackChannelSharingClassification::Public,
+            "channels",
+        ),
+        (
+            HostedSlackConversationKindV1::PrivateChannel,
+            "G08PRIVATE1",
+            SlackChannelSharingClassification::Private,
+            "private-channels",
+        ),
+        (
+            HostedSlackConversationKindV1::Im,
+            "D08DIRECT01",
+            SlackChannelSharingClassification::Private,
+            "dms",
+        ),
+        (
+            HostedSlackConversationKindV1::Mpim,
+            "G08GROUPDM1",
+            SlackChannelSharingClassification::Private,
+            "group-dms",
+        ),
+    ] {
+        let mut raw = raw_snapshot();
+        raw.channel.conversation_kind = conversation_kind;
+        raw.channel.id = channel_id.to_string();
+        raw.channel.sharing = sharing;
+        for message in &mut raw.messages {
+            message.channel_id = channel_id.to_string();
+        }
+        for thread in &mut raw.threads {
+            thread.channel_id = channel_id.to_string();
+        }
+        for file in &mut raw.files {
+            file.channel_id = channel_id.to_string();
+        }
+
+        let snapshot = HostedSlackNativeSnapshot::try_from(raw).expect("snapshot");
+        let paths = build_hosted_slack_logical_paths_v1(&snapshot).expect("logical paths");
+        let expected_prefix = format!("{root_folder}/engineering-{channel_id}/");
+
+        assert!(
+            paths.channel.as_str().starts_with(&expected_prefix),
+            "{}",
+            paths.channel.as_str()
+        );
+        assert_eq!(
+            paths.channel_directory(),
+            format!("{root_folder}/engineering-{channel_id}")
+        );
+        for thread in &paths.threads {
+            assert!(
+                thread.logical_path.as_str().starts_with(&expected_prefix),
+                "{}",
+                thread.logical_path.as_str()
+            );
+        }
+        for file in &paths.files {
+            assert!(
+                file.logical_path.as_str().starts_with(&expected_prefix),
+                "{}",
+                file.logical_path.as_str()
+            );
+        }
     }
 }
 

@@ -546,9 +546,14 @@ impl HostedSlackChannelSelector {
         validate_canonical_slack_id(
             "channel_id",
             &self.channel_id,
-            b"CG",
+            b"CGD",
             MAX_SLACK_CHANNEL_ID_BYTES,
         )?;
+        if self.channel_id.as_bytes().first() == Some(&b'D')
+            && self.sharing != SlackChannelSharingClassification::Private
+        {
+            return Err(ScopeContractError::InvalidSlackId("channel_id"));
+        }
         validate_canonical_utc_timestamp(
             "authorized_history_start_at",
             &self.authorized_history_start_at,

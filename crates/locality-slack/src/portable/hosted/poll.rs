@@ -16,6 +16,7 @@ use super::checkpoint::{
     HostedSlackRootExpectationV1, MAX_HOSTED_SLACK_APPLIED_PAGES_V1, compare_slack_timestamps,
     parse_canonical_utc_timestamp, parse_slack_timestamp, validate_cursor, validate_page_scope_id,
 };
+use super::identity::HOSTED_SLACK_CONVERSATION_ID_PREFIXES;
 use super::native::{
     HostedSlackFileMetadata, HostedSlackMessage, HostedSlackNativeSnapshot, HostedSlackUser,
     MAX_HOSTED_SLACK_THREAD_REPLIES, RawHostedSlackFileMetadata, RawHostedSlackMessage,
@@ -1018,7 +1019,11 @@ fn validate_page_scope(
     poll_overlap_watermark: &str,
 ) -> Result<(), HostedSlackPollError> {
     validate_page_scope_id("page.team_id", team_id, b"T")?;
-    validate_page_scope_id("page.channel_id", channel_id, b"CG")?;
+    validate_page_scope_id(
+        "page.channel_id",
+        channel_id,
+        HOSTED_SLACK_CONVERSATION_ID_PREFIXES,
+    )?;
     let history_start =
         parse_canonical_utc_timestamp("page.authorized_history_start_at", history_start_at)?;
     let backfill_cut = parse_canonical_utc_timestamp("page.backfill_cut_at", backfill_cut_at)?;

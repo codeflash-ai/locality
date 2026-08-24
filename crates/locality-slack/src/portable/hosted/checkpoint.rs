@@ -10,9 +10,9 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 
 use super::identity::{HostedSlackPortableError, validate_slack_id};
 use super::native::{
-    HostedSlackChannel, HostedSlackFileMetadata, HostedSlackMessage, HostedSlackUser,
-    MAX_HOSTED_SLACK_COLLECTION_ENTRIES, MAX_HOSTED_SLACK_THREAD_REPLIES, RawHostedSlackChannel,
-    RawHostedSlackFileMetadata, RawHostedSlackMessage, RawHostedSlackUser,
+    HostedSlackChannel, HostedSlackConversationKindV1, HostedSlackFileMetadata, HostedSlackMessage,
+    HostedSlackUser, MAX_HOSTED_SLACK_COLLECTION_ENTRIES, MAX_HOSTED_SLACK_THREAD_REPLIES,
+    RawHostedSlackChannel, RawHostedSlackFileMetadata, RawHostedSlackMessage, RawHostedSlackUser,
 };
 
 pub const HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V1: u16 = 1;
@@ -23,6 +23,8 @@ pub const HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3: u16 = 3;
 pub const HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V3: u16 = 3;
 pub const HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4: u16 = 4;
 pub const HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4: u16 = 4;
+pub const HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5: u16 = 5;
+pub const HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V5: u16 = 5;
 pub const MAX_HOSTED_SLACK_CURSOR_BYTES_V1: usize = 1024;
 pub const MAX_HOSTED_SLACK_APPLIED_PAGES_V1: usize = 256;
 pub const MAX_HOSTED_SLACK_REPLAY_BYTES_V1: usize = 512 * 1024;
@@ -408,8 +410,10 @@ impl HostedSlackPollCheckpointV1 {
             backfill_cut_at.clone(),
             poll_overlap_watermark,
         );
-        checkpoint.checkpoint_format_version = HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4;
-        checkpoint.minimum_reader_version = HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4;
+        if checkpoint.checkpoint_format_version < HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4 {
+            checkpoint.checkpoint_format_version = HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4;
+            checkpoint.minimum_reader_version = HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4;
+        }
         checkpoint.install_incremental_baseline(
             applied.candidate.clone(),
             applied.completed_roots.clone(),
@@ -421,6 +425,20 @@ impl HostedSlackPollCheckpointV1 {
         Ok(checkpoint)
     }
 
+    fn checkpoint_versions_for_channel(channel: &RawHostedSlackChannel) -> (u16, u16) {
+        if channel.conversation_kind == HostedSlackConversationKindV1::PublicChannel {
+            (
+                HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V1,
+                HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V1,
+            )
+        } else {
+            (
+                HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5,
+                HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V5,
+            )
+        }
+    }
+
     fn genesis(
         selector: &HostedSlackChannelSelector,
         channel: RawHostedSlackChannel,
@@ -428,9 +446,11 @@ impl HostedSlackPollCheckpointV1 {
         backfill_cut_at: String,
         poll_overlap_watermark: String,
     ) -> Self {
+        let (checkpoint_format_version, minimum_reader_version) =
+            Self::checkpoint_versions_for_channel(&channel);
         Self {
-            checkpoint_format_version: HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V1,
-            minimum_reader_version: HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V1,
+            checkpoint_format_version,
+            minimum_reader_version,
             poll_kind,
             installation_id: selector.installation_id.clone(),
             team_id: selector.team_id.clone(),
@@ -463,17 +483,32 @@ impl HostedSlackPollCheckpointV1 {
 
     pub fn validate(&self) -> Result<(), HostedSlackPollError> {
         self.validate_internal()?;
-        if (self.poll_kind == HostedSlackPollKindV2::Incremental)
-            != matches!(
-                self.checkpoint_format_version,
-                HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3
-                    | HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4
-            )
-        {
-            return Err(HostedSlackPollError::UnsupportedVersion {
-                format_version: self.checkpoint_format_version,
-                minimum_reader_version: self.minimum_reader_version,
-            });
+        match self.poll_kind {
+            HostedSlackPollKindV2::Incremental => {
+                if !matches!(
+                    self.checkpoint_format_version,
+                    HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3
+                        | HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4
+                        | HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5
+                ) {
+                    return Err(HostedSlackPollError::UnsupportedVersion {
+                        format_version: self.checkpoint_format_version,
+                        minimum_reader_version: self.minimum_reader_version,
+                    });
+                }
+            }
+            HostedSlackPollKindV2::Bootstrap | HostedSlackPollKindV2::FullRepair => {
+                if matches!(
+                    self.checkpoint_format_version,
+                    HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3
+                        | HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4
+                ) {
+                    return Err(HostedSlackPollError::UnsupportedVersion {
+                        format_version: self.checkpoint_format_version,
+                        minimum_reader_version: self.minimum_reader_version,
+                    });
+                }
+            }
         }
         if self.poll_kind == HostedSlackPollKindV2::Incremental {
             return Ok(());
@@ -489,8 +524,8 @@ impl HostedSlackPollCheckpointV1 {
         validate_checkpoint_versions_for_reader(
             self.checkpoint_format_version,
             self.minimum_reader_version,
-            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4,
-            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4,
+            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5,
+            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V5,
         )?;
         let selector = self.selector();
         selector
@@ -504,6 +539,15 @@ impl HostedSlackPollCheckpointV1 {
             || channel.sharing() != self.sharing
         {
             return Err(HostedSlackPollError::InvalidIdentity("candidate.channel"));
+        }
+        if channel.conversation_kind() != HostedSlackConversationKindV1::PublicChannel
+            && self.checkpoint_format_version < HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5
+        {
+            return Err(HostedSlackPollError::ReaderUpdateRequired {
+                format_version: HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5,
+                minimum_reader_version: HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V5,
+                supported_reader_version: self.minimum_reader_version,
+            });
         }
 
         let history_start = parse_canonical_utc_timestamp(
@@ -680,6 +724,17 @@ pub fn decode_hosted_slack_poll_checkpoint_v3(
     )
 }
 
+/// Reads checkpoints that can carry hosted private-channel, DM, and MPIM state.
+pub fn decode_hosted_slack_poll_checkpoint_v4(
+    bytes: &[u8],
+) -> Result<HostedSlackPollCheckpointV1, HostedSlackPollError> {
+    decode_hosted_slack_poll_checkpoint_for_reader(
+        bytes,
+        HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5,
+        HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V5,
+    )
+}
+
 fn decode_hosted_slack_poll_checkpoint_for_reader(
     bytes: &[u8],
     supported_format_version: u16,
@@ -700,8 +755,9 @@ fn decode_hosted_slack_poll_checkpoint_for_reader(
         supported_format_version,
         supported_reader_version,
     )?;
-    let checkpoint = serde_json::from_slice::<HostedSlackPollCheckpointV1>(bytes)
+    let wire = serde_json::from_slice::<HostedSlackPollCheckpointWireV1>(bytes)
         .map_err(|_| HostedSlackPollError::InvalidJson("checkpoint"))?;
+    let checkpoint = HostedSlackPollCheckpointV1::from(wire);
     checkpoint.validate()?;
     Ok(checkpoint)
 }
@@ -851,6 +907,9 @@ pub(crate) fn validate_checkpoint_versions_for_reader(
         ) | (
             HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4,
             HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4
+        ) | (
+            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5,
+            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V5
         )
     ) {
         return Err(HostedSlackPollError::UnsupportedVersion {
@@ -1195,7 +1254,7 @@ fn validate_evidence(checkpoint: &HostedSlackPollCheckpointV1) -> Result<(), Hos
                 }
                 if *applied_checkpoint_format_version == 0
                     || *applied_checkpoint_format_version
-                        > HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4
+                        > HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5
                     || applied_poll_cut_at != &checkpoint.backfill_cut_at
                 {
                     return Err(HostedSlackPollError::IncompleteCandidate(
@@ -1460,6 +1519,88 @@ mod compatibility_tests {
             .apply_replies_page(&page)
             .expect("V2 continuation deletion");
         checkpoint
+    }
+
+    #[test]
+    fn non_public_conversation_checkpoints_require_v5_reader() {
+        let installation_id: SlackInstallationId =
+            serde_json::from_str(r#""0198f3c2-7d4e-7a61-8b25-4f9c8d7e6a10""#).unwrap();
+        let selector = HostedSlackChannelSelector {
+            selector_version: 1,
+            installation_id: installation_id.clone(),
+            team_id: "T08LOCALITY1".to_string(),
+            channel_id: "D08DIRECT01".to_string(),
+            authorized_history_start_at: "2026-01-01T00:00:00Z".to_string(),
+            sharing: SlackChannelSharingClassification::Private,
+        };
+        let channel = RawHostedSlackChannel {
+            team_id: "T08LOCALITY1".to_string(),
+            id: "D08DIRECT01".to_string(),
+            conversation_kind: HostedSlackConversationKindV1::Im,
+            name: "dm-U08ADA00001".to_string(),
+            topic: None,
+            purpose: None,
+            created_ts: "1780000000.000000".to_string(),
+            updated_ts: None,
+            sharing: SlackChannelSharingClassification::Private,
+        };
+        let checkpoint = HostedSlackPollCheckpointV1::new(
+            &selector,
+            channel,
+            HostedSlackPollKindV1::FullRepair,
+            "2026-06-01T00:00:00Z".to_string(),
+            "2026-05-28T20:00:00Z".to_string(),
+        )
+        .expect("DM checkpoint");
+        assert_eq!(
+            checkpoint.checkpoint_format_version(),
+            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5
+        );
+        assert_eq!(
+            checkpoint.minimum_reader_version(),
+            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V5
+        );
+
+        let encoded = serde_json::to_vec(&checkpoint).unwrap();
+        let value = serde_json::from_slice::<serde_json::Value>(&encoded).unwrap();
+        assert_eq!(value["channel"]["conversation_kind"], "im");
+        assert_eq!(
+            decode_hosted_slack_poll_checkpoint_v3(&encoded),
+            Err(HostedSlackPollError::ReaderUpdateRequired {
+                format_version: HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5,
+                minimum_reader_version: HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V5,
+                supported_reader_version: HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4,
+            })
+        );
+        assert_eq!(
+            decode_hosted_slack_poll_checkpoint_v4(&encoded),
+            Ok(checkpoint)
+        );
+
+        let mut forged_v4_incremental = value;
+        forged_v4_incremental["checkpoint_format_version"] =
+            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4.into();
+        forged_v4_incremental["minimum_reader_version"] =
+            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4.into();
+        forged_v4_incremental["poll_kind"] = serde_json::json!("incremental");
+        assert_eq!(
+            decode_hosted_slack_poll_checkpoint_v3(
+                &serde_json::to_vec(&forged_v4_incremental).unwrap()
+            ),
+            Err(HostedSlackPollError::ReaderUpdateRequired {
+                format_version: HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V5,
+                minimum_reader_version: HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V5,
+                supported_reader_version: HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4,
+            })
+        );
+    }
+
+    #[test]
+    fn public_channel_checkpoint_serialization_stays_legacy_shaped() {
+        let checkpoint = decode_hosted_slack_poll_checkpoint_v1(PRE_CHANGE_READER_GOLDEN)
+            .expect("V1 continuation golden");
+        let value = serde_json::to_value(&checkpoint).unwrap();
+        assert!(value["channel"].get("conversation_kind").is_none());
     }
 
     #[test]
