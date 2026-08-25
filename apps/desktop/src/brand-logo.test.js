@@ -14,8 +14,8 @@ describe("Locality logo surfaces", () => {
   });
 
   it("uses LocalityLogo instead of the legacy ApertureIcon component", () => {
-    expect(appSource).toMatch(/import localityShortDarkUrl from "\.\/assets\/brand\/locality-short-dark\.svg";/);
-    expect(appSource).toMatch(/import localityShortLightUrl from "\.\/assets\/brand\/locality-short-light\.svg";/);
+    expect(appSource).toMatch(/new URL\("\.\/assets\/brand\/locality-short-dark\.svg", import\.meta\.url\)\.href/);
+    expect(appSource).toMatch(/new URL\("\.\/assets\/brand\/locality-short-light\.svg", import\.meta\.url\)\.href/);
     expect(appSource).toMatch(/function LocalityLogo\(/);
     expect(appSource).not.toMatch(/ApertureIcon/);
   });

@@ -520,6 +520,10 @@ struct GoogleDocsPickerSubmission {
 struct WorkspaceMountOnboardingRequest {
     path: String,
     action: String,
+    #[serde(default)]
+    connector: String,
+    #[serde(default)]
+    google_docs_document_ids: Option<Vec<String>>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1786,7 +1790,13 @@ fn google_docs_picker_submission(
                 .to_string(),
         );
     }
-    let submission: GoogleDocsPickerSubmission = serde_json::from_str(body)
+    let body = body.trim();
+    let body = body.strip_prefix("documentIds=").unwrap_or(body);
+    let submission = serde_json::from_str(body)
+        .or_else(|_| {
+            serde_json::from_str::<Vec<String>>(body)
+                .map(|document_ids| GoogleDocsPickerSubmission { document_ids })
+        })
         .map_err(|_| "Google Picker sent an invalid document selection.".to_string())?;
     if submission.document_ids.is_empty() {
         return Ok(Vec::new());
@@ -1801,7 +1811,7 @@ fn google_docs_picker_page(token: &str, configuration: &GoogleDocsPickerConfigur
         .expect("Google Picker configuration serializes")
         .replace('<', "\\u003c");
     format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><title>Choose Google Docs</title><script src="https://apis.google.com/js/api.js"></script></head><body><p id="status">Loading Google Picker…</p><script>const configuration={configuration};const selectionUrl='/google-docs-picker/{token}/selection';function submit(documentIds){{fetch(selectionUrl,{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{documentIds}})}}).then(()=>document.getElementById('status').textContent='Selection sent to Locality. You can close this tab.').catch(()=>document.getElementById('status').textContent='Could not send the selection to Locality.');}}gapi.load('picker',()=>{{const p=google.picker;const view=new p.DocsView(p.ViewId.DOCUMENTS).setIncludeFolders(false).setSelectFolderEnabled(false).setMimeTypes('application/vnd.google-apps.document');new p.PickerBuilder().setDeveloperKey(configuration.developerKey).setOAuthToken(configuration.accessToken).setAppId(configuration.projectNumber).setOrigin(window.location.origin).addView(view).enableFeature(p.Feature.MULTISELECT_ENABLED).setCallback(data=>{{const action=data[p.Response.ACTION];if(action===p.Action.PICKED)submit((data[p.Response.DOCUMENTS]||[]).map(doc=>doc.id));if(action===p.Action.CANCEL)submit([]);}}).build().setVisible(true);}});</script></body></html>"#
+        r#"<!doctype html><html><head><meta charset="utf-8"><title>Choose Google Docs</title><script src="https://apis.google.com/js/api.js"></script></head><body><p id="status">Loading Google Picker…</p><script>const configuration={configuration};const selectionUrl='/google-docs-picker/{token}/selection';let submitting=false;function submit(documentIds){{if(submitting)return;submitting=true;document.getElementById('status').textContent='Sending selection to Locality…';const form=document.createElement('form');form.method='POST';form.action=selectionUrl;form.enctype='text/plain';const input=document.createElement('input');input.name='documentIds';input.value=JSON.stringify(documentIds);form.append(input);document.body.append(form);form.submit();}}gapi.load('picker',()=>{{const p=google.picker;const view=new p.DocsView(p.ViewId.DOCUMENTS).setIncludeFolders(false).setSelectFolderEnabled(false).setMimeTypes('application/vnd.google-apps.document');const picker=new p.PickerBuilder().setDeveloperKey(configuration.developerKey).setOAuthToken(configuration.accessToken).setAppId(configuration.projectNumber).setOrigin(window.location.origin).addView(view).enableFeature(p.Feature.MULTISELECT_ENABLED).setCallback(data=>{{const action=data.action||(p.Response&&data[p.Response.ACTION]);const documents=data.docs||(p.Response&&data[p.Response.DOCUMENTS])||[];const pickedAction=(p.Action&&p.Action.PICKED)||'picked';const cancelAction=(p.Action&&p.Action.CANCEL)||'cancel';if(action===pickedAction){{const documentIds=documents.map(doc=>doc.id||doc.documentId||(p.Document&&doc[p.Document.ID])).filter(id=>typeof id==='string'&&id.length);if(!documentIds.length){{document.getElementById('status').textContent='Google Picker did not return document IDs. Close this tab and try again.';return;}}picker.setVisible(false);submit(documentIds);}}if(action===cancelAction)submit([]);}}).build();picker.setVisible(true);}});</script></body></html>"#
     )
 }
 
@@ -2612,14 +2622,32 @@ fn run_workspace_mount_onboarding_blocking(
         }
     }
 
+    let connector = if request.connector.trim().is_empty() {
+        // Keep requests from older desktop bundles working while they update.
+        "notion"
+    } else {
+        request.connector.trim()
+    };
+    let mount_id = match onboarding_mount_id_for_connector(connector) {
+        Ok(mount_id) => mount_id,
+        Err(message) => {
+            return workspace_mount_onboarding_report(
+                MacosWorkspaceMountOnboardingState::Failed,
+                message,
+                WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+                WorkspaceMountOnboardingLaunchStrategy::None,
+            );
+        }
+    };
+
     match create_desktop_mount_blocking(CreateDesktopMountRequest {
-        connector: "notion".to_string(),
+        connector: connector.to_string(),
         path: request.path,
-        mount_id: "notion-main".to_string(),
+        mount_id: mount_id.to_string(),
         connection_id: None,
         read_only: false,
         notion_root_page: None,
-        google_docs_document_ids: None,
+        google_docs_document_ids: request.google_docs_document_ids,
     }) {
         Ok(message) => workspace_mount_onboarding_report(
             MacosWorkspaceMountOnboardingState::Created,
@@ -2628,6 +2656,19 @@ fn run_workspace_mount_onboarding_blocking(
             WorkspaceMountOnboardingLaunchStrategy::None,
         ),
         Err(message) => classify_workspace_mount_onboarding_failure(&message),
+    }
+}
+
+fn onboarding_mount_id_for_connector(connector: &str) -> Result<&'static str, String> {
+    match connector {
+        "notion" => Ok("notion-main"),
+        "google-docs" => Ok("google-docs-main"),
+        "google-calendar" => Ok("google-calendar-main"),
+        "gmail" => Ok("gmail-main"),
+        "granola" => Ok("granola-main"),
+        "linear" => Ok("linear-main"),
+        SLACK_CONNECTOR_ID => Ok("slack-main"),
+        other => Err(format!("Unsupported onboarding connector `{other}`.")),
     }
 }
 
@@ -15523,6 +15564,19 @@ mod tests {
     }
 
     #[test]
+    fn google_docs_picker_submission_accepts_the_browser_form_payload() {
+        assert_eq!(
+            super::google_docs_picker_submission(
+                "session",
+                "session",
+                "documentIds=[\"doc-b\",\"doc-a\"]\r\n",
+            )
+            .unwrap(),
+            vec!["doc-a".to_string(), "doc-b".to_string()]
+        );
+    }
+
+    #[test]
     fn google_docs_picker_page_loads_the_google_api_script() {
         let page = super::google_docs_picker_page(
             "session",
@@ -15547,8 +15601,29 @@ mod tests {
             },
         );
 
-        assert!(page.contains("data[p.Response.ACTION]"));
-        assert!(page.contains("data[p.Response.DOCUMENTS]"));
+        assert!(page.contains("p.Response&&data[p.Response.ACTION]"));
+        assert!(page.contains("p.Response&&data[p.Response.DOCUMENTS]"));
+        assert!(page.contains("p.Document&&doc[p.Document.ID]"));
+    }
+
+    #[test]
+    fn google_docs_picker_page_accepts_legacy_picker_response_fields() {
+        let page = super::google_docs_picker_page(
+            "session",
+            &super::GoogleDocsPickerConfiguration {
+                developer_key: "picker-key".to_string(),
+                project_number: "123456789".to_string(),
+                access_token: "access-token".to_string(),
+            },
+        );
+
+        assert!(page.contains("data.action||"));
+        assert!(page.contains("data.docs||"));
+        assert!(page.contains("doc.id||doc.documentId"));
+        assert!(page.contains("let submitting=false"));
+        assert!(page.contains("picker.setVisible(false)"));
+        assert!(page.contains("form.enctype='text/plain'"));
+        assert!(page.contains("form.submit()"));
     }
 
     #[test]
@@ -17549,6 +17624,19 @@ mod tests {
         assert_eq!(report.state, "waiting_for_cloudstorage_root");
         assert_eq!(report.primary_action, "check_again");
         assert_eq!(report.launch_strategy, "instructions_only");
+    }
+
+    #[test]
+    fn workspace_mount_onboarding_uses_the_selected_connector_mount_id() {
+        assert_eq!(
+            super::onboarding_mount_id_for_connector("google-docs").expect("Google Docs mount id"),
+            "google-docs-main"
+        );
+        assert_eq!(
+            super::onboarding_mount_id_for_connector("notion").expect("Notion mount id"),
+            "notion-main"
+        );
+        assert!(super::onboarding_mount_id_for_connector("unsupported").is_err());
     }
 
     #[test]

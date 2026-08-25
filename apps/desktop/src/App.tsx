@@ -103,6 +103,7 @@ import {
   isSourceConnectorId,
   sourceConnectionReady,
   sourceConnectorIds,
+  sourceOnboardingConnector,
   sourceMountRetryOutcome,
   sourceMounted,
   sourceRequiresApiKey,
@@ -120,15 +121,19 @@ import {
   workspaceWorkflowCommand,
   type PortableWorkspaceReport,
 } from "./portable-workspace";
-import gmailIconUrl from "./assets/connectors/gmail.svg";
-import googleCalendarIconUrl from "./assets/connectors/google-calendar.svg";
-import googleDocsIconUrl from "./assets/connectors/google-docs.svg";
-import granolaIconUrl from "./assets/connectors/granola.svg";
-import linearIconUrl from "./assets/connectors/linear.svg";
-import notionIconUrl from "./assets/connectors/notion.svg";
-import slackIconUrl from "./assets/connectors/slack.svg";
-import localityShortDarkUrl from "./assets/brand/locality-short-dark.svg";
-import localityShortLightUrl from "./assets/brand/locality-short-light.svg";
+
+// Keep SVGs as image URLs. In Vite dev mode the generated `?import` modules
+// carry an image/svg+xml MIME type, which WebKit correctly refuses to execute
+// as JavaScript when resolving an ES module import.
+const gmailIconUrl = new URL("./assets/connectors/gmail.svg", import.meta.url).href;
+const googleCalendarIconUrl = new URL("./assets/connectors/google-calendar.svg", import.meta.url).href;
+const googleDocsIconUrl = new URL("./assets/connectors/google-docs.svg", import.meta.url).href;
+const granolaIconUrl = new URL("./assets/connectors/granola.svg", import.meta.url).href;
+const linearIconUrl = new URL("./assets/connectors/linear.svg", import.meta.url).href;
+const notionIconUrl = new URL("./assets/connectors/notion.svg", import.meta.url).href;
+const slackIconUrl = new URL("./assets/connectors/slack.svg", import.meta.url).href;
+const localityShortDarkUrl = new URL("./assets/brand/locality-short-dark.svg", import.meta.url).href;
+const localityShortLightUrl = new URL("./assets/brand/locality-short-light.svg", import.meta.url).href;
 
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
@@ -750,13 +755,7 @@ function isOnboardingConnector(value?: string | null): value is OnboardingConnec
 }
 
 function onboardingConnectorFromSnapshot(snapshot: DesktopSnapshot): OnboardingConnectorId {
-  if (isOnboardingConnector(snapshot.mount.connector)) {
-    return snapshot.mount.connector;
-  }
-  if (isOnboardingConnector(snapshot.connection.connector)) {
-    return snapshot.connection.connector;
-  }
-  return "notion";
+  return sourceOnboardingConnector(snapshot) ?? "notion";
 }
 
 function connectorUsesOAuth(connector: OnboardingConnectorId) {
@@ -951,6 +950,13 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>, f
 
 export function googleDocsPickerCommand() {
   return "choose_google_docs_in_browser";
+}
+
+export function googleDocsSelectionNeededForMount(
+  connector: OnboardingConnectorId,
+  documentIds: readonly string[] | null | undefined,
+) {
+  return connector === "google-docs" && !documentIds?.length;
 }
 
 async function chooseGoogleDocs(): Promise<string[]> {
@@ -1888,6 +1894,8 @@ function Onboarding({
   useEffect(() => {
     if (
       !snapshotLoaded ||
+      oauthInFlight ||
+      connectorConnecting ||
       window.location.hash === "#onboarding" ||
       window.location.hash === "#onboarding-ready" ||
       connectionMissing(snapshot)
@@ -1911,7 +1919,15 @@ function Onboarding({
       }
       return current < 5 ? 5 : current;
     });
-  }, [snapshot.connection.connector, snapshot.connection.status, snapshot.mount.connector, snapshot.mount.status, snapshotLoaded]);
+  }, [
+    connectorConnecting,
+    oauthInFlight,
+    snapshot.connection.connector,
+    snapshot.connection.status,
+    snapshot.mount.connector,
+    snapshot.mount.status,
+    snapshotLoaded,
+  ]);
 
   useEffect(() => {
     if (
@@ -2295,9 +2311,27 @@ function Onboarding({
     mountStartRequestedRef.current = true;
     setMounting(true);
     try {
+      let documentIds = googleDocsDocumentIds;
+      if (googleDocsSelectionNeededForMount(selectedOnboardingConnector, documentIds)) {
+        documentIds = await chooseGoogleDocs();
+        if (!documentIds.length) {
+          setMountOnboarding(failedMountOnboardingReport("Choose one or more Google Docs to create the local folder."));
+          return;
+        }
+        setGoogleDocsDocumentIds(documentIds);
+      }
       const report = await callCommand<WorkspaceMountOnboardingReport>(
         "run_workspace_mount_onboarding",
-        { request: { path: mountPath, action } },
+        {
+          request: {
+            path: mountPath,
+            action,
+            connector: selectedOnboardingConnector,
+            googleDocsDocumentIds: selectedOnboardingConnector === "google-docs"
+              ? documentIds
+              : null,
+          },
+        },
         {
           state: "created",
           message: "Created demo mount.",

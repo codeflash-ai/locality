@@ -3,6 +3,7 @@ import {
   connectedSourcesReadyToMount,
   isSourceConnectorId,
   sourceConnectorIds,
+  sourceOnboardingConnector,
   sourceRequiresApiKey,
   sourceSkipsManualMountStep,
   sourceMounted,
@@ -86,6 +87,17 @@ describe("source setup progress", () => {
         "notion",
       ),
     ).toBe(false);
+  });
+});
+
+describe("source onboarding snapshot selection", () => {
+  it("keeps the newly connected source when the default Notion mount is still absent", () => {
+    expect(
+      sourceOnboardingConnector({
+        connection: { connector: "gmail", status: "active" },
+        mount: { connector: "notion", status: "not_mounted" },
+      }),
+    ).toBe("gmail");
   });
 });
 
