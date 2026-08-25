@@ -14,9 +14,16 @@ import {
 } from "./oauth/google-calendar";
 import { exchangeGmailCode, gmailAuthorizeUrl, refreshGmailToken, type GmailTokenResponse } from "./oauth/gmail";
 import { googleClientId } from "./oauth/google";
+import { hostedGoogleDocsPickerPage } from "./picker/google-docs";
 import { exchangeNotionCode, notionAuthorizeUrl, refreshNotionToken, type NotionTokenResponse } from "./oauth/notion";
 import { exchangeSlackCode, refreshSlackToken, slackAuthorizeUrl, type SlackTokenResponse } from "./oauth/slack";
 import { randomBase64Url, decryptJsonHandle, encryptJsonHandle } from "./security/crypto";
+import {
+  createPickerBrowserCapability,
+  createPickerCompletionCapability,
+  readPickerBrowserCapability,
+  redeemPickerCompletionCapability
+} from "./security/picker-capabilities";
 import {
   providerCallbackUri,
   validateGmailRedirectUri,
@@ -45,6 +52,20 @@ interface ExchangeRequest {
 interface RefreshRequest {
   refresh_token?: string;
   refresh_token_handle?: string;
+}
+
+interface GoogleDocsPickerSessionRequest {
+  refresh_token_handle?: string;
+  redemption_secret_hash?: string;
+}
+
+interface GoogleDocsPickerSelectionRequest {
+  document_ids?: string[];
+}
+
+interface GoogleDocsPickerRedemptionRequest {
+  completion?: string;
+  redemption_secret?: string;
 }
 
 interface RefreshHandlePayload {
@@ -216,6 +237,85 @@ app.post("/v1/oauth/google-docs/refresh", async (c) => {
   const refreshToken = await resolveRefreshToken(c.env, "google-docs", body);
   const token = await refreshGoogleDocsToken(c.env, refreshToken);
   return c.json(await shapeGoogleDocsTokenResponse(c.env, token));
+});
+
+app.post("/v1/google-docs/picker/sessions", async (c) => {
+  const body = await requiredJson<GoogleDocsPickerSessionRequest>(c.req.raw);
+  const refreshTokenHandle = requireString(body.refresh_token_handle, "refresh_token_handle");
+  const redemptionSecretHash = requireString(body.redemption_secret_hash, "redemption_secret_hash");
+  await resolveRefreshToken(c.env, "google-docs", { refresh_token_handle: refreshTokenHandle });
+  const now = nowSeconds();
+  const capability = await createPickerBrowserCapability(
+    {
+      version: 1,
+      connector: "google-docs",
+      expires_at: now + SESSION_TTL_SECONDS,
+      capability_id: randomBase64Url(),
+      refresh_token_handle: refreshTokenHandle,
+      redemption_secret_hash: redemptionSecretHash
+    },
+    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
+  );
+  const baseUrl = c.env.LOCALITY_BROKER_PUBLIC_BASE_URL;
+  if (!baseUrl) {
+    throw configError("LOCALITY_BROKER_PUBLIC_BASE_URL must be configured");
+  }
+  return c.json(
+    { browser_url: `${baseUrl.replace(/\/+$/, "")}/v1/google-docs/picker/${capability}`, expires_in: SESSION_TTL_SECONDS },
+    201
+  );
+});
+
+app.get("/v1/google-docs/picker/:capability", async (c) => {
+  const secret = requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET");
+  const browserCapability = await readPickerBrowserCapability(c.req.param("capability"), secret);
+  const refreshToken = await resolveRefreshToken(c.env, "google-docs", {
+    refresh_token_handle: browserCapability.refresh_token_handle
+  });
+  const token = await refreshGoogleDocsToken(c.env, refreshToken);
+  const baseUrl = requiredPickerConfig(c.env.LOCALITY_BROKER_PUBLIC_BASE_URL, "LOCALITY_BROKER_PUBLIC_BASE_URL");
+  const page = hostedGoogleDocsPickerPage({
+    developerKey: requiredPickerConfig(c.env.LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY, "LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY"),
+    projectNumber: requiredPickerConfig(c.env.LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER, "LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER"),
+    accessToken: token.access_token,
+    selectionUrl: `${baseUrl.replace(/\/+$/, "")}/v1/google-docs/picker/${browserCapabilityToPath(c.req.param("capability"))}/selection`
+  });
+  c.header("Cache-Control", "no-store");
+  c.header("Referrer-Policy", "no-referrer");
+  return c.html(page);
+});
+
+app.post("/v1/google-docs/picker/:capability/selection", async (c) => {
+  const browserCapability = await readPickerBrowserCapability(
+    c.req.param("capability"),
+    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
+  );
+  const body = await requiredJson<GoogleDocsPickerSelectionRequest>(c.req.raw);
+  if (!Array.isArray(body.document_ids)) {
+    throw badRequest("invalid_picker_document_ids", "Google Picker must select one or more documents");
+  }
+  const completion = await createPickerCompletionCapability(
+    {
+      version: 1,
+      connector: "google-docs",
+      expires_at: nowSeconds() + 5 * 60,
+      capability_id: browserCapability.capability_id,
+      redemption_secret_hash: browserCapability.redemption_secret_hash,
+      document_ids: body.document_ids
+    },
+    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
+  );
+  return c.redirect(`locality://google-docs-picker?completion=${encodeURIComponent(completion)}`, 303);
+});
+
+app.post("/v1/google-docs/picker/redeem", async (c) => {
+  const body = await requiredJson<GoogleDocsPickerRedemptionRequest>(c.req.raw);
+  const documentIds = await redeemPickerCompletionCapability(
+    requireString(body.completion, "completion"),
+    requireString(body.redemption_secret, "redemption_secret"),
+    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
+  );
+  return c.json({ document_ids: documentIds });
 });
 
 app.post("/v1/oauth/google-calendar/start", async (c) => {
@@ -605,6 +705,17 @@ function requireOperationalSecret(value: string | undefined, name: string): stri
     throw configError(`${name} must be configured`);
   }
   return value;
+}
+
+function requiredPickerConfig(value: string | undefined, name: string): string {
+  if (!value || value.trim() === "") {
+    throw configError(`${name} must be configured`);
+  }
+  return value.trim();
+}
+
+function browserCapabilityToPath(capability: string): string {
+  return encodeURIComponent(capability);
 }
 
 export default app;
