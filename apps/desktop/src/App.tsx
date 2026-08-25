@@ -971,15 +971,29 @@ export function googleDocsPickerOptions() {
   };
 }
 
-function loadGooglePicker(): Promise<void> {
+export function loadGooglePicker(): Promise<void> {
   if (window.google?.picker) return Promise.resolve();
   if (googlePickerLoad) return googlePickerLoad;
   googlePickerLoad = new Promise((resolve, reject) => {
+    const fail = (message: string) => {
+      googlePickerLoad = null;
+      reject(new Error(message));
+    };
     const script = document.createElement("script");
     script.src = "https://apis.google.com/js/api.js";
     script.async = true;
-    script.onerror = () => reject(new Error("Could not load Google Picker. Check your network connection and try again."));
-    script.onload = () => window.gapi?.load("picker", resolve);
+    script.onerror = () => fail("Could not load Google Picker. Check your network connection and try again.");
+    script.onload = () => {
+      if (!window.gapi) {
+        fail("Google Picker did not load correctly. Check your network connection and try again.");
+        return;
+      }
+      try {
+        window.gapi.load("picker", resolve);
+      } catch {
+        fail("Google Picker did not load correctly. Check your network connection and try again.");
+      }
+    };
     document.head.appendChild(script);
   });
   return googlePickerLoad;
@@ -3714,7 +3728,9 @@ function MountsView({
         setSourceDialogState("idle");
         return;
       }
-      const report = await callCommand<ActionReport>("reconfigure_google_docs_mount", { documentIds });
+      const report = await callCommand<ActionReport>("reconfigure_google_docs_mount", {
+        request: { mountId: sourceMountId("google-docs"), documentIds },
+      });
       setSourceDialogMessage(report.message);
       setSourceDialogState(report.ok ? "success" : "error");
       if (report.ok) await onRefresh();

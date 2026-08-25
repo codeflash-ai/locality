@@ -490,6 +490,13 @@ struct CreateDesktopMountRequest {
     google_docs_document_ids: Option<Vec<String>>,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconfigureGoogleDocsMountRequest {
+    mount_id: String,
+    document_ids: Vec<String>,
+}
+
 /// This response intentionally exists only at the Tauri command boundary. It is never added to
 /// the desktop snapshot or persisted: Google Picker needs the current OAuth access token, but the
 /// token remains owned by the credential store.
@@ -1531,20 +1538,20 @@ async fn google_docs_picker_configuration() -> Result<GoogleDocsPickerConfigurat
 }
 
 #[tauri::command]
-async fn reconfigure_google_docs_mount(document_ids: Vec<String>) -> ActionReport {
+async fn reconfigure_google_docs_mount(request: ReconfigureGoogleDocsMountRequest) -> ActionReport {
     let report = tauri::async_runtime::spawn_blocking(move || {
         let state_root = default_state_root();
         let mut store = SqliteStateStore::open(state_root.clone())
             .map_err(|error| format!("Could not open Locality state: {error}"))?;
         let mut mount = store
-            .get_mount(&MountId::new("google-docs-main"))
+            .get_mount(&MountId::new(request.mount_id.trim()))
             .map_err(|error| format!("Could not inspect Google Docs mount: {error}"))?
             .filter(|mount| mount.connector == GOOGLE_DOCS_CONNECTOR_ID)
             .ok_or_else(|| {
                 "Create a Google Docs mount before changing its selection.".to_string()
             })?;
         mount.remote_root_id = None;
-        mount.settings_json = google_docs_picker_settings_json(&document_ids)?;
+        mount.settings_json = google_docs_picker_settings_json(&request.document_ids)?;
         store
             .save_mount(mount)
             .map_err(|error| format!("Could not save Google Docs selection: {error}"))?;
