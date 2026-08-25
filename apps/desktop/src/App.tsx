@@ -103,6 +103,7 @@ import {
   isSourceConnectorId,
   sourceConnectionReady,
   sourceConnectorIds,
+  sourceOnboardingConnector,
   sourceMountRetryOutcome,
   sourceMounted,
   sourceRequiresApiKey,
@@ -120,15 +121,18 @@ import {
   workspaceWorkflowCommand,
   type PortableWorkspaceReport,
 } from "./portable-workspace";
-import gmailIconUrl from "./assets/connectors/gmail.svg";
-import googleCalendarIconUrl from "./assets/connectors/google-calendar.svg";
-import googleDocsIconUrl from "./assets/connectors/google-docs.svg";
-import granolaIconUrl from "./assets/connectors/granola.svg";
-import linearIconUrl from "./assets/connectors/linear.svg";
-import notionIconUrl from "./assets/connectors/notion.svg";
-import slackIconUrl from "./assets/connectors/slack.svg";
-import localityShortDarkUrl from "./assets/brand/locality-short-dark.svg";
-import localityShortLightUrl from "./assets/brand/locality-short-light.svg";
+// Keep SVGs as image URLs. In Vite dev mode the generated `?import` modules
+// carry an image/svg+xml MIME type, which WebKit correctly refuses to execute
+// as JavaScript when resolving an ES module import.
+const gmailIconUrl = new URL("./assets/connectors/gmail.svg", import.meta.url).href;
+const googleCalendarIconUrl = new URL("./assets/connectors/google-calendar.svg", import.meta.url).href;
+const googleDocsIconUrl = new URL("./assets/connectors/google-docs.svg", import.meta.url).href;
+const granolaIconUrl = new URL("./assets/connectors/granola.svg", import.meta.url).href;
+const linearIconUrl = new URL("./assets/connectors/linear.svg", import.meta.url).href;
+const notionIconUrl = new URL("./assets/connectors/notion.svg", import.meta.url).href;
+const slackIconUrl = new URL("./assets/connectors/slack.svg", import.meta.url).href;
+const localityShortDarkUrl = new URL("./assets/brand/locality-short-dark.svg", import.meta.url).href;
+const localityShortLightUrl = new URL("./assets/brand/locality-short-light.svg", import.meta.url).href;
 
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
@@ -750,13 +754,7 @@ function isOnboardingConnector(value?: string | null): value is OnboardingConnec
 }
 
 function onboardingConnectorFromSnapshot(snapshot: DesktopSnapshot): OnboardingConnectorId {
-  if (isOnboardingConnector(snapshot.mount.connector)) {
-    return snapshot.mount.connector;
-  }
-  if (isOnboardingConnector(snapshot.connection.connector)) {
-    return snapshot.connection.connector;
-  }
-  return "notion";
+  return sourceOnboardingConnector(snapshot) ?? "notion";
 }
 
 function connectorUsesOAuth(connector: OnboardingConnectorId) {
@@ -1880,6 +1878,8 @@ function Onboarding({
   useEffect(() => {
     if (
       !snapshotLoaded ||
+      oauthInFlight ||
+      connectorConnecting ||
       window.location.hash === "#onboarding" ||
       window.location.hash === "#onboarding-ready" ||
       connectionMissing(snapshot)
@@ -1903,7 +1903,15 @@ function Onboarding({
       }
       return current < 5 ? 5 : current;
     });
-  }, [snapshot.connection.connector, snapshot.connection.status, snapshot.mount.connector, snapshot.mount.status, snapshotLoaded]);
+  }, [
+    connectorConnecting,
+    oauthInFlight,
+    snapshot.connection.connector,
+    snapshot.connection.status,
+    snapshot.mount.connector,
+    snapshot.mount.status,
+    snapshotLoaded,
+  ]);
 
   useEffect(() => {
     if (
