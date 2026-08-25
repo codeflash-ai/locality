@@ -5,7 +5,7 @@ use std::thread;
 #[cfg(unix)]
 use std::fs::{self, File, OpenOptions};
 #[cfg(unix)]
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
@@ -166,7 +166,7 @@ impl DesktopSingleInstanceGuard {
 impl DesktopActivationReceiver {
     pub fn start<F>(self, on_activate: F) -> io::Result<DesktopActivationReceiverControl>
     where
-        F: Fn() + Send + 'static,
+        F: Fn(Option<String>) + Send + 'static,
     {
         #[cfg(unix)]
         {
@@ -175,7 +175,11 @@ impl DesktopActivationReceiver {
                 .spawn(move || {
                     loop {
                         match self.activation_listener.accept() {
-                            Ok((_stream, _address)) => on_activate(),
+                            Ok((mut stream, _address)) => {
+                                let mut payload = String::new();
+                                let _ = (&mut stream).take(16 * 1024).read_to_string(&mut payload);
+                                on_activate(payload.strip_prefix("deep-link:").map(str::to_string));
+                            }
                             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                             Err(_) => break,
                         }
@@ -215,7 +219,7 @@ impl DesktopActivationReceiver {
                             )
                         };
                         if result == WAIT_OBJECT_0 {
-                            on_activate();
+                            on_activate(None);
                         } else {
                             break;
                         }
@@ -314,12 +318,14 @@ impl Drop for DesktopSingleInstanceGuard {
 
 pub fn acquire_desktop_single_instance(
     background_launch: bool,
+    activation_payload: Option<&str>,
 ) -> io::Result<Option<DesktopSingleInstanceGuard>> {
     #[cfg(unix)]
     {
         acquire_desktop_single_instance_at(
             &desktop_single_instance_coordination_dir()?,
             background_launch,
+            activation_payload,
         )
     }
 
@@ -330,7 +336,7 @@ pub fn acquire_desktop_single_instance(
 
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = background_launch;
+        let _ = (background_launch, activation_payload);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "desktop single-instance coordination is unsupported on this platform",
@@ -433,6 +439,7 @@ fn desktop_single_instance_coordination_dir() -> io::Result<PathBuf> {
 fn acquire_desktop_single_instance_at(
     coordination_dir: &Path,
     background_launch: bool,
+    activation_payload: Option<&str>,
 ) -> io::Result<Option<DesktopSingleInstanceGuard>> {
     ensure_private_coordination_dir(coordination_dir)?;
     let lock_file = open_coordination_lock(&coordination_dir.join("lock"))?;
@@ -440,7 +447,10 @@ fn acquire_desktop_single_instance_at(
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
             if !background_launch
-                && let Err(error) = notify_existing_desktop(&coordination_dir.join("activate.sock"))
+                && let Err(error) = notify_existing_desktop(
+                    &coordination_dir.join("activate.sock"),
+                    activation_payload,
+                )
             {
                 eprintln!("loc desktop could not activate the existing process: {error}");
             }
@@ -519,11 +529,16 @@ fn try_lock_coordination_file(file: &File) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn notify_existing_desktop(socket_path: &Path) -> io::Result<()> {
+fn notify_existing_desktop(socket_path: &Path, activation_payload: Option<&str>) -> io::Result<()> {
     let deadline = Instant::now() + UNIX_ACTIVATION_RETRY_TIMEOUT;
     loop {
         match UnixStream::connect(socket_path) {
-            Ok(mut stream) => return stream.write_all(b"activate"),
+            Ok(mut stream) => {
+                let message = activation_payload
+                    .map(|value| format!("deep-link:{value}"))
+                    .unwrap_or_else(|| "activate".to_string());
+                return stream.write_all(message.as_bytes());
+            }
             Err(error)
                 if matches!(
                     error.kind(),
@@ -630,13 +645,13 @@ mod tests {
     #[test]
     fn unix_guard_rejects_overlap_and_forwards_only_foreground_activation() {
         let temp = TestCoordinationDir::new("overlap");
-        let primary = super::acquire_desktop_single_instance_at(&temp.path, false)
+        let primary = super::acquire_desktop_single_instance_at(&temp.path, false, None)
             .expect("acquire primary")
             .expect("primary guard");
         let receiver = primary.activation_receiver().expect("clone receiver");
 
         assert!(
-            super::acquire_desktop_single_instance_at(&temp.path, false)
+            super::acquire_desktop_single_instance_at(&temp.path, false, None)
                 .expect("foreground overlap")
                 .is_none()
         );
@@ -651,7 +666,29 @@ mod tests {
         assert_eq!(message, "activate");
 
         assert!(
-            super::acquire_desktop_single_instance_at(&temp.path, true)
+            super::acquire_desktop_single_instance_at(
+                &temp.path,
+                false,
+                Some("locality://google-docs-picker?completion=opaque")
+            )
+            .expect("deep link overlap")
+            .is_none()
+        );
+        let (mut activation, _) = receiver
+            .activation_listener
+            .accept()
+            .expect("accept deep link activation");
+        let mut message = String::new();
+        activation
+            .read_to_string(&mut message)
+            .expect("read deep link activation");
+        assert_eq!(
+            message,
+            "deep-link:locality://google-docs-picker?completion=opaque"
+        );
+
+        assert!(
+            super::acquire_desktop_single_instance_at(&temp.path, true, None)
                 .expect("background overlap")
                 .is_none()
         );
@@ -675,7 +712,7 @@ mod tests {
         super::try_lock_coordination_file(&lock).expect("claim lock");
 
         assert!(
-            super::acquire_desktop_single_instance_at(&temp.path, false)
+            super::acquire_desktop_single_instance_at(&temp.path, false, None)
                 .expect("overlap without receiver")
                 .is_none(),
             "the lock loser must exit even when activation forwarding is not ready"
@@ -686,19 +723,19 @@ mod tests {
     #[test]
     fn relaunch_release_drops_ownership_before_a_successor_acquires_it() {
         let temp = TestCoordinationDir::new("relaunch-release");
-        let primary = super::acquire_desktop_single_instance_at(&temp.path, true)
+        let primary = super::acquire_desktop_single_instance_at(&temp.path, true, None)
             .expect("acquire primary")
             .expect("primary guard");
         let state = super::DesktopSingleInstanceState::new(Some(primary));
 
         assert!(
-            super::acquire_desktop_single_instance_at(&temp.path, true)
+            super::acquire_desktop_single_instance_at(&temp.path, true, None)
                 .expect("overlap before release")
                 .is_none()
         );
         assert!(state.release_for_relaunch().expect("release ownership"));
 
-        let successor = super::acquire_desktop_single_instance_at(&temp.path, true)
+        let successor = super::acquire_desktop_single_instance_at(&temp.path, true, None)
             .expect("acquire successor")
             .expect("successor guard");
         assert!(!state.release_for_relaunch().expect("idempotent release"));
@@ -776,7 +813,7 @@ mod tests {
             .activation_receiver()
             .expect("duplicate activation event");
         let receiver_event_handle = receiver.activation_event_handle;
-        let receiver_control = receiver.start(|| {}).expect("start activation receiver");
+        let receiver_control = receiver.start(|_| {}).expect("start activation receiver");
         let shutdown_event_handle = receiver_control
             .shutdown_event_handle
             .expect("receiver shutdown event");

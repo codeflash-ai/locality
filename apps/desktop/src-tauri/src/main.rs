@@ -1623,7 +1623,9 @@ fn choose_google_docs_in_browser_blocking() -> Result<Vec<String>, String> {
             .lock()
             .map_err(|_| "Google Picker is unavailable. Try again.".to_string())?;
         if guard.is_some() {
-            return Err("Google Picker is already open. Finish or cancel that selection first.".to_string());
+            return Err(
+                "Google Picker is already open. Finish or cancel that selection first.".to_string(),
+            );
         }
         *guard = Some(sender);
     }
@@ -22348,7 +22350,10 @@ fn main() {
     let background_launch = desktop_launch_requested_background();
     let smoke_test_requested = desktop_smoke_test_requested();
     let single_instance_guard = if desktop_single_instance_required(smoke_test_requested) {
-        match single_instance::acquire_desktop_single_instance(background_launch) {
+        match single_instance::acquire_desktop_single_instance(
+            background_launch,
+            std::env::args().nth(1).as_deref(),
+        ) {
             Ok(Some(guard)) => Some(guard),
             Ok(None) => return,
             Err(error) => {
@@ -22445,7 +22450,12 @@ fn main() {
             if let Some(receiver) = desktop_activation_receiver {
                 let app_handle = app.app_handle().clone();
                 let receiver_control = receiver
-                    .start(move || show_main_window_with_view(&app_handle, None))
+                    .start(move |activation_payload| {
+                        if let Some(link) = activation_payload {
+                            receive_google_docs_picker_deep_link(&link);
+                        }
+                        show_main_window_with_view(&app_handle, None)
+                    })
                     .map_err(|error| {
                         io::Error::other(format!(
                             "Locality could not start its desktop activation receiver: {error}"
