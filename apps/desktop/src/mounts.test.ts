@@ -59,11 +59,11 @@ describe("mount display helpers", () => {
       connector: "google-docs",
       connectorName: "Google Docs",
       connectionId: "google-docs-default",
-      workspaceName: "Drive",
+      workspaceName: "Selected documents",
       localPath: "/home/ada/Locality/google-docs-main",
       notionUrl: null,
-      accessScope: "Workspace folder",
-      remoteRootId: "drive-folder-1",
+      accessScope: "Selected Google Docs",
+      remoteRootId: null,
       readOnly: true,
       entityCount: 4,
       pendingChangeCount: 0,
@@ -86,7 +86,7 @@ describe("mount display helpers", () => {
     });
     expect(rows[1]).toMatchObject({
       title: "Google Docs",
-      subtitle: "Drive / google-docs-main",
+      subtitle: "Selected documents / google-docs-main",
       access: "Read only",
       content: "4 items",
       active: false,

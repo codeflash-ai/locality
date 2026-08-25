@@ -794,7 +794,7 @@ function onboardingConnectorDescription(
       case "notion":
         return `${workspaceLabel} is ready. Locality will now create the Notion folder under CloudStorage and prepare the local workspace.`;
       case "google-docs":
-        return "Google Docs is ready. Locality mounted the selected Drive folder as local files under CloudStorage.";
+        return "Google Docs is ready. Locality mounted your selected documents as local files under CloudStorage.";
       case "google-calendar":
         return "Google Calendar is ready. Locality mounted primary calendar events as local files under CloudStorage.";
       case "gmail":
@@ -850,7 +850,7 @@ function onboardingConnectorPills(connector: OnboardingConnectorId) {
     case "notion":
       return ["Scoped access", "Credentials in Keychain", "Direct app connection"];
     case "google-docs":
-      return ["Google OAuth", "Drive folder", "Markdown edits"];
+      return ["Google OAuth", "Selected Docs", "Markdown edits"];
     case "google-calendar":
       return ["Google OAuth", "Primary calendar", "Event drafts"];
     case "gmail":
@@ -947,6 +947,65 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>, f
   }
 
   return invoke<T>(command, args);
+}
+
+type GoogleDocsPickerConfiguration = {
+  developerKey: string;
+  clientId: string;
+  accessToken: string;
+};
+
+declare global {
+  interface Window {
+    gapi?: { load: (name: string, callback: () => void) => void; };
+    google?: { picker: any; };
+  }
+}
+
+let googlePickerLoad: Promise<void> | null = null;
+
+function loadGooglePicker(): Promise<void> {
+  if (window.google?.picker) return Promise.resolve();
+  if (googlePickerLoad) return googlePickerLoad;
+  googlePickerLoad = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://apis.google.com/js/api.js";
+    script.async = true;
+    script.onerror = () => reject(new Error("Could not load Google Picker. Check your network connection and try again."));
+    script.onload = () => window.gapi?.load("picker", resolve);
+    document.head.appendChild(script);
+  });
+  return googlePickerLoad;
+}
+
+async function chooseGoogleDocs(): Promise<string[]> {
+  const configuration = await callCommand<GoogleDocsPickerConfiguration>("google_docs_picker_configuration");
+  await loadGooglePicker();
+  return new Promise((resolve, reject) => {
+    const picker = window.google?.picker;
+    if (!picker) {
+      reject(new Error("Google Picker did not load. Check your network connection and try again."));
+      return;
+    }
+    const view = new picker.DocsView(picker.ViewId.DOCUMENTS)
+      .setIncludeFolders(false)
+      .setSelectFolderEnabled(false);
+    const dialog = new picker.PickerBuilder()
+      .setDeveloperKey(configuration.developerKey)
+      .setOAuthToken(configuration.accessToken)
+      .setAppId(configuration.clientId)
+      .addView(view)
+      .enableFeature(picker.Feature.MULTISELECT_ENABLED)
+      .setCallback((data: any) => {
+        if (data.action === picker.Action.PICKED) {
+          resolve(data.docs.map((document: any) => document.id));
+        } else if (data.action === picker.Action.CANCEL) {
+          resolve([]);
+        }
+      })
+      .build();
+    dialog.setVisible(true);
+  });
 }
 
 function errorMessage(error: unknown) {
@@ -1758,7 +1817,7 @@ function Onboarding({
   });
   const [granolaApiKey, setGranolaApiKey] = useState("");
   const [linearApiKey, setLinearApiKey] = useState("");
-  const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
+  const [googleDocsDocumentIds, setGoogleDocsDocumentIds] = useState<string[]>([]);
   const [connectorConnecting, setConnectorConnecting] = useState(false);
   const [connectedWorkspace, setConnectedWorkspace] = useState(snapshot.connection.workspaceName);
   const [mountPath, setMountPath] = useState(snapshot.mount.localPath);
@@ -2084,6 +2143,11 @@ function Onboarding({
   }
 
   async function createOnboardingConnectorMount(connector: Exclude<OnboardingConnectorId, "notion">) {
+    const documentIds = connector === "google-docs" ? await chooseGoogleDocs() : undefined;
+    if (connector === "google-docs" && !documentIds.length) {
+      return { ok: false, message: "Choose one or more Google Docs to continue." };
+    }
+    if (documentIds) setGoogleDocsDocumentIds(documentIds);
     return callCommand<ActionReport>(
       "create_desktop_mount",
       {
@@ -2094,9 +2158,7 @@ function Onboarding({
           connectionId: null,
           readOnly: connector === "granola" || connector === "slack",
           notionRootPage: null,
-          googleDocsWorkspaceFolder: connector === "google-docs"
-            ? googleDocsWorkspaceFolder.trim() || "Locality"
-            : null,
+          googleDocsDocumentIds: documentIds ?? null,
         },
       },
       { ok: true, message: `Mounted demo ${sourceDisplayName(connector)} source.` },
@@ -2107,11 +2169,6 @@ function Onboarding({
     if (selectedConnectorBusy) {
       return;
     }
-    if (connector === "google-docs" && !googleDocsWorkspaceFolder.trim()) {
-      setOauthError("Enter a Google Drive folder name, URL, or ID.");
-      return;
-    }
-
     setOauthError("");
     setLoginCopyMessage("");
     setMountOnboarding(null);
@@ -2614,16 +2671,8 @@ function Onboarding({
                 />
               </label>
             )}
-            {selectedOnboardingConnector === "google-docs" && !connectionReadyNow && (
-              <label className="source-inline-field onboarding-source-field">
-                <span>Drive folder</span>
-                <input
-                  value={googleDocsWorkspaceFolder}
-                  placeholder="Folder name, URL, or ID"
-                  disabled={oauthInFlight}
-                  onChange={(event) => setGoogleDocsWorkspaceFolder(event.target.value)}
-                />
-              </label>
+            {selectedOnboardingConnector === "google-docs" && (
+              <p className="quiet-note">Choose Google Docs after your account is connected. {googleDocsDocumentIds.length ? `${googleDocsDocumentIds.length} selected.` : ""}</p>
             )}
             <div className="button-row onboarding-nav-actions">
               <SecondaryButton disabled={!canLeaveConnectorStep} onClick={goBackFromOnboarding}>
@@ -2635,7 +2684,7 @@ function Onboarding({
                   !connectionReadyNow &&
                   (
                     (sourceRequiresApiKey(selectedOnboardingConnector) && !selectedApiKey.trim()) ||
-                    (selectedOnboardingConnector === "google-docs" && !googleDocsWorkspaceFolder.trim())
+                    false
                   )
                 }
                 onClick={
@@ -3423,7 +3472,7 @@ function MountsView({
   const [sourceFileProviderEnablement, setSourceFileProviderEnablement] = useState<FileProviderEnablementReport | null>(null);
   const [pendingMountRetry, setPendingMountRetry] = useState<{
     connector: SourceConnectorId;
-    googleDocsWorkspaceFolder?: string;
+    googleDocsDocumentIds?: string[];
   } | null>(null);
   const sourceFinderRevealRequestedRef = useRef(false);
   const sourceSetupBusy = sourceSetupIsBusy(sourceDialogState);
@@ -3460,7 +3509,7 @@ function MountsView({
         completionTimer = window.setTimeout(async () => {
           const mountReport = await createConnectorMount(
             pendingMountRetry.connector,
-            pendingMountRetry.googleDocsWorkspaceFolder,
+            pendingMountRetry.googleDocsDocumentIds,
           );
           const outcome = sourceMountRetryOutcome(mountReport);
           if (outcome.kind === "retry") {
@@ -3506,7 +3555,7 @@ function MountsView({
 
   function beginSourceFileProviderRecovery(
     connector: SourceConnectorId,
-    googleDocsWorkspaceFolder: string | undefined,
+    googleDocsDocumentIds: string[] | undefined,
   ) {
     setActionError("");
     setSourceDialogOpen(true);
@@ -3518,7 +3567,7 @@ function MountsView({
       message: "In Finder, click Enable for Locality.",
       path: sourceDefaultPath(snapshot, connector),
     });
-    setPendingMountRetry({ connector, googleDocsWorkspaceFolder });
+    setPendingMountRetry({ connector, googleDocsDocumentIds });
   }
 
   async function revealSourceFileProviderEnablement() {
@@ -3534,7 +3583,7 @@ function MountsView({
 
   async function createConnectorMount(
     connector: SourceConnectorId,
-    googleDocsWorkspaceFolder?: string,
+    googleDocsDocumentIds?: string[],
   ): Promise<ActionReport> {
     if (creating) {
       return { ok: false, message: "Source setup is already running." };
@@ -3555,8 +3604,8 @@ function MountsView({
                 connectionId: null,
                 readOnly: connector === "granola" || connector === "slack",
                 notionRootPage: null,
-                googleDocsWorkspaceFolder: connector === "google-docs"
-                  ? googleDocsWorkspaceFolder?.trim() || "Locality"
+                googleDocsDocumentIds: connector === "google-docs"
+                  ? googleDocsDocumentIds ?? []
                   : null,
               },
             },
@@ -3564,7 +3613,7 @@ function MountsView({
       );
       if (!report.ok) {
         if (classifyMountSetupError(report.message).kind === "file-provider-disabled") {
-          beginSourceFileProviderRecovery(connector, googleDocsWorkspaceFolder);
+          beginSourceFileProviderRecovery(connector, googleDocsDocumentIds);
           return report;
         }
         setActionError(report.message);
@@ -3575,7 +3624,7 @@ function MountsView({
     } catch (error) {
       const message = errorMessage(error);
       if (classifyMountSetupError(message).kind === "file-provider-disabled") {
-        beginSourceFileProviderRecovery(connector, googleDocsWorkspaceFolder);
+        beginSourceFileProviderRecovery(connector, googleDocsDocumentIds);
         return { ok: false, message };
       }
       setActionError(message);
@@ -3647,7 +3696,7 @@ function MountsView({
 
   async function runSourceDialogAction(
     connector: SourceConnectorId,
-    options?: { googleDocsWorkspaceFolder?: string },
+    options?: { googleDocsDocumentIds?: string[] },
   ) {
     if (sourceSetupBusy) {
       return;
@@ -3667,7 +3716,15 @@ function MountsView({
     setSourceDialogState(nextState);
     try {
       if (connectorReady && !connectorHasMount) {
-        const mountReport = await createConnectorMount(connector, options?.googleDocsWorkspaceFolder);
+        const documentIds = connector === "google-docs"
+          ? options?.googleDocsDocumentIds ?? await chooseGoogleDocs()
+          : undefined;
+        if (connector === "google-docs" && documentIds.length === 0) {
+          setSourceDialogMessage("Choose one or more Google Docs to continue.");
+          setSourceDialogState("idle");
+          return;
+        }
+        const mountReport = await createConnectorMount(connector, documentIds);
         if (classifyMountSetupError(mountReport.message).kind === "file-provider-disabled") {
           return;
         }
@@ -3688,7 +3745,13 @@ function MountsView({
       }
 
       setSourceDialogState("creating");
-      const mountReport = await createConnectorMount(connector, options?.googleDocsWorkspaceFolder);
+      const documentIds = connector === "google-docs" ? await chooseGoogleDocs() : undefined;
+      if (connector === "google-docs" && documentIds.length === 0) {
+        setSourceDialogMessage("Choose one or more Google Docs to continue.");
+        setSourceDialogState("idle");
+        return;
+      }
+      const mountReport = await createConnectorMount(connector, documentIds);
       if (classifyMountSetupError(mountReport.message).kind === "file-provider-disabled") {
         return;
       }
@@ -3961,14 +4024,14 @@ function AddSourceDialog({
   activeConnector: SourceConnectorId | null;
   message: string;
   fileProviderEnablement: FileProviderEnablementReport | null;
-  onAction: (connector: SourceConnectorId, options?: { googleDocsWorkspaceFolder?: string }) => void;
+  onAction: (connector: SourceConnectorId, options?: { googleDocsDocumentIds?: string[] }) => void;
   onApiKeyAction: (connector: "granola" | "linear", apiKey: string) => void;
   onReopenFinder: () => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [viewMode, setViewMode] = useState<SourceListViewMode>("list");
-  const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
+  const [googleDocsDocumentIds, setGoogleDocsDocumentIds] = useState<string[]>([]);
   const [granolaApiKey, setGranolaApiKey] = useState("");
   const [linearApiKey, setLinearApiKey] = useState("");
   const busy = sourceSetupIsBusy(state);
@@ -3984,7 +4047,7 @@ function AddSourceDialog({
     {
       id: "google-docs",
       name: "Google Docs",
-      description: "Docs and Drive folders through the same local file workflow.",
+      description: "Selected Google Docs as local Markdown files.",
       status: sourceConnectorStatus(snapshot, "google-docs"),
       keywords: ["google", "docs", "gdocs", "drive", "documents"],
       mounted: sourceMounted(snapshot, "google-docs"),
@@ -4163,7 +4226,7 @@ function AddSourceDialog({
                       </>
                     ) : connector.id === "google-docs" ? (
                       <>
-                        <SettingRow title="Workspace folder" value={googleDocsWorkspaceFolder || "Locality"} />
+                        <SettingRow title="Selection" value={googleDocsDocumentIds.length ? `${googleDocsDocumentIds.length} selected` : "Choose Google Docs"} />
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
                       </>
                     ) : connector.id === "google-calendar" ? (
@@ -4194,16 +4257,6 @@ function AddSourceDialog({
                       </>
                     )}
                   </div>
-                  {connector.id === "google-docs" && !connector.mounted && (
-                    <label className="source-inline-field">
-                      <span>Drive folder</span>
-                      <input
-                        value={googleDocsWorkspaceFolder}
-                        placeholder="Folder name, URL, or ID"
-                        onChange={(event) => setGoogleDocsWorkspaceFolder(event.target.value)}
-                      />
-                    </label>
-                  )}
                   {apiKeyConnector && !connector.mounted && needsConnection && (
                     <>
                       <label className="source-inline-field">
@@ -4260,11 +4313,23 @@ function AddSourceDialog({
                     <PrimaryButton
                       compact
                       busy={connectorBusy}
-                      disabled={disabled || (connector.id === "google-docs" && !googleDocsWorkspaceFolder.trim())}
+                      disabled={disabled}
                       icon={sourceActionIcon(connector.id, needsConnection)}
-                      onClick={() => onAction(connector.id, { googleDocsWorkspaceFolder })}
+                      onClick={() => {
+                        if (connector.id !== "google-docs" || !needsConnection) {
+                          void (async () => {
+                            const documentIds = connector.id === "google-docs" ? await chooseGoogleDocs() : undefined;
+                            if (connector.id !== "google-docs" || documentIds?.length) {
+                              if (documentIds) setGoogleDocsDocumentIds(documentIds);
+                              onAction(connector.id, { googleDocsDocumentIds: documentIds });
+                            }
+                          })();
+                          return;
+                        }
+                        onAction(connector.id);
+                      }}
                     >
-                      {connectorBusy ? sourceSetupProgressLabel(state, connector.mounted) : actionLabel}
+                      {connectorBusy ? sourceSetupProgressLabel(state, connector.mounted) : connector.id === "google-docs" ? "Choose Google Docs" : actionLabel}
                     </PrimaryButton>
                   )}
                 </article>
@@ -7863,7 +7928,7 @@ const onboardingConnectorCards: OnboardingConnectorCard[] = [
   {
     connector: "google-docs",
     title: "Google Docs",
-    description: "Docs and Drive folders through the same local model.",
+    description: "Selected Google Docs through the same local model.",
   },
   {
     connector: "google-calendar",

@@ -82,7 +82,8 @@ use locality_google_calendar::{
 };
 use locality_google_docs::{
     DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL, DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI,
-    GOOGLE_DOCS_CONNECTOR_ID, HttpGoogleDocsOAuthBrokerClient,
+    GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsMountSettings, HttpGoogleDocsOAuthBrokerClient,
+    StoredGoogleDocsCredential,
 };
 #[cfg(test)]
 use locality_notion::NotionConfig;
@@ -139,7 +140,6 @@ use localityd::durable_fs::{
     remove_dir_all_durable_if_identity_windows, remove_empty_dir_durable_if_identity_windows,
 };
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
-use localityd::google_docs::resolve_google_docs_connector_for_mount;
 use localityd::hydration::HydrationSource;
 use localityd::ipc::{
     DaemonBuildInfo, DaemonDebugQueueStatus, DaemonRequest, DaemonStatusReport, send_request,
@@ -487,7 +487,18 @@ struct CreateDesktopMountRequest {
     connection_id: Option<String>,
     read_only: bool,
     notion_root_page: Option<String>,
-    google_docs_workspace_folder: Option<String>,
+    google_docs_document_ids: Option<Vec<String>>,
+}
+
+/// This response intentionally exists only at the Tauri command boundary. It is never added to
+/// the desktop snapshot or persisted: Google Picker needs the current OAuth access token, but the
+/// token remains owned by the credential store.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleDocsPickerConfiguration {
+    developer_key: String,
+    client_id: String,
+    access_token: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1451,7 +1462,7 @@ async fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
             connection_id: None,
             read_only: false,
             notion_root_page: None,
-            google_docs_workspace_folder: None,
+            google_docs_document_ids: None,
         },
     )
     .await
@@ -1510,6 +1521,62 @@ fn portable_workspace_options_at_state_root(
 #[tauri::command]
 async fn create_desktop_mount(app: AppHandle, request: CreateDesktopMountRequest) -> ActionReport {
     create_desktop_mount_command(app, request).await
+}
+
+#[tauri::command]
+async fn google_docs_picker_configuration() -> Result<GoogleDocsPickerConfiguration, String> {
+    tauri::async_runtime::spawn_blocking(google_docs_picker_configuration_blocking)
+        .await
+        .map_err(|error| format!("Google Picker configuration worker failed: {error}"))?
+}
+
+fn google_docs_picker_configuration_blocking() -> Result<GoogleDocsPickerConfiguration, String> {
+    let developer_key = env::var("LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "Google Picker is not configured. Set LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY and restart Locality."
+                .to_string()
+        })?;
+    let state_root = default_state_root();
+    let store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let connection_id = preferred_connection_id_for_connector(&store, GOOGLE_DOCS_CONNECTOR_ID)?
+        .ok_or_else(|| "Connect a Google Docs account before choosing documents.".to_string())?;
+    let connection = store
+        .get_connection(&connection_id)
+        .map_err(|error| format!("Could not load Google Docs connection: {error}"))?
+        .filter(|connection| connection.status == "active")
+        .ok_or_else(|| "Reconnect Google Docs before choosing documents.".to_string())?;
+    if connection.auth_kind != "oauth" {
+        return Err(
+            "Google Picker requires a Google Docs OAuth connection. Reconnect Google Docs."
+                .to_string(),
+        );
+    }
+    let secret = open_credential_store(&state_root)
+        .get(&connection.secret_ref)
+        .map_err(|error| format!("Could not read Google Docs credential: {error}"))?;
+    let credential = serde_json::from_str::<StoredGoogleDocsCredential>(&secret)
+        .map_err(|error| format!("Could not read Google Docs OAuth credential: {error}"))?;
+    let client_id = credential
+        .oauth_client_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "Google Picker needs the OAuth client ID. Reconnect Google Docs and try again."
+                .to_string()
+        })?;
+    if credential.access_token.trim().is_empty() {
+        return Err(
+            "Google Docs access has expired. Reconnect Google Docs and try again.".to_string(),
+        );
+    }
+    Ok(GoogleDocsPickerConfiguration {
+        developer_key,
+        client_id,
+        access_token: credential.access_token,
+    })
 }
 
 #[tauri::command]
@@ -1587,7 +1654,7 @@ fn connect_granola_blocking(api_key: String) -> Result<String, String> {
         connection_id: Some(report.connection_id),
         read_only: !desktop_mount_is_editable_by_default("granola"),
         notion_root_page: None,
-        google_docs_workspace_folder: None,
+        google_docs_document_ids: None,
     })
 }
 
@@ -1638,7 +1705,7 @@ fn connect_linear_blocking(api_key: String) -> Result<String, String> {
         connection_id: Some(report.connection_id),
         read_only: !desktop_mount_is_editable_by_default("linear"),
         notion_root_page: None,
-        google_docs_workspace_folder: None,
+        google_docs_document_ids: None,
     })
 }
 
@@ -2299,7 +2366,7 @@ fn run_workspace_mount_onboarding_blocking(
         connection_id: None,
         read_only: false,
         notion_root_page: None,
-        google_docs_workspace_folder: None,
+        google_docs_document_ids: None,
     }) {
         Ok(message) => workspace_mount_onboarding_report(
             MacosWorkspaceMountOnboardingState::Created,
@@ -5814,11 +5881,7 @@ fn notion_access_scope_label(store: Option<&SqliteStateStore>, mount: &MountConf
 fn mount_access_scope_label(store: Option<&SqliteStateStore>, mount: &MountConfig) -> String {
     match mount.connector.as_str() {
         "notion" => notion_access_scope_label(store, mount),
-        "google-docs" => mount
-            .remote_root_id
-            .as_ref()
-            .map(|remote_id| format!("Drive folder {}", remote_id.0))
-            .unwrap_or_else(|| "Google Docs workspace folder".to_string()),
+        "google-docs" => "Selected Google Docs".to_string(),
         GOOGLE_CALENDAR_CONNECTOR_ID => mount
             .remote_root_id
             .as_ref()
@@ -7838,40 +7901,18 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| RemoteId::new(value.to_string())),
-        "google-docs" => {
-            let workspace = request
-                .google_docs_workspace_folder
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    "Google Docs mounts need a workspace folder name or ID.".to_string()
-                })?;
-            let temp_mount = MountConfig {
-                mount_id: mount_id.clone(),
-                connector: connector.clone(),
-                root: root.clone(),
-                remote_root_id: None,
-                connection_id: connection_id.clone(),
-                read_only,
-                projection: projection.clone(),
-                settings_json: "{}".to_string(),
-            };
-            let credentials = open_credential_store(&state_root);
-            let connector =
-                resolve_google_docs_connector_for_mount(&store, credentials.as_ref(), &temp_mount)
-                    .map_err(|error| error.message())?;
-            let folder_id = connector
-                .resolve_workspace_folder(workspace)
-                .map_err(|error| {
-                    format!("Failed to resolve Google Docs workspace folder `{workspace}`: {error}")
-                })?;
-            Some(folder_id)
-        }
+        "google-docs" => None,
         GOOGLE_CALENDAR_CONNECTOR_ID | "gmail" | "granola" | "linear" | SLACK_CONNECTOR_ID => None,
         _ => unreachable!("unsupported desktop connector should be rejected before mount setup"),
     };
-    let settings_json = if connector == SLACK_CONNECTOR_ID {
+    let settings_json = if connector == "google-docs" {
+        google_docs_picker_settings_json(
+            request
+                .google_docs_document_ids
+                .as_deref()
+                .unwrap_or_default(),
+        )?
+    } else if connector == SLACK_CONNECTOR_ID {
         SlackMountSettings::default()
             .to_json()
             .map_err(|error| format!("Could not encode Slack mount settings: {error}"))?
@@ -7900,6 +7941,12 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
     reload_daemon_mounts(&state_root)?;
 
     finish_desktop_mount_setup(&store, &state_root, mount_report, preserved)
+}
+
+fn google_docs_picker_settings_json(document_ids: &[String]) -> Result<String, String> {
+    GoogleDocsMountSettings::from_document_ids(document_ids.iter().map(String::as_str))
+        .and_then(|settings| settings.to_json())
+        .map_err(|error| format!("Choose one or more Google Docs documents: {error}"))
 }
 
 struct RemountInProgressGuard;
@@ -10949,7 +10996,7 @@ fn connect_google_docs_with_broker(
         _ => "Connected Google Docs.".to_string(),
     };
     Ok(format!(
-        "{connected_message} Create a Google Docs source folder to mount a Drive workspace."
+        "{connected_message} Choose Google Docs to mount selected documents."
     ))
 }
 
@@ -15105,7 +15152,7 @@ mod tests {
             connection_id: None,
             read_only: false,
             notion_root_page: Some("should-not-be-used".to_string()),
-            google_docs_workspace_folder: Some("should-not-be-used".to_string()),
+            google_docs_document_ids: Some(vec!["should-not-be-used".to_string()]),
         });
 
         if let Err(error) = &result {
@@ -15135,6 +15182,21 @@ mod tests {
             SlackMountSettings::default()
                 .to_json()
                 .expect("serialize default Slack settings")
+        );
+    }
+
+    #[test]
+    fn google_docs_picker_selection_is_encoded_without_a_remote_root() {
+        let settings_json = super::google_docs_picker_settings_json(&[
+            "doc-b".to_string(),
+            "doc-a".to_string(),
+            "doc-b".to_string(),
+        ])
+        .expect("encode selected Google Docs");
+
+        assert_eq!(
+            settings_json,
+            r#"{"google_docs":{"version":2,"document_ids":["doc-a","doc-b"]}}"#
         );
     }
 
@@ -22201,6 +22263,7 @@ fn main() {
             create_workspace_mount,
             materialize_portable_workspace,
             create_desktop_mount,
+            google_docs_picker_configuration,
             connect_granola,
             connect_linear,
             reset_source_state,
