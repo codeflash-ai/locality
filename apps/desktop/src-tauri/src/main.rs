@@ -1801,7 +1801,7 @@ fn google_docs_picker_page(token: &str, configuration: &GoogleDocsPickerConfigur
         .expect("Google Picker configuration serializes")
         .replace('<', "\\u003c");
     format!(
-        r#"<!doctype html><html><head><meta charset=\"utf-8\"><title>Choose Google Docs</title><script src=\"https://apis.google.com/js/api.js\"></script></head><body><p id=\"status\">Loading Google Picker…</p><script>const configuration={configuration};const selectionUrl='/google-docs-picker/{token}/selection';function submit(documentIds){{fetch(selectionUrl,{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{documentIds}})}}).then(()=>document.getElementById('status').textContent='Selection sent to Locality. You can close this tab.').catch(()=>document.getElementById('status').textContent='Could not send the selection to Locality.');}}gapi.load('picker',()=>{{const p=google.picker;const view=new p.DocsView(p.ViewId.DOCUMENTS).setIncludeFolders(false).setSelectFolderEnabled(false).setMimeTypes('application/vnd.google-apps.document');new p.PickerBuilder().setDeveloperKey(configuration.developerKey).setOAuthToken(configuration.accessToken).setAppId(configuration.projectNumber).setOrigin(window.location.origin).addView(view).enableFeature(p.Feature.MULTISELECT_ENABLED).setCallback(data=>{{if(data.action===p.Action.PICKED)submit(data.docs.map(doc=>doc.id));if(data.action===p.Action.CANCEL)submit([]);}}).build().setVisible(true);}});</script></body></html>"#
+        r#"<!doctype html><html><head><meta charset="utf-8"><title>Choose Google Docs</title><script src="https://apis.google.com/js/api.js"></script></head><body><p id="status">Loading Google Picker…</p><script>const configuration={configuration};const selectionUrl='/google-docs-picker/{token}/selection';function submit(documentIds){{fetch(selectionUrl,{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{documentIds}})}}).then(()=>document.getElementById('status').textContent='Selection sent to Locality. You can close this tab.').catch(()=>document.getElementById('status').textContent='Could not send the selection to Locality.');}}gapi.load('picker',()=>{{const p=google.picker;const view=new p.DocsView(p.ViewId.DOCUMENTS).setIncludeFolders(false).setSelectFolderEnabled(false).setMimeTypes('application/vnd.google-apps.document');new p.PickerBuilder().setDeveloperKey(configuration.developerKey).setOAuthToken(configuration.accessToken).setAppId(configuration.projectNumber).setOrigin(window.location.origin).addView(view).enableFeature(p.Feature.MULTISELECT_ENABLED).setCallback(data=>{{if(data.action===p.Action.PICKED)submit(data.docs.map(doc=>doc.id));if(data.action===p.Action.CANCEL)submit([]);}}).build().setVisible(true);}});</script></body></html>"#
     )
 }
 
@@ -15520,6 +15520,20 @@ mod tests {
                 .unwrap(),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn google_docs_picker_page_loads_the_google_api_script() {
+        let page = super::google_docs_picker_page(
+            "session",
+            &super::GoogleDocsPickerConfiguration {
+                developer_key: "picker-key".to_string(),
+                project_number: "123456789".to_string(),
+                access_token: "access-token".to_string(),
+            },
+        );
+
+        assert!(page.contains(r#"<script src="https://apis.google.com/js/api.js"></script>"#));
     }
 
     #[test]
