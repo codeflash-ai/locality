@@ -1000,8 +1000,10 @@ fn parse_launchd_service_enabled(output: &str) -> Result<bool, DaemonProcessErro
         ));
     };
     match value.trim().trim_end_matches(',').trim() {
-        "true" => Ok(false),
-        "false" => Ok(true),
+        // Older macOS releases print booleans where `true` means the service
+        // is disabled. Newer releases print the equivalent state names.
+        "true" | "disabled" => Ok(false),
+        "false" | "enabled" => Ok(true),
         _ => Err(DaemonProcessError::new(
             "launchctl_failed",
             "launchctl returned an invalid disabled-services value",
@@ -1443,6 +1445,20 @@ mod tests {
                 super::MACOS_LAUNCHD_LABEL
             ))
             .expect("explicit enabled state")
+        );
+        assert!(
+            !parse_launchd_service_enabled(&format!(
+                "disabled services = {{\n    \"{}\" => disabled\n}}",
+                super::MACOS_LAUNCHD_LABEL
+            ))
+            .expect("named disabled state")
+        );
+        assert!(
+            parse_launchd_service_enabled(&format!(
+                "disabled services = {{\n    \"{}\" => enabled\n}}",
+                super::MACOS_LAUNCHD_LABEL
+            ))
+            .expect("named enabled state")
         );
     }
 
