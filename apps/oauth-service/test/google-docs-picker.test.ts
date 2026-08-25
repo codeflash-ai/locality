@@ -178,6 +178,7 @@ describe("Google Docs Picker capabilities", () => {
       expect(page).not.toContain("opaque-refresh-handle");
       expect(page).toContain("setDeveloperKey");
       expect(page).toContain("setOAuthToken");
+      expect(page).not.toContain("setOrigin(");
       expect(page).toContain("form.submit()");
     } finally {
       globalThis.fetch = originalFetch;
