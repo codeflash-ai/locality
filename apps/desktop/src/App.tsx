@@ -3722,6 +3722,12 @@ function MountsView({
     setSourceDialogConnector("google-docs");
     setSourceDialogState("creating");
     try {
+      const mountId = googleDocsMountedMountId(snapshot);
+      if (!mountId) {
+        setSourceDialogMessage("Create a Google Docs mount before changing its selection.");
+        setSourceDialogState("error");
+        return;
+      }
       const documentIds = await chooseGoogleDocs();
       if (!documentIds.length) {
         setSourceDialogMessage("Choose one or more Google Docs to update the selection.");
@@ -3729,7 +3735,7 @@ function MountsView({
         return;
       }
       const report = await callCommand<ActionReport>("reconfigure_google_docs_mount", {
-        request: { mountId: sourceMountId("google-docs"), documentIds },
+        request: { mountId, documentIds },
       });
       setSourceDialogMessage(report.message);
       setSourceDialogState(report.ok ? "success" : "error");
@@ -4455,6 +4461,10 @@ function sourceMountDetails(snapshot: DesktopSnapshot, connector: SourceConnecto
     snapshot.mounts.find((mount) => mount.connector === connector) ??
     (snapshot.mount.connector === connector && snapshot.mount.status !== "not_mounted" ? snapshot.mount : null)
   );
+}
+
+export function googleDocsMountedMountId(snapshot: DesktopSnapshot): string | null {
+  return sourceMountDetails(snapshot, "google-docs")?.mountId ?? null;
 }
 
 function sourceConnectorStatus(snapshot: DesktopSnapshot, connector: SourceConnectorId) {
