@@ -242,7 +242,7 @@ describe("mount display helpers", () => {
       mountId: "google-docs-main",
       connector: "google-docs",
       connectorName: "Google Docs",
-      workspaceName: "Drive",
+      workspaceName: "Selected documents",
       localPath: "/home/ada/Locality/google-docs-main",
     });
     const rows = mountRows([notion, google], notion, "notion-main");

@@ -425,11 +425,11 @@ const sampleGoogleMount: MountSummary = {
   connector: "google-docs",
   connectorName: "Google Docs",
   connectionId: "google-docs-default",
-  workspaceName: "Drive",
+  workspaceName: "Selected documents",
   localPath: "~/Library/CloudStorage/Locality/google-docs-main",
   notionUrl: null,
-  accessScope: "Workspace folder",
-  remoteRootId: "drive-folder-1",
+  accessScope: "Selected Google Docs",
+  remoteRootId: null,
   projection: "macOS File Provider",
   readOnly: false,
   status: "ready",
@@ -951,7 +951,7 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>, f
 
 type GoogleDocsPickerConfiguration = {
   developerKey: string;
-  clientId: string;
+  projectNumber: string;
   accessToken: string;
 };
 
@@ -963,6 +963,13 @@ declare global {
 }
 
 let googlePickerLoad: Promise<void> | null = null;
+
+export function googleDocsPickerOptions() {
+  return {
+    mimeTypes: "application/vnd.google-apps.document",
+    multiSelect: true,
+  };
+}
 
 function loadGooglePicker(): Promise<void> {
   if (window.google?.picker) return Promise.resolve();
@@ -980,6 +987,7 @@ function loadGooglePicker(): Promise<void> {
 
 async function chooseGoogleDocs(): Promise<string[]> {
   const configuration = await callCommand<GoogleDocsPickerConfiguration>("google_docs_picker_configuration");
+  const options = googleDocsPickerOptions();
   await loadGooglePicker();
   return new Promise((resolve, reject) => {
     const picker = window.google?.picker;
@@ -989,13 +997,14 @@ async function chooseGoogleDocs(): Promise<string[]> {
     }
     const view = new picker.DocsView(picker.ViewId.DOCUMENTS)
       .setIncludeFolders(false)
-      .setSelectFolderEnabled(false);
+      .setSelectFolderEnabled(false)
+      .setMimeTypes(options.mimeTypes);
     const dialog = new picker.PickerBuilder()
       .setDeveloperKey(configuration.developerKey)
       .setOAuthToken(configuration.accessToken)
-      .setAppId(configuration.clientId)
+      .setAppId(configuration.projectNumber)
       .addView(view)
-      .enableFeature(picker.Feature.MULTISELECT_ENABLED)
+      .enableFeature(options.multiSelect ? picker.Feature.MULTISELECT_ENABLED : undefined)
       .setCallback((data: any) => {
         if (data.action === picker.Action.PICKED) {
           resolve(data.docs.map((document: any) => document.id));
@@ -2144,7 +2153,7 @@ function Onboarding({
 
   async function createOnboardingConnectorMount(connector: Exclude<OnboardingConnectorId, "notion">) {
     const documentIds = connector === "google-docs" ? await chooseGoogleDocs() : undefined;
-    if (connector === "google-docs" && !documentIds.length) {
+    if (connector === "google-docs" && !documentIds?.length) {
       return { ok: false, message: "Choose one or more Google Docs to continue." };
     }
     if (documentIds) setGoogleDocsDocumentIds(documentIds);
@@ -3694,6 +3703,27 @@ function MountsView({
     return report;
   }
 
+  async function reconfigureGoogleDocs() {
+    setSourceDialogMessage("");
+    setSourceDialogConnector("google-docs");
+    setSourceDialogState("creating");
+    try {
+      const documentIds = await chooseGoogleDocs();
+      if (!documentIds.length) {
+        setSourceDialogMessage("Choose one or more Google Docs to update the selection.");
+        setSourceDialogState("idle");
+        return;
+      }
+      const report = await callCommand<ActionReport>("reconfigure_google_docs_mount", { documentIds });
+      setSourceDialogMessage(report.message);
+      setSourceDialogState(report.ok ? "success" : "error");
+      if (report.ok) await onRefresh();
+    } catch (error) {
+      setSourceDialogMessage(errorMessage(error));
+      setSourceDialogState("error");
+    }
+  }
+
   async function runSourceDialogAction(
     connector: SourceConnectorId,
     options?: { googleDocsDocumentIds?: string[] },
@@ -3719,7 +3749,7 @@ function MountsView({
         const documentIds = connector === "google-docs"
           ? options?.googleDocsDocumentIds ?? await chooseGoogleDocs()
           : undefined;
-        if (connector === "google-docs" && documentIds.length === 0) {
+        if (connector === "google-docs" && !documentIds?.length) {
           setSourceDialogMessage("Choose one or more Google Docs to continue.");
           setSourceDialogState("idle");
           return;
@@ -3746,7 +3776,7 @@ function MountsView({
 
       setSourceDialogState("creating");
       const documentIds = connector === "google-docs" ? await chooseGoogleDocs() : undefined;
-      if (connector === "google-docs" && documentIds.length === 0) {
+      if (connector === "google-docs" && !documentIds?.length) {
         setSourceDialogMessage("Choose one or more Google Docs to continue.");
         setSourceDialogState("idle");
         return;
@@ -3997,6 +4027,7 @@ function MountsView({
           message={sourceDialogMessage}
           fileProviderEnablement={sourceFileProviderEnablement}
           onAction={(connector, options) => void runSourceDialogAction(connector, options)}
+          onReconfigureGoogleDocs={() => void reconfigureGoogleDocs()}
           onApiKeyAction={(connector, apiKey) => void connectApiKeySource(connector, apiKey)}
           onReopenFinder={() => void revealSourceFileProviderEnablement()}
           onClose={() => {
@@ -4015,6 +4046,7 @@ function AddSourceDialog({
   message,
   fileProviderEnablement,
   onAction,
+  onReconfigureGoogleDocs,
   onApiKeyAction,
   onReopenFinder,
   onClose,
@@ -4025,6 +4057,7 @@ function AddSourceDialog({
   message: string;
   fileProviderEnablement: FileProviderEnablementReport | null;
   onAction: (connector: SourceConnectorId, options?: { googleDocsDocumentIds?: string[] }) => void;
+  onReconfigureGoogleDocs: () => void;
   onApiKeyAction: (connector: "granola" | "linear", apiKey: string) => void;
   onReopenFinder: () => void;
   onClose: () => void;
@@ -4283,7 +4316,11 @@ function AddSourceDialog({
                       </p>
                     </>
                   )}
-                  {connector.mounted && connector.id !== "notion" && !connectorBusy ? (
+                  {connector.mounted && connector.id === "google-docs" && !connectorBusy ? (
+                    <SecondaryButton compact icon={<Check />} onClick={onReconfigureGoogleDocs}>
+                      Choose Google Docs
+                    </SecondaryButton>
+                  ) : connector.mounted && connector.id !== "notion" && !connectorBusy ? (
                     <SecondaryButton compact disabled icon={<Check />}>
                       Mounted
                     </SecondaryButton>

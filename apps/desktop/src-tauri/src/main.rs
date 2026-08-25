@@ -497,7 +497,7 @@ struct CreateDesktopMountRequest {
 #[serde(rename_all = "camelCase")]
 struct GoogleDocsPickerConfiguration {
     developer_key: String,
-    client_id: String,
+    project_number: String,
     access_token: String,
 }
 
@@ -1530,6 +1530,36 @@ async fn google_docs_picker_configuration() -> Result<GoogleDocsPickerConfigurat
         .map_err(|error| format!("Google Picker configuration worker failed: {error}"))?
 }
 
+#[tauri::command]
+async fn reconfigure_google_docs_mount(document_ids: Vec<String>) -> ActionReport {
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let state_root = default_state_root();
+        let mut store = SqliteStateStore::open(state_root.clone())
+            .map_err(|error| format!("Could not open Locality state: {error}"))?;
+        let mut mount = store
+            .get_mount(&MountId::new("google-docs-main"))
+            .map_err(|error| format!("Could not inspect Google Docs mount: {error}"))?
+            .filter(|mount| mount.connector == GOOGLE_DOCS_CONNECTOR_ID)
+            .ok_or_else(|| {
+                "Create a Google Docs mount before changing its selection.".to_string()
+            })?;
+        mount.remote_root_id = None;
+        mount.settings_json = google_docs_picker_settings_json(&document_ids)?;
+        store
+            .save_mount(mount)
+            .map_err(|error| format!("Could not save Google Docs selection: {error}"))?;
+        ensure_daemon_running(&state_root)?;
+        reload_daemon_mounts(&state_root)?;
+        Ok::<_, String>("Updated the selected Google Docs.".to_string())
+    })
+    .await
+    .map_err(|error| format!("Google Docs selection worker failed: {error}"))
+    .and_then(|result| result)
+    .map(|message| ActionReport { ok: true, message })
+    .unwrap_or_else(|message| ActionReport { ok: false, message });
+    report
+}
+
 fn google_docs_picker_configuration_blocking() -> Result<GoogleDocsPickerConfiguration, String> {
     let developer_key = env::var("LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY")
         .ok()
@@ -1537,6 +1567,15 @@ fn google_docs_picker_configuration_blocking() -> Result<GoogleDocsPickerConfigu
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             "Google Picker is not configured. Set LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY and restart Locality."
+                .to_string()
+        })?;
+    let project_number = env::var("LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER")
+        .ok()
+        .as_deref()
+        .map(google_docs_picker_project_number)
+        .transpose()?
+        .ok_or_else(|| {
+            "Google Picker is not configured. Set LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER to your numeric Google Cloud project number and restart Locality."
                 .to_string()
         })?;
     let state_root = default_state_root();
@@ -1560,13 +1599,16 @@ fn google_docs_picker_configuration_blocking() -> Result<GoogleDocsPickerConfigu
         .map_err(|error| format!("Could not read Google Docs credential: {error}"))?;
     let credential = serde_json::from_str::<StoredGoogleDocsCredential>(&secret)
         .map_err(|error| format!("Could not read Google Docs OAuth credential: {error}"))?;
-    let client_id = credential
+    if credential
         .oauth_client_id
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(
             "Google Picker needs the OAuth client ID. Reconnect Google Docs and try again."
-                .to_string()
-        })?;
+                .to_string(),
+        );
+    }
     if credential.access_token.trim().is_empty() {
         return Err(
             "Google Docs access has expired. Reconnect Google Docs and try again.".to_string(),
@@ -1574,9 +1616,17 @@ fn google_docs_picker_configuration_blocking() -> Result<GoogleDocsPickerConfigu
     }
     Ok(GoogleDocsPickerConfiguration {
         developer_key,
-        client_id,
+        project_number,
         access_token: credential.access_token,
     })
+}
+
+fn google_docs_picker_project_number(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("Google Picker project configuration is invalid. Set LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER to the numeric Google Cloud project number and restart Locality.".to_string());
+    }
+    Ok(value.to_string())
 }
 
 #[tauri::command]
@@ -14691,7 +14741,12 @@ mod tests {
             temp.path().join("google-docs"),
         )
         .with_connection_id(google_connection.connection_id.clone())
-        .with_remote_root_id(RemoteId::new("drive-folder-1"))
+        .with_settings_json(
+            super::GoogleDocsMountSettings::from_document_ids(["doc-1"])
+                .expect("Google Docs settings")
+                .to_json()
+                .expect("Google Docs settings json"),
+        )
         .projection(ProjectionMode::LinuxFuse);
 
         store
@@ -15198,6 +15253,18 @@ mod tests {
             settings_json,
             r#"{"google_docs":{"version":2,"document_ids":["doc-a","doc-b"]}}"#
         );
+    }
+
+    #[test]
+    fn google_docs_picker_project_number_requires_digits() {
+        assert_eq!(
+            super::google_docs_picker_project_number("123456789").unwrap(),
+            "123456789"
+        );
+        assert!(
+            super::google_docs_picker_project_number("client.apps.googleusercontent.com").is_err()
+        );
+        assert!(super::google_docs_picker_project_number("").is_err());
     }
 
     #[test]
@@ -22264,6 +22331,7 @@ fn main() {
             materialize_portable_workspace,
             create_desktop_mount,
             google_docs_picker_configuration,
+            reconfigure_google_docs_mount,
             connect_granola,
             connect_linear,
             reset_source_state,
