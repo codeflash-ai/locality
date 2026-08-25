@@ -5261,6 +5261,36 @@ impl JournalRepository for SqliteStateStore {
         Ok(())
     }
 
+    fn record_journal_apply_effects_and_update_mount_settings(
+        &mut self,
+        push_id: &PushId,
+        effects: Vec<JournalApplyEffect>,
+        settings_json: Option<String>,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mount_id: String = transaction
+            .query_row(
+                "SELECT mount_id FROM journals WHERE push_id = ?1",
+                params![push_id.0],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::JournalMissing(push_id.clone()))?;
+        transaction.execute(
+            "UPDATE journals SET apply_effects_json = ?2 WHERE push_id = ?1",
+            params![push_id.0, to_json(&effects)?],
+        )?;
+        if let Some(settings_json) = settings_json {
+            transaction.execute(
+                "UPDATE mounts SET settings_json = ?2 WHERE mount_id = ?1",
+                params![mount_id, settings_json],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn update_journal_status(
         &mut self,
         push_id: &PushId,
@@ -5333,7 +5363,7 @@ fn mount_source_identity_changed(existing: &MountConfig, next: &MountConfig) -> 
     existing.connector != next.connector
         || existing.remote_root_id != next.remote_root_id
         || existing.connection_id != next.connection_id
-        || (existing.settings_json != next.settings_json && existing.connector != "google-docs")
+        || existing.settings_json != next.settings_json
 }
 
 fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> StoreResult<()> {

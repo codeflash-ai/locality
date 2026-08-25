@@ -556,7 +556,7 @@ fn mount_source_identity_changed(existing: &MountConfig, next: &MountConfig) -> 
     existing.connector != next.connector
         || existing.remote_root_id != next.remote_root_id
         || existing.connection_id != next.connection_id
-        || (existing.settings_json != next.settings_json && existing.connector != "google-docs")
+        || existing.settings_json != next.settings_json
 }
 
 impl ConnectionRepository for InMemoryStateStore {
@@ -1598,6 +1598,29 @@ impl JournalRepository for InMemoryStateStore {
         };
 
         entry.apply_effects = effects;
+        Ok(())
+    }
+
+    fn record_journal_apply_effects_and_update_mount_settings(
+        &mut self,
+        push_id: &PushId,
+        effects: Vec<JournalApplyEffect>,
+        settings_json: Option<String>,
+    ) -> StoreResult<()> {
+        let mount_id = self
+            .journals
+            .get(&push_id.0)
+            .ok_or_else(|| StoreError::JournalMissing(push_id.clone()))?
+            .mount_id
+            .clone();
+        self.record_journal_apply_effects(push_id, effects)?;
+        if let Some(settings_json) = settings_json {
+            let mount = self
+                .mounts
+                .get_mut(&mount_id)
+                .ok_or_else(|| StoreError::MountMissing(mount_id.clone()))?;
+            mount.settings_json = settings_json;
+        }
         Ok(())
     }
 

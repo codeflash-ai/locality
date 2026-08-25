@@ -3834,7 +3834,7 @@ struct DaemonPushHost<'a, S, Source: ?Sized> {
 
 impl<S, Source> JournalStore for DaemonPushHost<'_, S, Source>
 where
-    S: JournalStore,
+    S: JournalStore + JournalRepository + MountRepository,
     Source: ?Sized,
 {
     fn append(&mut self, entry: JournalEntry) -> LocalityResult<()> {
@@ -3846,7 +3846,24 @@ where
         push_id: &PushId,
         effects: Vec<JournalApplyEffect>,
     ) -> LocalityResult<()> {
-        self.store.record_apply_effects(push_id, effects)
+        let journal = self
+            .store
+            .get_journal(push_id)
+            .map_err(LocalityError::from)?
+            .ok_or_else(|| {
+                LocalityError::InvalidState(format!("missing journal `{}`", push_id.0))
+            })?;
+        let mount = self
+            .store
+            .get_mount(&journal.mount_id)
+            .map_err(LocalityError::from)?
+            .ok_or_else(|| {
+                LocalityError::InvalidState(format!("missing mount `{}`", journal.mount_id.0))
+            })?;
+        let settings_json = created_google_docs_selection_json(&mount, &effects)?;
+        self.store
+            .record_journal_apply_effects_and_update_mount_settings(push_id, effects, settings_json)
+            .map_err(LocalityError::from)
     }
 
     fn update_status(&mut self, push_id: &PushId, status: JournalStatus) -> LocalityResult<()> {
@@ -3973,16 +3990,12 @@ where
     }
 }
 
-fn persist_created_google_docs_selection<S>(
-    store: &mut S,
+fn created_google_docs_selection_json(
     mount: &MountConfig,
     effects: &[JournalApplyEffect],
-) -> LocalityResult<()>
-where
-    S: MountRepository,
-{
+) -> LocalityResult<Option<String>> {
     if mount.connector != "google-docs" {
-        return Ok(());
+        return Ok(None);
     }
     let mut settings = GoogleDocsMountSettings::from_json(&mount.settings_json)?;
     let mut changed = false;
@@ -3999,11 +4012,9 @@ where
         }
     }
     if changed {
-        let mut updated = mount.clone();
-        updated.settings_json = settings.to_json()?;
-        store.save_mount(updated).map_err(LocalityError::from)?;
+        return settings.to_json().map(Some);
     }
-    Ok(())
+    Ok(None)
 }
 
 impl<S, Source> PushReconciler for DaemonPushHost<'_, S, Source>
@@ -4020,15 +4031,6 @@ where
         &mut self,
         request: PushReconcileRequest<'_>,
     ) -> LocalityResult<PushReconcileResult> {
-        let mount = self
-            .store
-            .get_mount(request.mount_id)
-            .map_err(LocalityError::from)?
-            .ok_or_else(|| StoreError::MountMissing(request.mount_id.clone()))
-            .map_err(LocalityError::from)?;
-        // The journal effects have been recorded by this point. Persist new
-        // Docs IDs before reconciliation fetches the newly-created document.
-        persist_created_google_docs_selection(self.store, &mount, request.apply_effects)?;
         let mount = self
             .store
             .get_mount(request.mount_id)

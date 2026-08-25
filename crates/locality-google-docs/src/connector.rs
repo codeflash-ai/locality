@@ -35,7 +35,7 @@ pub struct GoogleDocsConfig {
 mod docs_only_tests {
     use super::{GoogleDocsConfig, GoogleDocsConnector};
     use crate::client::GoogleDocsApi;
-    use crate::docs_dto::{BatchUpdateDocumentRequest, GoogleDocument};
+    use crate::docs_dto::{BatchUpdateDocumentRequest, DocsRequest, GoogleDocument};
     use locality_connector::{
         ApplyPlanRequest, Connector, EnumerateRequest, FetchRequest, ObserveRequest,
     };
@@ -51,7 +51,7 @@ mod docs_only_tests {
         gets: Mutex<usize>,
         creates: Mutex<usize>,
         create_title: Mutex<Option<String>>,
-        batches: Mutex<usize>,
+        batches: Mutex<Vec<BatchUpdateDocumentRequest>>,
     }
     impl Docs {
         fn document(self, id: &str, title: &str) -> Self {
@@ -77,9 +77,9 @@ mod docs_only_tests {
         fn batch_update_document(
             &self,
             id: &str,
-            _: BatchUpdateDocumentRequest,
+            request: BatchUpdateDocumentRequest,
         ) -> locality_core::LocalityResult<GoogleDocument> {
-            *self.batches.lock().unwrap() += 1;
+            self.batches.lock().unwrap().push(request);
             self.get_document(id).or_else(|_| Ok(serde_json::from_value(serde_json::json!({"documentId":id,"title":"Created","revisionId":"r1","body":{"content":[]}})).unwrap()))
         }
     }
@@ -164,7 +164,7 @@ mod docs_only_tests {
         );
         assert_eq!(*docs.create_title.lock().unwrap(), Some("New".into()));
         assert_eq!(*docs.creates.lock().unwrap(), 1);
-        assert_eq!(*docs.batches.lock().unwrap(), 1);
+        assert_eq!(docs.batches.lock().unwrap().len(), 1);
         let move_plan = PushPlan::new(
             vec![RemoteId::new("a")],
             vec![PushOperation::ArchiveEntity {
@@ -183,7 +183,7 @@ mod docs_only_tests {
                 })
                 .is_err()
         );
-        assert_eq!(*docs.batches.lock().unwrap(), 1);
+        assert_eq!(docs.batches.lock().unwrap().len(), 1);
     }
     #[test]
     fn mixed_plan_and_non_root_create_fail_before_any_docs_call() {
@@ -246,7 +246,80 @@ mod docs_only_tests {
         );
         assert_eq!(*docs.gets.lock().unwrap(), 0);
         assert_eq!(*docs.creates.lock().unwrap(), 0);
-        assert_eq!(*docs.batches.lock().unwrap(), 0);
+        assert_eq!(docs.batches.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn body_mutations_send_docs_batch_updates_while_archive_never_calls_docs() {
+        let docs = Arc::new(Docs::default().document("doc", "Doc"));
+        let connector = GoogleDocsConnector::with_documents(
+            GoogleDocsConfig::new("t").with_document_ids(vec!["doc".into()]),
+            docs.clone(),
+        );
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc")],
+            vec![
+                PushOperation::UpdateBlock {
+                    block_id: RemoteId::new("doc:1:1"),
+                    content: "update".into(),
+                },
+                PushOperation::ReplaceBlock {
+                    block_id: RemoteId::new("doc:1:1"),
+                    content: "replace".into(),
+                },
+                PushOperation::AppendBlock {
+                    parent_id: RemoteId::new("doc"),
+                    after: None,
+                    content: "append".into(),
+                },
+            ],
+        );
+        let ids = vec![
+            PushOperationId("p:0".into()),
+            PushOperationId("p:1".into()),
+            PushOperationId("p:2".into()),
+        ];
+        let push = PushId("p".into());
+        let mount = MountId::new("m");
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &push,
+                mount_id: &mount,
+                plan: &plan,
+                operation_ids: &ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .unwrap();
+        let batches = docs.batches.lock().unwrap();
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|batch| {
+            batch
+                .requests
+                .iter()
+                .any(|request| matches!(request, DocsRequest::InsertText { .. }))
+        }));
+        drop(batches);
+
+        let archive = PushPlan::new(
+            vec![RemoteId::new("doc")],
+            vec![PushOperation::ArchiveEntity {
+                entity_id: RemoteId::new("doc"),
+            }],
+        );
+        assert!(
+            connector
+                .apply(ApplyPlanRequest {
+                    push_id: &push,
+                    mount_id: &mount,
+                    plan: &archive,
+                    operation_ids: &ids[..1],
+                    remote_preconditions: &[],
+                    local_root: None
+                })
+                .is_err()
+        );
+        assert_eq!(docs.batches.lock().unwrap().len(), 3);
     }
 }
 

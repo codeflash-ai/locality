@@ -48,10 +48,7 @@ fn notion_descriptor_exposes_cli_and_mount_metadata() {
     assert_eq!(descriptor.auth_env_var(), Some(DEFAULT_NOTION_TOKEN_ENV));
     assert!(descriptor.supports_oauth());
     assert!(descriptor.mount_guidance().contains("Notion facts:"));
-    assert_eq!(
-        descriptor.source_root_create_parent_kind(),
-        Some(EntityKind::Directory)
-    );
+    assert_eq!(descriptor.source_root_create_parent_kind(), None);
     assert_eq!(descriptor.periodic_discovery_interval(), None);
     assert_eq!(descriptor.max_background_discovery_workers(), 3);
 }

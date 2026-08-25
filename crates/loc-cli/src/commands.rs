@@ -4992,6 +4992,16 @@ fn google_docs_mount_settings_json(args: &[String]) -> Result<String, CommandErr
         .into_iter()
         .map(normalize_google_docs_document_id)
         .collect::<Result<Vec<_>, _>>()?;
+    let unique_document_ids = document_ids
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique_document_ids.len() != document_ids.len() {
+        return Err(CommandError::new(
+            "mount",
+            "google_docs_document_invalid",
+            "Google Docs document ids must be unique",
+        ));
+    }
     GoogleDocsMountSettings::from_document_ids(document_ids)
         .and_then(|settings| settings.to_json())
         .map_err(|error| {
@@ -10813,9 +10823,9 @@ mod tests {
         auto_registration_for_mounted_projection, connector_resolve_command_error,
         daemon_error_exit_code, daemon_request_timeout_for, default_mount_id_for_source,
         diff_report_exit_code, exact_located_entity_record, file_provider_list_lines,
-        google_calendar_oauth_broker_config, google_docs_oauth_broker_config,
-        guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
-        guard_unresolved_windows_cloud_files_unregister,
+        google_calendar_oauth_broker_config, google_docs_mount_settings_json,
+        google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
+        guard_unresolved_linux_fuse_unregister, guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         locality_error_code, locate_result_from_report, mount_slack, mount_usage,
         mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
@@ -10849,6 +10859,31 @@ mod tests {
             daemon_error_exit_code("google_docs_selection_required"),
             EXIT_VALIDATION
         );
+    }
+
+    #[test]
+    fn google_docs_mount_settings_accept_documents_and_reject_duplicates() {
+        let settings = google_docs_mount_settings_json(&[
+            "--document".to_string(),
+            "https://docs.google.com/document/d/doc-b/edit".to_string(),
+            "--document".to_string(),
+            "doc-a".to_string(),
+        ])
+        .expect("selected Docs are accepted");
+        assert_eq!(
+            settings,
+            r#"{"google_docs":{"version":2,"document_ids":["doc-a","doc-b"]}}"#
+        );
+
+        let error = google_docs_mount_settings_json(&[
+            "--document".to_string(),
+            "doc-a".to_string(),
+            "--document".to_string(),
+            "doc-a".to_string(),
+        ])
+        .expect_err("duplicate Docs selection must not be silently deduplicated");
+        assert_eq!(error.code, "google_docs_document_invalid");
+        assert_eq!(error.message, "Google Docs document ids must be unique");
     }
 
     #[test]

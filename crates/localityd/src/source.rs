@@ -442,9 +442,7 @@ fn notion_source_descriptor() -> SourceDescriptor {
         auth_env_var: Some(DEFAULT_NOTION_TOKEN_ENV),
         supports_oauth: true,
         mount_guidance: Cow::Borrowed(NOTION_AGENT_GUIDANCE),
-        // A logical root enables creating a document directly in the flat mount;
-        // it is not a Drive folder and no child container kinds are allowed.
-        source_root_create_parent_kind: Some(EntityKind::Directory),
+        source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         move_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         supports_archive_entity: true,
