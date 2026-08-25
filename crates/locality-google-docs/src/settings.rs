@@ -83,6 +83,13 @@ impl GoogleDocsMountSettings {
         &self.google_docs.document_ids
     }
 
+    /// Adds a document created through this mount, keeping the persisted
+    /// selection canonical for the next connector instance.
+    pub fn include_document_id(&mut self, document_id: impl Into<String>) -> LocalityResult<()> {
+        self.google_docs.document_ids.push(document_id.into());
+        self.normalize(false)
+    }
+
     fn normalize(&mut self, reject_duplicates: bool) -> LocalityResult<()> {
         if self.google_docs.version != GOOGLE_DOCS_SETTINGS_VERSION {
             return Err(settings_validation(format!(

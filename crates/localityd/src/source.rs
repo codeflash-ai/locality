@@ -442,7 +442,9 @@ fn notion_source_descriptor() -> SourceDescriptor {
         auth_env_var: Some(DEFAULT_NOTION_TOKEN_ENV),
         supports_oauth: true,
         mount_guidance: Cow::Borrowed(NOTION_AGENT_GUIDANCE),
-        source_root_create_parent_kind: None,
+        // A logical root enables creating a document directly in the flat mount;
+        // it is not a Drive folder and no child container kinds are allowed.
+        source_root_create_parent_kind: Some(EntityKind::Directory),
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         move_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         supports_archive_entity: true,
@@ -462,10 +464,12 @@ fn google_docs_source_descriptor() -> SourceDescriptor {
         auth_env_var: None,
         supports_oauth: true,
         mount_guidance: Cow::Owned(google_docs_mount_guidance()),
+        // The logical mount root permits root document creation; it is not a
+        // Drive folder and no nested parent kinds are permitted.
         source_root_create_parent_kind: Some(EntityKind::Directory),
-        create_entity_parent_kinds: vec![EntityKind::Directory],
-        move_entity_parent_kinds: vec![EntityKind::Directory],
-        supports_archive_entity: true,
+        create_entity_parent_kinds: vec![],
+        move_entity_parent_kinds: vec![],
+        supports_archive_entity: false,
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
@@ -788,9 +792,9 @@ fn google_docs_mount_guidance() -> String {
     format!(
         "{}\n\
 Google Docs facts:\n\
-- This mount uses Google Docs document access plus Google Drive `drive.file`; it does not request a Drive metadata scope.\n\
-- Pull enumerates Google Docs and Drive folders under the configured workspace folder, including Docs manually added inside the workspace folder.\n\
-- Non-Google-Docs Drive files are ignored by this connector in V1.\n",
+- This mount contains only the selected Google Docs, each at the mount root.\n\
+- Pull never discovers Drive folders or unselected Drive files.\n\
+- Edit document bodies or create a new document at the mount root; rename, move, archive, folders, and nested creates are unavailable.\n",
         generic_mount_guidance("Google Docs")
     )
 }

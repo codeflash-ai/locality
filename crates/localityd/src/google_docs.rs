@@ -104,7 +104,7 @@ fn google_docs_settings_error_message(error: LocalityError) -> String {
 
 fn connector_from_connection(
     credentials: &dyn CredentialStore,
-    mount: &MountConfig,
+    _mount: &MountConfig,
     connection: &ConnectionRecord,
     settings: GoogleDocsMountSettings,
 ) -> Result<GoogleDocsConnector, ConnectorResolveError> {
@@ -116,11 +116,7 @@ fn connector_from_connection(
     }
 
     let token = connection_access_token(credentials, connection)?;
-    let mut config =
-        GoogleDocsConfig::new(token).with_document_ids(settings.document_ids().to_vec());
-    if let Some(remote_root_id) = &mount.remote_root_id {
-        config = config.with_workspace_folder_id(remote_root_id.clone());
-    }
+    let config = GoogleDocsConfig::new(token).with_document_ids(settings.document_ids().to_vec());
     Ok(GoogleDocsConnector::new(config))
 }
 
@@ -331,11 +327,10 @@ impl SourceAdapter for GoogleDocsConnector {
     where
         Self: Sized + Clone,
     {
-        mount
-            .remote_root_id
-            .as_ref()
-            .map(|root| self.with_workspace_folder_id(root.clone()))
-            .unwrap_or_else(|| self.clone())
+        // The resolver rejects legacy remote roots before this adapter is reached.
+        // A Docs connector is scoped exclusively by its persisted selected IDs.
+        let _ = mount;
+        self.clone()
     }
 }
 
@@ -436,20 +431,17 @@ impl HydrationSource for GoogleDocsConnector {
         let native = self.fetch(FetchRequest {
             remote_id: request.remote_id.clone(),
         })?;
-        let bundle =
-            serde_json::from_slice::<locality_google_docs::render::GoogleDocsNativeBundle>(
-                &native.raw,
-            )
-            .map_err(|error| {
+        let document =
+            serde_json::from_slice::<locality_google_docs::docs_dto::GoogleDocument>(&native.raw)
+                .map_err(|error| {
                 LocalityError::Io(format!("google docs native decode failed: {error}"))
             })?;
-        let rendered = locality_google_docs::render::render_google_document(&bundle)?;
+        let rendered = locality_google_docs::render::render_google_document(&document)?;
         Ok(HydratedEntity {
             document: rendered.document,
             shadow: rendered.shadow,
-            remote_edited_at: Some(locality_google_docs::render::combined_remote_version(
-                &bundle.drive_file,
-                bundle.document.revision_id.as_deref(),
+            remote_edited_at: Some(locality_google_docs::render::document_remote_version(
+                &document,
             )),
             assets: Vec::new(),
         })
@@ -465,11 +457,7 @@ impl HydrationSource for GoogleDocsConnector {
 
 impl crate::reconcile::ScheduledPullSource for GoogleDocsConnector {
     fn enumerate_mount(&self, mount: &MountConfig) -> LocalityResult<Vec<TreeEntry>> {
-        let connector = match &mount.remote_root_id {
-            Some(root) => self.with_workspace_folder_id(root.clone()),
-            None => self.clone(),
-        };
-        connector.enumerate(locality_connector::EnumerateRequest {
+        self.enumerate(locality_connector::EnumerateRequest {
             mount_id: mount.mount_id.clone(),
             cursor: None,
         })

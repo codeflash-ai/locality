@@ -44,6 +44,7 @@ use locality_core::shadow::{
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
 use locality_engine::prepare_changeset::{PrepareChangesetRequest, prepare_changeset};
+use locality_google_docs::GoogleDocsMountSettings;
 use locality_google_docs::render::{
     GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND, GOOGLE_DOCS_TABLE_NATIVE_KIND,
 };
@@ -3972,6 +3973,39 @@ where
     }
 }
 
+fn persist_created_google_docs_selection<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    effects: &[JournalApplyEffect],
+) -> LocalityResult<()>
+where
+    S: MountRepository,
+{
+    if mount.connector != "google-docs" {
+        return Ok(());
+    }
+    let mut settings = GoogleDocsMountSettings::from_json(&mount.settings_json)?;
+    let mut changed = false;
+    for effect in effects {
+        if let JournalApplyEffect::CreatedEntity { entity_id, .. } = effect {
+            if !settings
+                .document_ids()
+                .iter()
+                .any(|id| id == entity_id.as_str())
+            {
+                settings.include_document_id(entity_id.0.clone())?;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let mut updated = mount.clone();
+        updated.settings_json = settings.to_json()?;
+        store.save_mount(updated).map_err(LocalityError::from)?;
+    }
+    Ok(())
+}
+
 impl<S, Source> PushReconciler for DaemonPushHost<'_, S, Source>
 where
     S: MountRepository
@@ -3986,6 +4020,15 @@ where
         &mut self,
         request: PushReconcileRequest<'_>,
     ) -> LocalityResult<PushReconcileResult> {
+        let mount = self
+            .store
+            .get_mount(request.mount_id)
+            .map_err(LocalityError::from)?
+            .ok_or_else(|| StoreError::MountMissing(request.mount_id.clone()))
+            .map_err(LocalityError::from)?;
+        // The journal effects have been recorded by this point. Persist new
+        // Docs IDs before reconciliation fetches the newly-created document.
+        persist_created_google_docs_selection(self.store, &mount, request.apply_effects)?;
         let mount = self
             .store
             .get_mount(request.mount_id)
@@ -5330,7 +5373,7 @@ fn direct_source_root_create_diagnostic(
         )));
     }
 
-    if mount.remote_root_id.is_none() {
+    if mount.remote_root_id.is_none() && mount.connector != "google-docs" {
         return Some(PushPrepareError::Core(LocalityError::InvalidState(
             format!(
                 "mount `{mount_id}` has no known remote root id, so `{path}` cannot be created at the mount root; reconnect or re-mount `{connector}` to refresh mount metadata.",
@@ -5351,12 +5394,15 @@ fn source_root_create_parent_entity(
     if !is_direct_source_root_create_path(relative_path) {
         return None;
     }
-    let remote_id = mount.remote_root_id.as_ref()?;
     let descriptor = source_descriptor(&mount.connector);
     let kind = descriptor.source_root_create_parent_kind()?;
+    let remote_id = mount
+        .remote_root_id
+        .clone()
+        .unwrap_or_else(|| RemoteId::new("root"));
     Some(EntityRecord::new(
         mount.mount_id.clone(),
-        remote_id.clone(),
+        remote_id,
         kind,
         descriptor.display_name(),
         PathBuf::new(),
