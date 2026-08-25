@@ -25,7 +25,7 @@ describe("desktop single-instance startup", () => {
       "desktop_single_instance_required(smoke_test_requested)",
     );
     const ownershipClaim = tauriMain.indexOf(
-      "single_instance::acquire_desktop_single_instance(background_launch)",
+      "single_instance::acquire_desktop_single_instance(\n            background_launch,",
     );
     const tauriBuilder = tauriMain.indexOf("tauri::Builder::default()");
     expect(smokeCheck).toBeGreaterThan(-1);
