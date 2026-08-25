@@ -2,15 +2,10 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-const GOOGLE_PICKER_DEVELOPER_KEY: &str = "AIzaSyAcXokn6wqB1FQ79GrCX4zfBDQDFwyJ6HY";
-const GOOGLE_PICKER_PROJECT_NUMBER: &str = "532543982486";
-
 fn main() {
     println!("cargo:rerun-if-env-changed=LOCALITY_BUILD_ID_OVERRIDE");
     println!("cargo:rerun-if-env-changed=LOCALITY_DESKTOP_BUILD_ID_OVERRIDE");
     println!("cargo:rerun-if-env-changed=LOCALITY_DISTRIBUTION_CHANNEL");
-    println!("cargo:rerun-if-env-changed=LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY");
-    println!("cargo:rerun-if-env-changed=LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER");
     println!("cargo:rerun-if-changed=build.rs");
     let workspace = workspace_root();
     println!(
@@ -28,13 +23,6 @@ fn main() {
     let distribution_channel =
         env::var("LOCALITY_DISTRIBUTION_CHANNEL").unwrap_or_else(|_| "direct".to_string());
     println!("cargo:rustc-env=LOCALITY_DISTRIBUTION_CHANNEL={distribution_channel}");
-    println!(
-        "cargo:rustc-env=LOCALITY_BUNDLED_GOOGLE_PICKER_DEVELOPER_KEY={GOOGLE_PICKER_DEVELOPER_KEY}"
-    );
-    println!(
-        "cargo:rustc-env=LOCALITY_BUNDLED_GOOGLE_PICKER_PROJECT_NUMBER={GOOGLE_PICKER_PROJECT_NUMBER}"
-    );
-
     tauri_build::build();
 }
 
