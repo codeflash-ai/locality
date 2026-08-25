@@ -1,9 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { googleDocsMountedMountId, googleDocsPickerCommand } from "./App";
+import {
+  googleDocsMountedMountId,
+  googleDocsPickerCommand,
+  googleDocsSelectionNeededForMount,
+} from "./App";
 
 describe("Google Docs Picker", () => {
   it("requests selection through the loopback browser command", () => {
     expect(googleDocsPickerCommand()).toBe("choose_google_docs_in_browser");
+  });
+
+  it("reopens Picker before creating an unselected Google Docs mount", () => {
+    expect(googleDocsSelectionNeededForMount("google-docs", [])).toBe(true);
+    expect(googleDocsSelectionNeededForMount("google-docs", ["doc-1"])).toBe(false);
+    expect(googleDocsSelectionNeededForMount("notion", [])).toBe(false);
   });
 });
 

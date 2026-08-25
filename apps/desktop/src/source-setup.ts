@@ -99,6 +99,29 @@ export function sourceMounted(
   );
 }
 
+/**
+ * Pick the source onboarding should represent from a desktop snapshot. A mount
+ * descriptor with `not_mounted` status is only a placeholder, not the source
+ * currently being connected.
+ */
+export function sourceOnboardingConnector(snapshot: SourceSnapshotLike): SourceConnectorId | null {
+  const mountConnector = snapshot.mount?.connector;
+  if (mountConnector && isSourceConnectorId(mountConnector) && sourceMounted(snapshot, mountConnector)) {
+    return mountConnector;
+  }
+
+  const connectionConnector = snapshot.connection?.connector;
+  if (
+    connectionConnector &&
+    isSourceConnectorId(connectionConnector) &&
+    sourceConnectionReady(snapshot, connectionConnector)
+  ) {
+    return connectionConnector;
+  }
+
+  return null;
+}
+
 export function connectedSourcesReadyToMount(snapshot: SourceSnapshotLike): SourceConnectorId[] {
   return SOURCE_CONNECTORS.filter(
     (connector) => sourceConnectionReady(snapshot, connector) && !sourceMounted(snapshot, connector),
