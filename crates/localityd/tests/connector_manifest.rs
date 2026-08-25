@@ -13,7 +13,7 @@ use locality_connector::manifest::{
     AuthKind, BodyDiffMode as ManifestBodyDiffMode, ManifestEntityKind,
     VirtualRenamePolicy as ManifestRenamePolicy, bundled_connector_registry,
 };
-use locality_core::model::{EntityKind, MountId, RemoteId};
+use locality_core::model::{EntityKind, MountId};
 use locality_core::push::BodyDiffMode;
 use locality_gmail::{GMAIL_OAUTH_SCOPES, GmailConfig, GmailConnector, GmailMountSettings};
 use locality_google_calendar::{
@@ -46,7 +46,7 @@ fn runtime_connectors() -> Vec<(&'static str, Box<dyn Connector>)> {
             "google-docs",
             Box::new(GoogleDocsConnector::new(
                 GoogleDocsConfig::new("google-docs-secret-sentinel")
-                    .with_workspace_folder_id(RemoteId::new("folder")),
+                    .with_document_ids(vec!["selected-doc".to_string()]),
             )),
         ),
         (

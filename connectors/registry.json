@@ -124,16 +124,13 @@
         "replace_block",
         "append_block",
         "archive_block",
-        "archive_entity",
-        "update_properties",
-        "move_entity",
         "create_entity"
       ],
       "membership_operations": [],
       "projection": {
         "source_root_create_parent_kind": "directory",
-        "create_entity_parent_kinds": ["directory"],
-        "move_entity_parent_kinds": ["directory"],
+        "create_entity_parent_kinds": [],
+        "move_entity_parent_kinds": [],
         "body_diff_mode": "block",
         "virtual_rename_policy": "filename_derived",
         "periodic_discovery_seconds": null,
