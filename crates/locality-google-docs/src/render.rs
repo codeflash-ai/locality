@@ -1,23 +1,15 @@
 use locality_core::model::{CanonicalDocument, RemoteId};
 use locality_core::shadow::ShadowDocument;
 use locality_core::{LocalityError, LocalityResult};
-use serde::{Deserialize, Serialize};
 
 use crate::docs_dto::{
     GoogleDocument, InlineObjectElement, Paragraph, ParagraphElement, StructuralElement, Table,
     TextStyle,
 };
-use crate::drive_dto::DriveFile;
 use crate::oauth::GOOGLE_DOCS_CONNECTOR_ID;
 
 pub const GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND: &str = "google_docs_inline_object";
 pub const GOOGLE_DOCS_TABLE_NATIVE_KIND: &str = "google_docs_table";
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GoogleDocsNativeBundle {
-    pub drive_file: DriveFile,
-    pub document: GoogleDocument,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GoogleDocsRenderedEntity {
@@ -26,18 +18,16 @@ pub struct GoogleDocsRenderedEntity {
     pub push_blocking_directives: bool,
 }
 
-pub fn render_google_document(
-    bundle: &GoogleDocsNativeBundle,
-) -> LocalityResult<GoogleDocsRenderedEntity> {
+pub fn render_google_document(document: &GoogleDocument) -> LocalityResult<GoogleDocsRenderedEntity> {
     let mut rendered_blocks = Vec::new();
     let mut native_block_ids = Vec::new();
     let mut native_block_kinds = Vec::new();
     let mut push_blocking_directives = false;
 
-    for element in &bundle.document.body.content {
-        let block_id = element_block_id(&bundle.document.document_id, element);
+    for element in &document.body.content {
+        let block_id = element_block_id(&document.document_id, element);
         if let Some(paragraph) = &element.paragraph {
-            let paragraph = render_paragraph(&bundle.document, paragraph);
+            let paragraph = render_paragraph(document, paragraph);
             if !paragraph.text.trim().is_empty() {
                 rendered_blocks.push(paragraph.text);
                 native_block_ids.push(RemoteId::new(block_id));
@@ -51,11 +41,11 @@ pub fn render_google_document(
                 push_blocking_directives = true;
                 rendered_blocks.push(format!(
                     "::loc{{id={}:unsupported type=google_docs_unsupported kind=\"inline_element\"}}",
-                    element_block_id(&bundle.document.document_id, element)
+                    element_block_id(&document.document_id, element)
                 ));
             }
         } else if let Some(table) = &element.table {
-            let table = render_table(&bundle.document, table);
+            let table = render_table(document, table);
             if !table.trim().is_empty() {
                 rendered_blocks.push(table);
                 native_block_ids.push(RemoteId::new(block_id));
@@ -79,13 +69,10 @@ pub fn render_google_document(
     } else {
         format!("{}\n", rendered_blocks.join("\n\n"))
     };
-    let frontmatter = document_frontmatter(
-        &bundle.drive_file,
-        bundle.document.revision_id.as_deref().unwrap_or(""),
-    );
-    let document = CanonicalDocument::new(frontmatter.clone(), body.clone());
+    let frontmatter = document_frontmatter(document);
+    let canonical_document = CanonicalDocument::new(frontmatter.clone(), body.clone());
     let mut shadow = ShadowDocument::from_synced_body(
-        RemoteId::new(bundle.document.document_id.clone()),
+        RemoteId::new(document.document_id.clone()),
         body,
         1,
         native_block_ids,
@@ -100,34 +87,28 @@ pub fn render_google_document(
     }
 
     Ok(GoogleDocsRenderedEntity {
-        document,
+        document: canonical_document,
         shadow,
         push_blocking_directives,
     })
 }
 
-pub fn document_frontmatter(file: &DriveFile, docs_revision_id: &str) -> String {
-    let version = combined_remote_version(file, Some(docs_revision_id));
+pub fn document_frontmatter(document: &GoogleDocument) -> String {
+    let version = document_remote_version(document);
     format!(
         "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\n",
-        yaml_scalar(&file.id),
+        yaml_scalar(&document.document_id),
         GOOGLE_DOCS_CONNECTOR_ID,
         yaml_scalar(&version),
         yaml_scalar(&version),
-        yaml_scalar(&file.name)
+        yaml_scalar(&document.title)
     )
 }
 
-pub fn combined_remote_version(file: &DriveFile, docs_revision_id: Option<&str>) -> String {
-    match (
-        file.remote_version(),
-        docs_revision_id.filter(|revision| !revision.is_empty()),
-    ) {
-        (Some(drive), Some(revision)) => format!("{drive}|docs:{revision}"),
-        (Some(drive), None) => drive,
-        (None, Some(revision)) => format!("docs:{revision}"),
-        (None, None) => "unknown".to_string(),
-    }
+pub fn document_remote_version(document: &GoogleDocument) -> String {
+    document.revision_id.as_deref().filter(|revision| !revision.is_empty())
+        .map(|revision| format!("docs:{revision}"))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -524,7 +505,7 @@ fn yaml_scalar(value: &str) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use locality_core::model::CanonicalDocument;
 

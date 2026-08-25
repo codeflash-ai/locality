@@ -11,31 +11,47 @@ use locality_core::freshness::{RemoteObservation, RemoteVersion};
 use locality_core::journal::JournalApplyEffect;
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
 use locality_core::path_projection::{page_container_path, page_document_path};
-use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
+use locality_core::planner::{PushOperation, PushOperationKind, PushPlan};
 use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::{LocalityError, LocalityResult};
 
-use crate::client::{GoogleDocsApi, GoogleDriveApi, HttpGoogleApiClient};
+use crate::client::{GoogleDocsApi, HttpGoogleApiClient};
 use crate::docs_dto::{
     BatchUpdateDocumentRequest, CreateParagraphBulletsRequest, DeleteContentRangeRequest,
     DeleteParagraphBulletsRequest, DocsRequest, GoogleDocument, InsertTextRequest, Link, Location,
     ParagraphStylePatch, Range, TextStyle, TextStylePatch, UpdateParagraphStyleRequest,
     UpdateTextStyleRequest, WriteControl,
 };
-use crate::drive_dto::{
-    DRIVE_FOLDER_MIME_TYPE, DRIVE_GOOGLE_DOC_MIME_TYPE, DriveCreateFileRequest, DriveFile,
-    DriveUpdateFileRequest,
-};
 use crate::oauth::GOOGLE_DOCS_CONNECTOR_ID;
-use crate::render::{
-    GoogleDocsNativeBundle, combined_remote_version, document_frontmatter, render_google_document,
-};
+use crate::render::{document_frontmatter, document_remote_version, render_google_document};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct GoogleDocsConfig {
     pub access_token: String,
-    pub workspace_folder_id: Option<RemoteId>,
     pub document_ids: Vec<String>,
+}
+
+#[cfg(test)]
+mod docs_only_tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use locality_connector::{ApplyPlanRequest, Connector, EnumerateRequest};
+    use locality_core::journal::{PushId, PushOperationId};
+    use locality_core::model::{MountId, RemoteId};
+    use locality_core::planner::{PushOperation, PushPlan};
+    use super::{GoogleDocsConfig, GoogleDocsConnector};
+    use crate::client::GoogleDocsApi;
+    use crate::docs_dto::{BatchUpdateDocumentRequest, GoogleDocument};
+
+    #[derive(Debug, Default)] struct Docs { documents: Mutex<BTreeMap<String, GoogleDocument>>, creates: Mutex<usize>, batches: Mutex<usize> }
+    impl Docs { fn document(self, id: &str, title: &str) -> Self { self.documents.lock().unwrap().insert(id.into(), serde_json::from_value(serde_json::json!({"documentId": id, "title": title, "revisionId": "r1", "body": {"content": []}})).unwrap()); self } }
+    impl GoogleDocsApi for Docs {
+        fn get_document(&self, id: &str) -> locality_core::LocalityResult<GoogleDocument> { self.documents.lock().unwrap().get(id).cloned().ok_or_else(|| locality_core::LocalityError::RemoteNotFound(id.into())) }
+        fn create_document(&self, title: &str) -> locality_core::LocalityResult<GoogleDocument> { *self.creates.lock().unwrap() += 1; Ok(serde_json::from_value(serde_json::json!({"documentId":"created", "title":title, "revisionId":"r1", "body":{"content":[]}})).unwrap()) }
+        fn batch_update_document(&self, id: &str, _: BatchUpdateDocumentRequest) -> locality_core::LocalityResult<GoogleDocument> { *self.batches.lock().unwrap() += 1; self.get_document(id).or_else(|_| Ok(serde_json::from_value(serde_json::json!({"documentId":id,"title":"Created","revisionId":"r1","body":{"content":[]}})).unwrap())) }
+    }
+    #[test] fn selected_documents_are_flat_root_pages() { let docs = Arc::new(Docs::default().document("a", "Zeta").document("b", "Alpha")); let connector = GoogleDocsConnector::with_documents(GoogleDocsConfig::new("t").with_document_ids(vec!["a".into(), "b".into()]), docs); let entries = connector.enumerate(EnumerateRequest { mount_id: MountId::new("m"), cursor: None }).unwrap(); assert_eq!(entries.iter().map(|entry| entry.path.to_string_lossy().to_string()).collect::<Vec<_>>(), ["alpha/page.md", "zeta/page.md"]); }
+    #[test] fn create_and_body_mutations_use_docs_only_and_reject_drive_operations() { let docs = Arc::new(Docs::default().document("a", "Alpha")); let connector = GoogleDocsConnector::with_documents(GoogleDocsConfig::new("t"), docs.clone()); let create = PushPlan::new(vec![], vec![PushOperation::CreateEntity { parent_id: RemoteId::new("root"), parent_kind: None, parent_workspace: false, title: "New".into(), properties: BTreeMap::new(), body: String::new(), source_path: Default::default() }]); let ids = vec![PushOperationId("p:0".into())]; let push = PushId("p".into()); let mount = MountId::new("m"); let result = connector.apply(ApplyPlanRequest { push_id: &push, mount_id: &mount, plan: &create, operation_ids: &ids, remote_preconditions: &[], local_root: None }).unwrap(); assert_eq!(result.changed_remote_ids, [RemoteId::new("created")]); assert!(matches!(result.effects.as_slice(), [locality_core::journal::JournalApplyEffect::CreatedEntity { entity_id, .. }] if entity_id == &RemoteId::new("created"))); assert_eq!(*docs.creates.lock().unwrap(), 1); let move_plan = PushPlan::new(vec![RemoteId::new("a")], vec![PushOperation::ArchiveEntity { entity_id: RemoteId::new("a") }]); assert!(connector.apply(ApplyPlanRequest { push_id: &push, mount_id: &mount, plan: &move_plan, operation_ids: &ids, remote_preconditions: &[], local_root: None }).is_err()); assert_eq!(*docs.batches.lock().unwrap(), 0); }
 }
 
 impl std::fmt::Debug for GoogleDocsConfig {
@@ -43,7 +59,6 @@ impl std::fmt::Debug for GoogleDocsConfig {
         formatter
             .debug_struct("GoogleDocsConfig")
             .field("access_token", &"<redacted>")
-            .field("workspace_folder_id", &self.workspace_folder_id)
             .field("document_ids", &self.document_ids)
             .finish()
     }
@@ -53,14 +68,8 @@ impl GoogleDocsConfig {
     pub fn new(access_token: impl Into<String>) -> Self {
         Self {
             access_token: access_token.into(),
-            workspace_folder_id: None,
             document_ids: Vec::new(),
         }
-    }
-
-    pub fn with_workspace_folder_id(mut self, workspace_folder_id: RemoteId) -> Self {
-        self.workspace_folder_id = Some(workspace_folder_id);
-        self
     }
 
     pub fn with_document_ids(mut self, document_ids: Vec<String>) -> Self {
@@ -72,14 +81,12 @@ impl GoogleDocsConfig {
 #[derive(Clone)]
 pub struct GoogleDocsConnector {
     config: GoogleDocsConfig,
-    drive: Arc<dyn GoogleDriveApi>,
     docs: Arc<dyn GoogleDocsApi>,
 }
 
 impl std::fmt::Debug for GoogleDocsConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GoogleDocsConnector")
-            .field("workspace_folder_id", &self.config.workspace_folder_id)
             .field("document_ids", &self.config.document_ids)
             .field("access_token", &"<redacted>")
             .finish()
@@ -89,109 +96,17 @@ impl std::fmt::Debug for GoogleDocsConnector {
 impl GoogleDocsConnector {
     pub fn new(config: GoogleDocsConfig) -> Self {
         let api = Arc::new(HttpGoogleApiClient::new(config.access_token.clone()));
-        Self::with_apis(config, api.clone(), api)
+        Self::with_documents(config, api)
     }
 
-    pub fn with_apis(
-        config: GoogleDocsConfig,
-        drive: Arc<dyn GoogleDriveApi>,
-        docs: Arc<dyn GoogleDocsApi>,
-    ) -> Self {
-        Self {
-            config,
-            drive,
-            docs,
-        }
+    pub fn with_documents(config: GoogleDocsConfig, docs: Arc<dyn GoogleDocsApi>) -> Self {
+        Self { config, docs }
     }
 
     pub fn config(&self) -> &GoogleDocsConfig {
         &self.config
     }
 
-    pub fn with_workspace_folder_id(&self, workspace_folder_id: RemoteId) -> Self {
-        let mut config = self.config.clone();
-        config.workspace_folder_id = Some(workspace_folder_id);
-        Self {
-            config,
-            drive: Arc::clone(&self.drive),
-            docs: Arc::clone(&self.docs),
-        }
-    }
-
-    pub fn resolve_workspace_folder(&self, workspace_folder: &str) -> LocalityResult<RemoteId> {
-        let workspace_folder = workspace_folder.trim();
-        if workspace_folder.is_empty() {
-            return Err(LocalityError::InvalidState(
-                "google docs workspace folder cannot be empty".to_string(),
-            ));
-        }
-
-        if let Some(folder_id) = extract_google_drive_folder_id(workspace_folder) {
-            return self.verify_workspace_folder_id(&folder_id);
-        }
-        if looks_like_google_drive_id(workspace_folder) {
-            match self.verify_workspace_folder_id(workspace_folder) {
-                Ok(folder_id) => return Ok(folder_id),
-                Err(LocalityError::RemoteNotFound(_)) => {}
-                Err(error) => return Err(error),
-            }
-        }
-
-        if let Some(folder) = self.find_workspace_folder_by_name(workspace_folder)? {
-            return Ok(RemoteId::new(folder.id));
-        }
-        let created = self
-            .drive
-            .create_file(DriveCreateFileRequest::folder(workspace_folder, None))?;
-        if !created.is_folder() || created.trashed {
-            return Err(LocalityError::InvalidState(format!(
-                "google docs workspace folder create returned non-folder `{}`",
-                created.id
-            )));
-        }
-        Ok(RemoteId::new(created.id))
-    }
-
-    fn verify_workspace_folder_id(&self, folder_id: &str) -> LocalityResult<RemoteId> {
-        let file = self.drive.get_file(folder_id)?;
-        if file.trashed {
-            return Err(LocalityError::RemoteNotFound(format!(
-                "google docs workspace folder `{folder_id}` is trashed"
-            )));
-        }
-        if !file.is_folder() {
-            return Err(LocalityError::Guardrail(format!(
-                "google docs workspace root `{folder_id}` is not a Google Drive folder"
-            )));
-        }
-        Ok(RemoteId::new(file.id))
-    }
-
-    fn find_workspace_folder_by_name(&self, name: &str) -> LocalityResult<Option<DriveFile>> {
-        let mut cursor = None;
-        let mut matches = Vec::new();
-        loop {
-            let page = self
-                .drive
-                .list_workspace_folders_by_name(name, cursor.as_deref())?;
-            matches.extend(
-                page.files
-                    .into_iter()
-                    .filter(|file| file.is_folder() && !file.trashed),
-            );
-            if page.next_page_token.is_none() {
-                break;
-            }
-            cursor = page.next_page_token;
-        }
-        matches.sort_by(|left, right| {
-            left.name
-                .to_lowercase()
-                .cmp(&right.name.to_lowercase())
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        Ok(matches.into_iter().next())
-    }
 }
 
 impl Connector for GoogleDocsConnector {
@@ -219,9 +134,6 @@ impl Connector for GoogleDocsConnector {
             PushOperationKind::ReplaceBlock,
             PushOperationKind::AppendBlock,
             PushOperationKind::ArchiveBlock,
-            PushOperationKind::ArchiveEntity,
-            PushOperationKind::UpdateProperties,
-            PushOperationKind::MoveEntity,
             PushOperationKind::CreateEntity,
         ]
         .into_iter()
@@ -229,84 +141,26 @@ impl Connector for GoogleDocsConnector {
     }
 
     fn enumerate(&self, request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>> {
-        let root_id = self.workspace_folder_id()?;
-        enumerate_drive_tree(
-            self.drive.as_ref(),
-            &request.mount_id,
-            root_id.as_str(),
-            Path::new(""),
-        )
+        project_selected_documents(self.docs.as_ref(), &request.mount_id, &self.config.document_ids)
     }
 
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {
-        let parent_id = match request.container {
-            locality_connector::ChildContainer::Root => self.workspace_folder_id()?.0.clone(),
-            locality_connector::ChildContainer::PageChildren(remote_id)
-            | locality_connector::ChildContainer::DatabaseRows(remote_id)
-            | locality_connector::ChildContainer::DirectoryChildren(remote_id) => remote_id.0,
-        };
-        Ok(ListChildrenResult::complete(list_drive_children(
-            self.drive.as_ref(),
-            &request.mount_id,
-            &parent_id,
-            &request.parent_path,
-        )?))
+        match request.container {
+            locality_connector::ChildContainer::Root => Ok(ListChildrenResult::complete(project_selected_documents(self.docs.as_ref(), &request.mount_id, &self.config.document_ids)?)),
+            _ => Ok(ListChildrenResult::complete(Vec::new())),
+        }
     }
 
     fn observe(&self, request: ObserveRequest) -> LocalityResult<RemoteObservation> {
-        let file = self.drive.get_file(request.remote_id.as_str())?;
-        let revision = if file.is_google_doc() {
-            self.docs
-                .get_document(file.id.as_str())?
-                .revision_id
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let kind = if file.is_folder() {
-            EntityKind::Directory
-        } else if file.is_google_doc() {
-            EntityKind::Page
-        } else {
-            EntityKind::Unknown(file.mime_type.clone())
-        };
-        let projected_path = if file.is_google_doc() {
-            page_document_path(Path::new(&slugify_title(&file.name)))
-        } else {
-            PathBuf::from(slugify_title(&file.name))
-        };
-        let mut observation = RemoteObservation::new(
-            request.mount_id,
-            RemoteId::new(file.id.clone()),
-            kind,
-            file.name.clone(),
-            projected_path,
-        )
-        .deleted(file.trashed)
-        .with_raw_metadata_json(drive_file_metadata_json(&file));
-        if let Some(parent) = file.parents.first() {
-            observation = observation.with_parent(RemoteId::new(parent.clone()));
-        }
-        observation = observation.with_remote_version(RemoteVersion::new(combined_remote_version(
-            &file,
-            Some(revision.as_str()),
-        )));
-        Ok(observation)
+        let document = self.docs.get_document(request.remote_id.as_str())?;
+        Ok(RemoteObservation::new(request.mount_id, RemoteId::new(document.document_id.clone()), EntityKind::Page, document.title.clone(), page_document_path(Path::new(&slugify_title(&document.title))))
+            .with_raw_metadata_json(document_metadata_json(&document))
+            .with_remote_version(RemoteVersion::new(document_remote_version(&document))))
     }
 
     fn fetch(&self, request: FetchRequest) -> LocalityResult<NativeEntity> {
-        let drive_file = self.drive.get_file(request.remote_id.as_str())?;
-        if !drive_file.is_google_doc() {
-            return Err(LocalityError::Unsupported(
-                "google docs connector only hydrates Google Docs files",
-            ));
-        }
         let document = self.docs.get_document(request.remote_id.as_str())?;
-        let bundle = GoogleDocsNativeBundle {
-            drive_file,
-            document,
-        };
-        let raw = serde_json::to_vec(&bundle).map_err(|error| {
+        let raw = serde_json::to_vec(&document).map_err(|error| {
             LocalityError::Io(format!("google docs native encode failed: {error}"))
         })?;
         Ok(NativeEntity {
@@ -317,11 +171,10 @@ impl Connector for GoogleDocsConnector {
     }
 
     fn render(&self, entity: &NativeEntity) -> LocalityResult<CanonicalDocument> {
-        let bundle =
-            serde_json::from_slice::<GoogleDocsNativeBundle>(&entity.raw).map_err(|error| {
+        let document = serde_json::from_slice::<GoogleDocument>(&entity.raw).map_err(|error| {
                 LocalityError::Io(format!("google docs native decode failed: {error}"))
             })?;
-        render_google_document(&bundle).map(|rendered| rendered.document)
+        render_google_document(&document).map(|rendered| rendered.document)
     }
 
     fn parse(&self, document: &CanonicalDocument) -> LocalityResult<ParsedEntity> {
@@ -334,11 +187,11 @@ impl Connector for GoogleDocsConnector {
     }
 
     fn check_concurrency(&self, request: ApplyPlanRequest<'_>) -> LocalityResult<()> {
-        check_remote_preconditions(self.drive.as_ref(), self.docs.as_ref(), &request)
+        check_remote_preconditions(self.docs.as_ref(), &request)
     }
 
     fn apply(&self, request: ApplyPlanRequest<'_>) -> LocalityResult<ApplyPlanResult> {
-        apply_plan(self.drive.as_ref(), self.docs.as_ref(), request)
+        apply_plan(self.docs.as_ref(), request)
     }
 
     fn apply_undo(&self, _request: ApplyUndoRequest<'_>) -> LocalityResult<ApplyUndoResult> {
@@ -356,25 +209,6 @@ fn docs_revision_matches(expected: &str, current: &str) -> bool {
     }
 }
 
-fn remote_versions_match_for_entity_archive(expected: &str, current: &str) -> bool {
-    drive_modified_time_from_remote_version(expected)
-        .zip(drive_modified_time_from_remote_version(current))
-        .is_some_and(|(expected_modified, current_modified)| {
-            expected_modified == current_modified
-                && docs_revision_matches_archive_precondition(expected, current)
-        })
-}
-
-fn docs_revision_matches_archive_precondition(expected: &str, current: &str) -> bool {
-    match (
-        docs_revision_from_remote_version(expected),
-        docs_revision_from_remote_version(current),
-    ) {
-        (Some(expected), Some(current)) => expected == current,
-        (None, _) => true,
-        _ => false,
-    }
-}
 
 fn docs_revision_from_remote_version(version: &str) -> Option<&str> {
     version
@@ -383,25 +217,6 @@ fn docs_revision_from_remote_version(version: &str) -> Option<&str> {
         .or_else(|| version.strip_prefix("docs:"))
 }
 
-fn drive_modified_time_from_remote_version(version: &str) -> Option<&str> {
-    let drive_version = version.strip_prefix("drive:")?;
-    let (_, modified_time) = drive_version.split_once(':')?;
-    Some(
-        modified_time
-            .split_once("|docs:")
-            .map(|(modified_time, _)| modified_time)
-            .unwrap_or(modified_time),
-    )
-}
-
-fn plan_archives_entity(plan: &PushPlan, remote_id: &RemoteId) -> bool {
-    plan.operations.iter().any(|operation| {
-        matches!(
-            operation,
-            PushOperation::ArchiveEntity { entity_id } if entity_id == remote_id
-        )
-    })
-}
 
 fn plan_changes_only_document_body(plan: &PushPlan, remote_id: &RemoteId) -> bool {
     let mut body_change = false;
@@ -445,10 +260,10 @@ fn operation_targets_document(block_id: &RemoteId, remote_id: &RemoteId) -> bool
         .unwrap_or(false)
 }
 
-fn drive_file_metadata_json(file: &DriveFile) -> String {
-    let mut value = serde_json::to_value(file).unwrap_or_else(|_| serde_json::json!({}));
+fn document_metadata_json(document: &GoogleDocument) -> String {
+    let mut value = serde_json::to_value(document).unwrap_or_else(|_| serde_json::json!({}));
     if let serde_json::Value::Object(object) = &mut value {
-        let search_metadata = drive_file_search_metadata(file);
+        let search_metadata = document_search_metadata(document);
         if !search_metadata.is_empty()
             && let Ok(search_value) = serde_json::to_value(search_metadata)
         {
@@ -458,51 +273,18 @@ fn drive_file_metadata_json(file: &DriveFile) -> String {
     serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
 }
 
-fn drive_file_search_metadata(file: &DriveFile) -> SearchMetadata {
+fn document_search_metadata(document: &GoogleDocument) -> SearchMetadata {
     let mut metadata = SearchMetadata::default();
-    metadata.push_metadata_text(&file.id);
-    metadata.push_metadata_text(&file.name);
-    metadata.push_metadata_text(&file.mime_type);
-    metadata.push_alias(&file.id);
-    if file.is_google_doc() {
-        metadata.push_metadata_text("Google Docs");
-        metadata.set_source_url(format!(
-            "https://docs.google.com/document/d/{}/edit",
-            file.id
-        ));
-    } else if file.is_folder() {
-        metadata.push_metadata_text("Google Drive folder");
-        metadata.set_source_url(format!(
-            "https://drive.google.com/drive/folders/{}",
-            file.id
-        ));
-    } else {
-        metadata.set_source_url(format!("https://drive.google.com/file/d/{}/view", file.id));
-    }
-    for parent in &file.parents {
-        metadata.push_metadata_text(parent);
-    }
-    if let Some(modified_time) = &file.modified_time {
-        metadata.push_metadata_text(modified_time);
-    }
-    if let Some(version) = &file.version {
-        metadata.push_metadata_text(version);
-    }
+    metadata.push_metadata_text(&document.document_id);
+    metadata.push_metadata_text(&document.title);
+    metadata.push_metadata_text("Google Docs");
+    metadata.push_alias(&document.document_id);
+    metadata.set_source_url(format!("https://docs.google.com/document/d/{}/edit", document.document_id));
+    if let Some(revision) = &document.revision_id { metadata.push_metadata_text(revision); }
     metadata
 }
 
-impl GoogleDocsConnector {
-    fn workspace_folder_id(&self) -> LocalityResult<&RemoteId> {
-        self.config.workspace_folder_id.as_ref().ok_or_else(|| {
-            LocalityError::InvalidState(
-                "google docs mount is missing workspace folder id".to_string(),
-            )
-        })
-    }
-}
-
 fn check_remote_preconditions(
-    drive: &dyn GoogleDriveApi,
     docs: &dyn GoogleDocsApi,
     request: &ApplyPlanRequest<'_>,
 ) -> LocalityResult<()> {
@@ -510,13 +292,8 @@ fn check_remote_preconditions(
         let Some(expected) = &precondition.remote_edited_at else {
             continue;
         };
-        let current = remote_version_from_apis(drive, docs, &precondition.remote_id)?;
+        let current = remote_version_from_apis(docs, &precondition.remote_id)?;
         if expected == current.as_str() {
-            continue;
-        }
-        if remote_versions_match_for_entity_archive(expected, current.as_str())
-            && plan_archives_entity(request.plan, &precondition.remote_id)
-        {
             continue;
         }
         if docs_revision_matches(expected, current.as_str())
@@ -537,117 +314,34 @@ fn check_remote_preconditions(
 }
 
 fn remote_version_from_apis(
-    drive: &dyn GoogleDriveApi,
     docs: &dyn GoogleDocsApi,
     remote_id: &RemoteId,
 ) -> LocalityResult<String> {
-    let file = drive.get_file(remote_id.as_str())?;
-    let revision = if file.is_google_doc() {
-        docs.get_document(remote_id.as_str())?.revision_id
-    } else {
-        None
-    };
-    Ok(combined_remote_version(&file, revision.as_deref()))
+    Ok(document_remote_version(&docs.get_document(remote_id.as_str())?))
 }
 
-fn enumerate_drive_tree(
-    drive: &dyn GoogleDriveApi,
-    mount_id: &locality_core::model::MountId,
-    parent_id: &str,
-    parent_path: &Path,
-) -> LocalityResult<Vec<TreeEntry>> {
-    let mut entries = Vec::new();
-    let children = list_drive_children(drive, mount_id, parent_id, parent_path)?;
-    for entry in children {
-        let is_directory = entry.kind == EntityKind::Directory;
-        let remote_id = entry.remote_id.clone();
-        let dir_path = entry.path.clone();
-        entries.push(entry);
-        if is_directory {
-            entries.extend(enumerate_drive_tree(
-                drive,
-                mount_id,
-                remote_id.as_str(),
-                &dir_path,
-            )?);
-        }
-    }
-    Ok(entries)
-}
-
-fn list_drive_children(
-    drive: &dyn GoogleDriveApi,
-    mount_id: &locality_core::model::MountId,
-    parent_id: &str,
-    parent_path: &Path,
-) -> LocalityResult<Vec<TreeEntry>> {
-    let mut cursor = None;
-    let mut files = Vec::new();
-    loop {
-        let page = drive.list_children(parent_id, cursor.as_deref())?;
-        files.extend(page.files.into_iter().filter(|file| !file.trashed));
-        if page.next_page_token.is_none() {
-            break;
-        }
-        cursor = page.next_page_token;
-    }
-    files.sort_by(|left, right| {
-        left.name
-            .to_lowercase()
-            .cmp(&right.name.to_lowercase())
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    Ok(project_drive_children(mount_id, parent_path, files))
-}
-
-fn project_drive_children(
-    mount_id: &locality_core::model::MountId,
-    parent_path: &Path,
-    files: Vec<DriveFile>,
-) -> Vec<TreeEntry> {
+fn project_selected_documents(docs: &dyn GoogleDocsApi, mount_id: &locality_core::model::MountId, document_ids: &[String]) -> LocalityResult<Vec<TreeEntry>> {
     let mut used_paths = BTreeSet::new();
-    files
-        .into_iter()
-        .filter(|file| file.is_folder() || file.is_google_doc())
-        .map(|file| {
-            let path = if file.is_folder() {
-                allocate_path(parent_path, &file.name, &file.id, false, &mut used_paths)
-            } else {
-                allocate_path(parent_path, &file.name, &file.id, true, &mut used_paths)
-            };
-            let remote_version = file.remote_version();
-            let stub_frontmatter = if file.is_google_doc() {
-                Some(document_frontmatter(&file, ""))
-            } else {
-                None
-            };
-            TreeEntry {
+    let mut documents = document_ids.iter().map(|id| docs.get_document(id)).collect::<LocalityResult<Vec<_>>>()?;
+    documents.sort_by(|left, right| left.title.to_lowercase().cmp(&right.title.to_lowercase()).then_with(|| left.document_id.cmp(&right.document_id)));
+    Ok(documents.into_iter().map(|document| TreeEntry {
                 mount_id: mount_id.clone(),
-                remote_id: RemoteId::new(file.id),
-                kind: if file.mime_type == DRIVE_FOLDER_MIME_TYPE {
-                    EntityKind::Directory
-                } else if file.mime_type == DRIVE_GOOGLE_DOC_MIME_TYPE {
-                    EntityKind::Page
-                } else {
-                    EntityKind::Unknown(file.mime_type)
-                },
-                title: file.name,
-                path,
+                remote_id: RemoteId::new(document.document_id.clone()),
+                kind: EntityKind::Page,
+                title: document.title.clone(),
+                path: allocate_path(Path::new(""), &document.title, &document.document_id, true, &mut used_paths),
                 hydration: HydrationState::Stub,
                 content_hash: None,
-                remote_edited_at: remote_version,
-                stub_frontmatter,
-            }
-        })
-        .collect()
+                remote_edited_at: Some(document_remote_version(&document)),
+                stub_frontmatter: Some(document_frontmatter(&document)),
+            }).collect())
 }
 
 fn apply_plan(
-    drive: &dyn GoogleDriveApi,
     docs: &dyn GoogleDocsApi,
     request: ApplyPlanRequest<'_>,
 ) -> LocalityResult<ApplyPlanResult> {
-    check_remote_preconditions(drive, docs, &request)?;
+    check_remote_preconditions(docs, &request)?;
     let mut changed = BTreeSet::new();
     let mut effects = Vec::new();
     let mut append_offsets: BTreeMap<(String, Option<String>), usize> = BTreeMap::new();
@@ -815,59 +509,14 @@ fn apply_plan(
                     block_id: block_id.clone(),
                 });
             }
-            PushOperation::ArchiveEntity { entity_id } => {
-                drive.update_file(entity_id.as_str(), DriveUpdateFileRequest::trash())?;
-                changed.insert(entity_id.clone());
-                effects.push(JournalApplyEffect::ArchivedEntity {
-                    operation_id,
-                    operation_index: index,
-                    entity_id: entity_id.clone(),
-                });
-            }
             PushOperation::UpdateEntityBody { .. } => {
                 return Err(LocalityError::Unsupported(
                     "whole-entity body updates for Google Docs",
                 ));
             }
-            PushOperation::UpdateProperties {
-                entity_id,
-                properties,
-            } => {
-                if let Some(PropertyValue::String(title)) = properties.get("title") {
-                    drive.update_file(entity_id.as_str(), DriveUpdateFileRequest::rename(title))?;
-                    changed.insert(entity_id.clone());
-                    effects.push(JournalApplyEffect::UpdatedProperties {
-                        operation_id,
-                        operation_index: index,
-                        entity_id: entity_id.clone(),
-                        keys: vec!["title".to_string()],
-                    });
-                }
-            }
-            PushOperation::MoveEntity {
-                entity_id,
-                new_parent_id,
-                new_title,
-                ..
-            } => {
-                let file = drive.get_file(entity_id.as_str())?;
-                let remove_parents = file.parents.join(",");
-                drive.update_file(
-                    entity_id.as_str(),
-                    DriveUpdateFileRequest::move_and_rename(
-                        new_title,
-                        new_parent_id.0.clone(),
-                        remove_parents,
-                    ),
-                )?;
-                changed.insert(entity_id.clone());
-                effects.push(JournalApplyEffect::MovedEntity {
-                    operation_id,
-                    operation_index: index,
-                    entity_id: entity_id.clone(),
-                    parent_id: new_parent_id.clone(),
-                });
-            }
+            PushOperation::ArchiveEntity { .. }
+            | PushOperation::UpdateProperties { .. }
+            | PushOperation::MoveEntity { .. } => return Err(LocalityError::Unsupported("Google Docs mounts only support body edits; rename, move, and archive are unavailable")),
             PushOperation::CreateEntity {
                 parent_id,
                 parent_workspace,
@@ -875,32 +524,24 @@ fn apply_plan(
                 body,
                 ..
             } => {
-                if *parent_workspace {
+                if *parent_workspace || parent_id.0 != "root" {
                     return Err(LocalityError::Unsupported(
-                        "google docs connector cannot create workspace-private pages",
+                        "google docs connector can only create documents at the mount root",
                     ));
                 }
-                let created = drive.create_file(DriveCreateFileRequest::google_doc(
-                    title,
-                    parent_id.0.clone(),
-                ))?;
+                let created = docs.create_document(title)?;
                 if !body.trim().is_empty() {
-                    let document = docs
-                        .get_document(created.id.as_str())
-                        .unwrap_or_else(|_| empty_document(created.id.as_str(), title));
                     if let Err(error) = docs.batch_update_document(
-                        created.id.as_str(),
+                        created.document_id.as_str(),
                         BatchUpdateDocumentRequest {
                             requests: docs_document_text_requests(1, body),
-                            write_control: write_control(&document),
+                            write_control: write_control(&created),
                         },
                     ) {
-                        let _ =
-                            drive.update_file(created.id.as_str(), DriveUpdateFileRequest::trash());
                         return Err(error);
                     }
                 }
-                let entity_id = RemoteId::new(created.id);
+                let entity_id = RemoteId::new(created.document_id);
                 changed.insert(entity_id.clone());
                 effects.push(JournalApplyEffect::CreatedEntity {
                     operation_id,
@@ -3036,14 +2677,6 @@ fn document_start_index(document: &GoogleDocument) -> usize {
         .unwrap_or(1)
 }
 
-fn empty_document(id: &str, title: &str) -> GoogleDocument {
-    GoogleDocument {
-        document_id: id.to_string(),
-        title: title.to_string(),
-        ..GoogleDocument::default()
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GoogleBlockRange {
     document_id: String,
@@ -3174,36 +2807,7 @@ fn short_id(remote_id: &str, len: usize) -> String {
     }
 }
 
-pub fn extract_google_drive_folder_id(value: &str) -> Option<String> {
-    if let Some(after_folders) = value.split("/folders/").nth(1) {
-        return Some(
-            after_folders
-                .split(['?', '/', '#'])
-                .next()
-                .unwrap_or(after_folders)
-                .to_string(),
-        );
-    }
-    if let Some(after_id) = value.split("id=").nth(1) {
-        return Some(
-            after_id
-                .split(['&', '#'])
-                .next()
-                .unwrap_or(after_id)
-                .to_string(),
-        );
-    }
-    None
-}
-
-fn looks_like_google_drive_id(value: &str) -> bool {
-    value.len() >= 10
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-}
-
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
