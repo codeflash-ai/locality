@@ -15346,7 +15346,8 @@ mod tests {
             assert!(
                 error.contains("locality-fuse was not found")
                     || error.contains("locality-cloud-files")
-                    || error.contains("Windows Cloud Files"),
+                    || error.contains("Windows Cloud Files")
+                    || error.contains("localityd binary was not found"),
                 "unexpected Slack desktop mount error: {error}"
             );
         }
