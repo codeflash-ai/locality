@@ -22,23 +22,19 @@ Drive metadata scope, and it makes no Drive metadata API calls.
 In Desktop, create or reconfigure a Google Docs mount with the Google Picker.
 The Picker allows multi-selection and accepts only native Google Docs. Locality
 persists the selected document IDs; it never persists or discovers a Drive
-folder. Desktop opens Picker in the default browser because Google Picker
-requires an HTTP(S) origin and packaged desktop windows use a custom origin.
-The browser page is a short-lived, token-bound loopback session; it returns the
-selection automatically to Locality and never persists the OAuth token.
-Official Locality desktop packages include the Picker configuration for the
-Locality Google Cloud project. Development builds can override it before
-starting Locality:
+folder. Desktop opens a short-lived HTTPS picker page at the configured OAuth
+broker, then receives the selection through the `locality://` deep link. The
+Desktop sends only its opaque refresh-token handle and an in-memory redemption
+secret to create the session; the broker refreshes the Google token server-side.
+Neither token nor Picker API key is stored in the Desktop client or mount
+settings. The broker remains stateless: all short-lived session data is sealed
+into encrypted capabilities.
 
-```bash
-export LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY='<Google API key>'
-export LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER='<numeric Google Cloud project number>'
-```
-
-The project number must be numeric and belongs to the same Google Cloud project
-as the Picker API key and OAuth client. These values configure Picker only; an
-OAuth token is used only for the active local Picker session and is not saved in
-mount settings.
+The broker must configure `LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY` and
+`LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER`. The project number must be numeric and
+the API key, project number, and shared Google OAuth client must come from the
+same Google Cloud project. Restrict the API key to Google Picker API and the
+broker HTTPS origin.
 
 For CLI or automation setup, provide one or more selected document IDs or
 Google Docs URLs explicitly:

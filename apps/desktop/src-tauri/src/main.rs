@@ -4,8 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{self, BufRead, BufReader, Write};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -18,6 +17,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 #[cfg(test)]
 use loc_cli::connect::DEFAULT_NOTION_PROFILE_ID;
 use loc_cli::connect::{
@@ -164,6 +164,7 @@ use localityd::virtual_fs::{
 };
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 #[cfg(target_os = "macos")]
 use tauri::TitleBarStyle;
 use tauri::{
@@ -174,6 +175,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::Color,
 };
+use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::DialogExt;
 
 mod agent_guidance;
@@ -498,20 +500,25 @@ struct ReconfigureGoogleDocsMountRequest {
     document_ids: Vec<String>,
 }
 
-/// This response intentionally exists only at the Tauri command boundary. It is never added to
-/// the desktop snapshot or persisted: Google Picker needs the current OAuth access token, but the
-/// token remains owned by the credential store.
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GoogleDocsPickerConfiguration {
-    developer_key: String,
-    project_number: String,
-    access_token: String,
+struct GoogleDocsPickerSessionRequest {
+    refresh_token_handle: String,
+    redemption_secret_hash: String,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GoogleDocsPickerSubmission {
+struct GoogleDocsPickerSessionResponse {
+    browser_url: String,
+}
+
+#[derive(Serialize)]
+struct GoogleDocsPickerRedeemRequest {
+    completion: String,
+    redemption_secret: String,
+}
+
+#[derive(Deserialize)]
+struct GoogleDocsPickerRedeemResponse {
     document_ids: Vec<String>,
 }
 
@@ -1538,13 +1545,6 @@ async fn create_desktop_mount(app: AppHandle, request: CreateDesktopMountRequest
 }
 
 #[tauri::command]
-async fn google_docs_picker_configuration() -> Result<GoogleDocsPickerConfiguration, String> {
-    tauri::async_runtime::spawn_blocking(google_docs_picker_configuration_blocking)
-        .await
-        .map_err(|error| format!("Google Picker configuration worker failed: {error}"))?
-}
-
-#[tauri::command]
 async fn choose_google_docs_in_browser() -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(choose_google_docs_in_browser_blocking)
         .await
@@ -1581,15 +1581,7 @@ async fn reconfigure_google_docs_mount(request: ReconfigureGoogleDocsMountReques
     report
 }
 
-fn google_docs_picker_configuration_blocking() -> Result<GoogleDocsPickerConfiguration, String> {
-    let (developer_key, project_number) = google_docs_picker_configuration_values(
-        env::var("LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY")
-            .ok()
-            .as_deref(),
-        env::var("LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER")
-            .ok()
-            .as_deref(),
-    )?;
+fn google_docs_picker_connection_blocking() -> Result<StoredGoogleDocsCredential, String> {
     let state_root = default_state_root();
     let store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open Locality state: {error}"))?;
@@ -1611,58 +1603,44 @@ fn google_docs_picker_configuration_blocking() -> Result<GoogleDocsPickerConfigu
         .map_err(|error| format!("Could not read Google Docs credential: {error}"))?;
     let credential = serde_json::from_str::<StoredGoogleDocsCredential>(&secret)
         .map_err(|error| format!("Could not read Google Docs OAuth credential: {error}"))?;
-    if credential
-        .oauth_client_id
-        .as_deref()
-        .is_none_or(|value| value.trim().is_empty())
-    {
-        return Err(
-            "Google Picker needs the OAuth client ID. Reconnect Google Docs and try again."
-                .to_string(),
-        );
-    }
-    if credential.access_token.trim().is_empty() {
-        return Err(
-            "Google Docs access has expired. Reconnect Google Docs and try again.".to_string(),
-        );
-    }
-    Ok(GoogleDocsPickerConfiguration {
-        developer_key,
-        project_number,
-        access_token: credential.access_token,
-    })
+    Ok(credential)
 }
 
 fn choose_google_docs_in_browser_blocking() -> Result<Vec<String>, String> {
-    let configuration = google_docs_picker_configuration_blocking()?;
-    let token = google_docs_picker_session_token()?;
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|error| format!("Could not start the local Google Picker page: {error}"))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| format!("Could not prepare the local Google Picker page: {error}"))?;
-    let address = listener
-        .local_addr()
-        .map_err(|error| format!("Could not read the local Google Picker address: {error}"))?;
-    let picker_url = format!("http://{address}/google-docs-picker/{token}");
-    open_url_in_browser(&picker_url)?;
-    let deadline = Instant::now() + Duration::from_secs(10 * 60);
-    while Instant::now() < deadline {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                if let Some(document_ids) =
-                    google_docs_picker_handle_request(&mut stream, &token, &configuration)?
-                {
-                    return Ok(document_ids);
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(25))
-            }
-            Err(error) => return Err(format!("Google Picker local page failed: {error}")),
+    let credential = google_docs_picker_connection_blocking()?;
+    let broker_url = google_docs_picker_broker_url(credential.oauth_broker_url.as_deref())?;
+    let refresh_token_handle = credential
+        .refresh_token_handle
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Reconnect Google Docs before choosing documents.".to_string())?;
+    let redemption_secret = google_docs_picker_session_token()?;
+    let session =
+        google_docs_picker_create_session(&broker_url, &refresh_token_handle, &redemption_secret)?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let pending = google_docs_picker_pending_completion();
+    {
+        let mut guard = pending
+            .lock()
+            .map_err(|_| "Google Picker is unavailable. Try again.".to_string())?;
+        if guard.is_some() {
+            return Err("Google Picker is already open. Finish or cancel that selection first.".to_string());
         }
+        *guard = Some(sender);
     }
-    Err("Google Picker timed out. Return to Locality and try choosing documents again.".to_string())
+    if let Err(error) = open_url_in_browser(&session.browser_url) {
+        *pending
+            .lock()
+            .map_err(|_| "Google Picker is unavailable. Try again.".to_string())? = None;
+        return Err(error);
+    }
+    let completion = receiver.recv_timeout(Duration::from_secs(10 * 60));
+    *pending
+        .lock()
+        .map_err(|_| "Google Picker is unavailable. Try again.".to_string())? = None;
+    let completion = completion.map_err(|_| {
+        "Google Picker timed out. Return to Locality and try choosing documents again.".to_string()
+    })?;
+    google_docs_picker_redeem(&broker_url, &completion, &redemption_secret)
 }
 
 fn google_docs_picker_session_token() -> Result<String, String> {
@@ -1672,164 +1650,99 @@ fn google_docs_picker_session_token() -> Result<String, String> {
     Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn google_docs_picker_handle_request(
-    stream: &mut TcpStream,
-    token: &str,
-    configuration: &GoogleDocsPickerConfiguration,
-) -> Result<Option<Vec<String>>, String> {
-    let request = google_docs_picker_read_request(stream)?;
-    let page_path = format!("/google-docs-picker/{token}");
-    let selection_path = format!("{page_path}/selection");
-    match (request.method.as_str(), request.path.as_str()) {
-        ("GET", path) if path == page_path => {
-            google_docs_picker_write_response(
-                stream,
-                "200 OK",
-                &google_docs_picker_page(token, configuration),
-            )?;
-            Ok(None)
-        }
-        ("POST", path) if path == selection_path => {
-            let document_ids = google_docs_picker_submission(token, token, &request.body)?;
-            google_docs_picker_write_response(
-                stream,
-                "200 OK",
-                "<!doctype html><title>Google Docs selected</title><p>Selected documents were sent to Locality. You can close this tab.</p>",
-            )?;
-            Ok(Some(document_ids))
-        }
-        _ => {
-            google_docs_picker_write_response(stream, "404 Not Found", "Not found")?;
-            Ok(None)
-        }
+fn google_docs_picker_broker_url(value: Option<&str>) -> Result<String, String> {
+    let value = value.unwrap_or(DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL).trim();
+    let url = url::Url::parse(value).map_err(|_| {
+        "Google Docs OAuth broker URL is invalid. Reconnect Google Docs.".to_string()
+    })?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("Google Docs OAuth broker must use HTTPS. Reconnect Google Docs.".to_string());
     }
+    Ok(value.trim_end_matches('/').to_string())
 }
 
-struct GoogleDocsPickerHttpRequest {
-    method: String,
-    path: String,
-    body: String,
+fn google_docs_picker_create_session(
+    broker_url: &str,
+    refresh_token_handle: &str,
+    redemption_secret: &str,
+) -> Result<GoogleDocsPickerSessionResponse, String> {
+    let hash = URL_SAFE_NO_PAD.encode(Sha256::digest(redemption_secret.as_bytes()));
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{broker_url}/v1/google-docs/picker/sessions"))
+        .json(&GoogleDocsPickerSessionRequest {
+            refresh_token_handle: refresh_token_handle.to_string(),
+            redemption_secret_hash: hash,
+        })
+        .send()
+        .map_err(|error| format!("Could not start Google Picker: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Could not start Google Picker: {error}"))?;
+    response
+        .json()
+        .map_err(|error| format!("Google Picker returned an invalid session: {error}"))
 }
 
-fn google_docs_picker_read_request(
-    stream: &mut TcpStream,
-) -> Result<GoogleDocsPickerHttpRequest, String> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|error| format!("Could not read Google Picker request: {error}"))?;
-    let mut reader = BufReader::new(stream);
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .map_err(|error| format!("Could not read Google Picker request: {error}"))?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_string();
-    let path = parts.next().unwrap_or_default().to_string();
-    if method.is_empty() || path.is_empty() {
-        return Err("Google Picker local page received an invalid request.".to_string());
-    }
-    let mut content_length = 0_usize;
-    loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|error| format!("Could not read Google Picker request: {error}"))?;
-        if line == "\r\n" || line.is_empty() {
-            break;
-        }
-        if let Some(length) = google_docs_picker_content_length(&line)? {
-            content_length = length;
-        }
-    }
-    if content_length > 16 * 1024 {
-        return Err("Google Picker local page received an oversized request.".to_string());
-    }
-    let mut body = vec![0_u8; content_length];
-    reader
-        .read_exact(&mut body)
-        .map_err(|error| format!("Could not read Google Picker selection: {error}"))?;
-    String::from_utf8(body)
-        .map(|body| GoogleDocsPickerHttpRequest { method, path, body })
-        .map_err(|_| "Google Picker local page sent invalid text.".to_string())
-}
-
-fn google_docs_picker_content_length(line: &str) -> Result<Option<usize>, String> {
-    let Some((name, value)) = line.split_once(':') else {
-        return Ok(None);
-    };
-    if !name.trim().eq_ignore_ascii_case("content-length") {
-        return Ok(None);
-    }
-    value
-        .trim()
-        .parse()
-        .map(Some)
-        .map_err(|_| "Google Picker local page received an invalid content length.".to_string())
-}
-
-fn google_docs_picker_write_response(
-    stream: &mut TcpStream,
-    status: &str,
-    body: &str,
-) -> Result<(), String> {
-    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len()).map_err(|error| format!("Could not respond to Google Picker: {error}"))
-}
-
-fn google_docs_picker_submission(
-    expected_token: &str,
-    submitted_token: &str,
-    body: &str,
+fn google_docs_picker_redeem(
+    broker_url: &str,
+    completion: &str,
+    redemption_secret: &str,
 ) -> Result<Vec<String>, String> {
-    if submitted_token != expected_token {
-        return Err(
-            "Google Picker session did not match Locality. Try choosing documents again."
-                .to_string(),
-        );
-    }
-    let submission: GoogleDocsPickerSubmission = serde_json::from_str(body)
-        .map_err(|_| "Google Picker sent an invalid document selection.".to_string())?;
-    if submission.document_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    GoogleDocsMountSettings::from_document_ids(&submission.document_ids)
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{broker_url}/v1/google-docs/picker/redeem"))
+        .json(&GoogleDocsPickerRedeemRequest {
+            completion: completion.to_string(),
+            redemption_secret: redemption_secret.to_string(),
+        })
+        .send()
+        .map_err(|error| format!("Could not redeem Google Picker selection: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Could not redeem Google Picker selection: {error}"))?;
+    let selection: GoogleDocsPickerRedeemResponse = response
+        .json()
+        .map_err(|error| format!("Google Picker returned an invalid selection: {error}"))?;
+    GoogleDocsMountSettings::from_document_ids(&selection.document_ids)
         .map(|settings| settings.document_ids().to_vec())
-        .map_err(|error| format!("Google Picker sent an invalid document selection: {error}"))
+        .map_err(|error| format!("Google Picker returned an invalid selection: {error}"))
 }
 
-fn google_docs_picker_page(token: &str, configuration: &GoogleDocsPickerConfiguration) -> String {
-    let configuration = serde_json::to_string(configuration)
-        .expect("Google Picker configuration serializes")
-        .replace('<', "\\u003c");
-    format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><title>Choose Google Docs</title><script src="https://apis.google.com/js/api.js"></script></head><body><p id="status">Loading Google Picker…</p><script>const configuration={configuration};const selectionUrl='/google-docs-picker/{token}/selection';function submit(documentIds){{fetch(selectionUrl,{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{documentIds}})}}).then(()=>document.getElementById('status').textContent='Selection sent to Locality. You can close this tab.').catch(()=>document.getElementById('status').textContent='Could not send the selection to Locality.');}}gapi.load('picker',()=>{{const p=google.picker;const view=new p.DocsView(p.ViewId.DOCUMENTS).setIncludeFolders(false).setSelectFolderEnabled(false).setMimeTypes('application/vnd.google-apps.document');new p.PickerBuilder().setDeveloperKey(configuration.developerKey).setOAuthToken(configuration.accessToken).setAppId(configuration.projectNumber).setOrigin(window.location.origin).addView(view).enableFeature(p.Feature.MULTISELECT_ENABLED).setCallback(data=>{{const action=data[p.Response.ACTION];if(action===p.Action.PICKED)submit((data[p.Response.DOCUMENTS]||[]).map(doc=>doc.id));if(action===p.Action.CANCEL)submit([]);}}).build().setVisible(true);}});</script></body></html>"#
-    )
+fn google_docs_picker_pending_completion() -> &'static Mutex<Option<mpsc::SyncSender<String>>> {
+    static PENDING: OnceLock<Mutex<Option<mpsc::SyncSender<String>>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(None))
 }
 
-fn google_docs_picker_configuration_values(
-    developer_key_override: Option<&str>,
-    project_number_override: Option<&str>,
-) -> Result<(String, String), String> {
-    let developer_key = developer_key_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(env!("LOCALITY_BUNDLED_GOOGLE_PICKER_DEVELOPER_KEY"))
-        .to_string();
-    let project_number = project_number_override
-        .map(google_docs_picker_project_number)
-        .transpose()?
-        .unwrap_or_else(|| {
-            google_docs_picker_project_number(env!("LOCALITY_BUNDLED_GOOGLE_PICKER_PROJECT_NUMBER"))
-                .expect("bundled Google Picker project number must be numeric")
-        });
-    Ok((developer_key, project_number))
-}
-
-fn google_docs_picker_project_number(value: &str) -> Result<String, String> {
-    let value = value.trim();
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("Google Picker project configuration is invalid. Set LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER to the numeric Google Cloud project number and restart Locality.".to_string());
+fn receive_google_docs_picker_deep_link(value: &str) {
+    let Ok(completion) = parse_google_docs_picker_deep_link(value) else {
+        return;
+    };
+    if let Ok(guard) = google_docs_picker_pending_completion().lock()
+        && let Some(sender) = guard.as_ref()
+    {
+        let _ = sender.send(completion);
     }
-    Ok(value.to_string())
+}
+
+fn parse_google_docs_picker_deep_link(value: &str) -> Result<String, String> {
+    let url = url::Url::parse(value)
+        .map_err(|_| "Google Picker returned an invalid completion link.".to_string())?;
+    if url.scheme() != "locality"
+        || url.host_str() != Some("google-docs-picker")
+        || url.path() != ""
+        || url.fragment().is_some()
+    {
+        return Err("Google Picker completion link did not target Locality.".to_string());
+    }
+    let completions = url
+        .query_pairs()
+        .filter_map(|(name, value)| (name == "completion").then_some(value.into_owned()))
+        .collect::<Vec<_>>();
+    match completions.as_slice() {
+        [completion] if !completion.trim().is_empty() => Ok(completion.to_string()),
+        _ => Err("Google Picker completion link must include one completion token.".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -15473,82 +15386,35 @@ mod tests {
     }
 
     #[test]
-    fn google_docs_picker_project_number_requires_digits() {
+    fn google_docs_picker_requires_an_https_broker() {
         assert_eq!(
-            super::google_docs_picker_project_number("123456789").unwrap(),
-            "123456789"
+            super::google_docs_picker_broker_url(Some("https://broker.example/ ")).unwrap(),
+            "https://broker.example"
         );
-        assert!(
-            super::google_docs_picker_project_number("client.apps.googleusercontent.com").is_err()
-        );
-        assert!(super::google_docs_picker_project_number("").is_err());
+        assert!(super::google_docs_picker_broker_url(Some("http://broker.example")).is_err());
     }
 
     #[test]
-    fn google_docs_picker_uses_bundled_configuration_without_overrides() {
-        let (developer_key, project_number) =
-            super::google_docs_picker_configuration_values(None, None).unwrap();
-
-        assert!(developer_key.starts_with("AIza"));
-        assert!(project_number.bytes().all(|byte| byte.is_ascii_digit()));
-    }
-
-    #[test]
-    fn google_docs_picker_submission_rejects_a_wrong_session_token() {
+    fn google_docs_picker_deep_link_requires_the_picker_host_and_one_completion() {
+        assert_eq!(
+            super::parse_google_docs_picker_deep_link(
+                "locality://google-docs-picker?completion=locpicker_v1.value"
+            )
+            .expect("valid picker deep link"),
+            "locpicker_v1.value"
+        );
         assert!(
-            super::google_docs_picker_submission(
-                "expected-session",
-                "wrong-session",
-                r#"{\"documentIds\":[\"doc-1\"]}"#,
+            super::parse_google_docs_picker_deep_link("locality://other?completion=value").is_err()
+        );
+        assert!(
+            super::parse_google_docs_picker_deep_link("locality://google-docs-picker").is_err()
+        );
+        assert!(
+            super::parse_google_docs_picker_deep_link(
+                "locality://google-docs-picker?completion=one&completion=two"
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn google_docs_picker_accepts_lowercase_content_length_headers() {
-        assert_eq!(
-            super::google_docs_picker_content_length("content-length: 17").unwrap(),
-            Some(17)
-        );
-    }
-
-    #[test]
-    fn google_docs_picker_submission_allows_cancel_without_documents() {
-        assert_eq!(
-            super::google_docs_picker_submission("session", "session", r#"{"documentIds":[]}"#)
-                .unwrap(),
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn google_docs_picker_page_loads_the_google_api_script() {
-        let page = super::google_docs_picker_page(
-            "session",
-            &super::GoogleDocsPickerConfiguration {
-                developer_key: "picker-key".to_string(),
-                project_number: "123456789".to_string(),
-                access_token: "access-token".to_string(),
-            },
-        );
-
-        assert!(page.contains(r#"<script src="https://apis.google.com/js/api.js"></script>"#));
-    }
-
-    #[test]
-    fn google_docs_picker_page_uses_documented_picker_response_fields() {
-        let page = super::google_docs_picker_page(
-            "session",
-            &super::GoogleDocsPickerConfiguration {
-                developer_key: "picker-key".to_string(),
-                project_number: "123456789".to_string(),
-                access_token: "access-token".to_string(),
-            },
-        );
-
-        assert!(page.contains("data[p.Response.ACTION]"));
-        assert!(page.contains("data[p.Response.DOCUMENTS]"));
     }
 
     #[test]
@@ -22521,6 +22387,7 @@ fn main() {
             single_instance_guard,
         ))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_process::init());
     let builder = if app_store_distribution() {
         builder
@@ -22542,6 +22409,16 @@ fn main() {
             }
         })
         .setup(move |app| {
+            app.deep_link().on_open_url(|event| {
+                for url in event.urls() {
+                    receive_google_docs_picker_deep_link(url.as_str());
+                }
+            });
+            if let Ok(Some(urls)) = app.deep_link().get_current() {
+                for url in urls {
+                    receive_google_docs_picker_deep_link(url.as_str());
+                }
+            }
             if smoke_test_requested {
                 configure_main_window_chrome(app);
                 // Keep release smoke tests isolated from the user's daemon state.
@@ -22614,7 +22491,6 @@ fn main() {
             create_workspace_mount,
             materialize_portable_workspace,
             create_desktop_mount,
-            google_docs_picker_configuration,
             choose_google_docs_in_browser,
             reconfigure_google_docs_mount,
             connect_granola,

@@ -329,6 +329,9 @@ npm run check
   provider callback URLs returned as `provider_redirect_uri`. `/start` endpoints
   fail with `broker_config_error` until it is configured. See
   [`docs/deployment.md`](docs/deployment.md) for Cloudflare Workers setup.
+- `LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY`: Google Picker browser API key.
+- `LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER`: numeric Google Cloud project number
+  for that API key and the shared Google OAuth client.
 
 ## Required Secrets
 

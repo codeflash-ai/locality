@@ -10,6 +10,7 @@ rust-version.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+base64 = "0.22"
 getrandom = "0.3"
 loc-cli = { path = "../../../crates/loc-cli" }
 locality-connector.workspace = true
@@ -23,12 +24,16 @@ locality-slack.workspace = true
 locality-store.workspace = true
 localityd = { path = "../../../crates/localityd" }
 notify = "8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-deep-link = "2.4.9"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
+url = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

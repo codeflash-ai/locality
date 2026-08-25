@@ -19,6 +19,11 @@
     }
   },
   "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["locality"]
+      }
+    },
     "updater": {
       "pubkey": "",
       "endpoints": []

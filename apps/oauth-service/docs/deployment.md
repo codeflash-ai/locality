@@ -38,7 +38,15 @@ or in `wrangler.toml`:
 ```toml
 [vars]
 LOCALITY_BROKER_PUBLIC_BASE_URL = "https://oauth.locality.example"
+LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY = "<Google Picker browser API key>"
+LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER = "<numeric Google Cloud project number>"
 ```
+
+Google Docs Picker requires the browser API key, numeric project number, and
+`LOCALITY_GOOGLE_CLIENT_ID` to belong to the same Google Cloud project. Restrict
+the API key to Google Picker API and the broker HTTPS origin. Picker sessions
+are encrypted, short-lived capabilities; this Worker remains stateless and does
+not store Desktop credentials or Picker selections.
 
 Broker `/start` endpoints fail with `broker_config_error` until
 `LOCALITY_BROKER_PUBLIC_BASE_URL` is configured.
