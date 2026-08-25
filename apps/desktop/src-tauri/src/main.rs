@@ -1568,23 +1568,14 @@ async fn reconfigure_google_docs_mount(request: ReconfigureGoogleDocsMountReques
 }
 
 fn google_docs_picker_configuration_blocking() -> Result<GoogleDocsPickerConfiguration, String> {
-    let developer_key = env::var("LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            "Google Picker is not configured. Set LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY and restart Locality."
-                .to_string()
-        })?;
-    let project_number = env::var("LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER")
-        .ok()
-        .as_deref()
-        .map(google_docs_picker_project_number)
-        .transpose()?
-        .ok_or_else(|| {
-            "Google Picker is not configured. Set LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER to your numeric Google Cloud project number and restart Locality."
-                .to_string()
-        })?;
+    let (developer_key, project_number) = google_docs_picker_configuration_values(
+        env::var("LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY")
+            .ok()
+            .as_deref(),
+        env::var("LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER")
+            .ok()
+            .as_deref(),
+    )?;
     let state_root = default_state_root();
     let store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open Locality state: {error}"))?;
@@ -1626,6 +1617,25 @@ fn google_docs_picker_configuration_blocking() -> Result<GoogleDocsPickerConfigu
         project_number,
         access_token: credential.access_token,
     })
+}
+
+fn google_docs_picker_configuration_values(
+    developer_key_override: Option<&str>,
+    project_number_override: Option<&str>,
+) -> Result<(String, String), String> {
+    let developer_key = developer_key_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(env!("LOCALITY_BUNDLED_GOOGLE_PICKER_DEVELOPER_KEY"))
+        .to_string();
+    let project_number = project_number_override
+        .map(google_docs_picker_project_number)
+        .transpose()?
+        .unwrap_or_else(|| {
+            google_docs_picker_project_number(env!("LOCALITY_BUNDLED_GOOGLE_PICKER_PROJECT_NUMBER"))
+                .expect("bundled Google Picker project number must be numeric")
+        });
+    Ok((developer_key, project_number))
 }
 
 fn google_docs_picker_project_number(value: &str) -> Result<String, String> {
@@ -15272,6 +15282,15 @@ mod tests {
             super::google_docs_picker_project_number("client.apps.googleusercontent.com").is_err()
         );
         assert!(super::google_docs_picker_project_number("").is_err());
+    }
+
+    #[test]
+    fn google_docs_picker_uses_bundled_configuration_without_overrides() {
+        let (developer_key, project_number) =
+            super::google_docs_picker_configuration_values(None, None).unwrap();
+
+        assert!(developer_key.starts_with("AIza"));
+        assert!(project_number.bytes().all(|byte| byte.is_ascii_digit()));
     }
 
     #[test]
