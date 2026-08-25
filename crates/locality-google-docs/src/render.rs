@@ -1,15 +1,23 @@
 use locality_core::model::{CanonicalDocument, RemoteId};
 use locality_core::shadow::ShadowDocument;
 use locality_core::{LocalityError, LocalityResult};
+use serde::{Deserialize, Serialize};
 
 use crate::docs_dto::{
     GoogleDocument, InlineObjectElement, Paragraph, ParagraphElement, StructuralElement, Table,
     TextStyle,
 };
+use crate::drive_dto::DriveFile;
 use crate::oauth::GOOGLE_DOCS_CONNECTOR_ID;
 
 pub const GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND: &str = "google_docs_inline_object";
 pub const GOOGLE_DOCS_TABLE_NATIVE_KIND: &str = "google_docs_table";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoogleDocsNativeBundle {
+    pub drive_file: DriveFile,
+    pub document: GoogleDocument,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GoogleDocsRenderedEntity {
@@ -19,17 +27,17 @@ pub struct GoogleDocsRenderedEntity {
 }
 
 pub fn render_google_document(
-    document: &GoogleDocument,
+    bundle: &GoogleDocsNativeBundle,
 ) -> LocalityResult<GoogleDocsRenderedEntity> {
     let mut rendered_blocks = Vec::new();
     let mut native_block_ids = Vec::new();
     let mut native_block_kinds = Vec::new();
     let mut push_blocking_directives = false;
 
-    for element in &document.body.content {
-        let block_id = element_block_id(&document.document_id, element);
+    for element in &bundle.document.body.content {
+        let block_id = element_block_id(&bundle.document.document_id, element);
         if let Some(paragraph) = &element.paragraph {
-            let paragraph = render_paragraph(document, paragraph);
+            let paragraph = render_paragraph(&bundle.document, paragraph);
             if !paragraph.text.trim().is_empty() {
                 rendered_blocks.push(paragraph.text);
                 native_block_ids.push(RemoteId::new(block_id));
@@ -43,11 +51,11 @@ pub fn render_google_document(
                 push_blocking_directives = true;
                 rendered_blocks.push(format!(
                     "::loc{{id={}:unsupported type=google_docs_unsupported kind=\"inline_element\"}}",
-                    element_block_id(&document.document_id, element)
+                    element_block_id(&bundle.document.document_id, element)
                 ));
             }
         } else if let Some(table) = &element.table {
-            let table = render_table(document, table);
+            let table = render_table(&bundle.document, table);
             if !table.trim().is_empty() {
                 rendered_blocks.push(table);
                 native_block_ids.push(RemoteId::new(block_id));
@@ -71,10 +79,13 @@ pub fn render_google_document(
     } else {
         format!("{}\n", rendered_blocks.join("\n\n"))
     };
-    let frontmatter = document_frontmatter(document);
-    let canonical_document = CanonicalDocument::new(frontmatter.clone(), body.clone());
+    let frontmatter = document_frontmatter(
+        &bundle.drive_file,
+        bundle.document.revision_id.as_deref().unwrap_or(""),
+    );
+    let document = CanonicalDocument::new(frontmatter.clone(), body.clone());
     let mut shadow = ShadowDocument::from_synced_body(
-        RemoteId::new(document.document_id.clone()),
+        RemoteId::new(bundle.document.document_id.clone()),
         body,
         1,
         native_block_ids,
@@ -89,31 +100,34 @@ pub fn render_google_document(
     }
 
     Ok(GoogleDocsRenderedEntity {
-        document: canonical_document,
+        document,
         shadow,
         push_blocking_directives,
     })
 }
 
-pub fn document_frontmatter(document: &GoogleDocument) -> String {
-    let version = document_remote_version(document);
+pub fn document_frontmatter(file: &DriveFile, docs_revision_id: &str) -> String {
+    let version = combined_remote_version(file, Some(docs_revision_id));
     format!(
         "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\n",
-        yaml_scalar(&document.document_id),
+        yaml_scalar(&file.id),
         GOOGLE_DOCS_CONNECTOR_ID,
         yaml_scalar(&version),
         yaml_scalar(&version),
-        yaml_scalar(&document.title)
+        yaml_scalar(&file.name)
     )
 }
 
-pub fn document_remote_version(document: &GoogleDocument) -> String {
-    document
-        .revision_id
-        .as_deref()
-        .filter(|revision| !revision.is_empty())
-        .map(|revision| format!("docs:{revision}"))
-        .unwrap_or_else(|| "unknown".to_string())
+pub fn combined_remote_version(file: &DriveFile, docs_revision_id: Option<&str>) -> String {
+    match (
+        file.remote_version(),
+        docs_revision_id.filter(|revision| !revision.is_empty()),
+    ) {
+        (Some(drive), Some(revision)) => format!("{drive}|docs:{revision}"),
+        (Some(drive), None) => drive,
+        (None, Some(revision)) => format!("docs:{revision}"),
+        (None, None) => "unknown".to_string(),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -507,5 +521,449 @@ fn yaml_scalar(value: &str) -> String {
         value.to_string()
     } else {
         format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use locality_core::model::CanonicalDocument;
+
+    use super::{GoogleDocsNativeBundle, render_google_document};
+    use crate::drive_dto::DriveFile;
+
+    #[test]
+    fn renders_common_google_docs_structures_to_markdown() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Launch Brief"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Launch Brief",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 1, "endIndex": 14, "paragraph": {
+                            "paragraphStyle": { "namedStyleType": "HEADING_1" },
+                            "elements": [{ "textRun": { "content": "Launch Brief\n" } }]
+                        }},
+                        { "startIndex": 14, "endIndex": 33, "paragraph": {
+                            "elements": [
+                                { "textRun": { "content": "Hello " } },
+                                { "textRun": { "content": "world", "textStyle": { "bold": true, "link": { "url": "https://example.test" } } } },
+                                { "textRun": { "content": "\n" } }
+                            ]
+                        }},
+                        { "startIndex": 33, "endIndex": 39, "paragraph": {
+                            "bullet": { "listId": "list-1", "nestingLevel": 0 },
+                            "elements": [{ "textRun": { "content": "Item\n" } }]
+                        }},
+                        { "startIndex": 39, "endIndex": 59, "table": {
+                            "tableRows": [
+                                { "tableCells": [
+                                    { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "Key\n" } }] } }] },
+                                    { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "Value\n" } }] } }] }
+                                ]},
+                                { "tableCells": [
+                                    { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "Owner\n" } }] } }] },
+                                    { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "Locality\n" } }] } }] }
+                                ]}
+                            ]
+                        }}
+                    ]
+                },
+                "lists": {
+                    "list-1": {
+                        "listProperties": {
+                            "nestingLevels": [{ "glyphType": "BULLET" }]
+                        }
+                    }
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert!(
+            rendered
+                .document
+                .frontmatter
+                .contains("connector: google-docs")
+        );
+        assert!(rendered.document.frontmatter.contains("id: doc-1"));
+        assert!(rendered.document.body.contains("# Launch Brief"));
+        assert!(
+            rendered
+                .document
+                .body
+                .contains("[**world**](https://example.test)")
+        );
+        assert!(rendered.document.body.contains("- Item"));
+        assert!(rendered.document.body.contains("| Key | Value |"));
+        let table_block = rendered
+            .shadow
+            .blocks
+            .iter()
+            .find(|block| block.text.contains("| Key | Value |"))
+            .expect("table shadow block");
+        assert_eq!(
+            table_block.native_kind.as_deref(),
+            Some("google_docs_table")
+        );
+        assert_eq!(rendered.shadow.entity_id.as_str(), "doc-1");
+    }
+
+    #[test]
+    fn render_escapes_literal_markdown_inline_markers() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Literal Markers"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Literal Markers",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 1, "endIndex": 81, "paragraph": {
+                            "elements": [{ "textRun": {
+                                "content": "Literal **bold** _italic_ ~~strike~~ `code` [link](https://example.com) <u>underline</u>\n"
+                            }}]
+                        }}
+                    ]
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert_eq!(
+            rendered.document.body,
+            "Literal \\**bold\\** \\_italic\\_ \\~~strike\\~~ \\`code\\` \\[link](https://example.com) \\<u>underline\\</u>\n"
+        );
+        assert_eq!(rendered.shadow.blocks.len(), 1);
+    }
+
+    #[test]
+    fn render_escapes_literal_markdown_block_start_markers() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Literal Block Markers"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Literal Block Markers",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 1, "endIndex": 19, "paragraph": {
+                            "elements": [{ "textRun": { "content": "# Literal heading\n" } }]
+                        }},
+                        { "startIndex": 19, "endIndex": 36, "paragraph": {
+                            "elements": [{ "textRun": { "content": "- Literal bullet\n" } }]
+                        }},
+                        { "startIndex": 36, "endIndex": 54, "paragraph": {
+                            "elements": [{ "textRun": { "content": "1. Literal number\n" } }]
+                        }},
+                        { "startIndex": 54, "endIndex": 70, "paragraph": {
+                            "elements": [{ "textRun": { "content": "> Literal quote\n" } }]
+                        }},
+                        { "startIndex": 70, "endIndex": 74, "paragraph": {
+                            "elements": [{ "textRun": { "content": "---\n" } }]
+                        }},
+                        { "startIndex": 74, "endIndex": 108, "paragraph": {
+                            "elements": [{ "textRun": { "content": "::loc{id=literal type=paragraph}\n" } }]
+                        }}
+                    ]
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert_eq!(
+            rendered.document.body,
+            "\\# Literal heading\n\n\\- Literal bullet\n\n\\1. Literal number\n\n\\> Literal quote\n\n\\---\n\n\\::loc{id=literal type=paragraph}\n"
+        );
+        assert!(!rendered.push_blocking_directives);
+    }
+
+    #[test]
+    fn render_uses_ordered_markers_for_nested_alpha_and_roman_lists() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Nested Ordered"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Nested Ordered",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 1, "endIndex": 9, "paragraph": {
+                            "bullet": { "listId": "ordered", "nestingLevel": 1 },
+                            "elements": [{ "textRun": { "content": "Alpha\n" } }]
+                        }},
+                        { "startIndex": 9, "endIndex": 17, "paragraph": {
+                            "bullet": { "listId": "ordered", "nestingLevel": 2 },
+                            "elements": [{ "textRun": { "content": "Roman\n" } }]
+                        }}
+                    ]
+                },
+                "lists": {
+                    "ordered": {
+                        "listProperties": {
+                            "nestingLevels": [
+                                { "glyphType": "DECIMAL" },
+                                { "glyphType": "ALPHA" },
+                                { "glyphType": "ROMAN" }
+                            ]
+                        }
+                    }
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert_eq!(rendered.document.body, "  1. Alpha\n\n    1. Roman\n");
+    }
+
+    #[test]
+    fn render_escapes_markdown_table_cell_pipes() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Table Pipes"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Table Pipes",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 1, "endIndex": 48, "table": {
+                            "tableRows": [
+                                { "tableCells": [
+                                    { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "Key\n" } }] } }] },
+                                    { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "Value\n" } }] } }] }
+                                ]},
+                                { "tableCells": [
+                                    { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "Owner | Reviewer\n" } }] } }] },
+                                    { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "Alex\n" } }] } }] }
+                                ]}
+                            ]
+                        }}
+                    ]
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert_eq!(
+            rendered.document.body,
+            "| Key | Value |\n| --- | --- |\n| Owner \\| Reviewer | Alex |\n"
+        );
+    }
+
+    #[test]
+    fn unsupported_structures_render_as_push_blocking_directives() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Drawing Doc"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Drawing Doc",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 1, "endIndex": 2, "sectionBreak": {} }
+                    ]
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert!(rendered.document.body.contains("::loc{"));
+        assert!(
+            rendered
+                .document
+                .body
+                .contains("type=google_docs_unsupported")
+        );
+        assert!(rendered.push_blocking_directives);
+    }
+
+    #[test]
+    fn initial_document_section_break_is_not_rendered_as_unsupported_content() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Plain Doc"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Plain Doc",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "endIndex": 1, "sectionBreak": {} },
+                        { "startIndex": 1, "endIndex": 12, "paragraph": {
+                            "elements": [{ "textRun": { "content": "Hello doc\n" } }]
+                        }}
+                    ]
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert_eq!(rendered.document.body, "Hello doc\n");
+        assert!(!rendered.document.body.contains("google_docs_unsupported"));
+        assert!(!rendered.push_blocking_directives);
+    }
+
+    #[test]
+    fn unsupported_inline_elements_render_as_push_blocking_directives() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Inline Object Doc"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Inline Object Doc",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 1, "endIndex": 20, "paragraph": {
+                            "elements": [
+                                { "textRun": { "content": "Before " } },
+                                { "inlineObjectElement": { "inlineObjectId": "obj-1" } },
+                                { "textRun": { "content": "after\n" } }
+                            ]
+                        }}
+                    ]
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert!(rendered.document.body.contains("Before after"));
+        assert!(
+            rendered
+                .document
+                .body
+                .contains("type=google_docs_unsupported")
+        );
+        assert!(rendered.push_blocking_directives);
+    }
+
+    #[test]
+    fn inline_image_objects_render_as_markdown_images() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Logo Doc"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Logo Doc",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 2, "endIndex": 4, "paragraph": {
+                            "elements": [
+                                { "startIndex": 2, "endIndex": 3, "inlineObjectElement": { "inlineObjectId": "obj-1" } },
+                                { "startIndex": 3, "endIndex": 4, "textRun": { "content": "\n" } }
+                            ]
+                        }}
+                    ]
+                },
+                "inlineObjects": {
+                    "obj-1": {
+                        "objectId": "obj-1",
+                        "inlineObjectProperties": {
+                            "embeddedObject": {
+                                "description": "A circle with logo written in the center",
+                                "imageProperties": {
+                                    "contentUri": "https://example.test/circle.png"
+                                }
+                            }
+                        }
+                    }
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert_eq!(
+            rendered.document.body,
+            "![A circle with logo written in the center](https://example.test/circle.png)\n"
+        );
+        assert!(!rendered.document.body.contains("google_docs_unsupported"));
+        assert!(!rendered.push_blocking_directives);
+        assert_eq!(
+            rendered.shadow.blocks[0].native_kind.as_deref(),
+            Some("google_docs_inline_object")
+        );
+    }
+
+    #[test]
+    fn google_docs_soft_line_breaks_render_as_markdown_newlines() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Pet Resume"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Pet Resume",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 1, "endIndex": 56, "paragraph": {
+                            "elements": [
+                                { "textRun": { "content": "Age:", "textStyle": { "bold": true } } },
+                                { "textRun": { "content": " 4 years\u{000b}" } },
+                                { "textRun": { "content": "Sex:", "textStyle": { "bold": true } } },
+                                { "textRun": { "content": "Male\u{000b}" } },
+                                { "textRun": { "content": "Breed:", "textStyle": { "bold": true } } },
+                                { "textRun": { "content": " Mutt\n" } }
+                            ]
+                        }}
+                    ]
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert!(!rendered.document.body.contains('\u{000b}'));
+        assert_eq!(
+            rendered.document.body,
+            "**Age:** 4 years\n**Sex:**Male\n**Breed:** Mutt\n"
+        );
+    }
+
+    fn drive_file(id: &str, name: &str) -> DriveFile {
+        DriveFile {
+            id: id.to_string(),
+            name: name.to_string(),
+            mime_type: crate::drive_dto::DRIVE_GOOGLE_DOC_MIME_TYPE.to_string(),
+            parents: vec!["folder-1".to_string()],
+            modified_time: Some("2026-06-25T10:00:00.000Z".to_string()),
+            version: Some("7".to_string()),
+            trashed: false,
+        }
+    }
+
+    #[test]
+    fn stub_frontmatter_uses_connector_neutral_identity() {
+        let file = drive_file("doc-1", "Launch Brief");
+
+        let frontmatter = super::document_frontmatter(&file, "rev-1");
+
+        assert!(frontmatter.contains("loc:"));
+        assert!(frontmatter.contains("connector: google-docs"));
+        assert!(frontmatter.contains("title: Launch Brief"));
+    }
+
+    #[test]
+    fn document_body_still_uses_standard_stub_marker_when_unhydrated() {
+        assert_eq!(
+            CanonicalDocument::empty_stub().body.trim(),
+            CanonicalDocument::STUB_MARKER
+        );
     }
 }

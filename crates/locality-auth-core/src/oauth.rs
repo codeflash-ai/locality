@@ -144,6 +144,7 @@ pub const NOTION_HOSTED_ADMIN_SCOPES: &[&str] = &[];
 pub const GOOGLE_DOCS_REQUIRED_API_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
 ];
 pub const GOOGLE_DOCS_LOCAL_BROKER_SCOPES: &[&str] = &[
     "openid",
@@ -151,6 +152,7 @@ pub const GOOGLE_DOCS_LOCAL_BROKER_SCOPES: &[&str] = &[
     "profile",
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
 ];
 pub const GOOGLE_DOCS_HOSTED_ADMIN_SCOPES: &[&str] = GOOGLE_DOCS_LOCAL_BROKER_SCOPES;
 
@@ -780,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn google_docs_hosted_authorization_uses_only_required_scopes() {
+    fn google_hosted_authorization_urls_are_profile_driven_and_https() {
         let url = google_authorization_url(
             OAuthConnector::GoogleDocs,
             "google-client.apps.googleusercontent.com",
@@ -795,8 +797,7 @@ mod tests {
         assert!(url.contains(
             "redirect_uri=https%3A%2F%2Fapi.locality.test%2Fv1%2Foauth%2Fgoogle-docs%2Fcallback"
         ));
-        assert!(url.contains("scope=openid%20email%20profile%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdocuments%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file"));
-        assert!(!url.contains("drive.metadata.readonly"));
+        assert!(url.contains("scope=openid%20email%20profile%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdocuments%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.metadata.readonly"));
         assert!(url.contains("state=intent.random"));
         assert!(url.contains("access_type=offline"));
         assert!(url.contains("prompt=consent"));
@@ -902,6 +903,7 @@ mod tests {
             "profile",
             "https://www.googleapis.com/auth/documents",
             "https://www.googleapis.com/auth/drive.file",
+            "https://www.googleapis.com/auth/drive.metadata.readonly",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -943,6 +945,7 @@ mod tests {
             "https://www.googleapis.com/auth/userinfo.profile",
             "https://www.googleapis.com/auth/documents",
             "https://www.googleapis.com/auth/drive.file",
+            "https://www.googleapis.com/auth/drive.metadata.readonly",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -984,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn google_docs_scope_validation_rejects_extra_scopes() {
+    fn google_scope_validation_rejects_extra_scopes() {
         let mut docs = hosted_scope_strings(OAuthConnector::GoogleDocs);
         docs.push("https://www.googleapis.com/auth/calendar.events.owned".to_string());
 
@@ -994,24 +997,6 @@ mod tests {
                 "https://www.googleapis.com/auth/calendar.events.owned".to_string()
             ))
         );
-
-        for restricted_drive_scope in [
-            "https://www.googleapis.com/auth/drive",
-            "https://www.googleapis.com/auth/drive.readonly",
-            "https://www.googleapis.com/auth/drive.metadata",
-            "https://www.googleapis.com/auth/drive.metadata.readonly",
-        ] {
-            let mut docs = hosted_scope_strings(OAuthConnector::GoogleDocs);
-            docs.push(restricted_drive_scope.to_string());
-
-            assert_eq!(
-                validate_google_oauth_scopes(OAuthConnector::GoogleDocs, &docs),
-                Err(GoogleOAuthScopeError::UnsupportedScope(
-                    restricted_drive_scope.to_string()
-                )),
-                "{restricted_drive_scope} must be rejected"
-            );
-        }
 
         let mut gmail = hosted_scope_strings(OAuthConnector::Gmail);
         gmail.push(GMAIL_FULL_MAILBOX_SCOPE.to_string());

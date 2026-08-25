@@ -7,7 +7,7 @@ use locality_core::model::{RemoteId, TreeEntry};
 use locality_core::validation::ValidationReport;
 use locality_core::{LocalityError, LocalityResult};
 use locality_google_docs::{
-    GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsConfig, GoogleDocsConnector, GoogleDocsMountSettings,
+    GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsConfig, GoogleDocsConnector,
     HttpGoogleDocsOAuthBrokerClient, StoredGoogleDocsCredential,
     oauth::GoogleDocsOAuthScopeError,
     render::{GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND, GOOGLE_DOCS_TABLE_NATIVE_KIND},
@@ -35,8 +35,6 @@ where
         ));
     }
 
-    let settings = google_docs_mount_settings(mount)?;
-
     if let Some(connection_id) = &mount.connection_id {
         let connection = store
             .get_connection(connection_id)
@@ -46,13 +44,13 @@ where
                 suggested_command: "loc connect google-docs".to_string(),
             })?;
         validate_connection_profile(store, &connection)?;
-        return connector_from_connection(credentials, mount, &connection, settings);
+        return connector_from_connection(credentials, mount, &connection);
     }
 
     let active = active_google_docs_connections(store)?;
     if active.len() == 1 {
         validate_connection_profile(store, &active[0])?;
-        return connector_from_connection(credentials, mount, &active[0], settings);
+        return connector_from_connection(credentials, mount, &active[0]);
     }
 
     let message = if active.is_empty() {
@@ -66,47 +64,10 @@ where
     })
 }
 
-fn google_docs_mount_settings(
-    mount: &MountConfig,
-) -> Result<GoogleDocsMountSettings, ConnectorResolveError> {
-    if mount.remote_root_id.is_some() {
-        return Err(ConnectorResolveError::GoogleDocsSelectionRequired {
-            message: format!(
-                "Google Docs mount `{}` uses a legacy Drive folder selection; select Google Docs documents again before syncing. Existing local files and pending work were preserved.",
-                mount.mount_id.0
-            ),
-            suggested_command: "loc mount google-docs".to_string(),
-        });
-    }
-
-    GoogleDocsMountSettings::from_json(&mount.settings_json).map_err(|error| {
-        ConnectorResolveError::GoogleDocsSelectionRequired {
-            message: format!(
-                "Google Docs mount `{}` requires document selection; select Google Docs documents before syncing: {}",
-                mount.mount_id.0,
-                google_docs_settings_error_message(error)
-            ),
-            suggested_command: "loc mount google-docs".to_string(),
-        }
-    })
-}
-
-fn google_docs_settings_error_message(error: LocalityError) -> String {
-    match error {
-        LocalityError::Validation(issues) => issues
-            .into_iter()
-            .map(|issue| issue.message)
-            .collect::<Vec<_>>()
-            .join("; "),
-        other => other.to_string(),
-    }
-}
-
 fn connector_from_connection(
     credentials: &dyn CredentialStore,
-    _mount: &MountConfig,
+    mount: &MountConfig,
     connection: &ConnectionRecord,
-    settings: GoogleDocsMountSettings,
 ) -> Result<GoogleDocsConnector, ConnectorResolveError> {
     if connection.status != "active" {
         return Err(ConnectorResolveError::ConnectionRevoked {
@@ -116,7 +77,10 @@ fn connector_from_connection(
     }
 
     let token = connection_access_token(credentials, connection)?;
-    let config = GoogleDocsConfig::new(token).with_document_ids(settings.document_ids().to_vec());
+    let mut config = GoogleDocsConfig::new(token);
+    if let Some(remote_root_id) = &mount.remote_root_id {
+        config = config.with_workspace_folder_id(remote_root_id.clone());
+    }
     Ok(GoogleDocsConnector::new(config))
 }
 
@@ -327,10 +291,11 @@ impl SourceAdapter for GoogleDocsConnector {
     where
         Self: Sized + Clone,
     {
-        // The resolver rejects legacy remote roots before this adapter is reached.
-        // A Docs connector is scoped exclusively by its persisted selected IDs.
-        let _ = mount;
-        self.clone()
+        mount
+            .remote_root_id
+            .as_ref()
+            .map(|root| self.with_workspace_folder_id(root.clone()))
+            .unwrap_or_else(|| self.clone())
     }
 }
 
@@ -431,17 +396,20 @@ impl HydrationSource for GoogleDocsConnector {
         let native = self.fetch(FetchRequest {
             remote_id: request.remote_id.clone(),
         })?;
-        let document =
-            serde_json::from_slice::<locality_google_docs::docs_dto::GoogleDocument>(&native.raw)
-                .map_err(|error| {
+        let bundle =
+            serde_json::from_slice::<locality_google_docs::render::GoogleDocsNativeBundle>(
+                &native.raw,
+            )
+            .map_err(|error| {
                 LocalityError::Io(format!("google docs native decode failed: {error}"))
             })?;
-        let rendered = locality_google_docs::render::render_google_document(&document)?;
+        let rendered = locality_google_docs::render::render_google_document(&bundle)?;
         Ok(HydratedEntity {
             document: rendered.document,
             shadow: rendered.shadow,
-            remote_edited_at: Some(locality_google_docs::render::document_remote_version(
-                &document,
+            remote_edited_at: Some(locality_google_docs::render::combined_remote_version(
+                &bundle.drive_file,
+                bundle.document.revision_id.as_deref(),
             )),
             assets: Vec::new(),
         })
@@ -457,7 +425,11 @@ impl HydrationSource for GoogleDocsConnector {
 
 impl crate::reconcile::ScheduledPullSource for GoogleDocsConnector {
     fn enumerate_mount(&self, mount: &MountConfig) -> LocalityResult<Vec<TreeEntry>> {
-        self.enumerate(locality_connector::EnumerateRequest {
+        let connector = match &mount.remote_root_id {
+            Some(root) => self.with_workspace_folder_id(root.clone()),
+            None => self.clone(),
+        };
+        connector.enumerate(locality_connector::EnumerateRequest {
             mount_id: mount.mount_id.clone(),
             cursor: None,
         })
