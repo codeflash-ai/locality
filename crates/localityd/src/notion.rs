@@ -47,6 +47,10 @@ pub enum ConnectorResolveError {
         profile_id: String,
         suggested_command: String,
     },
+    GoogleDocsSelectionRequired {
+        message: String,
+        suggested_command: String,
+    },
     CredentialStoreUnavailable(String),
 }
 
@@ -59,6 +63,7 @@ impl ConnectorResolveError {
             Self::AuthRequired { .. } => "auth_required",
             Self::ConnectionRevoked { .. } => "connection_revoked",
             Self::AuthProfileUnavailable { .. } => "auth_profile_unavailable",
+            Self::GoogleDocsSelectionRequired { .. } => "google_docs_selection_required",
             Self::CredentialStoreUnavailable(_) => "credential_store_unavailable",
         }
     }
@@ -83,6 +88,7 @@ impl ConnectorResolveError {
             Self::AuthProfileUnavailable { profile_id, .. } => {
                 format!("connector profile `{profile_id}` is unavailable")
             }
+            Self::GoogleDocsSelectionRequired { message, .. } => message.clone(),
             Self::CredentialStoreUnavailable(message) => message.clone(),
         }
     }
@@ -99,6 +105,9 @@ impl ConnectorResolveError {
                 suggested_command, ..
             }
             | Self::AuthProfileUnavailable {
+                suggested_command, ..
+            }
+            | Self::GoogleDocsSelectionRequired {
                 suggested_command, ..
             } => Some(suggested_command),
             _ => None,

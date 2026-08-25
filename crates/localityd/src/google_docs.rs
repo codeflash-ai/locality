@@ -70,18 +70,24 @@ fn google_docs_mount_settings(
     mount: &MountConfig,
 ) -> Result<GoogleDocsMountSettings, ConnectorResolveError> {
     if mount.remote_root_id.is_some() {
-        return Err(ConnectorResolveError::CredentialStoreUnavailable(format!(
-            "Google Docs mount `{}` uses a legacy Drive folder selection; select Google Docs documents again before syncing. Existing local files and pending work were preserved.",
-            mount.mount_id.0
-        )));
+        return Err(ConnectorResolveError::GoogleDocsSelectionRequired {
+            message: format!(
+                "Google Docs mount `{}` uses a legacy Drive folder selection; select Google Docs documents again before syncing. Existing local files and pending work were preserved.",
+                mount.mount_id.0
+            ),
+            suggested_command: "loc mount google-docs".to_string(),
+        });
     }
 
     GoogleDocsMountSettings::from_json(&mount.settings_json).map_err(|error| {
-        ConnectorResolveError::CredentialStoreUnavailable(format!(
-            "Google Docs mount `{}` requires document selection; select Google Docs documents before syncing: {}",
-            mount.mount_id.0,
-            google_docs_settings_error_message(error)
-        ))
+        ConnectorResolveError::GoogleDocsSelectionRequired {
+            message: format!(
+                "Google Docs mount `{}` requires document selection; select Google Docs documents before syncing: {}",
+                mount.mount_id.0,
+                google_docs_settings_error_message(error)
+            ),
+            suggested_command: "loc mount google-docs".to_string(),
+        }
     })
 }
 

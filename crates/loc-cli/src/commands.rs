@@ -7262,6 +7262,7 @@ impl PushCommandError {
             | "connection_revoked"
             | "auth_profile_unavailable"
             | "credential_store_unavailable" => EXIT_INTERNAL,
+            "google_docs_selection_required" => EXIT_VALIDATION,
             _ => EXIT_INTERNAL,
         };
         let mut payload = CommandError::new("push", error.code(), error.message());
@@ -9857,6 +9858,7 @@ fn daemon_error_exit_code(code: &str) -> i32 {
         | "connection_revoked"
         | "auth_profile_unavailable"
         | "credential_store_unavailable" => EXIT_INTERNAL,
+        "google_docs_selection_required" => EXIT_VALIDATION,
         _ => EXIT_INTERNAL,
     }
 }
@@ -10759,6 +10761,7 @@ mod tests {
         ShadowRepository, SqliteStateStore, StoreError, VirtualMutationKind, VirtualMutationRecord,
         VirtualMutationRepository, WorkspaceBindingRepository,
     };
+    use localityd::notion::ConnectorResolveError;
 
     use crate::diff::{DiffReport, GuardrailOutput, PlanSummaryOutput};
     use crate::history::{JournalEntryOutput, LogReport};
@@ -10776,11 +10779,12 @@ mod tests {
         EXIT_USAGE, EXIT_VALIDATION, FileProviderCommandReport, LocalityCommand,
         PushConfirmationPromptError, SLACK_CONNECTOR_ID, SandboxCommand, SandboxEncodingArg,
         VirtualProjectionRegistration, absolute_command_path,
-        auto_registration_for_mounted_projection, daemon_request_timeout_for,
-        default_mount_id_for_source, diff_report_exit_code, exact_located_entity_record,
-        file_provider_list_lines, google_calendar_oauth_broker_config,
-        google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
-        guard_unresolved_linux_fuse_unregister, guard_unresolved_windows_cloud_files_unregister,
+        auto_registration_for_mounted_projection, connector_resolve_command_error,
+        daemon_error_exit_code, daemon_request_timeout_for, default_mount_id_for_source,
+        diff_report_exit_code, exact_located_entity_record, file_provider_list_lines,
+        google_calendar_oauth_broker_config, google_docs_oauth_broker_config,
+        guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
+        guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         locality_error_code, locate_result_from_report, mount_slack, mount_usage,
         mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
@@ -10794,6 +10798,27 @@ mod tests {
         spinner_enabled, status as run_status_command, validate_virtual_projection_registration,
         write_connect_report, write_log_report,
     };
+
+    #[test]
+    fn google_docs_selection_required_is_exposed_as_a_mount_command_error() {
+        let error = connector_resolve_command_error(
+            "mount",
+            ConnectorResolveError::GoogleDocsSelectionRequired {
+                message: "select Google Docs documents again".to_string(),
+                suggested_command: "loc mount google-docs".to_string(),
+            },
+        );
+
+        assert_eq!(error.code, "google_docs_selection_required");
+        assert_eq!(
+            error.suggested_command.as_deref(),
+            Some("loc mount google-docs")
+        );
+        assert_eq!(
+            daemon_error_exit_code("google_docs_selection_required"),
+            EXIT_VALIDATION
+        );
+    }
 
     #[test]
     fn active_remount_causes_zero_cli_reset_step_mutation() {

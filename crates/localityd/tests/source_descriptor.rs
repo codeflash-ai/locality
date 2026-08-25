@@ -2134,6 +2134,8 @@ fn source_descriptor_rejects_legacy_google_docs_mount_before_credentials() {
     let error = resolve_source_for_mount(&store, &credentials, &mount)
         .expect_err("legacy Google Docs mounts must not resolve");
 
+    assert_eq!(error.code(), "google_docs_selection_required");
+    assert_eq!(error.suggested_command(), Some("loc mount google-docs"));
     assert!(error.message().contains("select Google Docs"));
 }
 
@@ -2150,6 +2152,8 @@ fn source_descriptor_requires_google_docs_selection_before_credentials() {
     let error = resolve_source_for_mount(&store, &credentials, &mount)
         .expect_err("unselected Google Docs mounts must not resolve");
 
+    assert_eq!(error.code(), "google_docs_selection_required");
+    assert_eq!(error.suggested_command(), Some("loc mount google-docs"));
     assert!(error.message().contains("requires document selection"));
     assert!(error.message().contains("select Google Docs"));
 }
