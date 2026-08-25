@@ -1566,6 +1566,20 @@ impl JournalRepository for BulkOnlyStatusStore {
         self.inner.record_journal_apply_effects(push_id, effects)
     }
 
+    fn record_journal_apply_effects_and_update_mount_settings(
+        &mut self,
+        push_id: &PushId,
+        effects: Vec<JournalApplyEffect>,
+        settings_json: Option<String>,
+    ) -> StoreResult<()> {
+        self.inner
+            .record_journal_apply_effects_and_update_mount_settings(
+                push_id,
+                effects,
+                settings_json,
+            )
+    }
+
     fn update_journal_status(
         &mut self,
         push_id: &PushId,
