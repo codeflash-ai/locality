@@ -436,12 +436,6 @@ pub trait JournalRepository {
         push_id: &PushId,
         effects: Vec<JournalApplyEffect>,
     ) -> StoreResult<()>;
-    fn record_journal_apply_effects_and_update_mount_settings(
-        &mut self,
-        push_id: &PushId,
-        effects: Vec<JournalApplyEffect>,
-        settings_json: Option<String>,
-    ) -> StoreResult<()>;
     fn update_journal_status(&mut self, push_id: &PushId, status: JournalStatus)
     -> StoreResult<()>;
     fn get_journal(&self, push_id: &PushId) -> StoreResult<Option<JournalEntry>>;

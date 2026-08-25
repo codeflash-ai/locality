@@ -344,9 +344,8 @@ describe("auth broker", () => {
     expect(body.authorization_url).toContain("prompt=consent");
     expect(body.authorization_url).not.toContain("include_granted_scopes");
     expect(body.authorization_url).toContain(
-      "scope=openid+email+profile+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdocuments+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file"
+      "scope=openid+email+profile+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdocuments+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.metadata.readonly"
     );
-    expect(body.authorization_url).not.toContain("drive.metadata.readonly");
     expect(body.redirect_uri).toBe("http://localhost:8757/oauth/google-docs/callback");
     expect(body.session).toBeTruthy();
     expect(body.state).toBeTruthy();
@@ -361,7 +360,7 @@ describe("auth broker", () => {
         token_type: "Bearer",
         expires_in: 3600,
         scope:
-          "openid email profile https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive.file"
+          "openid email profile https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly"
       })
     );
     globalThis.fetch = fetchMock as unknown as typeof fetch;

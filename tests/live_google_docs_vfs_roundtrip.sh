@@ -14,7 +14,11 @@ source "$script_dir/live_connector_common.sh"
 require_linux_fuse
 require_live_env \
   LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON \
-  LOCALITY_GOOGLE_DOCS_LIVE_DOCUMENT_IDS
+  LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER
+
+if ! command -v curl >/dev/null 2>&1; then
+  live_fail "curl is not installed"
+fi
 
 loc_bin="${LOCALITY_BIN:-./target/debug/loc}"
 localityd_bin="${LOCALITYD_BIN:-./target/debug/localityd}"
@@ -41,16 +45,18 @@ pull_after_push_report="$tmp_root/pull-after-push.json"
 edit_diff_report="$tmp_root/edit-diff.json"
 edit_push_report="$tmp_root/edit-push.json"
 pull_after_edit_report="$tmp_root/pull-after-edit.json"
+drive_search_report="$tmp_root/drive-search.json"
 credential_path=""
 oauth_refresh_marker=""
 daemon_pid=""
 fuse_pid=""
 doc_id=""
+doc_trashed=0
+doc_cleanup_needed=0
 page_title=""
 marker=""
 edit_marker=""
 step="initializing"
-google_docs_document_args=()
 
 assert_json_field_equals() {
   local report_path="$1"
@@ -101,6 +107,91 @@ find_marker_path_under_mount() {
   printf '%s\n' "$match"
 }
 
+find_created_drive_file_by_title() {
+  local access_token="$1"
+
+  if [[ -z "${page_title:-}" ]]; then
+    return 1
+  fi
+
+  if ! curl -fsS --get "https://www.googleapis.com/drive/v3/files" \
+    -H "Authorization: Bearer $access_token" \
+    --data-urlencode "q=name = '$page_title' and mimeType = 'application/vnd.google-apps.document' and trashed = false" \
+    --data-urlencode "fields=files(id,name)" \
+    --data-urlencode "pageSize=10" \
+    >"$drive_search_report" 2>>"$command_log"; then
+    return 1
+  fi
+
+  python3 - "$drive_search_report" "$page_title" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+title = sys.argv[2]
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+for item in data.get("files") or []:
+    if isinstance(item, dict) and item.get("name") == title and item.get("id"):
+        print(item["id"])
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+trash_created_drive_file() {
+  local mode="${1:-best_effort}"
+  local access_token
+
+  if [[ "$doc_trashed" == "1" ]]; then
+    return 0
+  fi
+  if [[ -z "$doc_id" && "$doc_cleanup_needed" != "1" ]]; then
+    return 0
+  fi
+  if [[ -z "$credential_path" ]]; then
+    credential_path="$(credential_file_path "$state_root" "connection:$connection_id")"
+  fi
+
+  access_token="$(credential_access_token "$credential_path" 2>/dev/null || true)"
+  if [[ -z "$access_token" ]]; then
+    if [[ "$mode" == "required" ]]; then
+      live_fail "could not read Google Docs OAuth access token for cleanup"
+    fi
+    return 1
+  fi
+
+  if [[ -z "$doc_id" ]]; then
+    doc_id="$(find_created_drive_file_by_title "$access_token" 2>/dev/null || true)"
+  fi
+  if [[ -z "$doc_id" ]]; then
+    unset access_token
+    if [[ "$mode" == "required" ]]; then
+      live_fail "could not find created Google Docs Drive file during cleanup"
+    fi
+    return 1
+  fi
+
+  if curl -fsS -X PATCH "https://www.googleapis.com/drive/v3/files/$doc_id" \
+    -H "Authorization: Bearer $access_token" \
+    -H "Content-Type: application/json" \
+    --data-binary '{"trashed":true}' >/dev/null 2>/dev/null; then
+    doc_trashed=1
+    doc_id=""
+    unset access_token
+    return 0
+  fi
+
+  unset access_token
+  if [[ "$mode" == "required" ]]; then
+    live_fail "failed to trash created Google Docs Drive file during cleanup"
+  fi
+  return 1
+}
+
 on_error() {
   local code=$?
   echo "live Google Docs VFS round trip failed during: $step" >&2
@@ -118,6 +209,10 @@ cleanup() {
       "$oauth_refresh_marker" \
       "Google Docs live credential" >/dev/null 2>&1 || true
   fi
+  if [[ "$doc_trashed" != "1" && ( -n "${doc_id:-}" || "$doc_cleanup_needed" == "1" ) ]]; then
+    trash_created_drive_file best_effort >/dev/null 2>&1 || \
+      echo "warning: failed to trash created Google Docs Drive file during cleanup" >&2
+  fi
   stop_live_processes "$locality_root" "$fuse_pid" "$daemon_pid"
   unset LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON
   if [[ "${LOCALITY_GOOGLE_DOCS_LIVE_KEEP_TMP:-}" == "1" ]]; then
@@ -132,15 +227,6 @@ trap cleanup EXIT
 
 step="creating isolated state"
 mkdir -p "$state_root" "$locality_root" "$mount_root"
-
-IFS=',' read -r -a selected_document_ids <<<"$LOCALITY_GOOGLE_DOCS_LIVE_DOCUMENT_IDS"
-for selected_document_id in "${selected_document_ids[@]}"; do
-  selected_document_id="${selected_document_id//[[:space:]]/}"
-  if [[ -z "$selected_document_id" ]]; then
-    live_fail "LOCALITY_GOOGLE_DOCS_LIVE_DOCUMENT_IDS must be a comma-separated list of Google Docs IDs"
-  fi
-  google_docs_document_args+=(--document "$selected_document_id")
-done
 
 step="building live-test binaries"
 build_live_binaries "$loc_bin" "$localityd_bin" "$fuse_bin"
@@ -167,7 +253,7 @@ unset LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON
 step="registering Google Docs Linux FUSE mount"
 LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 \
   "$loc_bin" mount google-docs "$mount_root" \
-    "${google_docs_document_args[@]}" \
+    --workspace-folder "$LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER" \
     --connection "$connection_id" \
     --mount-id "$mount_id" \
     --projection linux-fuse \
@@ -183,7 +269,7 @@ fuse_pid="$(start_live_fuse "$fuse_bin" "$state_root" "$locality_root" "$fuse_lo
 wait_for_fuse "$locality_root" "$fuse_pid"
 wait_for_projected_mount_root
 
-step="pulling selected Google Docs"
+step="pulling Google Docs workspace"
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root" \
   >"$initial_pull_report" 2>>"$command_log"
 assert_json_ok "$initial_pull_report" "Google Docs initial pull report"
@@ -221,6 +307,7 @@ assert_json_ok "$diff_report" "Google Docs diff report"
 assert_json_field_equals "$diff_report" "action" "confirm_plan" "Google Docs diff report"
 
 step="pushing created Google Docs page"
+doc_cleanup_needed=1
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$page_path" \
   >"$push_report" 2>>"$command_log"
 assert_json_ok "$push_report" "Google Docs push report"
@@ -229,7 +316,7 @@ if [[ -z "$doc_id" ]]; then
   live_fail "Google Docs push report did not include changed_remote_ids.0"
 fi
 
-step="pulling selected Google Docs after push"
+step="pulling Google Docs workspace after push"
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root" \
   >"$pull_after_push_report" 2>>"$command_log"
 assert_json_ok "$pull_after_push_report" "Google Docs pull-after-push report"
@@ -261,7 +348,7 @@ if [[ -n "$edited_doc_id" && "$edited_doc_id" != "$doc_id" ]]; then
   live_fail "Google Docs edit push changed an unexpected remote id"
 fi
 
-step="pulling selected Google Docs after edit"
+step="pulling Google Docs workspace after edit"
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root" \
   >"$pull_after_edit_report" 2>>"$command_log"
 assert_json_ok "$pull_after_edit_report" "Google Docs pull-after-edit report"
@@ -269,5 +356,8 @@ assert_json_ok "$pull_after_edit_report" "Google Docs pull-after-edit report"
 step="verifying edited Google Docs marker after pull"
 wait_for_marker_under_mount "$edit_marker"
 
+step="trashing created Google Docs Drive file"
+trash_created_drive_file required
+doc_cleanup_needed=0
+
 echo "live Google Docs API, CLI, daemon, and Linux FUSE create/edit checks passed"
-echo "manual cleanup: remove created scratch Doc $doc_id at https://docs.google.com/document/d/$doc_id/edit"

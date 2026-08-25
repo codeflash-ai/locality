@@ -44,7 +44,6 @@ use locality_core::shadow::{
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
 use locality_engine::prepare_changeset::{PrepareChangesetRequest, prepare_changeset};
-use locality_google_docs::GoogleDocsMountSettings;
 use locality_google_docs::render::{
     GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND, GOOGLE_DOCS_TABLE_NATIVE_KIND,
 };
@@ -3205,14 +3204,6 @@ where
                 let Some(remote_id) = mutation.target_remote_id.clone() else {
                     continue;
                 };
-                append_source_archive_validation(
-                    &mut validation,
-                    &mount,
-                    mutation
-                        .original_path
-                        .as_deref()
-                        .unwrap_or(&mutation.projected_path),
-                );
                 append_source_write_validation(
                     &mut validation,
                     &mount,
@@ -3480,26 +3471,6 @@ fn append_source_create_validation(
             None,
             reason,
             Some("remove the stale pending create or choose a writable parent".to_string()),
-        ));
-    }
-}
-
-fn append_source_archive_validation(
-    validation: &mut ValidationReport,
-    mount: &MountConfig,
-    path: &Path,
-) {
-    let descriptor = source_descriptor(&mount.connector);
-    if !descriptor.supports_archive_entity() {
-        validation.push(ValidationIssue::new(
-            "source_archive_unsupported",
-            path,
-            None,
-            format!(
-                "{} does not support archiving entities",
-                descriptor.display_name()
-            ),
-            Some("restore the local page instead of deleting it".to_string()),
         ));
     }
 }
@@ -3862,7 +3833,7 @@ struct DaemonPushHost<'a, S, Source: ?Sized> {
 
 impl<S, Source> JournalStore for DaemonPushHost<'_, S, Source>
 where
-    S: JournalStore + JournalRepository + MountRepository,
+    S: JournalStore,
     Source: ?Sized,
 {
     fn append(&mut self, entry: JournalEntry) -> LocalityResult<()> {
@@ -3874,24 +3845,7 @@ where
         push_id: &PushId,
         effects: Vec<JournalApplyEffect>,
     ) -> LocalityResult<()> {
-        let journal = self
-            .store
-            .get_journal(push_id)
-            .map_err(LocalityError::from)?
-            .ok_or_else(|| {
-                LocalityError::InvalidState(format!("missing journal `{}`", push_id.0))
-            })?;
-        let mount = self
-            .store
-            .get_mount(&journal.mount_id)
-            .map_err(LocalityError::from)?
-            .ok_or_else(|| {
-                LocalityError::InvalidState(format!("missing mount `{}`", journal.mount_id.0))
-            })?;
-        let settings_json = created_google_docs_selection_json(&mount, &effects)?;
-        self.store
-            .record_journal_apply_effects_and_update_mount_settings(push_id, effects, settings_json)
-            .map_err(LocalityError::from)
+        self.store.record_apply_effects(push_id, effects)
     }
 
     fn update_status(&mut self, push_id: &PushId, status: JournalStatus) -> LocalityResult<()> {
@@ -4016,33 +3970,6 @@ where
             effects: result.effects,
         })
     }
-}
-
-fn created_google_docs_selection_json(
-    mount: &MountConfig,
-    effects: &[JournalApplyEffect],
-) -> LocalityResult<Option<String>> {
-    if mount.connector != "google-docs" {
-        return Ok(None);
-    }
-    let mut settings = GoogleDocsMountSettings::from_json(&mount.settings_json)?;
-    let mut changed = false;
-    for effect in effects {
-        if let JournalApplyEffect::CreatedEntity { entity_id, .. } = effect {
-            if !settings
-                .document_ids()
-                .iter()
-                .any(|id| id == entity_id.as_str())
-            {
-                settings.include_document_id(entity_id.0.clone())?;
-                changed = true;
-            }
-        }
-    }
-    if changed {
-        return settings.to_json().map(Some);
-    }
-    Ok(None)
 }
 
 impl<S, Source> PushReconciler for DaemonPushHost<'_, S, Source>
@@ -5403,7 +5330,7 @@ fn direct_source_root_create_diagnostic(
         )));
     }
 
-    if mount.remote_root_id.is_none() && mount.connector != "google-docs" {
+    if mount.remote_root_id.is_none() {
         return Some(PushPrepareError::Core(LocalityError::InvalidState(
             format!(
                 "mount `{mount_id}` has no known remote root id, so `{path}` cannot be created at the mount root; reconnect or re-mount `{connector}` to refresh mount metadata.",
@@ -5424,15 +5351,12 @@ fn source_root_create_parent_entity(
     if !is_direct_source_root_create_path(relative_path) {
         return None;
     }
+    let remote_id = mount.remote_root_id.as_ref()?;
     let descriptor = source_descriptor(&mount.connector);
     let kind = descriptor.source_root_create_parent_kind()?;
-    let remote_id = mount
-        .remote_root_id
-        .clone()
-        .unwrap_or_else(|| RemoteId::new("root"));
     Some(EntityRecord::new(
         mount.mount_id.clone(),
-        remote_id,
+        remote_id.clone(),
         kind,
         descriptor.display_name(),
         PathBuf::new(),

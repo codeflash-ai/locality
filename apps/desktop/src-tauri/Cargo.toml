@@ -10,7 +10,6 @@ rust-version.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-getrandom = "0.3"
 loc-cli = { path = "../../../crates/loc-cli" }
 locality-connector.workspace = true
 locality-core.workspace = true

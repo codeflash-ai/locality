@@ -11,8 +11,7 @@ use locality_google_calendar::{
     GOOGLE_CALENDAR_CONNECTOR_ID, GOOGLE_CALENDAR_OAUTH_SCOPES, StoredGoogleCalendarCredential,
 };
 use locality_google_docs::{
-    GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, GoogleDocsMountSettings,
-    StoredGoogleDocsCredential,
+    GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, StoredGoogleDocsCredential,
 };
 use locality_granola::GRANOLA_CONNECTOR_ID;
 use locality_linear::LINEAR_CONNECTOR_ID;
@@ -71,15 +70,16 @@ fn google_docs_descriptor_comes_from_registry() {
             .mount_guidance()
             .contains("# Locality Google Docs Mount")
     );
-    assert!(descriptor.mount_guidance().contains("selected Google Docs"));
-    assert!(!descriptor.mount_guidance().contains("workspace folder"));
+    assert!(descriptor.mount_guidance().contains("Drive metadata"));
+    assert!(
+        descriptor
+            .mount_guidance()
+            .contains("Docs manually added inside the workspace folder")
+    );
     assert_eq!(
         descriptor.source_root_create_parent_kind(),
         Some(EntityKind::Directory)
     );
-    assert!(descriptor.create_entity_parent_kinds().is_empty());
-    assert!(descriptor.move_entity_parent_kinds().is_empty());
-    assert!(!descriptor.supports_archive_entity());
 }
 
 #[test]
@@ -2104,61 +2104,14 @@ fn resolving_google_docs_mount_uses_active_connection_credentials() {
         GOOGLE_DOCS_CONNECTOR_ID,
         "/tmp/locality/google-docs",
     )
-    .with_settings_json(
-        GoogleDocsMountSettings::from_document_ids(["doc-a"])
-            .expect("valid selection")
-            .to_json()
-            .expect("settings json"),
-    )
+    .with_remote_root_id(RemoteId::new("workspace-folder"))
     .with_connection_id(connection_id);
 
     let source =
         resolve_source_for_mount(&store, &credentials, &mount).expect("resolve google docs");
 
-    let ResolvedSource::GoogleDocs(connector) = source else {
-        panic!("expected Google Docs source");
-    };
-    assert_eq!(connector.kind().0, GOOGLE_DOCS_CONNECTOR_ID);
-    assert_eq!(connector.config().document_ids, ["doc-a"]);
-    assert!(connector.capabilities().supports_oauth);
-}
-
-#[test]
-fn source_descriptor_rejects_legacy_google_docs_mount_before_credentials() {
-    let store = InMemoryStateStore::new();
-    let credentials = InMemoryCredentialStore::new();
-    let mount = MountConfig::new(
-        MountId::new("google-docs-legacy"),
-        GOOGLE_DOCS_CONNECTOR_ID,
-        "/tmp/locality/google-docs",
-    )
-    .with_remote_root_id(RemoteId::new("old-drive-folder"));
-
-    let error = resolve_source_for_mount(&store, &credentials, &mount)
-        .expect_err("legacy Google Docs mounts must not resolve");
-
-    assert_eq!(error.code(), "google_docs_selection_required");
-    assert_eq!(error.suggested_command(), Some("loc mount google-docs"));
-    assert!(error.message().contains("select Google Docs"));
-}
-
-#[test]
-fn source_descriptor_requires_google_docs_selection_before_credentials() {
-    let store = InMemoryStateStore::new();
-    let credentials = InMemoryCredentialStore::new();
-    let mount = MountConfig::new(
-        MountId::new("google-docs-unselected"),
-        GOOGLE_DOCS_CONNECTOR_ID,
-        "/tmp/locality/google-docs",
-    );
-
-    let error = resolve_source_for_mount(&store, &credentials, &mount)
-        .expect_err("unselected Google Docs mounts must not resolve");
-
-    assert_eq!(error.code(), "google_docs_selection_required");
-    assert_eq!(error.suggested_command(), Some("loc mount google-docs"));
-    assert!(error.message().contains("requires document selection"));
-    assert!(error.message().contains("select Google Docs"));
+    assert_eq!(source.kind().0, GOOGLE_DOCS_CONNECTOR_ID);
+    assert!(source.capabilities().supports_oauth);
 }
 
 #[test]
@@ -2180,7 +2133,8 @@ fn resolving_expired_google_docs_credential_refreshes_with_broker_handle() {
             "email",
             "profile",
             "https://www.googleapis.com/auth/documents",
-            "https://www.googleapis.com/auth/drive.file"
+            "https://www.googleapis.com/auth/drive.file",
+            "https://www.googleapis.com/auth/drive.metadata.readonly"
         ],
     })
     .to_string();
@@ -2214,12 +2168,7 @@ fn resolving_expired_google_docs_credential_refreshes_with_broker_handle() {
         GOOGLE_DOCS_CONNECTOR_ID,
         "/tmp/locality/google-docs",
     )
-    .with_settings_json(
-        GoogleDocsMountSettings::from_document_ids(["doc-a"])
-            .expect("valid selection")
-            .to_json()
-            .expect("settings json"),
-    )
+    .with_remote_root_id(RemoteId::new("workspace-folder"))
     .with_connection_id(connection_id);
 
     let source = resolve_source_for_mount(&store, &credentials, &mount).expect("resolve source");
@@ -2289,12 +2238,7 @@ fn resolving_expired_google_docs_credential_rejects_refresh_unsupported_scope() 
         GOOGLE_DOCS_CONNECTOR_ID,
         "/tmp/locality/google-docs",
     )
-    .with_settings_json(
-        GoogleDocsMountSettings::from_document_ids(["doc-a"])
-            .expect("valid selection")
-            .to_json()
-            .expect("settings json"),
-    )
+    .with_remote_root_id(RemoteId::new("workspace-folder"))
     .with_connection_id(connection_id);
 
     let error = resolve_source_for_mount(&store, &credentials, &mount)
@@ -2356,12 +2300,7 @@ fn resolving_expired_google_docs_credential_with_stopped_local_broker_requires_r
         GOOGLE_DOCS_CONNECTOR_ID,
         "/tmp/locality/google-docs",
     )
-    .with_settings_json(
-        GoogleDocsMountSettings::from_document_ids(["doc-a"])
-            .expect("valid selection")
-            .to_json()
-            .expect("settings json"),
-    )
+    .with_remote_root_id(RemoteId::new("workspace-folder"))
     .with_connection_id(connection_id);
 
     let error =

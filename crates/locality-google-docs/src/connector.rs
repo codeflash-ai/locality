@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
@@ -11,316 +11,30 @@ use locality_core::freshness::{RemoteObservation, RemoteVersion};
 use locality_core::journal::JournalApplyEffect;
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
 use locality_core::path_projection::{page_container_path, page_document_path};
-use locality_core::planner::{PushOperation, PushOperationKind, PushPlan};
+use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
 use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::{LocalityError, LocalityResult};
 
-use crate::client::{GoogleDocsApi, HttpGoogleApiClient};
+use crate::client::{GoogleDocsApi, GoogleDriveApi, HttpGoogleApiClient};
 use crate::docs_dto::{
     BatchUpdateDocumentRequest, CreateParagraphBulletsRequest, DeleteContentRangeRequest,
     DeleteParagraphBulletsRequest, DocsRequest, GoogleDocument, InsertTextRequest, Link, Location,
     ParagraphStylePatch, Range, TextStyle, TextStylePatch, UpdateParagraphStyleRequest,
     UpdateTextStyleRequest, WriteControl,
 };
+use crate::drive_dto::{
+    DRIVE_FOLDER_MIME_TYPE, DRIVE_GOOGLE_DOC_MIME_TYPE, DriveCreateFileRequest, DriveFile,
+    DriveUpdateFileRequest,
+};
 use crate::oauth::GOOGLE_DOCS_CONNECTOR_ID;
-use crate::render::{document_frontmatter, document_remote_version, render_google_document};
+use crate::render::{
+    GoogleDocsNativeBundle, combined_remote_version, document_frontmatter, render_google_document,
+};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct GoogleDocsConfig {
     pub access_token: String,
-    pub document_ids: Vec<String>,
-}
-
-#[cfg(test)]
-mod docs_only_tests {
-    use super::{GoogleDocsConfig, GoogleDocsConnector};
-    use crate::client::GoogleDocsApi;
-    use crate::docs_dto::{BatchUpdateDocumentRequest, DocsRequest, GoogleDocument};
-    use locality_connector::{
-        ApplyPlanRequest, Connector, EnumerateRequest, FetchRequest, ObserveRequest,
-    };
-    use locality_core::journal::{PushId, PushOperationId};
-    use locality_core::model::{MountId, RemoteId};
-    use locality_core::planner::{PushOperation, PushPlan};
-    use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Debug, Default)]
-    struct Docs {
-        documents: Mutex<BTreeMap<String, GoogleDocument>>,
-        gets: Mutex<usize>,
-        creates: Mutex<usize>,
-        create_title: Mutex<Option<String>>,
-        batches: Mutex<Vec<BatchUpdateDocumentRequest>>,
-    }
-    impl Docs {
-        fn document(self, id: &str, title: &str) -> Self {
-            self.documents.lock().unwrap().insert(id.into(), serde_json::from_value(serde_json::json!({"documentId": id, "title": title, "revisionId": "r1", "body": {"content": []}})).unwrap());
-            self
-        }
-    }
-    impl GoogleDocsApi for Docs {
-        fn get_document(&self, id: &str) -> locality_core::LocalityResult<GoogleDocument> {
-            *self.gets.lock().unwrap() += 1;
-            self.documents
-                .lock()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .ok_or_else(|| locality_core::LocalityError::RemoteNotFound(id.into()))
-        }
-        fn create_document(&self, title: &str) -> locality_core::LocalityResult<GoogleDocument> {
-            *self.creates.lock().unwrap() += 1;
-            *self.create_title.lock().unwrap() = Some(title.into());
-            Ok(serde_json::from_value(serde_json::json!({"documentId":"created", "title":title, "revisionId":"r1", "body":{"content":[]}})).unwrap())
-        }
-        fn batch_update_document(
-            &self,
-            id: &str,
-            request: BatchUpdateDocumentRequest,
-        ) -> locality_core::LocalityResult<GoogleDocument> {
-            self.batches.lock().unwrap().push(request);
-            self.get_document(id).or_else(|_| Ok(serde_json::from_value(serde_json::json!({"documentId":id,"title":"Created","revisionId":"r1","body":{"content":[]}})).unwrap()))
-        }
-    }
-    #[test]
-    fn selected_documents_are_flat_root_pages() {
-        let docs = Arc::new(Docs::default().document("a", "Zeta").document("b", "Alpha"));
-        let connector = GoogleDocsConnector::with_documents(
-            GoogleDocsConfig::new("t").with_document_ids(vec!["a".into(), "b".into()]),
-            docs,
-        );
-        let entries = connector
-            .enumerate(EnumerateRequest {
-                mount_id: MountId::new("m"),
-                cursor: None,
-            })
-            .unwrap();
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| entry.path.to_string_lossy().to_string())
-                .collect::<Vec<_>>(),
-            ["alpha/page.md", "zeta/page.md"]
-        );
-    }
-    #[test]
-    fn fetch_and_observe_reject_unselected_documents_before_docs_get() {
-        let docs = Arc::new(Docs::default().document("a", "Alpha"));
-        let connector = GoogleDocsConnector::with_documents(
-            GoogleDocsConfig::new("t").with_document_ids(vec!["a".into()]),
-            docs.clone(),
-        );
-        assert!(
-            connector
-                .fetch(FetchRequest {
-                    remote_id: RemoteId::new("outside")
-                })
-                .is_err()
-        );
-        assert!(
-            connector
-                .observe(ObserveRequest {
-                    mount_id: MountId::new("m"),
-                    remote_id: RemoteId::new("outside")
-                })
-                .is_err()
-        );
-        assert_eq!(*docs.gets.lock().unwrap(), 0);
-    }
-    #[test]
-    fn create_posts_title_then_writes_body_and_rejects_drive_operations() {
-        let docs = Arc::new(Docs::default().document("a", "Alpha"));
-        let connector =
-            GoogleDocsConnector::with_documents(GoogleDocsConfig::new("t"), docs.clone());
-        let create = PushPlan::new(
-            vec![],
-            vec![PushOperation::CreateEntity {
-                parent_id: RemoteId::new("root"),
-                parent_kind: None,
-                parent_workspace: false,
-                title: "New".into(),
-                properties: BTreeMap::new(),
-                body: "Body".into(),
-                source_path: Default::default(),
-            }],
-        );
-        let ids = vec![PushOperationId("p:0".into())];
-        let push = PushId("p".into());
-        let mount = MountId::new("m");
-        let result = connector
-            .apply(ApplyPlanRequest {
-                push_id: &push,
-                mount_id: &mount,
-                plan: &create,
-                operation_ids: &ids,
-                remote_preconditions: &[],
-                local_root: None,
-            })
-            .unwrap();
-        assert_eq!(result.changed_remote_ids, [RemoteId::new("created")]);
-        assert!(
-            matches!(result.effects.as_slice(), [locality_core::journal::JournalApplyEffect::CreatedEntity { entity_id, .. }] if entity_id == &RemoteId::new("created"))
-        );
-        assert_eq!(*docs.create_title.lock().unwrap(), Some("New".into()));
-        assert_eq!(*docs.creates.lock().unwrap(), 1);
-        assert_eq!(docs.batches.lock().unwrap().len(), 1);
-        let move_plan = PushPlan::new(
-            vec![RemoteId::new("a")],
-            vec![PushOperation::ArchiveEntity {
-                entity_id: RemoteId::new("a"),
-            }],
-        );
-        assert!(
-            connector
-                .apply(ApplyPlanRequest {
-                    push_id: &push,
-                    mount_id: &mount,
-                    plan: &move_plan,
-                    operation_ids: &ids,
-                    remote_preconditions: &[],
-                    local_root: None
-                })
-                .is_err()
-        );
-        assert_eq!(docs.batches.lock().unwrap().len(), 1);
-    }
-    #[test]
-    fn mixed_plan_and_non_root_create_fail_before_any_docs_call() {
-        let docs = Arc::new(Docs::default().document("a", "Alpha"));
-        let connector = GoogleDocsConnector::with_documents(
-            GoogleDocsConfig::new("t").with_document_ids(vec!["a".into()]),
-            docs.clone(),
-        );
-        let plan = PushPlan::new(
-            vec![RemoteId::new("a")],
-            vec![
-                PushOperation::AppendBlock {
-                    parent_id: RemoteId::new("a"),
-                    after: None,
-                    content: "allowed".into(),
-                },
-                PushOperation::ArchiveEntity {
-                    entity_id: RemoteId::new("a"),
-                },
-            ],
-        );
-        let ids = vec![PushOperationId("p:0".into()), PushOperationId("p:1".into())];
-        let push = PushId("p".into());
-        let mount = MountId::new("m");
-        assert!(
-            connector
-                .apply(ApplyPlanRequest {
-                    push_id: &push,
-                    mount_id: &mount,
-                    plan: &plan,
-                    operation_ids: &ids,
-                    remote_preconditions: &[],
-                    local_root: None
-                })
-                .is_err()
-        );
-        let non_root = PushPlan::new(
-            vec![],
-            vec![PushOperation::CreateEntity {
-                parent_id: RemoteId::new("a"),
-                parent_kind: None,
-                parent_workspace: false,
-                title: "nested".into(),
-                properties: BTreeMap::new(),
-                body: String::new(),
-                source_path: Default::default(),
-            }],
-        );
-        assert!(
-            connector
-                .apply(ApplyPlanRequest {
-                    push_id: &push,
-                    mount_id: &mount,
-                    plan: &non_root,
-                    operation_ids: &ids[..1],
-                    remote_preconditions: &[],
-                    local_root: None
-                })
-                .is_err()
-        );
-        assert_eq!(*docs.gets.lock().unwrap(), 0);
-        assert_eq!(*docs.creates.lock().unwrap(), 0);
-        assert_eq!(docs.batches.lock().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn body_mutations_send_docs_batch_updates_while_archive_never_calls_docs() {
-        let docs = Arc::new(Docs::default().document("doc", "Doc"));
-        let connector = GoogleDocsConnector::with_documents(
-            GoogleDocsConfig::new("t").with_document_ids(vec!["doc".into()]),
-            docs.clone(),
-        );
-        let plan = PushPlan::new(
-            vec![RemoteId::new("doc")],
-            vec![
-                PushOperation::UpdateBlock {
-                    block_id: RemoteId::new("doc:1:1"),
-                    content: "update".into(),
-                },
-                PushOperation::ReplaceBlock {
-                    block_id: RemoteId::new("doc:1:1"),
-                    content: "replace".into(),
-                },
-                PushOperation::AppendBlock {
-                    parent_id: RemoteId::new("doc"),
-                    after: None,
-                    content: "append".into(),
-                },
-            ],
-        );
-        let ids = vec![
-            PushOperationId("p:0".into()),
-            PushOperationId("p:1".into()),
-            PushOperationId("p:2".into()),
-        ];
-        let push = PushId("p".into());
-        let mount = MountId::new("m");
-        connector
-            .apply(ApplyPlanRequest {
-                push_id: &push,
-                mount_id: &mount,
-                plan: &plan,
-                operation_ids: &ids,
-                remote_preconditions: &[],
-                local_root: None,
-            })
-            .unwrap();
-        let batches = docs.batches.lock().unwrap();
-        assert_eq!(batches.len(), 3);
-        assert!(batches.iter().all(|batch| {
-            batch
-                .requests
-                .iter()
-                .any(|request| matches!(request, DocsRequest::InsertText { .. }))
-        }));
-        drop(batches);
-
-        let archive = PushPlan::new(
-            vec![RemoteId::new("doc")],
-            vec![PushOperation::ArchiveEntity {
-                entity_id: RemoteId::new("doc"),
-            }],
-        );
-        assert!(
-            connector
-                .apply(ApplyPlanRequest {
-                    push_id: &push,
-                    mount_id: &mount,
-                    plan: &archive,
-                    operation_ids: &ids[..1],
-                    remote_preconditions: &[],
-                    local_root: None
-                })
-                .is_err()
-        );
-        assert_eq!(docs.batches.lock().unwrap().len(), 3);
-    }
+    pub workspace_folder_id: Option<RemoteId>,
 }
 
 impl std::fmt::Debug for GoogleDocsConfig {
@@ -328,7 +42,7 @@ impl std::fmt::Debug for GoogleDocsConfig {
         formatter
             .debug_struct("GoogleDocsConfig")
             .field("access_token", &"<redacted>")
-            .field("document_ids", &self.document_ids)
+            .field("workspace_folder_id", &self.workspace_folder_id)
             .finish()
     }
 }
@@ -337,12 +51,12 @@ impl GoogleDocsConfig {
     pub fn new(access_token: impl Into<String>) -> Self {
         Self {
             access_token: access_token.into(),
-            document_ids: Vec::new(),
+            workspace_folder_id: None,
         }
     }
 
-    pub fn with_document_ids(mut self, document_ids: Vec<String>) -> Self {
-        self.document_ids = document_ids;
+    pub fn with_workspace_folder_id(mut self, workspace_folder_id: RemoteId) -> Self {
+        self.workspace_folder_id = Some(workspace_folder_id);
         self
     }
 }
@@ -350,14 +64,14 @@ impl GoogleDocsConfig {
 #[derive(Clone)]
 pub struct GoogleDocsConnector {
     config: GoogleDocsConfig,
+    drive: Arc<dyn GoogleDriveApi>,
     docs: Arc<dyn GoogleDocsApi>,
-    created_document_ids: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl std::fmt::Debug for GoogleDocsConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GoogleDocsConnector")
-            .field("document_ids", &self.config.document_ids)
+            .field("workspace_folder_id", &self.config.workspace_folder_id)
             .field("access_token", &"<redacted>")
             .finish()
     }
@@ -366,14 +80,18 @@ impl std::fmt::Debug for GoogleDocsConnector {
 impl GoogleDocsConnector {
     pub fn new(config: GoogleDocsConfig) -> Self {
         let api = Arc::new(HttpGoogleApiClient::new(config.access_token.clone()));
-        Self::with_documents(config, api)
+        Self::with_apis(config, api.clone(), api)
     }
 
-    pub fn with_documents(config: GoogleDocsConfig, docs: Arc<dyn GoogleDocsApi>) -> Self {
+    pub fn with_apis(
+        config: GoogleDocsConfig,
+        drive: Arc<dyn GoogleDriveApi>,
+        docs: Arc<dyn GoogleDocsApi>,
+    ) -> Self {
         Self {
             config,
+            drive,
             docs,
-            created_document_ids: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -381,25 +99,89 @@ impl GoogleDocsConnector {
         &self.config
     }
 
-    fn require_selected(&self, remote_id: &RemoteId) -> LocalityResult<()> {
-        if self
-            .config
-            .document_ids
-            .iter()
-            .any(|id| id == remote_id.as_str())
-            || self
-                .created_document_ids
-                .lock()
-                .expect("created document ids")
-                .contains(remote_id.as_str())
-        {
-            Ok(())
-        } else {
-            Err(LocalityError::Guardrail(format!(
-                "google docs document `{}` is not selected for this mount",
-                remote_id.as_str()
-            )))
+    pub fn with_workspace_folder_id(&self, workspace_folder_id: RemoteId) -> Self {
+        let mut config = self.config.clone();
+        config.workspace_folder_id = Some(workspace_folder_id);
+        Self {
+            config,
+            drive: Arc::clone(&self.drive),
+            docs: Arc::clone(&self.docs),
         }
+    }
+
+    pub fn resolve_workspace_folder(&self, workspace_folder: &str) -> LocalityResult<RemoteId> {
+        let workspace_folder = workspace_folder.trim();
+        if workspace_folder.is_empty() {
+            return Err(LocalityError::InvalidState(
+                "google docs workspace folder cannot be empty".to_string(),
+            ));
+        }
+
+        if let Some(folder_id) = extract_google_drive_folder_id(workspace_folder) {
+            return self.verify_workspace_folder_id(&folder_id);
+        }
+        if looks_like_google_drive_id(workspace_folder) {
+            match self.verify_workspace_folder_id(workspace_folder) {
+                Ok(folder_id) => return Ok(folder_id),
+                Err(LocalityError::RemoteNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        if let Some(folder) = self.find_workspace_folder_by_name(workspace_folder)? {
+            return Ok(RemoteId::new(folder.id));
+        }
+        let created = self
+            .drive
+            .create_file(DriveCreateFileRequest::folder(workspace_folder, None))?;
+        if !created.is_folder() || created.trashed {
+            return Err(LocalityError::InvalidState(format!(
+                "google docs workspace folder create returned non-folder `{}`",
+                created.id
+            )));
+        }
+        Ok(RemoteId::new(created.id))
+    }
+
+    fn verify_workspace_folder_id(&self, folder_id: &str) -> LocalityResult<RemoteId> {
+        let file = self.drive.get_file(folder_id)?;
+        if file.trashed {
+            return Err(LocalityError::RemoteNotFound(format!(
+                "google docs workspace folder `{folder_id}` is trashed"
+            )));
+        }
+        if !file.is_folder() {
+            return Err(LocalityError::Guardrail(format!(
+                "google docs workspace root `{folder_id}` is not a Google Drive folder"
+            )));
+        }
+        Ok(RemoteId::new(file.id))
+    }
+
+    fn find_workspace_folder_by_name(&self, name: &str) -> LocalityResult<Option<DriveFile>> {
+        let mut cursor = None;
+        let mut matches = Vec::new();
+        loop {
+            let page = self
+                .drive
+                .list_workspace_folders_by_name(name, cursor.as_deref())?;
+            matches.extend(
+                page.files
+                    .into_iter()
+                    .filter(|file| file.is_folder() && !file.trashed),
+            );
+            if page.next_page_token.is_none() {
+                break;
+            }
+            cursor = page.next_page_token;
+        }
+        matches.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(matches.into_iter().next())
     }
 }
 
@@ -428,6 +210,9 @@ impl Connector for GoogleDocsConnector {
             PushOperationKind::ReplaceBlock,
             PushOperationKind::AppendBlock,
             PushOperationKind::ArchiveBlock,
+            PushOperationKind::ArchiveEntity,
+            PushOperationKind::UpdateProperties,
+            PushOperationKind::MoveEntity,
             PushOperationKind::CreateEntity,
         ]
         .into_iter()
@@ -435,44 +220,84 @@ impl Connector for GoogleDocsConnector {
     }
 
     fn enumerate(&self, request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>> {
-        project_selected_documents(
-            self.docs.as_ref(),
+        let root_id = self.workspace_folder_id()?;
+        enumerate_drive_tree(
+            self.drive.as_ref(),
             &request.mount_id,
-            &self.config.document_ids,
+            root_id.as_str(),
+            Path::new(""),
         )
     }
 
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {
-        match request.container {
-            locality_connector::ChildContainer::Root => {
-                Ok(ListChildrenResult::complete(project_selected_documents(
-                    self.docs.as_ref(),
-                    &request.mount_id,
-                    &self.config.document_ids,
-                )?))
-            }
-            _ => Ok(ListChildrenResult::complete(Vec::new())),
-        }
+        let parent_id = match request.container {
+            locality_connector::ChildContainer::Root => self.workspace_folder_id()?.0.clone(),
+            locality_connector::ChildContainer::PageChildren(remote_id)
+            | locality_connector::ChildContainer::DatabaseRows(remote_id)
+            | locality_connector::ChildContainer::DirectoryChildren(remote_id) => remote_id.0,
+        };
+        Ok(ListChildrenResult::complete(list_drive_children(
+            self.drive.as_ref(),
+            &request.mount_id,
+            &parent_id,
+            &request.parent_path,
+        )?))
     }
 
     fn observe(&self, request: ObserveRequest) -> LocalityResult<RemoteObservation> {
-        self.require_selected(&request.remote_id)?;
-        let document = self.docs.get_document(request.remote_id.as_str())?;
-        Ok(RemoteObservation::new(
+        let file = self.drive.get_file(request.remote_id.as_str())?;
+        let revision = if file.is_google_doc() {
+            self.docs
+                .get_document(file.id.as_str())?
+                .revision_id
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let kind = if file.is_folder() {
+            EntityKind::Directory
+        } else if file.is_google_doc() {
+            EntityKind::Page
+        } else {
+            EntityKind::Unknown(file.mime_type.clone())
+        };
+        let projected_path = if file.is_google_doc() {
+            page_document_path(Path::new(&slugify_title(&file.name)))
+        } else {
+            PathBuf::from(slugify_title(&file.name))
+        };
+        let mut observation = RemoteObservation::new(
             request.mount_id,
-            RemoteId::new(document.document_id.clone()),
-            EntityKind::Page,
-            document.title.clone(),
-            page_document_path(Path::new(&slugify_title(&document.title))),
+            RemoteId::new(file.id.clone()),
+            kind,
+            file.name.clone(),
+            projected_path,
         )
-        .with_raw_metadata_json(document_metadata_json(&document))
-        .with_remote_version(RemoteVersion::new(document_remote_version(&document))))
+        .deleted(file.trashed)
+        .with_raw_metadata_json(drive_file_metadata_json(&file));
+        if let Some(parent) = file.parents.first() {
+            observation = observation.with_parent(RemoteId::new(parent.clone()));
+        }
+        observation = observation.with_remote_version(RemoteVersion::new(combined_remote_version(
+            &file,
+            Some(revision.as_str()),
+        )));
+        Ok(observation)
     }
 
     fn fetch(&self, request: FetchRequest) -> LocalityResult<NativeEntity> {
-        self.require_selected(&request.remote_id)?;
+        let drive_file = self.drive.get_file(request.remote_id.as_str())?;
+        if !drive_file.is_google_doc() {
+            return Err(LocalityError::Unsupported(
+                "google docs connector only hydrates Google Docs files",
+            ));
+        }
         let document = self.docs.get_document(request.remote_id.as_str())?;
-        let raw = serde_json::to_vec(&document).map_err(|error| {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file,
+            document,
+        };
+        let raw = serde_json::to_vec(&bundle).map_err(|error| {
             LocalityError::Io(format!("google docs native encode failed: {error}"))
         })?;
         Ok(NativeEntity {
@@ -483,10 +308,11 @@ impl Connector for GoogleDocsConnector {
     }
 
     fn render(&self, entity: &NativeEntity) -> LocalityResult<CanonicalDocument> {
-        let document = serde_json::from_slice::<GoogleDocument>(&entity.raw).map_err(|error| {
-            LocalityError::Io(format!("google docs native decode failed: {error}"))
-        })?;
-        render_google_document(&document).map(|rendered| rendered.document)
+        let bundle =
+            serde_json::from_slice::<GoogleDocsNativeBundle>(&entity.raw).map_err(|error| {
+                LocalityError::Io(format!("google docs native decode failed: {error}"))
+            })?;
+        render_google_document(&bundle).map(|rendered| rendered.document)
     }
 
     fn parse(&self, document: &CanonicalDocument) -> LocalityResult<ParsedEntity> {
@@ -499,24 +325,11 @@ impl Connector for GoogleDocsConnector {
     }
 
     fn check_concurrency(&self, request: ApplyPlanRequest<'_>) -> LocalityResult<()> {
-        preflight_plan(request.plan, &self.config.document_ids)?;
-        preflight_preconditions(request.remote_preconditions, &self.config.document_ids)?;
-        check_remote_preconditions(self.docs.as_ref(), &request)
+        check_remote_preconditions(self.drive.as_ref(), self.docs.as_ref(), &request)
     }
 
     fn apply(&self, request: ApplyPlanRequest<'_>) -> LocalityResult<ApplyPlanResult> {
-        preflight_plan(request.plan, &self.config.document_ids)?;
-        preflight_preconditions(request.remote_preconditions, &self.config.document_ids)?;
-        let result = apply_plan(self.docs.as_ref(), request)?;
-        for effect in &result.effects {
-            if let JournalApplyEffect::CreatedEntity { entity_id, .. } = effect {
-                self.created_document_ids
-                    .lock()
-                    .expect("created document ids")
-                    .insert(entity_id.0.clone());
-            }
-        }
-        Ok(result)
+        apply_plan(self.drive.as_ref(), self.docs.as_ref(), request)
     }
 
     fn apply_undo(&self, _request: ApplyUndoRequest<'_>) -> LocalityResult<ApplyUndoResult> {
@@ -534,11 +347,51 @@ fn docs_revision_matches(expected: &str, current: &str) -> bool {
     }
 }
 
+fn remote_versions_match_for_entity_archive(expected: &str, current: &str) -> bool {
+    drive_modified_time_from_remote_version(expected)
+        .zip(drive_modified_time_from_remote_version(current))
+        .is_some_and(|(expected_modified, current_modified)| {
+            expected_modified == current_modified
+                && docs_revision_matches_archive_precondition(expected, current)
+        })
+}
+
+fn docs_revision_matches_archive_precondition(expected: &str, current: &str) -> bool {
+    match (
+        docs_revision_from_remote_version(expected),
+        docs_revision_from_remote_version(current),
+    ) {
+        (Some(expected), Some(current)) => expected == current,
+        (None, _) => true,
+        _ => false,
+    }
+}
+
 fn docs_revision_from_remote_version(version: &str) -> Option<&str> {
     version
         .rsplit_once("|docs:")
         .map(|(_, revision)| revision)
         .or_else(|| version.strip_prefix("docs:"))
+}
+
+fn drive_modified_time_from_remote_version(version: &str) -> Option<&str> {
+    let drive_version = version.strip_prefix("drive:")?;
+    let (_, modified_time) = drive_version.split_once(':')?;
+    Some(
+        modified_time
+            .split_once("|docs:")
+            .map(|(modified_time, _)| modified_time)
+            .unwrap_or(modified_time),
+    )
+}
+
+fn plan_archives_entity(plan: &PushPlan, remote_id: &RemoteId) -> bool {
+    plan.operations.iter().any(|operation| {
+        matches!(
+            operation,
+            PushOperation::ArchiveEntity { entity_id } if entity_id == remote_id
+        )
+    })
 }
 
 fn plan_changes_only_document_body(plan: &PushPlan, remote_id: &RemoteId) -> bool {
@@ -583,10 +436,10 @@ fn operation_targets_document(block_id: &RemoteId, remote_id: &RemoteId) -> bool
         .unwrap_or(false)
 }
 
-fn document_metadata_json(document: &GoogleDocument) -> String {
-    let mut value = serde_json::to_value(document).unwrap_or_else(|_| serde_json::json!({}));
+fn drive_file_metadata_json(file: &DriveFile) -> String {
+    let mut value = serde_json::to_value(file).unwrap_or_else(|_| serde_json::json!({}));
     if let serde_json::Value::Object(object) = &mut value {
-        let search_metadata = document_search_metadata(document);
+        let search_metadata = drive_file_search_metadata(file);
         if !search_metadata.is_empty()
             && let Ok(search_value) = serde_json::to_value(search_metadata)
         {
@@ -596,23 +449,51 @@ fn document_metadata_json(document: &GoogleDocument) -> String {
     serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
 }
 
-fn document_search_metadata(document: &GoogleDocument) -> SearchMetadata {
+fn drive_file_search_metadata(file: &DriveFile) -> SearchMetadata {
     let mut metadata = SearchMetadata::default();
-    metadata.push_metadata_text(&document.document_id);
-    metadata.push_metadata_text(&document.title);
-    metadata.push_metadata_text("Google Docs");
-    metadata.push_alias(&document.document_id);
-    metadata.set_source_url(format!(
-        "https://docs.google.com/document/d/{}/edit",
-        document.document_id
-    ));
-    if let Some(revision) = &document.revision_id {
-        metadata.push_metadata_text(revision);
+    metadata.push_metadata_text(&file.id);
+    metadata.push_metadata_text(&file.name);
+    metadata.push_metadata_text(&file.mime_type);
+    metadata.push_alias(&file.id);
+    if file.is_google_doc() {
+        metadata.push_metadata_text("Google Docs");
+        metadata.set_source_url(format!(
+            "https://docs.google.com/document/d/{}/edit",
+            file.id
+        ));
+    } else if file.is_folder() {
+        metadata.push_metadata_text("Google Drive folder");
+        metadata.set_source_url(format!(
+            "https://drive.google.com/drive/folders/{}",
+            file.id
+        ));
+    } else {
+        metadata.set_source_url(format!("https://drive.google.com/file/d/{}/view", file.id));
+    }
+    for parent in &file.parents {
+        metadata.push_metadata_text(parent);
+    }
+    if let Some(modified_time) = &file.modified_time {
+        metadata.push_metadata_text(modified_time);
+    }
+    if let Some(version) = &file.version {
+        metadata.push_metadata_text(version);
     }
     metadata
 }
 
+impl GoogleDocsConnector {
+    fn workspace_folder_id(&self) -> LocalityResult<&RemoteId> {
+        self.config.workspace_folder_id.as_ref().ok_or_else(|| {
+            LocalityError::InvalidState(
+                "google docs mount is missing workspace folder id".to_string(),
+            )
+        })
+    }
+}
+
 fn check_remote_preconditions(
+    drive: &dyn GoogleDriveApi,
     docs: &dyn GoogleDocsApi,
     request: &ApplyPlanRequest<'_>,
 ) -> LocalityResult<()> {
@@ -620,8 +501,13 @@ fn check_remote_preconditions(
         let Some(expected) = &precondition.remote_edited_at else {
             continue;
         };
-        let current = remote_version_from_apis(docs, &precondition.remote_id)?;
+        let current = remote_version_from_apis(drive, docs, &precondition.remote_id)?;
         if expected == current.as_str() {
+            continue;
+        }
+        if remote_versions_match_for_entity_archive(expected, current.as_str())
+            && plan_archives_entity(request.plan, &precondition.remote_id)
+        {
             continue;
         }
         if docs_revision_matches(expected, current.as_str())
@@ -642,143 +528,117 @@ fn check_remote_preconditions(
 }
 
 fn remote_version_from_apis(
+    drive: &dyn GoogleDriveApi,
     docs: &dyn GoogleDocsApi,
     remote_id: &RemoteId,
 ) -> LocalityResult<String> {
-    Ok(document_remote_version(
-        &docs.get_document(remote_id.as_str())?,
-    ))
+    let file = drive.get_file(remote_id.as_str())?;
+    let revision = if file.is_google_doc() {
+        docs.get_document(remote_id.as_str())?.revision_id
+    } else {
+        None
+    };
+    Ok(combined_remote_version(&file, revision.as_deref()))
 }
 
-fn project_selected_documents(
-    docs: &dyn GoogleDocsApi,
+fn enumerate_drive_tree(
+    drive: &dyn GoogleDriveApi,
     mount_id: &locality_core::model::MountId,
-    document_ids: &[String],
+    parent_id: &str,
+    parent_path: &Path,
 ) -> LocalityResult<Vec<TreeEntry>> {
-    let mut used_paths = BTreeSet::new();
-    let mut documents = document_ids
-        .iter()
-        .map(|id| docs.get_document(id))
-        .collect::<LocalityResult<Vec<_>>>()?;
-    documents.sort_by(|left, right| {
-        left.title
+    let mut entries = Vec::new();
+    let children = list_drive_children(drive, mount_id, parent_id, parent_path)?;
+    for entry in children {
+        let is_directory = entry.kind == EntityKind::Directory;
+        let remote_id = entry.remote_id.clone();
+        let dir_path = entry.path.clone();
+        entries.push(entry);
+        if is_directory {
+            entries.extend(enumerate_drive_tree(
+                drive,
+                mount_id,
+                remote_id.as_str(),
+                &dir_path,
+            )?);
+        }
+    }
+    Ok(entries)
+}
+
+fn list_drive_children(
+    drive: &dyn GoogleDriveApi,
+    mount_id: &locality_core::model::MountId,
+    parent_id: &str,
+    parent_path: &Path,
+) -> LocalityResult<Vec<TreeEntry>> {
+    let mut cursor = None;
+    let mut files = Vec::new();
+    loop {
+        let page = drive.list_children(parent_id, cursor.as_deref())?;
+        files.extend(page.files.into_iter().filter(|file| !file.trashed));
+        if page.next_page_token.is_none() {
+            break;
+        }
+        cursor = page.next_page_token;
+    }
+    files.sort_by(|left, right| {
+        left.name
             .to_lowercase()
-            .cmp(&right.title.to_lowercase())
-            .then_with(|| left.document_id.cmp(&right.document_id))
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
     });
-    Ok(documents
+    Ok(project_drive_children(mount_id, parent_path, files))
+}
+
+fn project_drive_children(
+    mount_id: &locality_core::model::MountId,
+    parent_path: &Path,
+    files: Vec<DriveFile>,
+) -> Vec<TreeEntry> {
+    let mut used_paths = BTreeSet::new();
+    files
         .into_iter()
-        .map(|document| TreeEntry {
-            mount_id: mount_id.clone(),
-            remote_id: RemoteId::new(document.document_id.clone()),
-            kind: EntityKind::Page,
-            title: document.title.clone(),
-            path: allocate_path(
-                Path::new(""),
-                &document.title,
-                &document.document_id,
-                true,
-                &mut used_paths,
-            ),
-            hydration: HydrationState::Stub,
-            content_hash: None,
-            remote_edited_at: Some(document_remote_version(&document)),
-            stub_frontmatter: Some(document_frontmatter(&document)),
+        .filter(|file| file.is_folder() || file.is_google_doc())
+        .map(|file| {
+            let path = if file.is_folder() {
+                allocate_path(parent_path, &file.name, &file.id, false, &mut used_paths)
+            } else {
+                allocate_path(parent_path, &file.name, &file.id, true, &mut used_paths)
+            };
+            let remote_version = file.remote_version();
+            let stub_frontmatter = if file.is_google_doc() {
+                Some(document_frontmatter(&file, ""))
+            } else {
+                None
+            };
+            TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new(file.id),
+                kind: if file.mime_type == DRIVE_FOLDER_MIME_TYPE {
+                    EntityKind::Directory
+                } else if file.mime_type == DRIVE_GOOGLE_DOC_MIME_TYPE {
+                    EntityKind::Page
+                } else {
+                    EntityKind::Unknown(file.mime_type)
+                },
+                title: file.name,
+                path,
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: remote_version,
+                stub_frontmatter,
+            }
         })
-        .collect())
-}
-
-/// Reject an entire plan before checking remote versions or issuing any Docs call.
-fn preflight_plan(plan: &PushPlan, selected_ids: &[String]) -> LocalityResult<()> {
-    let selected = |id: &str| selected_ids.iter().any(|selected_id| selected_id == id);
-    for entity_id in &plan.affected_entities {
-        if entity_id.as_str() != "root" && !selected(entity_id.as_str()) {
-            return Err(LocalityError::Guardrail(format!(
-                "google docs document `{}` is not selected for this mount",
-                entity_id.as_str()
-            )));
-        }
-    }
-    for operation in &plan.operations {
-        match operation {
-            PushOperation::UpdateBlock { block_id, .. }
-            | PushOperation::ReplaceBlock { block_id, .. }
-            | PushOperation::ArchiveBlock { block_id } => {
-                let range = GoogleBlockRange::parse(block_id)?;
-                if !selected(&range.document_id) {
-                    return Err(LocalityError::Guardrail(format!(
-                        "google docs document `{}` is not selected for this mount",
-                        range.document_id
-                    )));
-                }
-            }
-            PushOperation::AppendBlock {
-                parent_id, after, ..
-            } => {
-                if !selected(parent_id.as_str()) {
-                    return Err(LocalityError::Guardrail(format!(
-                        "google docs document `{}` is not selected for this mount",
-                        parent_id.as_str()
-                    )));
-                }
-                if let Some(after) = after {
-                    let range = GoogleBlockRange::parse(after)?;
-                    if range.document_id != parent_id.0 {
-                        return Err(LocalityError::Guardrail(
-                            "google docs append block belongs to a different document".to_string(),
-                        ));
-                    }
-                }
-            }
-            PushOperation::CreateEntity {
-                parent_id,
-                parent_workspace,
-                ..
-            } if parent_id.as_str() == "root" && !parent_workspace => {}
-            PushOperation::CreateEntity { .. } => {
-                return Err(LocalityError::Unsupported(
-                    "google docs connector can only create documents at the mount root",
-                ));
-            }
-            PushOperation::UpdateEntityBody { .. } => {
-                return Err(LocalityError::Unsupported(
-                    "whole-entity body updates for Google Docs",
-                ));
-            }
-            _ => {
-                return Err(LocalityError::Unsupported(
-                    "Google Docs mounts only support body edits and root document creation",
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn preflight_preconditions(
-    preconditions: &[locality_core::push::RemotePrecondition],
-    selected_ids: &[String],
-) -> LocalityResult<()> {
-    for precondition in preconditions {
-        if precondition.remote_id.as_str() != "root"
-            && !selected_ids
-                .iter()
-                .any(|id| id == precondition.remote_id.as_str())
-        {
-            return Err(LocalityError::Guardrail(format!(
-                "google docs document `{}` is not selected for this mount",
-                precondition.remote_id.as_str()
-            )));
-        }
-    }
-    Ok(())
+        .collect()
 }
 
 fn apply_plan(
+    drive: &dyn GoogleDriveApi,
     docs: &dyn GoogleDocsApi,
     request: ApplyPlanRequest<'_>,
 ) -> LocalityResult<ApplyPlanResult> {
-    check_remote_preconditions(docs, &request)?;
+    check_remote_preconditions(drive, docs, &request)?;
     let mut changed = BTreeSet::new();
     let mut effects = Vec::new();
     let mut append_offsets: BTreeMap<(String, Option<String>), usize> = BTreeMap::new();
@@ -946,17 +806,58 @@ fn apply_plan(
                     block_id: block_id.clone(),
                 });
             }
+            PushOperation::ArchiveEntity { entity_id } => {
+                drive.update_file(entity_id.as_str(), DriveUpdateFileRequest::trash())?;
+                changed.insert(entity_id.clone());
+                effects.push(JournalApplyEffect::ArchivedEntity {
+                    operation_id,
+                    operation_index: index,
+                    entity_id: entity_id.clone(),
+                });
+            }
             PushOperation::UpdateEntityBody { .. } => {
                 return Err(LocalityError::Unsupported(
                     "whole-entity body updates for Google Docs",
                 ));
             }
-            PushOperation::ArchiveEntity { .. }
-            | PushOperation::UpdateProperties { .. }
-            | PushOperation::MoveEntity { .. } => {
-                return Err(LocalityError::Unsupported(
-                    "Google Docs mounts only support body edits; rename, move, and archive are unavailable",
-                ));
+            PushOperation::UpdateProperties {
+                entity_id,
+                properties,
+            } => {
+                if let Some(PropertyValue::String(title)) = properties.get("title") {
+                    drive.update_file(entity_id.as_str(), DriveUpdateFileRequest::rename(title))?;
+                    changed.insert(entity_id.clone());
+                    effects.push(JournalApplyEffect::UpdatedProperties {
+                        operation_id,
+                        operation_index: index,
+                        entity_id: entity_id.clone(),
+                        keys: vec!["title".to_string()],
+                    });
+                }
+            }
+            PushOperation::MoveEntity {
+                entity_id,
+                new_parent_id,
+                new_title,
+                ..
+            } => {
+                let file = drive.get_file(entity_id.as_str())?;
+                let remove_parents = file.parents.join(",");
+                drive.update_file(
+                    entity_id.as_str(),
+                    DriveUpdateFileRequest::move_and_rename(
+                        new_title,
+                        new_parent_id.0.clone(),
+                        remove_parents,
+                    ),
+                )?;
+                changed.insert(entity_id.clone());
+                effects.push(JournalApplyEffect::MovedEntity {
+                    operation_id,
+                    operation_index: index,
+                    entity_id: entity_id.clone(),
+                    parent_id: new_parent_id.clone(),
+                });
             }
             PushOperation::CreateEntity {
                 parent_id,
@@ -965,24 +866,32 @@ fn apply_plan(
                 body,
                 ..
             } => {
-                if *parent_workspace || parent_id.0 != "root" {
+                if *parent_workspace {
                     return Err(LocalityError::Unsupported(
-                        "google docs connector can only create documents at the mount root",
+                        "google docs connector cannot create workspace-private pages",
                     ));
                 }
-                let created = docs.create_document(title)?;
+                let created = drive.create_file(DriveCreateFileRequest::google_doc(
+                    title,
+                    parent_id.0.clone(),
+                ))?;
                 if !body.trim().is_empty() {
+                    let document = docs
+                        .get_document(created.id.as_str())
+                        .unwrap_or_else(|_| empty_document(created.id.as_str(), title));
                     if let Err(error) = docs.batch_update_document(
-                        created.document_id.as_str(),
+                        created.id.as_str(),
                         BatchUpdateDocumentRequest {
                             requests: docs_document_text_requests(1, body),
-                            write_control: write_control(&created),
+                            write_control: write_control(&document),
                         },
                     ) {
+                        let _ =
+                            drive.update_file(created.id.as_str(), DriveUpdateFileRequest::trash());
                         return Err(error);
                     }
                 }
-                let entity_id = RemoteId::new(created.document_id);
+                let entity_id = RemoteId::new(created.id);
                 changed.insert(entity_id.clone());
                 effects.push(JournalApplyEffect::CreatedEntity {
                     operation_id,
@@ -3118,6 +3027,14 @@ fn document_start_index(document: &GoogleDocument) -> usize {
         .unwrap_or(1)
 }
 
+fn empty_document(id: &str, title: &str) -> GoogleDocument {
+    GoogleDocument {
+        document_id: id.to_string(),
+        title: title.to_string(),
+        ..GoogleDocument::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GoogleBlockRange {
     document_id: String,
@@ -3245,5 +3162,3249 @@ fn short_id(remote_id: &str, len: usize) -> String {
         "id".to_string()
     } else {
         short
+    }
+}
+
+pub fn extract_google_drive_folder_id(value: &str) -> Option<String> {
+    if let Some(after_folders) = value.split("/folders/").nth(1) {
+        return Some(
+            after_folders
+                .split(['?', '/', '#'])
+                .next()
+                .unwrap_or(after_folders)
+                .to_string(),
+        );
+    }
+    if let Some(after_id) = value.split("id=").nth(1) {
+        return Some(
+            after_id
+                .split(['&', '#'])
+                .next()
+                .unwrap_or(after_id)
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn looks_like_google_drive_id(value: &str) -> bool {
+    value.len() >= 10
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use locality_connector::{
+        ApplyPlanRequest, Connector, EnumerateRequest, FetchRequest, ObserveRequest,
+    };
+    use locality_core::journal::{PushId, PushOperationId};
+    use locality_core::model::{EntityKind, MountId, RemoteId};
+    use locality_core::planner::{PushOperation, PushPlan};
+    use locality_core::push::RemotePrecondition;
+    use locality_core::search::RAW_SEARCH_METADATA_KEY;
+
+    use super::{
+        GoogleDocsConfig, GoogleDocsConnector, docs_block_text, docs_document_text_requests,
+        docs_text_len,
+    };
+    use crate::client::{GoogleDocsApi, GoogleDriveApi};
+    use crate::docs_dto::{BatchUpdateDocumentRequest, DocsRequest, GoogleDocument, Range};
+    use crate::drive_dto::{
+        DriveCreateFileRequest, DriveFile, DriveFileList, DriveUpdateFileRequest,
+    };
+
+    #[test]
+    fn enumerate_projects_workspace_folders_and_docs_as_page_directories() {
+        let drive = Arc::new(
+            FakeDrive::default()
+                .with_children(
+                    "workspace",
+                    vec![folder("folder-1", "Marketing", "workspace")],
+                )
+                .with_children(
+                    "folder-1",
+                    vec![
+                        doc_file("doc-1", "Launch Brief", "folder-1"),
+                        doc_file("doc-2", "Nested Doc", "folder-1"),
+                    ],
+                ),
+        );
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token").with_workspace_folder_id(RemoteId::new("workspace")),
+            drive,
+            Arc::new(FakeDocs::default()),
+        );
+
+        let entries = connector
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("google-docs-main"),
+                cursor: None,
+            })
+            .expect("enumerate");
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].kind, EntityKind::Directory);
+        assert_eq!(entries[0].path, std::path::Path::new("marketing"));
+        assert_eq!(entries[1].kind, EntityKind::Page);
+        assert_eq!(
+            entries[1].path,
+            std::path::Path::new("marketing/launch-brief/page.md")
+        );
+        assert_eq!(
+            entries[1]
+                .stub_frontmatter
+                .as_ref()
+                .unwrap()
+                .contains("google-docs"),
+            true
+        );
+        assert_eq!(
+            entries[2].path,
+            std::path::Path::new("marketing/nested-doc/page.md")
+        );
+    }
+
+    #[test]
+    fn fetch_gets_drive_metadata_and_document_body() {
+        let drive = Arc::new(FakeDrive::default().with_file(doc_file(
+            "doc-1",
+            "Launch Brief",
+            "workspace",
+        )));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Launch Brief",
+            "rev-1",
+            "Hello\n",
+        )));
+        let connector = GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs);
+
+        let native = connector
+            .fetch(FetchRequest {
+                remote_id: RemoteId::new("doc-1"),
+            })
+            .expect("fetch");
+
+        assert_eq!(native.kind, "google_docs_document");
+        assert!(
+            String::from_utf8(native.raw)
+                .unwrap()
+                .contains("Launch Brief")
+        );
+    }
+
+    #[test]
+    fn observe_reports_remote_version_from_drive_and_docs() {
+        let drive = Arc::new(FakeDrive::default().with_file(doc_file(
+            "doc-1",
+            "Launch Brief",
+            "workspace",
+        )));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Launch Brief",
+            "rev-1",
+            "Hello\n",
+        )));
+        let connector = GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs);
+
+        let observation = connector
+            .observe(ObserveRequest {
+                mount_id: MountId::new("google-docs-main"),
+                remote_id: RemoteId::new("doc-1"),
+            })
+            .expect("observe");
+
+        assert_eq!(
+            observation.remote_version.unwrap().as_str(),
+            "drive:7:2026-06-25T10:00:00.000Z|docs:rev-1"
+        );
+        let raw_metadata: serde_json::Value =
+            serde_json::from_str(&observation.raw_metadata_json).expect("raw metadata json");
+        assert_eq!(
+            raw_metadata[RAW_SEARCH_METADATA_KEY]["source_url"],
+            serde_json::json!("https://docs.google.com/document/d/doc-1/edit")
+        );
+        assert_eq!(
+            raw_metadata[RAW_SEARCH_METADATA_KEY]["aliases"],
+            serde_json::json!(["doc-1"])
+        );
+        let search_terms = raw_metadata[RAW_SEARCH_METADATA_KEY]["metadata_text"]
+            .as_array()
+            .expect("metadata_text");
+        assert!(search_terms.contains(&serde_json::json!("Launch Brief")));
+        assert!(search_terms.contains(&serde_json::json!("Google Docs")));
+    }
+
+    #[test]
+    fn apply_uses_required_revision_for_body_update_and_trashes_deletes() {
+        let drive = Arc::new(FakeDrive::default().with_file(doc_file(
+            "doc-1",
+            "Launch Brief",
+            "workspace",
+        )));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Launch Brief",
+            "rev-1",
+            "Hello\n",
+        )));
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive.clone(),
+            docs.clone(),
+        );
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![
+                PushOperation::UpdateBlock {
+                    block_id: RemoteId::new("doc-1:1:7"),
+                    content: "Updated".to_string(),
+                },
+                PushOperation::ArchiveEntity {
+                    entity_id: RemoteId::new("doc-1"),
+                },
+            ],
+        );
+        let op_ids = vec![
+            PushOperationId("push-1:0:update_block:doc-1".to_string()),
+            PushOperationId("push-1:1:archive_entity:doc-1".to_string()),
+        ];
+        let preconditions = vec![RemotePrecondition {
+            remote_id: RemoteId::new("doc-1"),
+            remote_edited_at: Some("drive:7:2026-06-25T10:00:00.000Z|docs:rev-1".to_string()),
+        }];
+
+        connector
+            .check_concurrency(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &preconditions,
+                local_root: None,
+            })
+            .expect("concurrency");
+        let result = connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &preconditions,
+                local_root: None,
+            })
+            .expect("apply");
+
+        assert_eq!(result.changed_remote_ids, vec![RemoteId::new("doc-1")]);
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert_eq!(
+            batch.write_control.unwrap().required_revision_id.as_deref(),
+            Some("rev-1")
+        );
+        assert_eq!(
+            drive
+                .last_update
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .1
+                .trashed,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn concurrency_allows_drive_only_version_drift_when_docs_revision_matches() {
+        let mut file = doc_file("doc-1", "Launch Brief", "workspace");
+        file.version = Some("8".to_string());
+        let drive = Arc::new(FakeDrive::default().with_file(file));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Launch Brief",
+            "rev-1",
+            "Hello\n",
+        )));
+        let connector = GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs);
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::AppendBlock {
+                parent_id: RemoteId::new("doc-1"),
+                after: Some(RemoteId::new("doc-1:1:7")),
+                content: "Local body edit".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:append_block:doc-1".to_string())];
+        let preconditions = vec![RemotePrecondition {
+            remote_id: RemoteId::new("doc-1"),
+            remote_edited_at: Some("drive:7:2026-06-25T10:00:00.000Z|docs:rev-1".to_string()),
+        }];
+
+        connector
+            .check_concurrency(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &preconditions,
+                local_root: None,
+            })
+            .expect("drive-only version drift should not block body push");
+    }
+
+    #[test]
+    fn concurrency_allows_drive_version_only_drift_for_entity_archive() {
+        let mut file = doc_file("doc-1", "Launch Brief", "workspace");
+        file.version = Some("8".to_string());
+        let drive = Arc::new(FakeDrive::default().with_file(file));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Launch Brief",
+            "rev-1",
+            "Hello\n",
+        )));
+        let connector = GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs);
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::ArchiveEntity {
+                entity_id: RemoteId::new("doc-1"),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:archive_entity:doc-1".to_string())];
+        let preconditions = vec![RemotePrecondition {
+            remote_id: RemoteId::new("doc-1"),
+            remote_edited_at: Some("drive:7:2026-06-25T10:00:00.000Z|docs:rev-1".to_string()),
+        }];
+
+        connector
+            .check_concurrency(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &preconditions,
+                local_root: None,
+            })
+            .expect("Drive version-only drift should not block entity archive");
+    }
+
+    #[test]
+    fn concurrency_allows_drive_only_stub_precondition_for_entity_archive() {
+        let mut file = doc_file("doc-1", "Launch Brief", "workspace");
+        file.version = Some("8".to_string());
+        let drive = Arc::new(FakeDrive::default().with_file(file));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Launch Brief",
+            "rev-1",
+            "Hello\n",
+        )));
+        let connector = GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs);
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::ArchiveEntity {
+                entity_id: RemoteId::new("doc-1"),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:archive_entity:doc-1".to_string())];
+        let preconditions = vec![RemotePrecondition {
+            remote_id: RemoteId::new("doc-1"),
+            remote_edited_at: Some("drive:8:2026-06-25T10:00:00.000Z".to_string()),
+        }];
+
+        connector
+            .check_concurrency(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &preconditions,
+                local_root: None,
+            })
+            .expect("drive-only stub precondition should not block entity archive");
+    }
+
+    #[test]
+    fn apply_rejects_stale_docs_revision_precondition_without_writing() {
+        let drive = Arc::new(FakeDrive::default().with_file(doc_file(
+            "doc-1",
+            "Launch Brief",
+            "workspace",
+        )));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Launch Brief",
+            "rev-2",
+            "Hello\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:7"),
+                content: "Second client body".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+        let preconditions = vec![RemotePrecondition {
+            remote_id: RemoteId::new("doc-1"),
+            remote_edited_at: Some("drive:7:2026-06-25T10:00:00.000Z|docs:rev-1".to_string()),
+        }];
+
+        let error = connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &preconditions,
+                local_root: None,
+            })
+            .expect_err("stale remote");
+
+        assert!(matches!(error, locality_core::LocalityError::Conflict(_)));
+        assert!(docs.last_batch.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn apply_converts_markdown_inline_styles_to_docs_text() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Pet Resume", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Pet Resume",
+            "rev-1",
+            "Age: 4 years\u{000b}Weight: 33 pounds\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:36"),
+                content: "**Age:** 4 years\n**Weight:** 34 pounds".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let DocsRequest::InsertText { insert_text } = &batch.requests[1] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(insert_text.text, "Age: 4 years\u{000b}Weight: 34 pounds\n");
+        let DocsRequest::UpdateTextStyle { update_text_style } = &batch.requests[2] else {
+            panic!("expected style reset request");
+        };
+        assert_eq!(update_text_style.range.start_index, 1);
+        assert_eq!(update_text_style.range.end_index, 32);
+        assert_eq!(update_text_style.text_style.bold, Some(false));
+        let DocsRequest::UpdateParagraphStyle {
+            update_paragraph_style,
+        } = &batch.requests[4]
+        else {
+            panic!("expected paragraph style request");
+        };
+        assert_eq!(update_paragraph_style.range.start_index, 1);
+        assert_eq!(update_paragraph_style.range.end_index, 32);
+        assert_eq!(
+            update_paragraph_style
+                .paragraph_style
+                .named_style_type
+                .as_deref(),
+            Some("NORMAL_TEXT")
+        );
+        let DocsRequest::UpdateTextStyle { update_text_style } = &batch.requests[5] else {
+            panic!("expected age style request");
+        };
+        assert_eq!(update_text_style.range.start_index, 1);
+        assert_eq!(update_text_style.range.end_index, 5);
+        assert_eq!(update_text_style.text_style.bold, Some(true));
+        let DocsRequest::UpdateTextStyle { update_text_style } = &batch.requests[6] else {
+            panic!("expected weight style request");
+        };
+        assert_eq!(update_text_style.range.start_index, 14);
+        assert_eq!(update_text_style.range.end_index, 21);
+        assert_eq!(update_text_style.text_style.bold, Some(true));
+    }
+
+    #[test]
+    fn apply_decodes_escaped_literal_markdown_inline_markers() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Literal Doc", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Literal Doc",
+            "rev-1",
+            "Original\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let literal = "Literal **bold** _italic_ ~~strike~~ `code` [link](https://example.com) <u>underline</u>";
+        let escaped = "Literal \\**bold\\** \\_italic\\_ \\~~strike\\~~ \\`code\\` \\[link](https://example.com) \\<u>underline\\</u>";
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:10"),
+                content: escaped.to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let DocsRequest::InsertText { insert_text } = &batch.requests[1] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(insert_text.text, literal);
+        assert_eq!(
+            batch
+                .requests
+                .iter()
+                .filter(|request| matches!(request, DocsRequest::UpdateTextStyle { .. }))
+                .count(),
+            1,
+            "escaped literal markers should not emit inline style requests beyond the reset"
+        );
+    }
+
+    #[test]
+    fn apply_decodes_escaped_parentheses_in_markdown_link_hrefs() {
+        let parsed = docs_block_text(
+            "[<u>Reference v2</u>](https://example.test/path\\(abc\\)?q=one\\(two\\)) link",
+        );
+
+        assert_eq!(parsed.text, "Reference v2 link\n");
+        assert!(
+            parsed.style_ranges.iter().any(|range| {
+                range.start == 0
+                    && range.end == docs_text_len("Reference v2")
+                    && range.style.link.as_deref()
+                        == Some("https://example.test/path(abc)?q=one(two)")
+            }),
+            "expected escaped Markdown href parentheses to decode into one link style: {:#?}",
+            parsed.style_ranges
+        );
+        assert!(
+            parsed.style_ranges.iter().any(|range| {
+                range.start == 0
+                    && range.end == docs_text_len("Reference v2")
+                    && range.style.underline
+            }),
+            "expected nested underline to remain scoped to the linked label: {:#?}",
+            parsed.style_ranges
+        );
+    }
+
+    #[test]
+    fn apply_ignores_escaped_link_label_delimiters() {
+        let parsed =
+            docs_block_text(r#"[<u>A2\](B</u>](https://example.test/label-delimiter) link target"#);
+
+        assert_eq!(parsed.text, "A2](B link target\n");
+        assert!(
+            parsed.style_ranges.iter().any(|range| {
+                range.start == 0
+                    && range.end == docs_text_len("A2](B")
+                    && range.style.link.as_deref() == Some("https://example.test/label-delimiter")
+            }),
+            "expected escaped Markdown label delimiter to stay inside one link label: {:#?}",
+            parsed.style_ranges
+        );
+        assert!(
+            parsed.style_ranges.iter().any(|range| {
+                range.start == 0 && range.end == docs_text_len("A2](B") && range.style.underline
+            }),
+            "expected nested underline to remain scoped to the complete linked label: {:#?}",
+            parsed.style_ranges
+        );
+    }
+
+    #[test]
+    fn apply_decodes_escaped_literal_markdown_block_markers() {
+        for (escaped, literal) in [
+            ("\\# Literal heading", "# Literal heading\n"),
+            ("\\- Literal bullet", "- Literal bullet\n"),
+            ("\\1. Literal number", "1. Literal number\n"),
+            ("\\> Literal quote", "> Literal quote\n"),
+            ("\\---", "---\n"),
+            (
+                "\\::loc{id=literal type=paragraph}",
+                "::loc{id=literal type=paragraph}\n",
+            ),
+        ] {
+            let parsed = docs_block_text(escaped);
+            assert_eq!(parsed.text, literal, "escaped block marker {escaped:?}");
+            assert!(
+                parsed.bullet_ranges.is_empty(),
+                "escaped block marker must not create bullets: {escaped:?}"
+            );
+            assert!(
+                parsed
+                    .paragraph_styles
+                    .iter()
+                    .all(|range| range.named_style_type == "NORMAL_TEXT"),
+                "escaped block marker must remain a normal paragraph: {escaped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_converts_nested_markdown_list_indent_to_docs_tabs() {
+        let nested_bullet = docs_block_text("  - Nested bullet");
+        assert_eq!(nested_bullet.text, "\tNested bullet\n");
+        assert_eq!(nested_bullet.bullet_ranges.len(), 1);
+        assert_eq!(nested_bullet.bullet_ranges[0].start, 0);
+        assert_eq!(
+            nested_bullet.bullet_ranges[0].end,
+            docs_text_len("\tNested bullet\n")
+        );
+        assert_eq!(
+            nested_bullet.bullet_ranges[0].preset,
+            "BULLET_DISC_CIRCLE_SQUARE"
+        );
+
+        let double_nested_number = docs_block_text("    1. Nested number");
+        assert_eq!(double_nested_number.text, "\t\tNested number\n");
+        assert_eq!(double_nested_number.bullet_ranges.len(), 1);
+        assert_eq!(
+            double_nested_number.bullet_ranges[0].end,
+            docs_text_len("\t\tNested number\n")
+        );
+        assert_eq!(
+            double_nested_number.bullet_ranges[0].preset,
+            "NUMBERED_DECIMAL_ALPHA_ROMAN"
+        );
+    }
+
+    #[test]
+    fn document_text_groups_adjacent_nested_bullets_in_one_create_request() {
+        let requests = docs_document_text_requests(
+            1,
+            "- Parent bullet\n\n  - Child bullet\n\n    1. Grandchild number",
+        );
+        let bullet_requests = requests
+            .iter()
+            .filter_map(|request| match request {
+                DocsRequest::CreateParagraphBullets {
+                    create_paragraph_bullets,
+                } => Some(create_paragraph_bullets),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(bullet_requests.len(), 2);
+        assert_eq!(
+            bullet_requests[0].bullet_preset,
+            "BULLET_DISC_CIRCLE_SQUARE"
+        );
+        assert_eq!(bullet_requests[0].range.start_index, 1);
+        assert_eq!(
+            bullet_requests[0].range.end_index,
+            1 + docs_text_len("Parent bullet\n\tChild bullet\n")
+        );
+        assert_eq!(
+            bullet_requests[1].bullet_preset,
+            "NUMBERED_DECIMAL_ALPHA_ROMAN"
+        );
+        assert_eq!(
+            bullet_requests[1].range.start_index,
+            1 + docs_text_len("Parent bullet\n\tChild bullet\n")
+        );
+    }
+
+    #[test]
+    fn apply_converts_markdown_inline_styles_beyond_bold_to_docs_text() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Pet Resume", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Pet Resume",
+            "rev-1",
+            "Styled: Bold Italic Under Strike Link Plain\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:45"),
+                content: "Styled: **Bold** *Italic* <u>Under</u> ~~Strike~~ [<u>Link</u>](https://example.test/live-inline) Plain edited".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let DocsRequest::InsertText { insert_text } = &batch.requests[1] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(
+            insert_text.text,
+            "Styled: Bold Italic Under Strike Link Plain edited"
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[4]).expect("paragraph style json"),
+            serde_json::json!({
+                "updateParagraphStyle": {
+                    "range": { "startIndex": 1, "endIndex": 51 },
+                    "paragraphStyle": {
+                        "namedStyleType": "NORMAL_TEXT"
+                    },
+                    "fields": "namedStyleType"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[5]).expect("bold style json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 9, "endIndex": 13 },
+                    "textStyle": { "bold": true },
+                    "fields": "bold"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[6]).expect("italic style json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 14, "endIndex": 20 },
+                    "textStyle": { "italic": true },
+                    "fields": "italic"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[7]).expect("underline style json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 21, "endIndex": 26 },
+                    "textStyle": { "underline": true },
+                    "fields": "underline"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[8]).expect("strike style json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 27, "endIndex": 33 },
+                    "textStyle": { "strikethrough": true },
+                    "fields": "strikethrough"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[9]).expect("link underline style json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 34, "endIndex": 38 },
+                    "textStyle": { "underline": true },
+                    "fields": "underline"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[10]).expect("link style json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 34, "endIndex": 38 },
+                    "textStyle": { "link": { "url": "https://example.test/live-inline" } },
+                    "fields": "link"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn apply_resets_inherited_style_outside_markdown_inline_span() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Pet Resume", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Pet Resume",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 14,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 5,
+                                        "textRun": {
+                                            "content": "Age:",
+                                            "textStyle": {
+                                                "bold": true,
+                                                "foregroundColor": {
+                                                    "color": {
+                                                        "rgbColor": {
+                                                            "green": 0.67058825,
+                                                            "blue": 0.26666668
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 5,
+                                        "endIndex": 14,
+                                        "textRun": {
+                                            "content": " 4 years\n",
+                                            "textStyle": {}
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("styled document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:14"),
+                content: "**Age**: 5 years".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert_eq!(batch.requests.len(), 6);
+        assert_eq!(
+            serde_json::to_value(&batch.requests[2]).expect("style reset json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 1, "endIndex": 13 },
+                    "textStyle": {
+                        "bold": false,
+                        "italic": false,
+                        "underline": false,
+                        "strikethrough": false,
+                        "smallCaps": false,
+                        "baselineOffset": "NONE"
+                    },
+                    "fields": "bold,italic,underline,strikethrough,smallCaps,foregroundColor,backgroundColor,baselineOffset,fontSize,weightedFontFamily,link"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[4]).expect("paragraph style json"),
+            serde_json::json!({
+                "updateParagraphStyle": {
+                    "range": { "startIndex": 1, "endIndex": 13 },
+                    "paragraphStyle": {
+                        "namedStyleType": "NORMAL_TEXT"
+                    },
+                    "fields": "namedStyleType"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[5]).expect("age style json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 1, "endIndex": 4 },
+                    "textStyle": {
+                        "bold": true,
+                        "foregroundColor": {
+                            "color": {
+                                "rgbColor": {
+                                    "green": 0.67058825,
+                                    "blue": 0.26666668
+                                }
+                            }
+                        }
+                    },
+                    "fields": "bold,foregroundColor"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn apply_restores_inline_styles_after_paragraph_style_reset() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Pet Resume", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Pet Resume",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 14,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 5,
+                                        "textRun": {
+                                            "content": "Age:",
+                                            "textStyle": {
+                                                "bold": true,
+                                                "foregroundColor": {
+                                                    "color": {
+                                                        "rgbColor": {
+                                                            "green": 0.67058825,
+                                                            "blue": 0.26666668
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 5,
+                                        "endIndex": 14,
+                                        "textRun": {
+                                            "content": " 4 years\n",
+                                            "textStyle": {}
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("styled document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:14"),
+                content: "**Age:** 5 years".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert!(
+            matches!(
+                batch.requests.last(),
+                Some(DocsRequest::UpdateTextStyle { update_text_style })
+                    if update_text_style.range.start_index == 1
+                        && update_text_style.range.end_index == 5
+                        && update_text_style.text_style.bold == Some(true)
+                        && update_text_style.text_style.foreground_color.is_some()
+                        && update_text_style.fields == "bold,foregroundColor"
+            ),
+            "the inline style restore must be the final style-affecting request: {:#?}",
+            batch.requests
+        );
+    }
+
+    #[test]
+    fn apply_preserves_color_only_text_style_for_edited_span() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Status", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Status",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 15,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 9,
+                                        "textRun": {
+                                            "content": "Status: ",
+                                            "textStyle": {}
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 9,
+                                        "endIndex": 14,
+                                        "textRun": {
+                                            "content": "Green",
+                                            "textStyle": {
+                                                "foregroundColor": {
+                                                    "color": {
+                                                        "rgbColor": {
+                                                            "green": 0.6,
+                                                            "blue": 0.2
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 14,
+                                        "endIndex": 15,
+                                        "textRun": {
+                                            "content": "\n",
+                                            "textStyle": {}
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("styled document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:15"),
+                content: "Status: Emerald".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert!(
+            batch.requests.iter().any(|request| {
+                matches!(
+                    request,
+                    DocsRequest::UpdateTextStyle { update_text_style }
+                        if update_text_style.range.start_index == 9
+                            && update_text_style.range.end_index == 16
+                            && update_text_style.text_style.foreground_color.is_some()
+                            && update_text_style.fields == "foregroundColor"
+                )
+            }),
+            "color-only source style should be restored onto the edited span: {:#?}",
+            batch.requests
+        );
+    }
+
+    #[test]
+    fn apply_does_not_extend_color_only_style_to_appended_plain_text() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Status", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Status",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 15,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 9,
+                                        "textRun": {
+                                            "content": "Status: ",
+                                            "textStyle": {}
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 9,
+                                        "endIndex": 14,
+                                        "textRun": {
+                                            "content": "Green",
+                                            "textStyle": {
+                                                "foregroundColor": {
+                                                    "color": {
+                                                        "rgbColor": {
+                                                            "green": 0.6,
+                                                            "blue": 0.2
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 14,
+                                        "endIndex": 15,
+                                        "textRun": {
+                                            "content": "\n",
+                                            "textStyle": {}
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("styled document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:15"),
+                content: "Status: Green today".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert!(
+            batch.requests.iter().any(|request| {
+                matches!(
+                    request,
+                    DocsRequest::UpdateTextStyle { update_text_style }
+                        if update_text_style.range.start_index == 9
+                            && update_text_style.range.end_index == 14
+                            && update_text_style.text_style.foreground_color.is_some()
+                            && update_text_style.fields == "foregroundColor"
+                )
+            }),
+            "appended plain text after a colored span must remain uncolored: {:#?}",
+            batch.requests
+        );
+    }
+
+    #[test]
+    fn apply_preserves_background_color_only_text_style_for_edited_span() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Highlight", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Highlight",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 19,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 12,
+                                        "textRun": {
+                                            "content": "Highlight: ",
+                                            "textStyle": {}
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 12,
+                                        "endIndex": 18,
+                                        "textRun": {
+                                            "content": "Yellow",
+                                            "textStyle": {
+                                                "backgroundColor": {
+                                                    "color": {
+                                                        "rgbColor": {
+                                                            "red": 1.0,
+                                                            "green": 0.9019608,
+                                                            "blue": 0.2
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 18,
+                                        "endIndex": 19,
+                                        "textRun": {
+                                            "content": "\n",
+                                            "textStyle": {}
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("highlighted document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:19"),
+                content: "Highlight: Amber".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert!(
+            batch.requests.iter().any(|request| {
+                let value = serde_json::to_value(request).expect("request json");
+                value["updateTextStyle"]["range"]["startIndex"] == 12
+                    && value["updateTextStyle"]["range"]["endIndex"] == 17
+                    && value["updateTextStyle"]["textStyle"]["backgroundColor"].is_object()
+                    && value["updateTextStyle"]["fields"] == "backgroundColor"
+            }),
+            "background-only source style should be restored onto the edited span: {:#?}",
+            batch.requests
+        );
+    }
+
+    #[test]
+    fn apply_preserves_baseline_offset_only_text_style_for_edited_span() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Formula", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Formula",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 18,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 11,
+                                        "textRun": {
+                                            "content": "Formula: x",
+                                            "textStyle": {}
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 11,
+                                        "endIndex": 12,
+                                        "textRun": {
+                                            "content": "2",
+                                            "textStyle": {
+                                                "baselineOffset": "SUPERSCRIPT"
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 12,
+                                        "endIndex": 16,
+                                        "textRun": {
+                                            "content": " + y",
+                                            "textStyle": {}
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 16,
+                                        "endIndex": 17,
+                                        "textRun": {
+                                            "content": "2",
+                                            "textStyle": {
+                                                "baselineOffset": "SUPERSCRIPT"
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 17,
+                                        "endIndex": 18,
+                                        "textRun": {
+                                            "content": "\n",
+                                            "textStyle": {}
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("superscript document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:18"),
+                content: "Formula: x3 + y3".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let serialized: Vec<_> = batch
+            .requests
+            .iter()
+            .map(|request| serde_json::to_value(request).expect("request json"))
+            .collect();
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateTextStyle"]["range"]["startIndex"] == 11
+                    && value["updateTextStyle"]["range"]["endIndex"] == 12
+                    && value["updateTextStyle"]["textStyle"]["baselineOffset"] == "SUPERSCRIPT"
+                    && value["updateTextStyle"]["fields"] == "baselineOffset"
+            }),
+            "first superscript source style should be restored onto the edited exponent: {serialized:#?}"
+        );
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateTextStyle"]["range"]["startIndex"] == 16
+                    && value["updateTextStyle"]["range"]["endIndex"] == 17
+                    && value["updateTextStyle"]["textStyle"]["baselineOffset"] == "SUPERSCRIPT"
+                    && value["updateTextStyle"]["fields"] == "baselineOffset"
+            }),
+            "second superscript source style should be restored onto the edited exponent: {serialized:#?}"
+        );
+    }
+
+    #[test]
+    fn apply_preserves_font_size_only_text_style_for_edited_span() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Sized", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Sized",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 13,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 7,
+                                        "textRun": {
+                                            "content": "Size: ",
+                                            "textStyle": {}
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 7,
+                                        "endIndex": 12,
+                                        "textRun": {
+                                            "content": "Large",
+                                            "textStyle": {
+                                                "fontSize": {
+                                                    "magnitude": 24,
+                                                    "unit": "PT"
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 12,
+                                        "endIndex": 13,
+                                        "textRun": {
+                                            "content": "\n",
+                                            "textStyle": {}
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("sized document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:13"),
+                content: "Size: Huge".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let serialized: Vec<_> = batch
+            .requests
+            .iter()
+            .map(|request| serde_json::to_value(request).expect("request json"))
+            .collect();
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateTextStyle"]["range"]["startIndex"] == 7
+                    && value["updateTextStyle"]["range"]["endIndex"] == 11
+                    && value["updateTextStyle"]["textStyle"]["fontSize"]["magnitude"] == 24
+                    && value["updateTextStyle"]["fields"] == "fontSize"
+            }),
+            "font-size-only source style should be restored onto the edited span: {serialized:#?}"
+        );
+    }
+
+    #[test]
+    fn apply_preserves_font_family_only_text_style_for_edited_span() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Mono", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Mono",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 13,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 7,
+                                        "textRun": {
+                                            "content": "Font: ",
+                                            "textStyle": {}
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 7,
+                                        "endIndex": 12,
+                                        "textRun": {
+                                            "content": "Mono\n",
+                                            "textStyle": {
+                                                "weightedFontFamily": {
+                                                    "fontFamily": "Courier New",
+                                                    "weight": 400
+                                                }
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("font family document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:13"),
+                content: "Font: Code".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let serialized: Vec<_> = batch
+            .requests
+            .iter()
+            .map(|request| serde_json::to_value(request).expect("request json"))
+            .collect();
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateTextStyle"]["range"]["startIndex"] == 7
+                    && value["updateTextStyle"]["range"]["endIndex"] == 11
+                    && value["updateTextStyle"]["textStyle"]["weightedFontFamily"]["fontFamily"]
+                        == "Courier New"
+                    && value["updateTextStyle"]["textStyle"]["weightedFontFamily"]["weight"] == 400
+                    && value["updateTextStyle"]["fields"] == "weightedFontFamily"
+            }),
+            "font-family-only source style should be restored onto the edited span: {serialized:#?}"
+        );
+    }
+
+    #[test]
+    fn apply_preserves_small_caps_only_text_style_for_edited_span() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Caps", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Caps",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 13,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 7,
+                                        "textRun": {
+                                            "content": "Caps: ",
+                                            "textStyle": {}
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 7,
+                                        "endIndex": 12,
+                                        "textRun": {
+                                            "content": "Word\n",
+                                            "textStyle": {
+                                                "smallCaps": true
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("small caps document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:13"),
+                content: "Caps: Term".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let serialized: Vec<_> = batch
+            .requests
+            .iter()
+            .map(|request| serde_json::to_value(request).expect("request json"))
+            .collect();
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateTextStyle"]["range"]["startIndex"] == 7
+                    && value["updateTextStyle"]["range"]["endIndex"] == 11
+                    && value["updateTextStyle"]["textStyle"]["smallCaps"] == true
+                    && value["updateTextStyle"]["fields"] == "smallCaps"
+            }),
+            "small-caps-only source style should be restored onto the edited span: {serialized:#?}"
+        );
+    }
+
+    #[test]
+    fn apply_preserves_paragraph_alignment_for_edited_block() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Aligned", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Aligned",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 15,
+                            "paragraph": {
+                                "paragraphStyle": {
+                                    "namedStyleType": "NORMAL_TEXT",
+                                    "alignment": "CENTER"
+                                },
+                                "elements": [{
+                                    "startIndex": 1,
+                                    "endIndex": 15,
+                                    "textRun": {
+                                        "content": "Centered line\n",
+                                        "textStyle": {}
+                                    }
+                                }]
+                            }
+                        }]
+                    }
+                }))
+                .expect("centered document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:15"),
+                content: "Centered phrase".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let serialized: Vec<_> = batch
+            .requests
+            .iter()
+            .map(|request| serde_json::to_value(request).expect("request json"))
+            .collect();
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateParagraphStyle"]["range"]["startIndex"] == 1
+                    && value["updateParagraphStyle"]["range"]["endIndex"] == 16
+                    && value["updateParagraphStyle"]["paragraphStyle"]["alignment"] == "CENTER"
+                    && value["updateParagraphStyle"]["fields"] == "alignment"
+            }),
+            "source paragraph alignment should be restored after editing the block: {serialized:#?}"
+        );
+    }
+
+    #[test]
+    fn apply_preserves_paragraph_indentation_for_edited_block() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Indented", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Indented",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 20,
+                            "paragraph": {
+                                "paragraphStyle": {
+                                    "namedStyleType": "NORMAL_TEXT",
+                                    "indentStart": {
+                                        "magnitude": 36,
+                                        "unit": "PT"
+                                    },
+                                    "indentFirstLine": {
+                                        "magnitude": 18,
+                                        "unit": "PT"
+                                    }
+                                },
+                                "elements": [{
+                                    "startIndex": 1,
+                                    "endIndex": 20,
+                                    "textRun": {
+                                        "content": "Indented paragraph\n",
+                                        "textStyle": {}
+                                    }
+                                }]
+                            }
+                        }]
+                    }
+                }))
+                .expect("indented document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:20"),
+                content: "Indented paragraph updated".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let serialized: Vec<_> = batch
+            .requests
+            .iter()
+            .map(|request| serde_json::to_value(request).expect("request json"))
+            .collect();
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateParagraphStyle"]["range"]["startIndex"] == 1
+                    && value["updateParagraphStyle"]["range"]["endIndex"] == 27
+                    && value["updateParagraphStyle"]["paragraphStyle"]["indentStart"]["magnitude"]
+                        == 36
+                    && value["updateParagraphStyle"]["paragraphStyle"]["indentFirstLine"]
+                        ["magnitude"]
+                        == 18
+                    && value["updateParagraphStyle"]["fields"] == "indentStart,indentFirstLine"
+            }),
+            "source paragraph indentation should be restored after editing the block: {serialized:#?}"
+        );
+    }
+
+    #[test]
+    fn apply_preserves_paragraph_end_indentation_for_edited_block() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "End indent", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "End indent",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 17,
+                            "paragraph": {
+                                "paragraphStyle": {
+                                    "namedStyleType": "NORMAL_TEXT",
+                                    "indentEnd": {
+                                        "magnitude": 42,
+                                        "unit": "PT"
+                                    }
+                                },
+                                "elements": [{
+                                    "startIndex": 1,
+                                    "endIndex": 17,
+                                    "textRun": {
+                                        "content": "End indent line\n",
+                                        "textStyle": {}
+                                    }
+                                }]
+                            }
+                        }]
+                    }
+                }))
+                .expect("end indented document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:17"),
+                content: "End indent phrase".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let serialized: Vec<_> = batch
+            .requests
+            .iter()
+            .map(|request| serde_json::to_value(request).expect("request json"))
+            .collect();
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateParagraphStyle"]["range"]["startIndex"] == 1
+                    && value["updateParagraphStyle"]["range"]["endIndex"] == 18
+                    && value["updateParagraphStyle"]["paragraphStyle"]["indentEnd"]["magnitude"]
+                        == 42
+                    && value["updateParagraphStyle"]["fields"] == "indentEnd"
+            }),
+            "source paragraph end indentation should be restored after editing the block: {serialized:#?}"
+        );
+    }
+
+    #[test]
+    fn apply_preserves_paragraph_spacing_for_edited_block() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Spaced", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Spaced",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 14,
+                            "paragraph": {
+                                "paragraphStyle": {
+                                    "namedStyleType": "NORMAL_TEXT",
+                                    "lineSpacing": 150,
+                                    "spaceAbove": {
+                                        "magnitude": 18,
+                                        "unit": "PT"
+                                    },
+                                    "spaceBelow": {
+                                        "magnitude": 6,
+                                        "unit": "PT"
+                                    }
+                                },
+                                "elements": [{
+                                    "startIndex": 1,
+                                    "endIndex": 14,
+                                    "textRun": {
+                                        "content": "Spacing line\n",
+                                        "textStyle": {}
+                                    }
+                                }]
+                            }
+                        }]
+                    }
+                }))
+                .expect("spaced document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:14"),
+                content: "Spacing phrase".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let serialized: Vec<_> = batch
+            .requests
+            .iter()
+            .map(|request| serde_json::to_value(request).expect("request json"))
+            .collect();
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateParagraphStyle"]["range"]["startIndex"] == 1
+                    && value["updateParagraphStyle"]["range"]["endIndex"] == 15
+                    && value["updateParagraphStyle"]["paragraphStyle"]["lineSpacing"] == 150
+                    && value["updateParagraphStyle"]["paragraphStyle"]["spaceAbove"]["magnitude"]
+                        == 18
+                    && value["updateParagraphStyle"]["paragraphStyle"]["spaceBelow"]["magnitude"]
+                        == 6
+                    && value["updateParagraphStyle"]["fields"]
+                        == "lineSpacing,spaceAbove,spaceBelow"
+            }),
+            "source paragraph spacing should be restored after editing the block: {serialized:#?}"
+        );
+    }
+
+    #[test]
+    fn apply_clears_inherited_bullets_for_non_list_block_updates() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "List Doc", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "List Doc",
+                    "revisionId": "rev-1",
+                    "lists": {
+                        "list-1": {
+                            "listProperties": {
+                                "nestingLevels": [{ "glyphType": "DECIMAL" }]
+                            }
+                        }
+                    },
+                    "body": {
+                        "content": [
+                            {
+                                "startIndex": 1,
+                                "endIndex": 12,
+                                "paragraph": {
+                                    "elements": [{
+                                        "startIndex": 1,
+                                        "endIndex": 12,
+                                        "textRun": { "content": "Intro line\n" }
+                                    }]
+                                }
+                            },
+                            {
+                                "startIndex": 12,
+                                "endIndex": 22,
+                                "paragraph": {
+                                    "bullet": { "listId": "list-1", "nestingLevel": 0 },
+                                    "elements": [{
+                                        "startIndex": 12,
+                                        "endIndex": 22,
+                                        "textRun": { "content": "List item\n" }
+                                    }]
+                                }
+                            }
+                        ]
+                    }
+                }))
+                .expect("list document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:12"),
+                content: "Intro edited".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert!(
+            batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .get("deleteParagraphBullets")
+                    .is_some()
+            }),
+            "expected non-list block updates to clear inherited list bullets"
+        );
+    }
+
+    #[test]
+    fn create_entity_preserves_markdown_paragraph_breaks_as_docs_paragraphs() {
+        let drive = Arc::new(FakeDrive::default());
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "created-doc",
+            "Local Shape Create",
+            "rev-1",
+            "",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("workspace")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("workspace"),
+                parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
+                title: "Local Shape Create".to_string(),
+                properties: BTreeMap::new(),
+                body: "# Local Shape Create\n\nIntro paragraph\n".to_string(),
+                source_path: PathBuf::from("local-shape-create/page.md"),
+            }],
+        );
+        let op_ids = vec![PushOperationId(
+            "push-1:0:create_entity:workspace".to_string(),
+        )];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let DocsRequest::InsertText { insert_text } = &batch.requests[0] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(insert_text.text, "Local Shape Create\nIntro paragraph\n");
+        assert!(
+            !insert_text.text.contains('\u{000b}'),
+            "full-document creates must not collapse Markdown blocks into soft breaks"
+        );
+    }
+
+    #[test]
+    fn create_entity_converts_markdown_blocks_to_docs_paragraph_styles_and_lists() {
+        let drive = Arc::new(FakeDrive::default());
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "created-doc",
+            "Local Shape Create",
+            "rev-1",
+            "",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("workspace")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("workspace"),
+                parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
+                title: "Local Shape Create".to_string(),
+                properties: BTreeMap::new(),
+                body: "# Local Shape Create\n\nIntro with **Bold** and *Italic*.\n\n## Section Two\n\n- Bullet alpha\n\n1. Number alpha\n".to_string(),
+                source_path: PathBuf::from("local-shape-create/page.md"),
+            }],
+        );
+        let op_ids = vec![PushOperationId(
+            "push-1:0:create_entity:workspace".to_string(),
+        )];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let DocsRequest::InsertText { insert_text } = &batch.requests[0] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(
+            insert_text.text,
+            "Local Shape Create\nIntro with Bold and Italic.\nSection Two\nBullet alpha\nNumber alpha\n"
+        );
+        assert!(
+            batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/updateParagraphStyle/paragraphStyle/namedStyleType")
+                    == Some(&serde_json::Value::String("HEADING_1".to_string()))
+            }),
+            "expected heading 1 paragraph style update"
+        );
+        assert!(
+            batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/updateParagraphStyle/paragraphStyle/namedStyleType")
+                    == Some(&serde_json::Value::String("HEADING_2".to_string()))
+            }),
+            "expected heading 2 paragraph style update"
+        );
+        assert!(
+            batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/createParagraphBullets/bulletPreset")
+                    == Some(&serde_json::Value::String(
+                        "BULLET_DISC_CIRCLE_SQUARE".to_string(),
+                    ))
+            }),
+            "expected unordered list bullet creation"
+        );
+        assert!(
+            batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/createParagraphBullets/bulletPreset")
+                    == Some(&serde_json::Value::String(
+                        "NUMBERED_DECIMAL_ALPHA_ROMAN".to_string(),
+                    ))
+            }),
+            "expected ordered list bullet creation"
+        );
+    }
+
+    #[test]
+    fn update_block_converts_markdown_heading_and_list_markers_to_docs_shape() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Shape Doc", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Shape Doc",
+                    "revisionId": "rev-1",
+                    "lists": {
+                        "bullets": {
+                            "listProperties": {
+                                "nestingLevels": [{ "glyphType": "BULLET" }]
+                            }
+                        }
+                    },
+                    "body": {
+                        "content": [
+                            {
+                                "startIndex": 1,
+                                "endIndex": 13,
+                                "paragraph": {
+                                    "paragraphStyle": { "namedStyleType": "HEADING_2" },
+                                    "elements": [{
+                                        "startIndex": 1,
+                                        "endIndex": 13,
+                                        "textRun": { "content": "Section Two\n" }
+                                    }]
+                                }
+                            },
+                            {
+                                "startIndex": 13,
+                                "endIndex": 26,
+                                "paragraph": {
+                                    "bullet": { "listId": "bullets", "nestingLevel": 0 },
+                                    "elements": [{
+                                        "startIndex": 13,
+                                        "endIndex": 26,
+                                        "textRun": { "content": "Bullet alpha\n" }
+                                    }]
+                                }
+                            }
+                        ]
+                    }
+                }))
+                .expect("shape document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![
+                PushOperation::UpdateBlock {
+                    block_id: RemoteId::new("doc-1:1:13"),
+                    content: "## Section Two Edited".to_string(),
+                },
+                PushOperation::UpdateBlock {
+                    block_id: RemoteId::new("doc-1:13:26"),
+                    content: "- Bullet alpha edited".to_string(),
+                },
+            ],
+        );
+        let op_ids = vec![
+            PushOperationId("push-1:0:update_block:doc-1".to_string()),
+            PushOperationId("push-1:1:update_block:doc-1".to_string()),
+        ];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batches = docs.batches.lock().unwrap();
+        let heading_batch = &batches[1].1;
+        let DocsRequest::InsertText { insert_text } = &heading_batch.requests[1] else {
+            panic!("expected heading insert text request");
+        };
+        assert_eq!(insert_text.text, "Section Two Edited\n");
+        assert!(
+            heading_batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/updateParagraphStyle/paragraphStyle/namedStyleType")
+                    == Some(&serde_json::Value::String("HEADING_2".to_string()))
+            }),
+            "expected heading update to preserve heading style without literal marker"
+        );
+
+        let list_batch = &batches[0].1;
+        let DocsRequest::InsertText { insert_text } = &list_batch.requests[1] else {
+            panic!("expected list insert text request");
+        };
+        assert_eq!(insert_text.text, "Bullet alpha edited");
+        assert!(
+            list_batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/createParagraphBullets/bulletPreset")
+                    == Some(&serde_json::Value::String(
+                        "BULLET_DISC_CIRCLE_SQUARE".to_string(),
+                    ))
+            }),
+            "expected list update to preserve bullet shape without literal marker"
+        );
+    }
+
+    #[test]
+    fn update_block_clears_heading_style_when_markdown_heading_marker_is_removed() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Shape Doc", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Shape Doc",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [
+                            {
+                                "startIndex": 1,
+                                "endIndex": 13,
+                                "paragraph": {
+                                    "paragraphStyle": { "namedStyleType": "HEADING_2" },
+                                    "elements": [{
+                                        "startIndex": 1,
+                                        "endIndex": 13,
+                                        "textRun": { "content": "Old Heading\n" }
+                                    }]
+                                }
+                            }
+                        ]
+                    }
+                }))
+                .expect("heading document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:13"),
+                content: "Plain paragraph now".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert!(
+            batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/updateParagraphStyle/paragraphStyle/namedStyleType")
+                    == Some(&serde_json::Value::String("NORMAL_TEXT".to_string()))
+            }),
+            "expected plain Markdown block to clear existing heading style"
+        );
+    }
+
+    #[test]
+    fn update_final_block_preserves_google_docs_segment_newline() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Final Doc", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Final Doc",
+            "rev-1",
+            "Original\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:10"),
+                content: "Updated".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let delete_range = first_delete_range(&batch);
+        assert_eq!(delete_range.start_index, 1);
+        assert_eq!(delete_range.end_index, 9);
+        let DocsRequest::InsertText { insert_text } = &batch.requests[1] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(insert_text.text, "Updated");
+    }
+
+    #[test]
+    fn append_block_converts_markdown_heading_and_list_markers_to_docs_shape() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Shape Doc", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Shape Doc",
+            "rev-1",
+            "Intro\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![
+                PushOperation::AppendBlock {
+                    parent_id: RemoteId::new("doc-1"),
+                    after: None,
+                    content: "## Appended Section".to_string(),
+                },
+                PushOperation::AppendBlock {
+                    parent_id: RemoteId::new("doc-1"),
+                    after: None,
+                    content: "- Appended bullet".to_string(),
+                },
+                PushOperation::AppendBlock {
+                    parent_id: RemoteId::new("doc-1"),
+                    after: None,
+                    content: "1. Appended number".to_string(),
+                },
+            ],
+        );
+        let op_ids = vec![
+            PushOperationId("push-1:0:append_block:doc-1".to_string()),
+            PushOperationId("push-1:1:append_block:doc-1".to_string()),
+            PushOperationId("push-1:2:append_block:doc-1".to_string()),
+        ];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batches = docs.batches.lock().unwrap();
+        let heading_batch = &batches[0].1;
+        let DocsRequest::InsertText { insert_text } = &heading_batch.requests[0] else {
+            panic!("expected heading insert text request");
+        };
+        assert_eq!(insert_text.location.index, 1);
+        assert_eq!(insert_text.text, "Appended Section\n");
+        assert!(
+            heading_batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/updateParagraphStyle/paragraphStyle/namedStyleType")
+                    == Some(&serde_json::Value::String("HEADING_2".to_string()))
+            }),
+            "expected appended heading to use paragraph style without literal marker"
+        );
+
+        let list_batch = &batches[1].1;
+        let DocsRequest::InsertText { insert_text } = &list_batch.requests[0] else {
+            panic!("expected list insert text request");
+        };
+        assert_eq!(insert_text.location.index, 18);
+        assert_eq!(insert_text.text, "Appended bullet\n");
+        assert!(
+            list_batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/createParagraphBullets/bulletPreset")
+                    == Some(&serde_json::Value::String(
+                        "BULLET_DISC_CIRCLE_SQUARE".to_string(),
+                    ))
+            }),
+            "expected appended list item to use bullet shape without literal marker"
+        );
+
+        let ordered_list_batch = &batches[2].1;
+        let DocsRequest::InsertText { insert_text } = &ordered_list_batch.requests[0] else {
+            panic!("expected ordered list insert text request");
+        };
+        assert_eq!(insert_text.location.index, 34);
+        assert_eq!(insert_text.text, "Appended number\n");
+        assert!(
+            ordered_list_batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/createParagraphBullets/bulletPreset")
+                    == Some(&serde_json::Value::String(
+                        "NUMBERED_DECIMAL_ALPHA_ROMAN".to_string(),
+                    ))
+            }),
+            "expected appended ordered list item to use numbered shape without literal marker"
+        );
+    }
+
+    #[test]
+    fn append_block_without_after_inserts_before_first_document_block() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Shape Doc", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Shape Doc",
+            "rev-1",
+            "Intro\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::AppendBlock {
+                parent_id: RemoteId::new("doc-1"),
+                after: None,
+                content: "Before intro".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:append_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let DocsRequest::InsertText { insert_text } = &batch.requests[0] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(insert_text.location.index, 1);
+        assert_eq!(insert_text.text, "Before intro\n");
+    }
+
+    #[test]
+    fn append_block_after_final_block_inserts_before_segment_newline() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Shape Doc", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Shape Doc",
+            "rev-1",
+            "Intro\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::AppendBlock {
+                parent_id: RemoteId::new("doc-1"),
+                after: Some(RemoteId::new("doc-1:1:7")),
+                content: "## Appended Section".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:append_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let DocsRequest::InsertText { insert_text } = &batch.requests[0] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(insert_text.location.index, 6);
+        assert_eq!(insert_text.text, "\nAppended Section");
+        assert!(batch.requests.iter().any(|request| {
+            let value = serde_json::to_value(request).expect("request json");
+            value["updateParagraphStyle"]["range"]["startIndex"] == 7
+                && value["updateParagraphStyle"]["range"]["endIndex"] == 23
+                && value["updateParagraphStyle"]["paragraphStyle"]["namedStyleType"] == "HEADING_2"
+        }));
+    }
+
+    #[test]
+    fn archive_after_insert_before_block_uses_shifted_range() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Shape Doc", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Shape Doc",
+            "rev-1",
+            "Intro\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![
+                PushOperation::AppendBlock {
+                    parent_id: RemoteId::new("doc-1"),
+                    after: None,
+                    content: "Before".to_string(),
+                },
+                PushOperation::ArchiveBlock {
+                    block_id: RemoteId::new("doc-1:10:16"),
+                },
+            ],
+        );
+        let op_ids = vec![
+            PushOperationId("push-1:0:append_block:doc-1".to_string()),
+            PushOperationId("push-1:1:archive_block:doc-1:10:16".to_string()),
+        ];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batches = docs.batches.lock().unwrap();
+        let shifted_delete = first_delete_range(&batches[1].1);
+        assert_eq!(shifted_delete.start_index, 17);
+        assert_eq!(shifted_delete.end_index, 23);
+    }
+
+    #[test]
+    fn apply_orders_same_document_block_updates_from_bottom_to_top() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Pet Resume", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Pet Resume",
+            "rev-1",
+            "First block\nSecond block\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![
+                PushOperation::UpdateBlock {
+                    block_id: RemoteId::new("doc-1:1:13"),
+                    content: "First".to_string(),
+                },
+                PushOperation::UpdateBlock {
+                    block_id: RemoteId::new("doc-1:13:26"),
+                    content: "Second".to_string(),
+                },
+            ],
+        );
+        let op_ids = vec![
+            PushOperationId("push-1:0:update_block:doc-1".to_string()),
+            PushOperationId("push-1:1:update_block:doc-1".to_string()),
+        ];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batches = docs.batches.lock().unwrap();
+        let first_delete = first_delete_range(&batches[0].1);
+        let second_delete = first_delete_range(&batches[1].1);
+        assert_eq!(first_delete.start_index, 13);
+        assert_eq!(second_delete.start_index, 1);
+    }
+
+    #[test]
+    fn concurrency_skips_preconditions_without_synced_remote_version() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(folder("workspace", "Locality", "root")));
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive,
+            Arc::new(FakeDocs::default()),
+        );
+        let plan = PushPlan::new(
+            vec![RemoteId::new("workspace")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("workspace"),
+                parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
+                title: "Scratch Hydration".to_string(),
+                properties: BTreeMap::new(),
+                body: "Created locally.\n".to_string(),
+                source_path: PathBuf::from("scratch-hydration/page.md"),
+            }],
+        );
+        let op_ids = vec![PushOperationId(
+            "push-1:0:create_entity:workspace".to_string(),
+        )];
+        let preconditions = vec![RemotePrecondition {
+            remote_id: RemoteId::new("workspace"),
+            remote_edited_at: None,
+        }];
+
+        connector
+            .check_concurrency(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &preconditions,
+                local_root: None,
+            })
+            .expect("concurrency");
+    }
+
+    #[test]
+    fn apply_trashes_created_doc_when_body_insert_fails() {
+        let drive = Arc::new(FakeDrive::default());
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive.clone(),
+            Arc::new(FakeDocs::default()),
+        );
+        let plan = PushPlan::new(
+            vec![RemoteId::new("workspace")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("workspace"),
+                parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
+                title: "Scratch Hydration".to_string(),
+                properties: BTreeMap::new(),
+                body: "Created locally.\n".to_string(),
+                source_path: PathBuf::from("scratch-hydration/page.md"),
+            }],
+        );
+        let op_ids = vec![PushOperationId(
+            "push-1:0:create_entity:workspace".to_string(),
+        )];
+
+        let error = connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect_err("apply should fail");
+
+        assert!(
+            matches!(error, locality_core::LocalityError::RemoteNotFound(_)),
+            "{error:?}"
+        );
+        let update = drive
+            .last_update
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("rollback trash");
+        assert_eq!(update.0, "created-doc");
+        assert_eq!(update.1.trashed, Some(true));
+    }
+
+    #[test]
+    fn apply_move_entity_renames_and_replaces_drive_parent() {
+        let drive = Arc::new(
+            FakeDrive::default()
+                .with_file(doc_file("doc-1", "Launch Brief", "folder-old"))
+                .with_file(folder("folder-new", "Archive", "workspace")),
+        );
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive.clone(),
+            Arc::new(FakeDocs::default()),
+        );
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::MoveEntity {
+                entity_id: RemoteId::new("doc-1"),
+                new_parent_id: RemoteId::new("folder-new"),
+                new_parent_kind: EntityKind::Directory,
+                new_title: "Archived Brief".to_string(),
+                projected_path: PathBuf::from("Archive/Archived Brief/page.md"),
+            }],
+        );
+        let push_id = PushId("push-1".to_string());
+        let op_ids = vec![PushOperationId::for_operation(
+            &push_id,
+            0,
+            &plan.operations[0],
+        )];
+
+        let result = connector
+            .apply(ApplyPlanRequest {
+                push_id: &push_id,
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply move entity");
+
+        assert_eq!(result.changed_remote_ids, vec![RemoteId::new("doc-1")]);
+        assert_eq!(result.effects.len(), 1);
+        let update = drive
+            .last_update
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("move update");
+        assert_eq!(update.0, "doc-1");
+        assert_eq!(update.1.name.as_deref(), Some("Archived Brief"));
+        assert_eq!(update.1.add_parents.as_deref(), Some("folder-new"));
+        assert_eq!(update.1.remove_parents.as_deref(), Some("folder-old"));
+    }
+
+    #[test]
+    fn resolve_workspace_folder_reuses_matching_named_folder() {
+        let drive = Arc::new(FakeDrive::default().with_workspace_folders(
+            "Locality Workspace",
+            vec![folder("folder-1", "Locality Workspace", "root")],
+        ));
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive.clone(),
+            Arc::new(FakeDocs::default()),
+        );
+
+        let folder_id = connector
+            .resolve_workspace_folder("Locality Workspace")
+            .expect("resolve workspace folder");
+
+        assert_eq!(folder_id, RemoteId::new("folder-1"));
+        assert!(drive.last_created.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_workspace_folder_creates_missing_named_folder() {
+        let drive = Arc::new(FakeDrive::default());
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive.clone(),
+            Arc::new(FakeDocs::default()),
+        );
+
+        let folder_id = connector
+            .resolve_workspace_folder("Locality Workspace")
+            .expect("create workspace folder");
+
+        assert_eq!(folder_id, RemoteId::new("created-folder"));
+        let created = drive.last_created.lock().unwrap().clone().expect("create");
+        assert_eq!(created.name, "Locality Workspace");
+        assert_eq!(created.mime_type, crate::drive_dto::DRIVE_FOLDER_MIME_TYPE);
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeDrive {
+        files: Mutex<std::collections::BTreeMap<String, DriveFile>>,
+        children: Mutex<std::collections::BTreeMap<String, Vec<DriveFile>>>,
+        workspace_folders: Mutex<std::collections::BTreeMap<String, Vec<DriveFile>>>,
+        last_created: Mutex<Option<DriveCreateFileRequest>>,
+        last_update: Mutex<Option<(String, DriveUpdateFileRequest)>>,
+    }
+
+    impl FakeDrive {
+        fn with_file(self, file: DriveFile) -> Self {
+            self.files.lock().unwrap().insert(file.id.clone(), file);
+            self
+        }
+
+        fn with_children(self, parent: &str, files: Vec<DriveFile>) -> Self {
+            for file in &files {
+                self.files
+                    .lock()
+                    .unwrap()
+                    .insert(file.id.clone(), file.clone());
+            }
+            self.children
+                .lock()
+                .unwrap()
+                .insert(parent.to_string(), files);
+            self
+        }
+
+        fn with_workspace_folders(self, name: &str, files: Vec<DriveFile>) -> Self {
+            for file in &files {
+                self.files
+                    .lock()
+                    .unwrap()
+                    .insert(file.id.clone(), file.clone());
+            }
+            self.workspace_folders
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), files);
+            self
+        }
+    }
+
+    impl GoogleDriveApi for FakeDrive {
+        fn get_file(&self, file_id: &str) -> locality_core::LocalityResult<DriveFile> {
+            self.files
+                .lock()
+                .unwrap()
+                .get(file_id)
+                .cloned()
+                .ok_or_else(|| locality_core::LocalityError::RemoteNotFound(file_id.to_string()))
+        }
+
+        fn list_children(
+            &self,
+            parent_id: &str,
+            _page_token: Option<&str>,
+        ) -> locality_core::LocalityResult<DriveFileList> {
+            Ok(DriveFileList {
+                files: self
+                    .children
+                    .lock()
+                    .unwrap()
+                    .get(parent_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                next_page_token: None,
+            })
+        }
+
+        fn list_workspace_folders_by_name(
+            &self,
+            name: &str,
+            _page_token: Option<&str>,
+        ) -> locality_core::LocalityResult<DriveFileList> {
+            Ok(DriveFileList {
+                files: self
+                    .workspace_folders
+                    .lock()
+                    .unwrap()
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default(),
+                next_page_token: None,
+            })
+        }
+
+        fn create_file(
+            &self,
+            request: DriveCreateFileRequest,
+        ) -> locality_core::LocalityResult<DriveFile> {
+            *self.last_created.lock().unwrap() = Some(request.clone());
+            if request.mime_type == crate::drive_dto::DRIVE_FOLDER_MIME_TYPE {
+                let created = folder(
+                    "created-folder",
+                    &request.name,
+                    request
+                        .parents
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("root"),
+                );
+                self.files
+                    .lock()
+                    .unwrap()
+                    .insert(created.id.clone(), created.clone());
+                return Ok(created);
+            }
+            let created = doc_file(
+                "created-doc",
+                &request.name,
+                request
+                    .parents
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("workspace"),
+            );
+            self.files
+                .lock()
+                .unwrap()
+                .insert(created.id.clone(), created.clone());
+            Ok(created)
+        }
+
+        fn update_file(
+            &self,
+            file_id: &str,
+            request: DriveUpdateFileRequest,
+        ) -> locality_core::LocalityResult<DriveFile> {
+            *self.last_update.lock().unwrap() = Some((file_id.to_string(), request));
+            self.get_file(file_id)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeDocs {
+        docs: Mutex<std::collections::BTreeMap<String, GoogleDocument>>,
+        last_batch: Mutex<Option<BatchUpdateDocumentRequest>>,
+        batches: Mutex<Vec<(String, BatchUpdateDocumentRequest)>>,
+    }
+
+    impl FakeDocs {
+        fn with_document(self, document: GoogleDocument) -> Self {
+            self.docs
+                .lock()
+                .unwrap()
+                .insert(document.document_id.clone(), document);
+            self
+        }
+    }
+
+    impl GoogleDocsApi for FakeDocs {
+        fn get_document(&self, document_id: &str) -> locality_core::LocalityResult<GoogleDocument> {
+            self.docs
+                .lock()
+                .unwrap()
+                .get(document_id)
+                .cloned()
+                .ok_or_else(|| {
+                    locality_core::LocalityError::RemoteNotFound(document_id.to_string())
+                })
+        }
+
+        fn batch_update_document(
+            &self,
+            document_id: &str,
+            request: BatchUpdateDocumentRequest,
+        ) -> locality_core::LocalityResult<GoogleDocument> {
+            self.batches
+                .lock()
+                .unwrap()
+                .push((document_id.to_string(), request.clone()));
+            *self.last_batch.lock().unwrap() = Some(request);
+            self.get_document(document_id)
+        }
+    }
+
+    fn first_delete_range(request: &BatchUpdateDocumentRequest) -> Range {
+        request
+            .requests
+            .iter()
+            .find_map(|request| match request {
+                DocsRequest::DeleteContentRange {
+                    delete_content_range,
+                } => Some(delete_content_range.range.clone()),
+                _ => None,
+            })
+            .expect("delete request")
+    }
+
+    fn folder(id: &str, name: &str, parent: &str) -> DriveFile {
+        DriveFile {
+            id: id.to_string(),
+            name: name.to_string(),
+            mime_type: crate::drive_dto::DRIVE_FOLDER_MIME_TYPE.to_string(),
+            parents: vec![parent.to_string()],
+            modified_time: Some("2026-06-25T10:00:00.000Z".to_string()),
+            version: Some("7".to_string()),
+            trashed: false,
+        }
+    }
+
+    fn doc_file(id: &str, name: &str, parent: &str) -> DriveFile {
+        DriveFile {
+            id: id.to_string(),
+            name: name.to_string(),
+            mime_type: crate::drive_dto::DRIVE_GOOGLE_DOC_MIME_TYPE.to_string(),
+            parents: vec![parent.to_string()],
+            modified_time: Some("2026-06-25T10:00:00.000Z".to_string()),
+            version: Some("7".to_string()),
+            trashed: false,
+        }
+    }
+
+    fn document(id: &str, title: &str, revision: &str, content: &str) -> GoogleDocument {
+        serde_json::from_value(serde_json::json!({
+            "documentId": id,
+            "title": title,
+            "revisionId": revision,
+            "body": {
+                "content": [
+                    { "startIndex": 1, "endIndex": content.len() + 1, "paragraph": {
+                        "elements": [{ "textRun": { "content": content } }]
+                    }}
+                ]
+            }
+        }))
+        .expect("document")
     }
 }
