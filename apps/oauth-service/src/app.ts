@@ -290,7 +290,7 @@ app.post("/v1/google-docs/picker/:capability/selection", async (c) => {
     c.req.param("capability"),
     requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
   );
-  const body = await requiredJson<GoogleDocsPickerSelectionRequest>(c.req.raw);
+  const body = await googleDocsPickerSelection(c.req.raw);
   if (!Array.isArray(body.document_ids)) {
     throw badRequest("invalid_picker_document_ids", "Google Picker must select one or more documents");
   }
@@ -712,6 +712,23 @@ function requiredPickerConfig(value: string | undefined, name: string): string {
     throw configError(`${name} must be configured`);
   }
   return value.trim();
+}
+
+async function googleDocsPickerSelection(request: Request): Promise<GoogleDocsPickerSelectionRequest> {
+  const body = await request.text();
+  try {
+    return JSON.parse(body) as GoogleDocsPickerSelectionRequest;
+  } catch {
+    const documentIds = new URLSearchParams(body).get("document_ids");
+    if (!documentIds) {
+      throw badRequest("invalid_picker_document_ids", "Google Picker must select one or more documents");
+    }
+    try {
+      return { document_ids: JSON.parse(documentIds) as string[] };
+    } catch {
+      throw badRequest("invalid_picker_document_ids", "Google Picker must select one or more documents");
+    }
+  }
 }
 
 function browserCapabilityToPath(capability: string): string {
