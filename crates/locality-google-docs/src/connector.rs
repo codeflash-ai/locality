@@ -35,6 +35,7 @@ use crate::render::{
 pub struct GoogleDocsConfig {
     pub access_token: String,
     pub workspace_folder_id: Option<RemoteId>,
+    pub document_ids: Vec<String>,
 }
 
 impl std::fmt::Debug for GoogleDocsConfig {
@@ -43,6 +44,7 @@ impl std::fmt::Debug for GoogleDocsConfig {
             .debug_struct("GoogleDocsConfig")
             .field("access_token", &"<redacted>")
             .field("workspace_folder_id", &self.workspace_folder_id)
+            .field("document_ids", &self.document_ids)
             .finish()
     }
 }
@@ -52,11 +54,17 @@ impl GoogleDocsConfig {
         Self {
             access_token: access_token.into(),
             workspace_folder_id: None,
+            document_ids: Vec::new(),
         }
     }
 
     pub fn with_workspace_folder_id(mut self, workspace_folder_id: RemoteId) -> Self {
         self.workspace_folder_id = Some(workspace_folder_id);
+        self
+    }
+
+    pub fn with_document_ids(mut self, document_ids: Vec<String>) -> Self {
+        self.document_ids = document_ids;
         self
     }
 }
@@ -72,6 +80,7 @@ impl std::fmt::Debug for GoogleDocsConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GoogleDocsConnector")
             .field("workspace_folder_id", &self.config.workspace_folder_id)
+            .field("document_ids", &self.config.document_ids)
             .field("access_token", &"<redacted>")
             .finish()
     }

@@ -35,7 +35,7 @@ where
         ));
     }
 
-    google_docs_mount_settings(mount)?;
+    let settings = google_docs_mount_settings(mount)?;
 
     if let Some(connection_id) = &mount.connection_id {
         let connection = store
@@ -46,13 +46,13 @@ where
                 suggested_command: "loc connect google-docs".to_string(),
             })?;
         validate_connection_profile(store, &connection)?;
-        return connector_from_connection(credentials, mount, &connection);
+        return connector_from_connection(credentials, mount, &connection, settings);
     }
 
     let active = active_google_docs_connections(store)?;
     if active.len() == 1 {
         validate_connection_profile(store, &active[0])?;
-        return connector_from_connection(credentials, mount, &active[0]);
+        return connector_from_connection(credentials, mount, &active[0], settings);
     }
 
     let message = if active.is_empty() {
@@ -106,6 +106,7 @@ fn connector_from_connection(
     credentials: &dyn CredentialStore,
     mount: &MountConfig,
     connection: &ConnectionRecord,
+    settings: GoogleDocsMountSettings,
 ) -> Result<GoogleDocsConnector, ConnectorResolveError> {
     if connection.status != "active" {
         return Err(ConnectorResolveError::ConnectionRevoked {
@@ -115,7 +116,8 @@ fn connector_from_connection(
     }
 
     let token = connection_access_token(credentials, connection)?;
-    let mut config = GoogleDocsConfig::new(token);
+    let mut config =
+        GoogleDocsConfig::new(token).with_document_ids(settings.document_ids().to_vec());
     if let Some(remote_root_id) = &mount.remote_root_id {
         config = config.with_workspace_folder_id(remote_root_id.clone());
     }

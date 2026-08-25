@@ -2116,8 +2116,12 @@ fn resolving_google_docs_mount_uses_active_connection_credentials() {
     let source =
         resolve_source_for_mount(&store, &credentials, &mount).expect("resolve google docs");
 
-    assert_eq!(source.kind().0, GOOGLE_DOCS_CONNECTOR_ID);
-    assert!(source.capabilities().supports_oauth);
+    let ResolvedSource::GoogleDocs(connector) = source else {
+        panic!("expected Google Docs source");
+    };
+    assert_eq!(connector.kind().0, GOOGLE_DOCS_CONNECTOR_ID);
+    assert_eq!(connector.config().document_ids, ["doc-a"]);
+    assert!(connector.capabilities().supports_oauth);
 }
 
 #[test]
