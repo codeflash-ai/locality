@@ -949,86 +949,12 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>, f
   return invoke<T>(command, args);
 }
 
-type GoogleDocsPickerConfiguration = {
-  developerKey: string;
-  projectNumber: string;
-  accessToken: string;
-};
-
-declare global {
-  interface Window {
-    gapi?: { load: (name: string, callback: () => void) => void; };
-    google?: { picker: any; };
-  }
-}
-
-let googlePickerLoad: Promise<void> | null = null;
-
-export function googleDocsPickerOptions() {
-  return {
-    mimeTypes: "application/vnd.google-apps.document",
-    multiSelect: true,
-  };
-}
-
-export function loadGooglePicker(): Promise<void> {
-  if (window.google?.picker) return Promise.resolve();
-  if (googlePickerLoad) return googlePickerLoad;
-  googlePickerLoad = new Promise((resolve, reject) => {
-    const fail = (message: string) => {
-      googlePickerLoad = null;
-      reject(new Error(message));
-    };
-    const script = document.createElement("script");
-    script.src = "https://apis.google.com/js/api.js";
-    script.async = true;
-    script.onerror = () => fail("Could not load Google Picker. Check your network connection and try again.");
-    script.onload = () => {
-      if (!window.gapi) {
-        fail("Google Picker did not load correctly. Check your network connection and try again.");
-        return;
-      }
-      try {
-        window.gapi.load("picker", resolve);
-      } catch {
-        fail("Google Picker did not load correctly. Check your network connection and try again.");
-      }
-    };
-    document.head.appendChild(script);
-  });
-  return googlePickerLoad;
+export function googleDocsPickerCommand() {
+  return "choose_google_docs_in_browser";
 }
 
 async function chooseGoogleDocs(): Promise<string[]> {
-  const configuration = await callCommand<GoogleDocsPickerConfiguration>("google_docs_picker_configuration");
-  const options = googleDocsPickerOptions();
-  await loadGooglePicker();
-  return new Promise((resolve, reject) => {
-    const picker = window.google?.picker;
-    if (!picker) {
-      reject(new Error("Google Picker did not load. Check your network connection and try again."));
-      return;
-    }
-    const view = new picker.DocsView(picker.ViewId.DOCUMENTS)
-      .setIncludeFolders(false)
-      .setSelectFolderEnabled(false)
-      .setMimeTypes(options.mimeTypes);
-    const dialog = new picker.PickerBuilder()
-      .setDeveloperKey(configuration.developerKey)
-      .setOAuthToken(configuration.accessToken)
-      .setAppId(configuration.projectNumber)
-      .addView(view)
-      .enableFeature(options.multiSelect ? picker.Feature.MULTISELECT_ENABLED : undefined)
-      .setCallback((data: any) => {
-        if (data.action === picker.Action.PICKED) {
-          resolve(data.docs.map((document: any) => document.id));
-        } else if (data.action === picker.Action.CANCEL) {
-          resolve([]);
-        }
-      })
-      .build();
-    dialog.setVisible(true);
-  });
+  return callCommand<string[]>(googleDocsPickerCommand());
 }
 
 function errorMessage(error: unknown) {

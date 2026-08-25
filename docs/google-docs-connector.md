@@ -22,8 +22,12 @@ Drive metadata scope, and it makes no Drive metadata API calls.
 In Desktop, create or reconfigure a Google Docs mount with the Google Picker.
 The Picker allows multi-selection and accepts only native Google Docs. Locality
 persists the selected document IDs; it never persists or discovers a Drive
-folder. Official Locality desktop packages include the Picker configuration for
-the Locality Google Cloud project. Development builds can override it before
+folder. Desktop opens Picker in the default browser because Google Picker
+requires an HTTP(S) origin and packaged desktop windows use a custom origin.
+The browser page is a short-lived, token-bound loopback session; it returns the
+selection automatically to Locality and never persists the OAuth token.
+Official Locality desktop packages include the Picker configuration for the
+Locality Google Cloud project. Development builds can override it before
 starting Locality:
 
 ```bash
