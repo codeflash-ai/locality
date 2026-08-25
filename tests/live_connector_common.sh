@@ -850,7 +850,7 @@ connector_auth_kind() {
 connector_scopes_json() {
   case "$1" in
     google-docs)
-      printf '%s\n' '["openid","email","profile","https://www.googleapis.com/auth/documents","https://www.googleapis.com/auth/drive.file","https://www.googleapis.com/auth/drive.metadata"]'
+      printf '%s\n' '["openid","email","profile","https://www.googleapis.com/auth/documents","https://www.googleapis.com/auth/drive.file"]'
       ;;
     google-calendar)
       printf '%s\n' '["openid","email","profile","https://www.googleapis.com/auth/calendar.events"]'

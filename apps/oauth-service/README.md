@@ -102,8 +102,7 @@ Request:
 
 The broker requests `openid`, `email`, `profile`,
 `https://www.googleapis.com/auth/documents`,
-`https://www.googleapis.com/auth/drive.file`, and
-`https://www.googleapis.com/auth/drive.metadata.readonly`.
+and `https://www.googleapis.com/auth/drive.file`.
 
 Response:
 

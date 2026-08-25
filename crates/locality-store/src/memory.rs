@@ -1601,6 +1601,29 @@ impl JournalRepository for InMemoryStateStore {
         Ok(())
     }
 
+    fn record_journal_apply_effects_and_update_mount_settings(
+        &mut self,
+        push_id: &PushId,
+        effects: Vec<JournalApplyEffect>,
+        settings_json: Option<String>,
+    ) -> StoreResult<()> {
+        let mount_id = self
+            .journals
+            .get(&push_id.0)
+            .ok_or_else(|| StoreError::JournalMissing(push_id.clone()))?
+            .mount_id
+            .clone();
+        self.record_journal_apply_effects(push_id, effects)?;
+        if let Some(settings_json) = settings_json {
+            let mount = self
+                .mounts
+                .get_mut(&mount_id)
+                .ok_or_else(|| StoreError::MountMissing(mount_id.clone()))?;
+            mount.settings_json = settings_json;
+        }
+        Ok(())
+    }
+
     fn update_journal_status(
         &mut self,
         push_id: &PushId,

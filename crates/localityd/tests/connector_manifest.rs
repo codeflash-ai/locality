@@ -13,7 +13,7 @@ use locality_connector::manifest::{
     AuthKind, BodyDiffMode as ManifestBodyDiffMode, ManifestEntityKind,
     VirtualRenamePolicy as ManifestRenamePolicy, bundled_connector_registry,
 };
-use locality_core::model::{EntityKind, MountId, RemoteId};
+use locality_core::model::{EntityKind, MountId};
 use locality_core::push::BodyDiffMode;
 use locality_gmail::{GMAIL_OAUTH_SCOPES, GmailConfig, GmailConnector, GmailMountSettings};
 use locality_google_calendar::{
@@ -46,7 +46,7 @@ fn runtime_connectors() -> Vec<(&'static str, Box<dyn Connector>)> {
             "google-docs",
             Box::new(GoogleDocsConnector::new(
                 GoogleDocsConfig::new("google-docs-secret-sentinel")
-                    .with_workspace_folder_id(RemoteId::new("folder")),
+                    .with_document_ids(vec!["selected-doc".to_string()]),
             )),
         ),
         (
@@ -249,9 +249,9 @@ fn source_descriptors_match_manifest_defaults_and_projection_policy() {
 #[test]
 fn google_docs_oauth_verification_scope_manifest_matches_runtime_profile() {
     assert!(
-        GOOGLE_DOCS_OAUTH_SCOPES
+        !GOOGLE_DOCS_OAUTH_SCOPES
             .contains(&"https://www.googleapis.com/auth/drive.metadata.readonly"),
-        "Google Docs should request readonly Drive metadata for discovery"
+        "Google Docs must not request readonly Drive metadata"
     );
     assert!(
         !GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive.metadata"),
@@ -306,6 +306,7 @@ fn google_docs_oauth_verification_scope_manifest_matches_runtime_profile() {
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/drive.readonly",
         "https://www.googleapis.com/auth/drive.metadata",
+        "https://www.googleapis.com/auth/drive.metadata.readonly",
         "https://www.googleapis.com/auth/documents.readonly",
     ] {
         assert!(

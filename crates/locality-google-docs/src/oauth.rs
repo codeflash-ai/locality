@@ -290,7 +290,6 @@ mod tests {
                 "profile",
                 "https://www.googleapis.com/auth/documents",
                 "https://www.googleapis.com/auth/drive.file",
-                "https://www.googleapis.com/auth/drive.metadata.readonly",
             ]
         );
     }
@@ -304,25 +303,23 @@ mod tests {
 
         validate_google_docs_oauth_scopes(&scopes).expect("valid Google Docs scopes");
 
-        let missing_drive_metadata = GOOGLE_DOCS_OAUTH_SCOPES
-            .iter()
-            .filter(|scope| **scope != "https://www.googleapis.com/auth/drive.metadata.readonly")
-            .map(|scope| scope.to_string())
-            .collect::<Vec<_>>();
+        let mut unsupported_drive_metadata = scopes;
+        unsupported_drive_metadata
+            .push("https://www.googleapis.com/auth/drive.metadata.readonly".to_string());
 
-        let error = validate_google_docs_oauth_scopes(&missing_drive_metadata)
-            .expect_err("missing drive.metadata.readonly scope");
+        let error = validate_google_docs_oauth_scopes(&unsupported_drive_metadata)
+            .expect_err("drive.metadata.readonly is not an allowed Google Docs scope");
 
         assert_eq!(
             error,
-            GoogleDocsOAuthScopeError::MissingRequiredScope(
-                "https://www.googleapis.com/auth/drive.metadata.readonly"
+            GoogleDocsOAuthScopeError::UnsupportedScope(
+                "https://www.googleapis.com/auth/drive.metadata.readonly".to_string()
             )
         );
         assert!(
             error
                 .to_string()
-                .contains("missing required Google Docs OAuth scope")
+                .contains("unsupported Google Docs OAuth scope")
         );
     }
 

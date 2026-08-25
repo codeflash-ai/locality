@@ -4,7 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -82,7 +83,8 @@ use locality_google_calendar::{
 };
 use locality_google_docs::{
     DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL, DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI,
-    GOOGLE_DOCS_CONNECTOR_ID, HttpGoogleDocsOAuthBrokerClient,
+    GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsMountSettings, HttpGoogleDocsOAuthBrokerClient,
+    StoredGoogleDocsCredential,
 };
 #[cfg(test)]
 use locality_notion::NotionConfig;
@@ -139,7 +141,6 @@ use localityd::durable_fs::{
     remove_dir_all_durable_if_identity_windows, remove_empty_dir_durable_if_identity_windows,
 };
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
-use localityd::google_docs::resolve_google_docs_connector_for_mount;
 use localityd::hydration::HydrationSource;
 use localityd::ipc::{
     DaemonBuildInfo, DaemonDebugQueueStatus, DaemonRequest, DaemonStatusReport, send_request,
@@ -487,7 +488,31 @@ struct CreateDesktopMountRequest {
     connection_id: Option<String>,
     read_only: bool,
     notion_root_page: Option<String>,
-    google_docs_workspace_folder: Option<String>,
+    google_docs_document_ids: Option<Vec<String>>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconfigureGoogleDocsMountRequest {
+    mount_id: String,
+    document_ids: Vec<String>,
+}
+
+/// This response intentionally exists only at the Tauri command boundary. It is never added to
+/// the desktop snapshot or persisted: Google Picker needs the current OAuth access token, but the
+/// token remains owned by the credential store.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleDocsPickerConfiguration {
+    developer_key: String,
+    project_number: String,
+    access_token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleDocsPickerSubmission {
+    document_ids: Vec<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1451,7 +1476,7 @@ async fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
             connection_id: None,
             read_only: false,
             notion_root_page: None,
-            google_docs_workspace_folder: None,
+            google_docs_document_ids: None,
         },
     )
     .await
@@ -1510,6 +1535,301 @@ fn portable_workspace_options_at_state_root(
 #[tauri::command]
 async fn create_desktop_mount(app: AppHandle, request: CreateDesktopMountRequest) -> ActionReport {
     create_desktop_mount_command(app, request).await
+}
+
+#[tauri::command]
+async fn google_docs_picker_configuration() -> Result<GoogleDocsPickerConfiguration, String> {
+    tauri::async_runtime::spawn_blocking(google_docs_picker_configuration_blocking)
+        .await
+        .map_err(|error| format!("Google Picker configuration worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn choose_google_docs_in_browser() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(choose_google_docs_in_browser_blocking)
+        .await
+        .map_err(|error| format!("Google Picker worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn reconfigure_google_docs_mount(request: ReconfigureGoogleDocsMountRequest) -> ActionReport {
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let state_root = default_state_root();
+        let mut store = SqliteStateStore::open(state_root.clone())
+            .map_err(|error| format!("Could not open Locality state: {error}"))?;
+        let mut mount = store
+            .get_mount(&MountId::new(request.mount_id.trim()))
+            .map_err(|error| format!("Could not inspect Google Docs mount: {error}"))?
+            .filter(|mount| mount.connector == GOOGLE_DOCS_CONNECTOR_ID)
+            .ok_or_else(|| {
+                "Create a Google Docs mount before changing its selection.".to_string()
+            })?;
+        mount.remote_root_id = None;
+        mount.settings_json = google_docs_picker_settings_json(&request.document_ids)?;
+        store
+            .save_mount(mount)
+            .map_err(|error| format!("Could not save Google Docs selection: {error}"))?;
+        ensure_daemon_running(&state_root)?;
+        reload_daemon_mounts(&state_root)?;
+        Ok::<_, String>("Updated the selected Google Docs.".to_string())
+    })
+    .await
+    .map_err(|error| format!("Google Docs selection worker failed: {error}"))
+    .and_then(|result| result)
+    .map(|message| ActionReport { ok: true, message })
+    .unwrap_or_else(|message| ActionReport { ok: false, message });
+    report
+}
+
+fn google_docs_picker_configuration_blocking() -> Result<GoogleDocsPickerConfiguration, String> {
+    let (developer_key, project_number) = google_docs_picker_configuration_values(
+        env::var("LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY")
+            .ok()
+            .as_deref(),
+        env::var("LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER")
+            .ok()
+            .as_deref(),
+    )?;
+    let state_root = default_state_root();
+    let store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let connection_id = preferred_connection_id_for_connector(&store, GOOGLE_DOCS_CONNECTOR_ID)?
+        .ok_or_else(|| "Connect a Google Docs account before choosing documents.".to_string())?;
+    let connection = store
+        .get_connection(&connection_id)
+        .map_err(|error| format!("Could not load Google Docs connection: {error}"))?
+        .filter(|connection| connection.status == "active")
+        .ok_or_else(|| "Reconnect Google Docs before choosing documents.".to_string())?;
+    if connection.auth_kind != "oauth" {
+        return Err(
+            "Google Picker requires a Google Docs OAuth connection. Reconnect Google Docs."
+                .to_string(),
+        );
+    }
+    let secret = open_credential_store(&state_root)
+        .get(&connection.secret_ref)
+        .map_err(|error| format!("Could not read Google Docs credential: {error}"))?;
+    let credential = serde_json::from_str::<StoredGoogleDocsCredential>(&secret)
+        .map_err(|error| format!("Could not read Google Docs OAuth credential: {error}"))?;
+    if credential
+        .oauth_client_id
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(
+            "Google Picker needs the OAuth client ID. Reconnect Google Docs and try again."
+                .to_string(),
+        );
+    }
+    if credential.access_token.trim().is_empty() {
+        return Err(
+            "Google Docs access has expired. Reconnect Google Docs and try again.".to_string(),
+        );
+    }
+    Ok(GoogleDocsPickerConfiguration {
+        developer_key,
+        project_number,
+        access_token: credential.access_token,
+    })
+}
+
+fn choose_google_docs_in_browser_blocking() -> Result<Vec<String>, String> {
+    let configuration = google_docs_picker_configuration_blocking()?;
+    let token = google_docs_picker_session_token()?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|error| format!("Could not start the local Google Picker page: {error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("Could not prepare the local Google Picker page: {error}"))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("Could not read the local Google Picker address: {error}"))?;
+    let picker_url = format!("http://{address}/google-docs-picker/{token}");
+    open_url_in_browser(&picker_url)?;
+    let deadline = Instant::now() + Duration::from_secs(10 * 60);
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                if let Some(document_ids) =
+                    google_docs_picker_handle_request(&mut stream, &token, &configuration)?
+                {
+                    return Ok(document_ids);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(25))
+            }
+            Err(error) => return Err(format!("Google Picker local page failed: {error}")),
+        }
+    }
+    Err("Google Picker timed out. Return to Locality and try choosing documents again.".to_string())
+}
+
+fn google_docs_picker_session_token() -> Result<String, String> {
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random)
+        .map_err(|error| format!("Could not create a secure Google Picker session: {error}"))?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn google_docs_picker_handle_request(
+    stream: &mut TcpStream,
+    token: &str,
+    configuration: &GoogleDocsPickerConfiguration,
+) -> Result<Option<Vec<String>>, String> {
+    let request = google_docs_picker_read_request(stream)?;
+    let page_path = format!("/google-docs-picker/{token}");
+    let selection_path = format!("{page_path}/selection");
+    match (request.method.as_str(), request.path.as_str()) {
+        ("GET", path) if path == page_path => {
+            google_docs_picker_write_response(
+                stream,
+                "200 OK",
+                &google_docs_picker_page(token, configuration),
+            )?;
+            Ok(None)
+        }
+        ("POST", path) if path == selection_path => {
+            let document_ids = google_docs_picker_submission(token, token, &request.body)?;
+            google_docs_picker_write_response(
+                stream,
+                "200 OK",
+                "<!doctype html><title>Google Docs selected</title><p>Selected documents were sent to Locality. You can close this tab.</p>",
+            )?;
+            Ok(Some(document_ids))
+        }
+        _ => {
+            google_docs_picker_write_response(stream, "404 Not Found", "Not found")?;
+            Ok(None)
+        }
+    }
+}
+
+struct GoogleDocsPickerHttpRequest {
+    method: String,
+    path: String,
+    body: String,
+}
+
+fn google_docs_picker_read_request(
+    stream: &mut TcpStream,
+) -> Result<GoogleDocsPickerHttpRequest, String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| format!("Could not read Google Picker request: {error}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .map_err(|error| format!("Could not read Google Picker request: {error}"))?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let path = parts.next().unwrap_or_default().to_string();
+    if method.is_empty() || path.is_empty() {
+        return Err("Google Picker local page received an invalid request.".to_string());
+    }
+    let mut content_length = 0_usize;
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|error| format!("Could not read Google Picker request: {error}"))?;
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        if let Some(length) = google_docs_picker_content_length(&line)? {
+            content_length = length;
+        }
+    }
+    if content_length > 16 * 1024 {
+        return Err("Google Picker local page received an oversized request.".to_string());
+    }
+    let mut body = vec![0_u8; content_length];
+    reader
+        .read_exact(&mut body)
+        .map_err(|error| format!("Could not read Google Picker selection: {error}"))?;
+    String::from_utf8(body)
+        .map(|body| GoogleDocsPickerHttpRequest { method, path, body })
+        .map_err(|_| "Google Picker local page sent invalid text.".to_string())
+}
+
+fn google_docs_picker_content_length(line: &str) -> Result<Option<usize>, String> {
+    let Some((name, value)) = line.split_once(':') else {
+        return Ok(None);
+    };
+    if !name.trim().eq_ignore_ascii_case("content-length") {
+        return Ok(None);
+    }
+    value
+        .trim()
+        .parse()
+        .map(Some)
+        .map_err(|_| "Google Picker local page received an invalid content length.".to_string())
+}
+
+fn google_docs_picker_write_response(
+    stream: &mut TcpStream,
+    status: &str,
+    body: &str,
+) -> Result<(), String> {
+    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len()).map_err(|error| format!("Could not respond to Google Picker: {error}"))
+}
+
+fn google_docs_picker_submission(
+    expected_token: &str,
+    submitted_token: &str,
+    body: &str,
+) -> Result<Vec<String>, String> {
+    if submitted_token != expected_token {
+        return Err(
+            "Google Picker session did not match Locality. Try choosing documents again."
+                .to_string(),
+        );
+    }
+    let submission: GoogleDocsPickerSubmission = serde_json::from_str(body)
+        .map_err(|_| "Google Picker sent an invalid document selection.".to_string())?;
+    if submission.document_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    GoogleDocsMountSettings::from_document_ids(&submission.document_ids)
+        .map(|settings| settings.document_ids().to_vec())
+        .map_err(|error| format!("Google Picker sent an invalid document selection: {error}"))
+}
+
+fn google_docs_picker_page(token: &str, configuration: &GoogleDocsPickerConfiguration) -> String {
+    let configuration = serde_json::to_string(configuration)
+        .expect("Google Picker configuration serializes")
+        .replace('<', "\\u003c");
+    format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"><title>Choose Google Docs</title><script src="https://apis.google.com/js/api.js"></script></head><body><p id="status">Loading Google Picker…</p><script>const configuration={configuration};const selectionUrl='/google-docs-picker/{token}/selection';function submit(documentIds){{fetch(selectionUrl,{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{documentIds}})}}).then(()=>document.getElementById('status').textContent='Selection sent to Locality. You can close this tab.').catch(()=>document.getElementById('status').textContent='Could not send the selection to Locality.');}}gapi.load('picker',()=>{{const p=google.picker;const view=new p.DocsView(p.ViewId.DOCUMENTS).setIncludeFolders(false).setSelectFolderEnabled(false).setMimeTypes('application/vnd.google-apps.document');new p.PickerBuilder().setDeveloperKey(configuration.developerKey).setOAuthToken(configuration.accessToken).setAppId(configuration.projectNumber).setOrigin(window.location.origin).addView(view).enableFeature(p.Feature.MULTISELECT_ENABLED).setCallback(data=>{{const action=data[p.Response.ACTION];if(action===p.Action.PICKED)submit((data[p.Response.DOCUMENTS]||[]).map(doc=>doc.id));if(action===p.Action.CANCEL)submit([]);}}).build().setVisible(true);}});</script></body></html>"#
+    )
+}
+
+fn google_docs_picker_configuration_values(
+    developer_key_override: Option<&str>,
+    project_number_override: Option<&str>,
+) -> Result<(String, String), String> {
+    let developer_key = developer_key_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(env!("LOCALITY_BUNDLED_GOOGLE_PICKER_DEVELOPER_KEY"))
+        .to_string();
+    let project_number = project_number_override
+        .map(google_docs_picker_project_number)
+        .transpose()?
+        .unwrap_or_else(|| {
+            google_docs_picker_project_number(env!("LOCALITY_BUNDLED_GOOGLE_PICKER_PROJECT_NUMBER"))
+                .expect("bundled Google Picker project number must be numeric")
+        });
+    Ok((developer_key, project_number))
+}
+
+fn google_docs_picker_project_number(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("Google Picker project configuration is invalid. Set LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER to the numeric Google Cloud project number and restart Locality.".to_string());
+    }
+    Ok(value.to_string())
 }
 
 #[tauri::command]
@@ -1587,7 +1907,7 @@ fn connect_granola_blocking(api_key: String) -> Result<String, String> {
         connection_id: Some(report.connection_id),
         read_only: !desktop_mount_is_editable_by_default("granola"),
         notion_root_page: None,
-        google_docs_workspace_folder: None,
+        google_docs_document_ids: None,
     })
 }
 
@@ -1638,7 +1958,7 @@ fn connect_linear_blocking(api_key: String) -> Result<String, String> {
         connection_id: Some(report.connection_id),
         read_only: !desktop_mount_is_editable_by_default("linear"),
         notion_root_page: None,
-        google_docs_workspace_folder: None,
+        google_docs_document_ids: None,
     })
 }
 
@@ -2299,7 +2619,7 @@ fn run_workspace_mount_onboarding_blocking(
         connection_id: None,
         read_only: false,
         notion_root_page: None,
-        google_docs_workspace_folder: None,
+        google_docs_document_ids: None,
     }) {
         Ok(message) => workspace_mount_onboarding_report(
             MacosWorkspaceMountOnboardingState::Created,
@@ -5814,11 +6134,7 @@ fn notion_access_scope_label(store: Option<&SqliteStateStore>, mount: &MountConf
 fn mount_access_scope_label(store: Option<&SqliteStateStore>, mount: &MountConfig) -> String {
     match mount.connector.as_str() {
         "notion" => notion_access_scope_label(store, mount),
-        "google-docs" => mount
-            .remote_root_id
-            .as_ref()
-            .map(|remote_id| format!("Drive folder {}", remote_id.0))
-            .unwrap_or_else(|| "Google Docs workspace folder".to_string()),
+        "google-docs" => "Selected Google Docs".to_string(),
         GOOGLE_CALENDAR_CONNECTOR_ID => mount
             .remote_root_id
             .as_ref()
@@ -7366,6 +7682,20 @@ fn open_in_file_manager(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn open_url_in_browser(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = Command::new("explorer");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = Command::new("xdg-open");
+    command
+        .arg(url)
+        .spawn()
+        .map_err(|error| format!("Could not open Google Picker in your browser: {error}"))?;
+    Ok(())
+}
+
 fn schedule_relaunch_after_process_exit(pid: u32, executable: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -7838,40 +8168,18 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| RemoteId::new(value.to_string())),
-        "google-docs" => {
-            let workspace = request
-                .google_docs_workspace_folder
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    "Google Docs mounts need a workspace folder name or ID.".to_string()
-                })?;
-            let temp_mount = MountConfig {
-                mount_id: mount_id.clone(),
-                connector: connector.clone(),
-                root: root.clone(),
-                remote_root_id: None,
-                connection_id: connection_id.clone(),
-                read_only,
-                projection: projection.clone(),
-                settings_json: "{}".to_string(),
-            };
-            let credentials = open_credential_store(&state_root);
-            let connector =
-                resolve_google_docs_connector_for_mount(&store, credentials.as_ref(), &temp_mount)
-                    .map_err(|error| error.message())?;
-            let folder_id = connector
-                .resolve_workspace_folder(workspace)
-                .map_err(|error| {
-                    format!("Failed to resolve Google Docs workspace folder `{workspace}`: {error}")
-                })?;
-            Some(folder_id)
-        }
+        "google-docs" => None,
         GOOGLE_CALENDAR_CONNECTOR_ID | "gmail" | "granola" | "linear" | SLACK_CONNECTOR_ID => None,
         _ => unreachable!("unsupported desktop connector should be rejected before mount setup"),
     };
-    let settings_json = if connector == SLACK_CONNECTOR_ID {
+    let settings_json = if connector == "google-docs" {
+        google_docs_picker_settings_json(
+            request
+                .google_docs_document_ids
+                .as_deref()
+                .unwrap_or_default(),
+        )?
+    } else if connector == SLACK_CONNECTOR_ID {
         SlackMountSettings::default()
             .to_json()
             .map_err(|error| format!("Could not encode Slack mount settings: {error}"))?
@@ -7900,6 +8208,12 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
     reload_daemon_mounts(&state_root)?;
 
     finish_desktop_mount_setup(&store, &state_root, mount_report, preserved)
+}
+
+fn google_docs_picker_settings_json(document_ids: &[String]) -> Result<String, String> {
+    GoogleDocsMountSettings::from_document_ids(document_ids.iter().map(String::as_str))
+        .and_then(|settings| settings.to_json())
+        .map_err(|error| format!("Choose one or more Google Docs documents: {error}"))
 }
 
 struct RemountInProgressGuard;
@@ -10949,7 +11263,7 @@ fn connect_google_docs_with_broker(
         _ => "Connected Google Docs.".to_string(),
     };
     Ok(format!(
-        "{connected_message} Create a Google Docs source folder to mount a Drive workspace."
+        "{connected_message} Choose Google Docs to mount selected documents."
     ))
 }
 
@@ -14644,7 +14958,12 @@ mod tests {
             temp.path().join("google-docs"),
         )
         .with_connection_id(google_connection.connection_id.clone())
-        .with_remote_root_id(RemoteId::new("drive-folder-1"))
+        .with_settings_json(
+            super::GoogleDocsMountSettings::from_document_ids(["doc-1"])
+                .expect("Google Docs settings")
+                .to_json()
+                .expect("Google Docs settings json"),
+        )
         .projection(ProjectionMode::LinuxFuse);
 
         store
@@ -15105,7 +15424,7 @@ mod tests {
             connection_id: None,
             read_only: false,
             notion_root_page: Some("should-not-be-used".to_string()),
-            google_docs_workspace_folder: Some("should-not-be-used".to_string()),
+            google_docs_document_ids: Some(vec!["should-not-be-used".to_string()]),
         });
 
         if let Err(error) = &result {
@@ -15136,6 +15455,100 @@ mod tests {
                 .to_json()
                 .expect("serialize default Slack settings")
         );
+    }
+
+    #[test]
+    fn google_docs_picker_selection_is_encoded_without_a_remote_root() {
+        let settings_json = super::google_docs_picker_settings_json(&[
+            "doc-b".to_string(),
+            "doc-a".to_string(),
+            "doc-b".to_string(),
+        ])
+        .expect("encode selected Google Docs");
+
+        assert_eq!(
+            settings_json,
+            r#"{"google_docs":{"version":2,"document_ids":["doc-a","doc-b"]}}"#
+        );
+    }
+
+    #[test]
+    fn google_docs_picker_project_number_requires_digits() {
+        assert_eq!(
+            super::google_docs_picker_project_number("123456789").unwrap(),
+            "123456789"
+        );
+        assert!(
+            super::google_docs_picker_project_number("client.apps.googleusercontent.com").is_err()
+        );
+        assert!(super::google_docs_picker_project_number("").is_err());
+    }
+
+    #[test]
+    fn google_docs_picker_uses_bundled_configuration_without_overrides() {
+        let (developer_key, project_number) =
+            super::google_docs_picker_configuration_values(None, None).unwrap();
+
+        assert!(developer_key.starts_with("AIza"));
+        assert!(project_number.bytes().all(|byte| byte.is_ascii_digit()));
+    }
+
+    #[test]
+    fn google_docs_picker_submission_rejects_a_wrong_session_token() {
+        assert!(
+            super::google_docs_picker_submission(
+                "expected-session",
+                "wrong-session",
+                r#"{\"documentIds\":[\"doc-1\"]}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn google_docs_picker_accepts_lowercase_content_length_headers() {
+        assert_eq!(
+            super::google_docs_picker_content_length("content-length: 17").unwrap(),
+            Some(17)
+        );
+    }
+
+    #[test]
+    fn google_docs_picker_submission_allows_cancel_without_documents() {
+        assert_eq!(
+            super::google_docs_picker_submission("session", "session", r#"{"documentIds":[]}"#)
+                .unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn google_docs_picker_page_loads_the_google_api_script() {
+        let page = super::google_docs_picker_page(
+            "session",
+            &super::GoogleDocsPickerConfiguration {
+                developer_key: "picker-key".to_string(),
+                project_number: "123456789".to_string(),
+                access_token: "access-token".to_string(),
+            },
+        );
+
+        assert!(page.contains(r#"<script src="https://apis.google.com/js/api.js"></script>"#));
+    }
+
+    #[test]
+    fn google_docs_picker_page_uses_documented_picker_response_fields() {
+        let page = super::google_docs_picker_page(
+            "session",
+            &super::GoogleDocsPickerConfiguration {
+                developer_key: "picker-key".to_string(),
+                project_number: "123456789".to_string(),
+                access_token: "access-token".to_string(),
+            },
+        );
+
+        assert!(page.contains("data[p.Response.ACTION]"));
+        assert!(page.contains("data[p.Response.DOCUMENTS]"));
     }
 
     #[test]
@@ -22201,6 +22614,9 @@ fn main() {
             create_workspace_mount,
             materialize_portable_workspace,
             create_desktop_mount,
+            google_docs_picker_configuration,
+            choose_google_docs_in_browser,
+            reconfigure_google_docs_mount,
             connect_granola,
             connect_linear,
             reset_source_state,
