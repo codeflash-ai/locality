@@ -73,7 +73,10 @@ fn google_docs_descriptor_comes_from_registry() {
     );
     assert!(descriptor.mount_guidance().contains("selected Google Docs"));
     assert!(!descriptor.mount_guidance().contains("workspace folder"));
-    assert_eq!(descriptor.source_root_create_parent_kind(), None);
+    assert_eq!(
+        descriptor.source_root_create_parent_kind(),
+        Some(EntityKind::Directory)
+    );
     assert!(descriptor.create_entity_parent_kinds().is_empty());
     assert!(descriptor.move_entity_parent_kinds().is_empty());
     assert!(!descriptor.supports_archive_entity());
