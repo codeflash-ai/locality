@@ -4962,7 +4962,7 @@ fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex
         kind,
         read_only,
         mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
-        can_rename: can_mutate,
+        can_rename: can_mutate && mount.connector != "google-docs",
         can_delete,
         entity_kind: Some(entity.kind.clone()),
         remote_id: Some(entity.remote_id.0.clone()),
@@ -5053,7 +5053,7 @@ fn pending_page_child_dir_item(
         kind: VirtualFsItemKind::Folder,
         read_only: item_folder_read_only(mount, &path, Some(&entity_kind)),
         mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
-        can_rename: can_mutate,
+        can_rename: can_mutate && mount.connector != "google-docs",
         can_delete: can_mutate,
         entity_kind: Some(entity_kind),
         remote_id: None,
@@ -5547,7 +5547,7 @@ fn page_child_dir_item(
         kind: VirtualFsItemKind::Folder,
         read_only: item_folder_read_only(mount, path, Some(&EntityKind::Page)),
         mutation_permissions_version: VIRTUAL_FS_ITEM_MUTATION_PERMISSIONS_VERSION,
-        can_rename: can_mutate,
+        can_rename: can_mutate && mount.connector != "google-docs",
         can_delete,
         entity_kind: None,
         remote_id: Some(remote_id.0.clone()),
@@ -6656,15 +6656,6 @@ mod tests {
         google_store
             .save_entity(EntityRecord::new(
                 google_mount_id.clone(),
-                RemoteId::new("folder-1"),
-                EntityKind::Directory,
-                "Folder",
-                "Folder",
-            ))
-            .expect("save google docs folder");
-        google_store
-            .save_entity(EntityRecord::new(
-                google_mount_id.clone(),
                 RemoteId::new("doc-1"),
                 EntityKind::Page,
                 "Doc",
@@ -6672,12 +6663,6 @@ mod tests {
             ))
             .expect("save google docs page");
 
-        assert!(
-            !virtual_fs_item(&google_store, &google_mount_id, "folder-1")
-                .expect("google docs folder item")
-                .item
-                .read_only
-        );
         let google_root_children =
             virtual_fs_children(&google_store, &google_mount_id, "mount:google-docs-main")
                 .expect("google docs mount point children");
@@ -6687,8 +6672,8 @@ mod tests {
             .find(|child| child.identifier == "children:doc-1")
             .expect("google docs page folder");
         assert!(google_page_folder.read_only);
-        assert!(google_page_folder.can_rename);
-        assert!(google_page_folder.can_delete);
+        assert!(!google_page_folder.can_rename);
+        assert!(!google_page_folder.can_delete);
     }
 
     #[test]
@@ -6957,7 +6942,7 @@ mod tests {
     }
 
     #[test]
-    fn google_docs_directory_accepts_virtual_move_destination_parent() {
+    fn google_docs_rejects_virtual_move_destination_parent() {
         let mount_id = MountId::new("google-docs-main");
         let state_root = temp_root("loc-google-docs-directory-move");
         let content_root = state_root.join("content/google-docs-main/files");
@@ -7002,7 +6987,7 @@ mod tests {
             )
             .expect("save moving doc shadow");
 
-        let moved = rename_virtual_fs_item(
+        let error = rename_virtual_fs_item(
             &mut store,
             &content_root,
             &mount_id,
@@ -7010,23 +6995,15 @@ mod tests {
             "folder-parent",
             "Moved.md",
         )
-        .expect("google docs directory accepts moves");
-
-        assert_eq!(moved.path, "Folder/Moved.md");
+        .expect_err("Docs-only mounts reject moves into folders");
+        assert!(matches!(error, LocalityError::Unsupported(_)));
         let entity = store
             .get_entity(&mount_id, &RemoteId::new("doc-moving"))
             .expect("load entity")
             .expect("entity");
-        assert_eq!(entity.path, PathBuf::from("Folder/Moved.md"));
-        assert_eq!(entity.hydration, HydrationState::Dirty);
-        let mutation = store
-            .get_virtual_mutation(&mount_id, "move:doc-moving")
-            .expect("load move mutation")
-            .expect("move mutation");
-        assert_eq!(
-            mutation.parent_remote_id.as_ref().map(RemoteId::as_str),
-            Some("folder-parent")
-        );
+        assert_eq!(entity.path, PathBuf::from("Moving/page.md"));
+        assert_eq!(entity.hydration, HydrationState::Hydrated);
+        assert!(store.list_virtual_mutations(&mount_id).expect("list mutations").is_empty());
 
         let _ = std::fs::remove_dir_all(state_root);
     }
@@ -9368,7 +9345,7 @@ mod tests {
     }
 
     #[test]
-    fn create_directory_under_google_docs_source_root_uses_workspace_folder_parent() {
+    fn create_directory_under_google_docs_source_root_is_rejected() {
         let mount_id = MountId::new("google-docs-main");
         let state_root = temp_root("loc-virtual-fs-google-docs-root-create-dir");
         let content_root = state_root.join("content/google-docs-main/files");
@@ -9376,37 +9353,20 @@ mod tests {
         store
             .save_mount(
                 MountConfig::new(mount_id.clone(), "google-docs", "/tmp/loc/google-docs")
-                    .with_remote_root_id(RemoteId::new("workspace-folder"))
                     .projection(ProjectionMode::LinuxFuse),
             )
             .expect("save mount");
 
-        let created = create_virtual_fs_directory(
+        let error = create_virtual_fs_directory(
             &mut store,
             &content_root,
             &mount_id,
             "mount:google-docs-main",
             "Scratch Hydration",
         )
-        .expect("create google docs directory under mount point root");
-
-        assert!(created.identifier.starts_with("children:local:"));
-        assert_eq!(created.item.filename, "Scratch Hydration");
-        assert_eq!(created.item.path, "Scratch Hydration");
-        assert_eq!(
-            std::fs::read(content_root.join("Scratch Hydration/page.md"))
-                .expect("read pending page cache"),
-            b""
-        );
-        let mutation = store
-            .list_virtual_mutations(&mount_id)
-            .expect("list mutations")
-            .pop()
-            .expect("pending create");
-        assert_eq!(
-            mutation.parent_remote_id.as_ref().map(|id| id.as_str()),
-            Some("workspace-folder")
-        );
+        .expect_err("Docs-only mounts do not support folders");
+        assert!(matches!(error, LocalityError::Unsupported(_)));
+        assert!(store.list_virtual_mutations(&mount_id).expect("list mutations").is_empty());
 
         let _ = std::fs::remove_dir_all(state_root);
     }
