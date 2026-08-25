@@ -43,6 +43,8 @@ use locality_platform::{
     DaemonManager, DaemonManagerRestartFence, DaemonProcessPaths, DaemonRemountCoordinatorLock,
     daemon_manager_supervision_enabled, restore_daemon_manager_supervision,
 };
+use locality_protocol::SCOPE_AUTHORIZED_COMPONENT_VERSIONS;
+use locality_protocol::workspace_api_v2::WORKSPACE_HTTP_API_GENERATION_V2;
 use locality_slack::{
     DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
     SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE, SLACK_CONNECTOR_ID, SlackConversationType,
@@ -229,6 +231,8 @@ enum LocalityCommand {
     },
     #[command(about = "Run read-only diagnostics for daemon, mounts, providers, and auth")]
     Doctor,
+    #[command(about = "Show build and sandbox protocol metadata")]
+    Version,
     #[command(about = "Materialize a sealed read-only workspace replica")]
     Sandbox {
         #[command(subcommand)]
@@ -1223,6 +1227,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         LocalityCommand::Status(_) => status(&legacy_args[1..], json),
         LocalityCommand::LiveMode { .. } => live_mode(&legacy_args[1..], json),
         LocalityCommand::Doctor => doctor(json),
+        LocalityCommand::Version => version(json),
         LocalityCommand::Sandbox {
             command: SandboxCommand::Init(options),
         } => sandbox_init(options, json),
@@ -1560,6 +1565,7 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
             }
         }
         LocalityCommand::Doctor => args.push("doctor".to_string()),
+        LocalityCommand::Version => args.push("version".to_string()),
         LocalityCommand::Sandbox { command } => {
             args.push("sandbox".to_string());
             match command {
@@ -1885,6 +1891,62 @@ enum SandboxInitCredential {
     Bootstrap(crate::sandbox::SandboxBootstrapToken),
     ProfileKey(crate::sandbox::SandboxProfileKey),
     Session(locality_protocol::SessionCapability),
+}
+
+#[derive(Serialize)]
+struct VersionReport {
+    ok: bool,
+    command: &'static str,
+    version: &'static str,
+    build_id: &'static str,
+    git_revision: &'static str,
+    build_time: &'static str,
+    default_api_url: &'static str,
+    workspace_api_generation: u16,
+    session_generation: u16,
+    replica_generation: u16,
+    export_metadata_generation: u16,
+}
+
+fn version_report() -> VersionReport {
+    VersionReport {
+        ok: true,
+        command: "version",
+        version: env!("CARGO_PKG_VERSION"),
+        build_id: option_env!("LOCALITY_BUILD_ID").unwrap_or("unknown"),
+        git_revision: option_env!("LOCALITY_GIT_REVISION").unwrap_or("unknown"),
+        build_time: option_env!("LOCALITY_BUILD_TIME").unwrap_or("unknown"),
+        default_api_url: DEFAULT_SANDBOX_API_URL,
+        workspace_api_generation: WORKSPACE_HTTP_API_GENERATION_V2,
+        session_generation: SCOPE_AUTHORIZED_COMPONENT_VERSIONS.session,
+        replica_generation: SCOPE_AUTHORIZED_COMPONENT_VERSIONS.replica,
+        export_metadata_generation: SCOPE_AUTHORIZED_COMPONENT_VERSIONS.export_metadata,
+    }
+}
+
+fn version(json: bool) -> i32 {
+    let report = version_report();
+    if json {
+        print_json(&report);
+    } else {
+        print_version_report(&report);
+    }
+    EXIT_SUCCESS
+}
+
+fn print_version_report(report: &VersionReport) {
+    println!("loc version={}", report.version);
+    println!("build_id={}", report.build_id);
+    println!("git_revision={}", report.git_revision);
+    println!("build_time={}", report.build_time);
+    println!("default_api_url={}", report.default_api_url);
+    println!(
+        "workspace_api_generation={} session_generation={} replica_generation={} export_metadata_generation={}",
+        report.workspace_api_generation,
+        report.session_generation,
+        report.replica_generation,
+        report.export_metadata_generation
+    );
 }
 
 fn finish_sandbox_profile(profile: Option<&mut SandboxInitProfile>) {
@@ -11491,6 +11553,7 @@ mod tests {
                     "Commands:",
                     "push",
                     "live-mode",
+                    "version",
                     "file-provider",
                 ],
             ),
@@ -11728,6 +11791,14 @@ mod tests {
             (
                 vec!["doctor", "--help"],
                 vec!["Usage: loc doctor", "Run read-only diagnostics", "--json"],
+            ),
+            (
+                vec!["version", "--help"],
+                vec![
+                    "Usage: loc version",
+                    "Show build and sandbox protocol metadata",
+                    "--json",
+                ],
             ),
             (
                 vec!["sandbox", "init", "--help"],
@@ -12049,6 +12120,13 @@ mod tests {
         assert_eq!(
             legacy_args_for_command(cli.command.as_ref().expect("command")),
             vec!["live-mode", "status", "Roadmap/page.md"]
+        );
+
+        let cli = parse_cli(["--json", "version"]);
+        assert!(cli.json);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec!["version"]
         );
 
         let cli = parse_cli([
@@ -12509,6 +12587,38 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("invalid value 'gzip'"));
         assert!(message.contains("[possible values: zstd, identity]"));
+    }
+
+    #[test]
+    fn version_report_is_exact_and_redaction_safe() {
+        let report = super::version_report();
+        assert!(report.ok);
+        assert_eq!(report.command, "version");
+        assert_eq!(report.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(report.default_api_url, super::DEFAULT_SANDBOX_API_URL);
+        assert_eq!(
+            report.workspace_api_generation,
+            locality_protocol::workspace_api_v2::WORKSPACE_HTTP_API_GENERATION_V2
+        );
+        assert_eq!(
+            report.session_generation,
+            locality_protocol::SCOPE_AUTHORIZED_COMPONENT_VERSIONS.session
+        );
+        assert_eq!(
+            report.replica_generation,
+            locality_protocol::SCOPE_AUTHORIZED_COMPONENT_VERSIONS.replica
+        );
+        assert_eq!(
+            report.export_metadata_generation,
+            locality_protocol::SCOPE_AUTHORIZED_COMPONENT_VERSIONS.export_metadata
+        );
+        let json = serde_json::to_string(&report).expect("serialize version report");
+        for forbidden in ["token", "secret", "profile_key", "capability"] {
+            assert!(
+                !json.contains(forbidden),
+                "version report leaked sensitive field marker `{forbidden}`: {json}"
+            );
+        }
     }
 
     #[test]
