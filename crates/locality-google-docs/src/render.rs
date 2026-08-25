@@ -18,7 +18,9 @@ pub struct GoogleDocsRenderedEntity {
     pub push_blocking_directives: bool,
 }
 
-pub fn render_google_document(document: &GoogleDocument) -> LocalityResult<GoogleDocsRenderedEntity> {
+pub fn render_google_document(
+    document: &GoogleDocument,
+) -> LocalityResult<GoogleDocsRenderedEntity> {
     let mut rendered_blocks = Vec::new();
     let mut native_block_ids = Vec::new();
     let mut native_block_kinds = Vec::new();
@@ -106,7 +108,10 @@ pub fn document_frontmatter(document: &GoogleDocument) -> String {
 }
 
 pub fn document_remote_version(document: &GoogleDocument) -> String {
-    document.revision_id.as_deref().filter(|revision| !revision.is_empty())
+    document
+        .revision_id
+        .as_deref()
+        .filter(|revision| !revision.is_empty())
         .map(|revision| format!("docs:{revision}"))
         .unwrap_or_else(|| "unknown".to_string())
 }

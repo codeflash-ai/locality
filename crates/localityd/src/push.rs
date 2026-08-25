@@ -3205,6 +3205,14 @@ where
                 let Some(remote_id) = mutation.target_remote_id.clone() else {
                     continue;
                 };
+                append_source_archive_validation(
+                    &mut validation,
+                    &mount,
+                    mutation
+                        .original_path
+                        .as_deref()
+                        .unwrap_or(&mutation.projected_path),
+                );
                 append_source_write_validation(
                     &mut validation,
                     &mount,
@@ -3472,6 +3480,26 @@ fn append_source_create_validation(
             None,
             reason,
             Some("remove the stale pending create or choose a writable parent".to_string()),
+        ));
+    }
+}
+
+fn append_source_archive_validation(
+    validation: &mut ValidationReport,
+    mount: &MountConfig,
+    path: &Path,
+) {
+    let descriptor = source_descriptor(&mount.connector);
+    if !descriptor.supports_archive_entity() {
+        validation.push(ValidationIssue::new(
+            "source_archive_unsupported",
+            path,
+            None,
+            format!(
+                "{} does not support archiving entities",
+                descriptor.display_name()
+            ),
+            Some("restore the local page instead of deleting it".to_string()),
         ));
     }
 }

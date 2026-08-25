@@ -7003,7 +7003,12 @@ mod tests {
             .expect("entity");
         assert_eq!(entity.path, PathBuf::from("Moving/page.md"));
         assert_eq!(entity.hydration, HydrationState::Hydrated);
-        assert!(store.list_virtual_mutations(&mount_id).expect("list mutations").is_empty());
+        assert!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")
+                .is_empty()
+        );
 
         let _ = std::fs::remove_dir_all(state_root);
     }
@@ -9366,7 +9371,12 @@ mod tests {
         )
         .expect_err("Docs-only mounts do not support folders");
         assert!(matches!(error, LocalityError::Unsupported(_)));
-        assert!(store.list_virtual_mutations(&mount_id).expect("list mutations").is_empty());
+        assert!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")
+                .is_empty()
+        );
 
         let _ = std::fs::remove_dir_all(state_root);
     }

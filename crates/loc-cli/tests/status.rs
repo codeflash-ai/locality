@@ -1573,11 +1573,7 @@ impl JournalRepository for BulkOnlyStatusStore {
         settings_json: Option<String>,
     ) -> StoreResult<()> {
         self.inner
-            .record_journal_apply_effects_and_update_mount_settings(
-                push_id,
-                effects,
-                settings_json,
-            )
+            .record_journal_apply_effects_and_update_mount_settings(push_id, effects, settings_json)
     }
 
     fn update_journal_status(
