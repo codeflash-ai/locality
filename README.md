@@ -257,7 +257,7 @@ If you are building production agents and want to use Locality Cloud,
 | Source | Local workspace | Write support |
 | --- | --- | --- |
 | <img src="apps/desktop/src/assets/connectors/notion.svg" alt="" width="18" height="18"> &nbsp; **Notion** | Pages, databases, properties, and supported media | Conservative page, block, property, and database-row updates |
-| <img src="apps/desktop/src/assets/connectors/google-docs.svg" alt="" width="18" height="18"> &nbsp; **Google Docs** | Documents and Drive-backed structure | Conservative document updates |
+| <img src="apps/desktop/src/assets/connectors/google-docs.svg" alt="" width="18" height="18"> &nbsp; **Google Docs** | Explicitly selected documents | Conservative document-body updates and root-level creates |
 | <img src="apps/desktop/src/assets/connectors/google-calendar.svg" alt="" width="18" height="18"> &nbsp; **Google Calendar** | Primary-calendar events | Reviewed event-draft creation |
 | <img src="apps/desktop/src/assets/connectors/gmail.svg" alt="" width="18" height="18"> &nbsp; **Gmail** | Messages and threads | Reviewed Gmail-draft creation |
 | <img src="apps/desktop/src/assets/connectors/linear.svg" alt="" width="18" height="18"> &nbsp; **Linear** | Teams, issues, and issue context | Supported issue edits |

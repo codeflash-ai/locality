@@ -1,9 +1,10 @@
 ---
 title: "Google Docs connector"
-description: "How Google Docs and Drive folders map into Locality."
+description: "How selected Google Docs map into Locality."
 ---
 
-The Google Docs connector mounts a configured Google Drive workspace folder.
+The Google Docs connector mounts Google Docs that you explicitly select. It
+does not enumerate Google Drive or use Drive folders or metadata.
 
 ## Connect
 
@@ -14,27 +15,34 @@ loc connect google-docs --name google-docs-default
 ## Mount
 
 ```bash
-loc mount google-docs ~/Locality/google-docs-main --workspace-folder "Locality" --projection plain-files
+loc mount google-docs ~/Locality/google-docs-main --document <id-or-url> --document <id-or-url> --projection plain-files
 loc pull ~/Locality/google-docs-main
 ```
 
-`--workspace-folder` accepts a folder name, ID, or folder URL.
+In Desktop, choose one or more Google Docs with Google Picker when creating or
+reconfiguring the mount. For CLI and automation, repeat `--document` with each
+document ID or Google Docs URL.
+
+Desktop Picker requires these values before Locality starts:
+
+```bash
+export LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY='<Google API key>'
+export LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER='<numeric Google Cloud project number>'
+```
 
 ## Projection
 
 ```text
 google-docs-main/
-  planning/
-    launch-brief/
-      page.md
-  product/
-    roadmap/
-      page.md
+  launch-brief/
+    page.md
+  roadmap/
+    page.md
 ```
 
-- Drive folders become directories;
-- Google Docs documents become page directories with `page.md`;
-- non-Google-Docs Drive files are ignored by the V1 connector.
+Every selected Google Doc becomes a root-level page directory with `page.md`.
+New root-level page directories create Google Docs and become selected after a
+successful push.
 
 ## Supported content
 
@@ -63,6 +71,7 @@ After push, Locality fetches the accepted remote state and reconciles the local 
 ## Current limits
 
 - Google Sheets and Slides are not projected by this connector.
-- Binary Drive files are ignored.
 - Comments, suggestions, and rich unsupported Docs structures are not editable through V1.
-- Enumeration stays scoped to the configured workspace folder.
+- Rename, move, archive/delete, and folder creation are unsupported.
+- OAuth requests Docs and `drive.file` only; Locality makes no Drive metadata API calls.
+- Legacy folder mounts pause for re-selection rather than discarding pending work.

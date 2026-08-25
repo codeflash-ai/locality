@@ -1,22 +1,12 @@
 # Google Docs Connector Summary
 
-This document summarizes the first Google Docs connector implementation and the
-follow-up fixes made during live testing.
+The `google-docs` connector mounts an explicit, flat selection of Google Docs.
+It does not enumerate Google Drive, inspect Drive metadata, or use Drive
+folders as mount boundaries.
 
-## Connector Scope
+## OAuth and selection
 
-Google Docs is registered as a first-party Locality source connector named
-`google-docs`. It uses the same host semantics as the Notion connector:
-connect, mount, enumerate, hydrate, diff, push, status, and live projection
-paths resolve through the source registry.
-
-The mounted remote root is a configured Google Drive workspace folder. The
-folder id is stored in `MountConfig.remote_root_id`, so no SQLite schema change
-was required for Google Docs mounts.
-
-## OAuth And Drive Access
-
-The Google Docs OAuth flow uses the Locality OAuth broker and requests:
+Google Docs OAuth uses the Locality OAuth broker and requests only:
 
 - `openid`
 - `email`
@@ -24,206 +14,107 @@ The Google Docs OAuth flow uses the Locality OAuth broker and requests:
 - `https://www.googleapis.com/auth/documents`
 - `https://www.googleapis.com/auth/drive.file`
 
-The broker uses the shared `LOCALITY_GOOGLE_CLIENT_ID` and
-`LOCALITY_GOOGLE_CLIENT_SECRET` pair for Google Docs, Google Calendar, and
-Gmail. The Google OAuth client must allow all Google connector localhost
-callbacks.
+`documents` reads and writes document bodies. `drive.file` lets Google Picker
+grant Locality access to Docs the user selects and lets Locality keep access to
+Docs it creates. Locality does not request full Drive, Drive read-only, or any
+Drive metadata scope, and it makes no Drive metadata API calls.
 
-`documents` is used for Google Docs body read/write. `drive.file` keeps access
-limited to files Locality created or that the user explicitly granted. It does
-not allow arbitrary workspace-folder discovery or Drive metadata hydration.
+In Desktop, create or reconfigure a Google Docs mount with the Google Picker.
+The Picker allows multi-selection and accepts only native Google Docs. Locality
+persists the selected document IDs; it never persists or discovers a Drive
+folder. Configure the desktop Picker with these environment variables before
+starting Locality:
 
-The current `--workspace-folder` mount is a legacy folder mount: it can operate
-only on app-created Docs or Docs explicitly granted by the user (for example,
-through Google Picker outside the current mount setup), and must not promise
-visibility of every file in that folder. A Picker-based selected-document
-migration is forthcoming; it is not part of the current mount setup.
-
-Google can return the canonical
-`https://www.googleapis.com/auth/userinfo.email` and
-`https://www.googleapis.com/auth/userinfo.profile` identity aliases in a broker
-response. Locality accepts those aliases while requiring `documents` and
-`drive.file`, and rejects restricted Drive scopes including
-`drive.metadata.readonly`.
-
-## Google OAuth Verification
-
-Keep the Google Cloud Console verification scope list aligned with
-`connectors/oauth-verification/google-docs.json`.
-
-Submit only these Google API scopes:
-
-- `https://www.googleapis.com/auth/documents`
-- `https://www.googleapis.com/auth/drive.file`
-
-Do not submit full Drive, Drive readonly, writable Drive metadata, or Docs
-readonly scopes for this connector.
-
-The verification demo should show the OAuth consent screen with all requested
-permissions readable, then demonstrate only Docs that Locality created or that
-the user explicitly granted: reading a body, editing an existing Doc, and
-creating a new Doc. Do not present the legacy folder mount as arbitrary Drive
-discovery or metadata hydration. For every write shown in Locality, show the
-resulting change in the user's Google Drive or Google Docs account.
-
-## Projection
-
-Drive folders project as local directories. Google Docs project as page
-directories containing `page.md`.
-
-Examples under a shared Locality root:
-
-```text
-~/Locality/
-  google-docs-main/
-    project-notes/
-      page.md
-    planning/
-      sprint-plan/
-        page.md
+```bash
+export LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY='<Google API key>'
+export LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER='<numeric Google Cloud project number>'
 ```
 
-Non-Google-Docs Drive files are ignored by the V1 connector.
+The project number must be numeric and belongs to the same Google Cloud project
+as the Picker API key and OAuth client. These values configure Picker only; an
+OAuth token is used only for the active local Picker session and is not saved in
+mount settings.
 
-## Hydration And Markdown
+For CLI or automation setup, provide one or more selected document IDs or
+Google Docs URLs explicitly:
 
-Hydration fetches Drive metadata and Google Docs body content, then renders a
-canonical Markdown document with connector-neutral Locality frontmatter. The
-renderer supports common Google Docs structures:
+```bash
+loc mount google-docs ~/Locality/google-docs-main \
+  --document <id-or-url> \
+  --document <id-or-url> \
+  --projection plain-files
+loc pull ~/Locality/google-docs-main
+```
 
-- paragraphs and headings
-- bold, italic, underline, strikethrough
-- links
-- inline code where representable
-- bullets and numbered lists
-- simple tables
+Existing folder-based Google Docs mounts are preserved as durable state but are
+not opened as Drive mounts. Locality pauses them with re-selection guidance, so
+pending local work is not silently discarded. Reconfigure the mount in Desktop
+with Google Picker, or create a replacement CLI mount with `--document` values.
 
-Unsupported Google Docs structures are rendered as `::loc{...}` directives and
-validated as push-blocking if an edit would be lossy.
+## Projection and operations
 
-## Push Behavior
+Every selected Doc appears directly at the mount root as a page directory with
+`page.md`:
 
-Local changes use the existing shadow and push planner flow. The connector maps
-operations to:
+```text
+google-docs-main/
+  launch-brief/
+    page.md
+  roadmap/
+    page.md
+```
 
-- Docs `documents.batchUpdate` for body edits
-- Drive `files.update` for title, parent move, and trash operations
-- Drive `files.create` for new Google Docs and folders
+The connector supports Google Docs body reads and supported body updates. A new
+root-level page directory with `page.md` creates a Google Doc; after a successful
+push, its ID is added to the mount selection automatically. Use the normal
+review flow:
 
-Body updates use `writeControl.requiredRevisionId` when a synced Docs revision
-is available. After apply, Locality re-fetches accepted remote state and
-reconciles local Markdown and shadows.
+```bash
+loc status <path>
+loc diff <path>
+loc push <path> -y
+```
 
-Page-directory renames and parent moves plan as `move_entity`. The Google Docs
-connector applies them with Drive metadata updates, replacing the old parent
-with the new folder parent and updating the document name when needed.
+Rename, move, archive/delete, and folder creation are unsupported because they
+require Drive metadata or folder operations. Google Sheets, Slides, binary Drive
+files, comments, suggestions, and unsupported rich Docs structures are not
+editable through this connector. Unsupported rendered structures remain
+push-blocking when an edit would be lossy.
 
-Failed Google Docs creates now trash the just-created Drive file when body
-insertion fails, preventing partial empty remote documents.
+## Google OAuth verification
 
-## Live Testing Fixes
+Keep the Google Cloud Console verification scope list aligned with
+`connectors/oauth-verification/google-docs.json`. Submit only the Docs and
+`drive.file` scopes above. Do not submit full Drive, Drive read-only, Drive
+metadata, or Docs read-only scopes.
 
-Live testing found and fixed several integration issues:
-
-- Creating a directory under the Google Docs mount-point root now uses the mount
-  workspace folder id as the remote parent.
-- Push planning now treats the mount remote root as a valid directory parent for
-  pending creates.
-- Google Docs create preconditions without a synced remote version no longer
-  cause false concurrency conflicts.
-- `loc diff` plain text summaries now include entity creates and archives.
-- `loc status` treats Drive-only observations as equivalent to synced
-  Drive-plus-Docs versions when the Drive version matches.
-- Local OAuth callback handling now binds `localhost` redirects on IPv4
-  loopback and launches the browser asynchronously so the callback listener can
-  process redirects while the browser remains open.
-
-## Current Limitations
-
-- Only Google Docs and Drive folders are projected.
-- Google Sheets, Slides, binary Drive files, comments, suggestions, and rich
-  unsupported Docs structures are not editable through V1.
-- Unsupported structures must be preserved or they block push.
-- The OAuth broker project must have both Google Docs API and Google Drive API
-  enabled.
+The verification demo should show consent, Picker selection of one or more
+Google Docs, body read/edit, and creation of a new root-level Doc. It should not
+show Drive folder discovery, Drive metadata, rename/move/archive, or folder
+creation.
 
 ## Live E2E
 
 `tests/live_google_docs_vfs_roundtrip.sh` exercises the live Google Docs API,
-CLI mount/pull/diff/push paths, `localityd`, and the Linux FUSE projection. It
-uses isolated Locality state and a temporary shared root, creates one generated
-Google Docs page through the mounted filesystem, verifies the create marker
-survives a pull after push, edits the created document through mounted
-`page.md`, verifies the edit marker survives another pull, and trashes the
-created Drive file during cleanup.
-
-Set the required environment from a stored `connection:google-docs-live`
-credential and choose a scratch workspace folder:
+CLI mount/pull/diff/push paths, `localityd`, and Linux FUSE. It requires an
+already-selected scratch Google Doc ID (or a comma-separated list of IDs):
 
 ```bash
 secret_ref='connection:google-docs-live'
 secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
 export LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
-export LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER='Locality Live E2E'
+export LOCALITY_GOOGLE_DOCS_LIVE_DOCUMENT_IDS='scratch-doc-id-1,scratch-doc-id-2'
 ```
 
-Use the full stored credential JSON. The live harness requires
-`access_token`, `oauth_broker_url`, `refresh_token_handle`, and numeric
-`expires_at` so it can exercise broker refresh when the token expires.
-
-Run the gated test explicitly:
+The test creates and edits a new root-level Doc, verifies both changes after
+pull, and verifies the created Doc joins the selected mount. Docs API has no
+trash/delete operation, so cleanup of the created scratch Doc is manual; the
+script prints its ID and URL. Run it explicitly:
 
 ```bash
 LOCALITY_LIVE_GOOGLE_DOCS_VFS=1 tests/live_google_docs_vfs_roundtrip.sh
 ```
 
-For deeper local connector quality work, run the mutation scenario:
-
-```bash
-LOCALITY_LIVE_GOOGLE_DOCS_SCENARIO=1 tests/live_google_docs_mutation_scenario.sh
-```
-
-The scenario uses the same isolated state and scratch workspace folder as the
-roundtrip test, then exercises the broader edit surface:
-
-- creates a scratch Google Doc from a mounted `page.md`
-- pulls it back as an existing one-line document
-- edits that existing body into one line, one blank line, then another text line
-- updates `title` frontmatter and verifies the Drive file name
-- renames the page directory and verifies the Drive file name
-- creates a scratch Drive folder through the Drive API, pulls it into the mount,
-  moves the document under it through the mounted filesystem, and verifies the
-  Drive parent
-- deletes the mounted page directory through the filesystem and verifies the
-  Drive file is trashed
-
-The scenario also trashes its scratch Drive folder during cleanup. Set
-`LOCALITY_GOOGLE_DOCS_SCENARIO_KEEP_TMP=1` to keep the temporary Locality state
-and mount root after a failure for inspection.
-
-## Useful Commands
-
-Connect with the local broker:
-
-```bash
-./target/debug/loc connect google-docs --name google-docs-default --broker-url http://127.0.0.1:8787
-```
-
-Mount a workspace folder:
-
-```bash
-./target/debug/loc mount google-docs ~/Locality/google-docs-main --workspace-folder "Locality" --projection linux-fuse
-```
-
-Force enumeration and hydration:
-
-```bash
-./target/debug/loc pull --json "$HOME/Locality/google-docs-main"
-```
-
-Inspect planned pushes:
-
-```bash
-./target/debug/loc status "$HOME/Locality/google-docs-main"
-./target/debug/loc diff "$HOME/Locality/google-docs-main"
-```
+Use the full stored credential JSON. The live harness requires `access_token`,
+`oauth_broker_url`, `refresh_token_handle`, and numeric `expires_at` to exercise
+broker refresh when the token expires.

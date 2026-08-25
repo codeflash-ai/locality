@@ -123,8 +123,9 @@ Connect Google Docs through the Locality OAuth broker.
 loc connect google-docs [--name <id>] [--no-browser] [--broker-url <url>] [--redirect-uri <uri>]
 ```
 
-Use this before mounting a Google Drive workspace folder that contains Google
-Docs. Non-Google-Docs Drive files are ignored by the Google Docs connector.
+Use this before mounting Google Docs selected through Desktop Google Picker or
+explicit `loc mount google-docs --document` values. Locality requests Docs and
+`drive.file` access only; it does not enumerate Google Drive or read Drive metadata.
 
 Key arguments:
 
@@ -207,21 +208,27 @@ loc pull ~/Locality/notion-page
 
 ### `loc mount google-docs`
 
-Register Google Docs content under a Drive workspace folder.
+Register explicitly selected Google Docs content.
 
 ```bash
-loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection <mode>] [--read-only]
+loc mount google-docs <path> --document <id-or-url> [--document <id-or-url> ...] [--connection <id>] [--mount-id <id>] [--projection <mode>] [--read-only]
 ```
 
-Use this when a Google Drive folder is the workspace boundary for Locality. The
-folder can be specified by name, id, or folder URL.
+Use this to mount exactly the Google Docs whose IDs or URLs you provide. In
+Desktop, Google Picker provides the equivalent multi-select flow and can
+reconfigure an existing mount.
+
+Before starting Desktop, configure Picker with
+`LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY` and
+`LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER`; the latter is the numeric Google Cloud
+project number for the Picker API key and OAuth client.
 
 Key arguments:
 
 | Argument | Meaning |
 | --- | --- |
 | `<path>` | Local directory to register as the mount. |
-| `--workspace-folder <name-or-id>` | Google Drive folder name, folder id, or folder URL. |
+| `--document <id-or-url>` | Google Docs document ID or URL. Repeat for each selected document. |
 | `--connection <id>` | Saved Google Docs connection to use. |
 | `--mount-id <id>` | Stable mount id. Defaults to a Google Docs mount id when safe. |
 | `--projection <mode>` | Platform-specific projection mode. |
@@ -230,8 +237,8 @@ Key arguments:
 Examples:
 
 ```bash
-loc mount google-docs ~/Locality/google-docs-main --workspace-folder "Locality" --projection plain-files
-loc mount google-docs ~/Locality/google-docs-main --workspace-folder <folder-id> --connection google-docs-default
+loc mount google-docs ~/Locality/google-docs-main --document <document-id> --projection plain-files
+loc mount google-docs ~/Locality/google-docs-main --document <document-url> --document <second-document-id> --connection google-docs-default
 loc pull ~/Locality/google-docs-main
 ```
 

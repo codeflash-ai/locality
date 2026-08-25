@@ -13,7 +13,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc connection show <id> [--json]`
 - `loc disconnect <id> [--json]`
 - `loc mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
-- `loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
+- `loc mount google-docs <path> --document <id-or-url> [--document <id-or-url> ...] [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
 - `loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--json]`
 - `loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--json]`
 - `loc daemon status [--json]`
@@ -159,9 +159,9 @@ The default connection ID is `notion-default` when no Notion connection exists. 
 
 `loc connect google-docs [--name <id>]` uses the same Locality OAuth broker flow for Google Docs. The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_GOOGLE_DOCS_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default callback is `http://localhost:8757/oauth/google-docs/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GOOGLE_DOCS_OAUTH_REDIRECT_URI`. The shared Google OAuth client must allow the Google Docs, Google Calendar, and Gmail callbacks, and the broker must be configured with `LOCALITY_GOOGLE_CLIENT_ID` and `LOCALITY_GOOGLE_CLIENT_SECRET`.
 
-`loc mount google-docs <path> --workspace-folder <name-or-id>` registers a legacy Google Docs mount configured with a Drive folder root. Existing configurations store the resolved Drive folder id as the mount `remote_root_id`. Google Docs files project as page directories containing `page.md`, and Drive folders project as local directories.
+`loc mount google-docs <path> --document <id-or-url>` registers a flat mount of explicitly selected Google Docs. Repeat `--document` for every document ID or Docs URL. Each selected Doc projects directly below the mount as a page directory containing `page.md`; Locality does not enumerate Drive, read Drive metadata, or project Drive folders. Desktop uses Google Picker for the equivalent Docs-only multi-select flow and can reconfigure the selection. Set `LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY` and `LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER` (the numeric Google Cloud project number) before starting Desktop.
 
-Google Docs mounts use Google Docs document access plus Drive `drive.file` access. The current `--workspace-folder` mount is legacy behavior: it can operate only on Docs Locality created or that the user explicitly granted (for example, through Google Picker outside the current mount setup), and cannot reliably enumerate arbitrary folder contents or hydrate Drive metadata. A Picker-selected-document migration is forthcoming; it is not currently exposed by `loc mount`. Non-Google-Docs Drive files are ignored by this connector in V1. Google may return canonical `userinfo.email` and `userinfo.profile` identity aliases to the broker; Locality accepts them while requiring `documents` and `drive.file` and rejecting restricted Drive scopes. For Google OAuth verification, keep the submitted Google Docs API scopes aligned with `connectors/oauth-verification/google-docs.json`; do not submit full Drive, Drive readonly, writable or readonly Drive metadata, or Docs readonly scopes.
+Google Docs mounts use Google Docs document access plus Drive `drive.file` access. `drive.file` covers Docs the user selected through Picker and Docs Locality creates; it does not authorize Drive metadata access. Local body edits and root-level Doc creation are supported. Rename, move, archive/delete, and folder creation are rejected. Created Docs are added to the persisted selection after push. Legacy folder mounts pause with re-selection guidance without discarding pending local work. Google may return canonical `userinfo.email` and `userinfo.profile` identity aliases to the broker; Locality accepts them while requiring `documents` and `drive.file`, and rejects restricted Drive scopes. For Google OAuth verification, keep the submitted Google Docs API scopes aligned with `connectors/oauth-verification/google-docs.json`; do not submit full Drive, Drive readonly, writable or readonly Drive metadata, or Docs readonly scopes.
 
 `loc connect google-calendar [--name <id>]` uses the same Locality OAuth broker flow for Google Calendar. The default callback is `http://localhost:8757/oauth/google-calendar/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI`.
 
@@ -638,7 +638,7 @@ Concrete shared-root examples:
 ```bash
 loc mount notion ~/Locality/notion-main --workspace --projection linux-fuse
 loc mount notion ~/Locality/notion-my-company --workspace --connection notion-company --projection linux-fuse
-loc mount google-docs ~/Locality/google-docs-main --workspace-folder "Locality" --projection linux-fuse
+loc mount google-docs ~/Locality/google-docs-main --document <document-id> --projection linux-fuse
 loc mount gmail ~/Locality/gmail-main --projection linux-fuse
 loc file-provider register ~/Locality/notion-main
 loc file-provider open notion-main
