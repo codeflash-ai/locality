@@ -179,11 +179,20 @@ describe("Google Docs Picker capabilities", () => {
       expect(page).toContain("setDeveloperKey");
       expect(page).toContain("setOAuthToken");
       expect(page).not.toContain("setOrigin(");
+      expect(page).toContain("setRelayUrl(configuration.relayUrl)");
       expect(page).toContain("data.action||(p.Response&&data[p.Response.ACTION])");
       expect(page).toContain("data.docs||(p.Response&&data[p.Response.DOCUMENTS])||[]");
       expect(page).toContain("form.submit()");
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  it("serves a same-origin Picker relay page", async () => {
+    const response = await app.request("/v1/google-docs/picker/relay", { method: "GET" }, env);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    await expect(response.text()).resolves.toContain("Locality Google Picker relay");
   });
 });

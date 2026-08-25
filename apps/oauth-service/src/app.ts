@@ -14,7 +14,7 @@ import {
 } from "./oauth/google-calendar";
 import { exchangeGmailCode, gmailAuthorizeUrl, refreshGmailToken, type GmailTokenResponse } from "./oauth/gmail";
 import { googleClientId } from "./oauth/google";
-import { hostedGoogleDocsPickerPage } from "./picker/google-docs";
+import { hostedGoogleDocsPickerPage, hostedGoogleDocsPickerRelayPage } from "./picker/google-docs";
 import { exchangeNotionCode, notionAuthorizeUrl, refreshNotionToken, type NotionTokenResponse } from "./oauth/notion";
 import { exchangeSlackCode, refreshSlackToken, slackAuthorizeUrl, type SlackTokenResponse } from "./oauth/slack";
 import { randomBase64Url, decryptJsonHandle, encryptJsonHandle } from "./security/crypto";
@@ -266,6 +266,12 @@ app.post("/v1/google-docs/picker/sessions", async (c) => {
   );
 });
 
+app.get("/v1/google-docs/picker/relay", (c) => {
+  c.header("Cache-Control", "no-store");
+  c.header("Referrer-Policy", "no-referrer");
+  return c.html(hostedGoogleDocsPickerRelayPage());
+});
+
 app.get("/v1/google-docs/picker/:capability", async (c) => {
   const secret = requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET");
   const browserCapability = await readPickerBrowserCapability(c.req.param("capability"), secret);
@@ -278,7 +284,8 @@ app.get("/v1/google-docs/picker/:capability", async (c) => {
     developerKey: requiredPickerConfig(c.env.LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY, "LOCALITY_GOOGLE_PICKER_DEVELOPER_KEY"),
     projectNumber: requiredPickerConfig(c.env.LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER, "LOCALITY_GOOGLE_PICKER_PROJECT_NUMBER"),
     accessToken: token.access_token,
-    selectionUrl: `${baseUrl.replace(/\/+$/, "")}/v1/google-docs/picker/${browserCapabilityToPath(c.req.param("capability"))}/selection`
+    selectionUrl: `${baseUrl.replace(/\/+$/, "")}/v1/google-docs/picker/${browserCapabilityToPath(c.req.param("capability"))}/selection`,
+    relayUrl: `${baseUrl.replace(/\/+$/, "")}/v1/google-docs/picker/relay`
   });
   c.header("Cache-Control", "no-store");
   c.header("Referrer-Policy", "no-referrer");
