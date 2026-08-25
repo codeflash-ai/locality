@@ -7,7 +7,7 @@ use locality_core::model::{RemoteId, TreeEntry};
 use locality_core::validation::ValidationReport;
 use locality_core::{LocalityError, LocalityResult};
 use locality_google_docs::{
-    GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsConfig, GoogleDocsConnector,
+    GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsConfig, GoogleDocsConnector, GoogleDocsMountSettings,
     HttpGoogleDocsOAuthBrokerClient, StoredGoogleDocsCredential,
     oauth::GoogleDocsOAuthScopeError,
     render::{GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND, GOOGLE_DOCS_TABLE_NATIVE_KIND},
@@ -34,6 +34,8 @@ where
             mount.connector.clone(),
         ));
     }
+
+    google_docs_mount_settings(mount)?;
 
     if let Some(connection_id) = &mount.connection_id {
         let connection = store
@@ -62,6 +64,36 @@ where
         message,
         suggested_command: "loc connect google-docs".to_string(),
     })
+}
+
+fn google_docs_mount_settings(
+    mount: &MountConfig,
+) -> Result<GoogleDocsMountSettings, ConnectorResolveError> {
+    if mount.remote_root_id.is_some() {
+        return Err(ConnectorResolveError::CredentialStoreUnavailable(format!(
+            "Google Docs mount `{}` uses a legacy Drive folder selection; select Google Docs documents again before syncing. Existing local files and pending work were preserved.",
+            mount.mount_id.0
+        )));
+    }
+
+    GoogleDocsMountSettings::from_json(&mount.settings_json).map_err(|error| {
+        ConnectorResolveError::CredentialStoreUnavailable(format!(
+            "Google Docs mount `{}` requires document selection; select Google Docs documents before syncing: {}",
+            mount.mount_id.0,
+            google_docs_settings_error_message(error)
+        ))
+    })
+}
+
+fn google_docs_settings_error_message(error: LocalityError) -> String {
+    match error {
+        LocalityError::Validation(issues) => issues
+            .into_iter()
+            .map(|issue| issue.message)
+            .collect::<Vec<_>>()
+            .join("; "),
+        other => other.to_string(),
+    }
 }
 
 fn connector_from_connection(

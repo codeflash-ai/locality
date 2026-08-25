@@ -4,6 +4,7 @@ pub mod docs_dto;
 pub mod drive_dto;
 pub mod oauth;
 pub mod render;
+pub mod settings;
 
 pub use connector::{GoogleDocsConfig, GoogleDocsConnector, extract_google_drive_folder_id};
 pub use oauth::{
@@ -11,3 +12,4 @@ pub use oauth::{
     GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, HttpGoogleDocsOAuthBrokerClient,
     StoredGoogleDocsCredential, google_docs_capabilities_json,
 };
+pub use settings::{GoogleDocsMountSettings, GoogleDocsSelection};
