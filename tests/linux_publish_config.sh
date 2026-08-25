@@ -67,6 +67,18 @@ grep -q 'PKG_CONFIG_PATH' "${ROOT}/scripts/publish-linux.sh" \
   || fail "publish-linux must export PKG_CONFIG_PATH when using temporary metadata"
 grep -q 'copy_latest_alias' "${ROOT}/scripts/publish-linux.sh" \
   || fail "publish-linux must create stable latest-release artifact aliases"
+grep -Eq '^RPM_DIR=' "${ROOT}/scripts/publish-linux.sh" \
+  || fail "publish-linux must retain the Tauri RPM bundle directory"
+grep -Eq '^[[:space:]]+require_command rpm$' "${ROOT}/scripts/publish-linux.sh" \
+  || fail "publish-linux must require RPM tooling"
+grep -Eq '^[[:space:]]+rpm=.*latest_artifact.*RPM_DIR' "${ROOT}/scripts/publish-linux.sh" \
+  || fail "publish-linux must collect the generated RPM artifact"
+grep -Eq '^[[:space:]]+validate_rpm .*rpm' "${ROOT}/scripts/publish-linux.sh" \
+  || fail "publish-linux must validate the generated RPM artifact"
+grep -Eq '^[[:space:]]+final_rpm=.*copy_artifact .*rpm' "${ROOT}/scripts/publish-linux.sh" \
+  || fail "publish-linux must stage a versioned RPM artifact"
+grep -Eq '^[[:space:]]+alias_rpm=.*copy_latest_alias .*rpm' "${ROOT}/scripts/publish-linux.sh" \
+  || fail "publish-linux must stage the latest RPM alias"
 grep -q 'appimage' "${ROOT}/scripts/publish-linux.sh" \
   || fail "publish-linux must build AppImage artifacts for Tauri self-update"
 grep -q 'latest-linux.json' "${ROOT}/scripts/publish-linux.sh" \

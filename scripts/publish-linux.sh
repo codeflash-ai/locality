@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT}/scripts/linux-repository-config.sh"
 DESKTOP_DIR="${ROOT}/apps/desktop"
 DEB_DIR="${ROOT}/target/release/bundle/deb"
-# RPM_DIR="${ROOT}/target/release/bundle/rpm"
+RPM_DIR="${ROOT}/target/release/bundle/rpm"
 APPIMAGE_DIR="${ROOT}/target/release/bundle/appimage"
 LINUX_OUT_DIR="${ROOT}/target/release/bundle/linux"
 UPDATER_DIR="${ROOT}/target/release/bundle/updater"
@@ -314,8 +314,7 @@ main() {
   require_command ar
   require_command tar
   require_command zstd
-  # require_command rpm
-  
+  require_command rpm
   require_command sha256sum
   require_command pkg-config
   require_command ldconfig
@@ -338,24 +337,24 @@ main() {
     log "Linux AppImage updater artifacts disabled; set TAURI_UPDATER_PUBKEY and TAURI_SIGNING_PRIVATE_KEY to enable"
   fi
   log "building Tauri Debian, RPM, and optional AppImage packages"
-  rm -rf "${DEB_DIR}" "${APPIMAGE_DIR}" "${UPDATER_DIR}"
-  mkdir -p "${DEB_DIR}" "${APPIMAGE_DIR}" "${LINUX_OUT_DIR}"
+  rm -rf "${DEB_DIR}" "${RPM_DIR}" "${APPIMAGE_DIR}" "${UPDATER_DIR}"
+  mkdir -p "${DEB_DIR}" "${RPM_DIR}" "${APPIMAGE_DIR}" "${LINUX_OUT_DIR}"
   build_linux_packages "${config_json}"
 
   deb="$(latest_artifact "${DEB_DIR}" '*.deb')"
-  # rpm="$(latest_artifact "${RPM_DIR}" '*.rpm')"
+  rpm="$(latest_artifact "${RPM_DIR}" '*.rpm')"
   [[ -n "${deb}" && -f "${deb}" ]] || fail "Tauri did not produce a .deb artifact"
-  # [[ -n "${rpm}" && -f "${rpm}" ]] || fail "Tauri did not produce a .rpm artifact"
+  [[ -n "${rpm}" && -f "${rpm}" ]] || fail "Tauri did not produce a .rpm artifact"
 
   log "validating Debian package"
   validate_deb "${deb}"
-  # log "validating RPM package"
-  # validate_rpm "${rpm}"
+  log "validating RPM package"
+  validate_rpm "${rpm}"
 
   final_deb="$(copy_artifact "${deb}" "deb" "${commit_short}" "${arch}")"
-  # final_rpm="$(copy_artifact "${rpm}" "rpm" "${commit_short}" "${arch}")"
+  final_rpm="$(copy_artifact "${rpm}" "rpm" "${commit_short}" "${arch}")"
   alias_deb="$(copy_latest_alias "${deb}" "deb" "${arch}")"
-  # alias_rpm="$(copy_latest_alias "${rpm}" "rpm" "${arch}")"
+  alias_rpm="$(copy_latest_alias "${rpm}" "rpm" "${arch}")"
 
   if updater_enabled; then
     appimage="$(latest_artifact "${APPIMAGE_DIR}" '*.AppImage')"
@@ -366,12 +365,12 @@ main() {
   printf '\nPublished Linux packages:\n'
   printf '  %s\n' "${final_deb}"
   printf '  %s.sha256\n' "${final_deb}"
-  # printf '  %s\n' "${final_rpm}"
-  # printf '  %s.sha256\n' "${final_rpm}"
+  printf '  %s\n' "${final_rpm}"
+  printf '  %s.sha256\n' "${final_rpm}"
   printf '  %s\n' "${alias_deb}"
   printf '  %s.sha256\n' "${alias_deb}"
-  # printf '  %s\n' "${alias_rpm}"
-  # printf '  %s.sha256\n' "${alias_rpm}"
+  printf '  %s\n' "${alias_rpm}"
+  printf '  %s.sha256\n' "${alias_rpm}"
   if [[ -n "${updater_appimage:-}" ]]; then
     printf '  %s\n' "${updater_appimage}"
     printf '  %s.sig\n' "${updater_appimage}"
