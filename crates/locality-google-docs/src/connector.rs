@@ -35,7 +35,7 @@ pub struct GoogleDocsConfig {
 mod docs_only_tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
-    use locality_connector::{ApplyPlanRequest, Connector, EnumerateRequest};
+    use locality_connector::{ApplyPlanRequest, Connector, EnumerateRequest, FetchRequest, ObserveRequest};
     use locality_core::journal::{PushId, PushOperationId};
     use locality_core::model::{MountId, RemoteId};
     use locality_core::planner::{PushOperation, PushPlan};
@@ -43,15 +43,17 @@ mod docs_only_tests {
     use crate::client::GoogleDocsApi;
     use crate::docs_dto::{BatchUpdateDocumentRequest, GoogleDocument};
 
-    #[derive(Debug, Default)] struct Docs { documents: Mutex<BTreeMap<String, GoogleDocument>>, creates: Mutex<usize>, batches: Mutex<usize> }
+    #[derive(Debug, Default)] struct Docs { documents: Mutex<BTreeMap<String, GoogleDocument>>, gets: Mutex<usize>, creates: Mutex<usize>, create_title: Mutex<Option<String>>, batches: Mutex<usize> }
     impl Docs { fn document(self, id: &str, title: &str) -> Self { self.documents.lock().unwrap().insert(id.into(), serde_json::from_value(serde_json::json!({"documentId": id, "title": title, "revisionId": "r1", "body": {"content": []}})).unwrap()); self } }
     impl GoogleDocsApi for Docs {
-        fn get_document(&self, id: &str) -> locality_core::LocalityResult<GoogleDocument> { self.documents.lock().unwrap().get(id).cloned().ok_or_else(|| locality_core::LocalityError::RemoteNotFound(id.into())) }
-        fn create_document(&self, title: &str) -> locality_core::LocalityResult<GoogleDocument> { *self.creates.lock().unwrap() += 1; Ok(serde_json::from_value(serde_json::json!({"documentId":"created", "title":title, "revisionId":"r1", "body":{"content":[]}})).unwrap()) }
+        fn get_document(&self, id: &str) -> locality_core::LocalityResult<GoogleDocument> { *self.gets.lock().unwrap() += 1; self.documents.lock().unwrap().get(id).cloned().ok_or_else(|| locality_core::LocalityError::RemoteNotFound(id.into())) }
+        fn create_document(&self, title: &str) -> locality_core::LocalityResult<GoogleDocument> { *self.creates.lock().unwrap() += 1; *self.create_title.lock().unwrap() = Some(title.into()); Ok(serde_json::from_value(serde_json::json!({"documentId":"created", "title":title, "revisionId":"r1", "body":{"content":[]}})).unwrap()) }
         fn batch_update_document(&self, id: &str, _: BatchUpdateDocumentRequest) -> locality_core::LocalityResult<GoogleDocument> { *self.batches.lock().unwrap() += 1; self.get_document(id).or_else(|_| Ok(serde_json::from_value(serde_json::json!({"documentId":id,"title":"Created","revisionId":"r1","body":{"content":[]}})).unwrap())) }
     }
     #[test] fn selected_documents_are_flat_root_pages() { let docs = Arc::new(Docs::default().document("a", "Zeta").document("b", "Alpha")); let connector = GoogleDocsConnector::with_documents(GoogleDocsConfig::new("t").with_document_ids(vec!["a".into(), "b".into()]), docs); let entries = connector.enumerate(EnumerateRequest { mount_id: MountId::new("m"), cursor: None }).unwrap(); assert_eq!(entries.iter().map(|entry| entry.path.to_string_lossy().to_string()).collect::<Vec<_>>(), ["alpha/page.md", "zeta/page.md"]); }
-    #[test] fn create_and_body_mutations_use_docs_only_and_reject_drive_operations() { let docs = Arc::new(Docs::default().document("a", "Alpha")); let connector = GoogleDocsConnector::with_documents(GoogleDocsConfig::new("t"), docs.clone()); let create = PushPlan::new(vec![], vec![PushOperation::CreateEntity { parent_id: RemoteId::new("root"), parent_kind: None, parent_workspace: false, title: "New".into(), properties: BTreeMap::new(), body: String::new(), source_path: Default::default() }]); let ids = vec![PushOperationId("p:0".into())]; let push = PushId("p".into()); let mount = MountId::new("m"); let result = connector.apply(ApplyPlanRequest { push_id: &push, mount_id: &mount, plan: &create, operation_ids: &ids, remote_preconditions: &[], local_root: None }).unwrap(); assert_eq!(result.changed_remote_ids, [RemoteId::new("created")]); assert!(matches!(result.effects.as_slice(), [locality_core::journal::JournalApplyEffect::CreatedEntity { entity_id, .. }] if entity_id == &RemoteId::new("created"))); assert_eq!(*docs.creates.lock().unwrap(), 1); let move_plan = PushPlan::new(vec![RemoteId::new("a")], vec![PushOperation::ArchiveEntity { entity_id: RemoteId::new("a") }]); assert!(connector.apply(ApplyPlanRequest { push_id: &push, mount_id: &mount, plan: &move_plan, operation_ids: &ids, remote_preconditions: &[], local_root: None }).is_err()); assert_eq!(*docs.batches.lock().unwrap(), 0); }
+    #[test] fn fetch_and_observe_reject_unselected_documents_before_docs_get() { let docs = Arc::new(Docs::default().document("a", "Alpha")); let connector = GoogleDocsConnector::with_documents(GoogleDocsConfig::new("t").with_document_ids(vec!["a".into()]), docs.clone()); assert!(connector.fetch(FetchRequest { remote_id: RemoteId::new("outside") }).is_err()); assert!(connector.observe(ObserveRequest { mount_id: MountId::new("m"), remote_id: RemoteId::new("outside") }).is_err()); assert_eq!(*docs.gets.lock().unwrap(), 0); }
+    #[test] fn create_posts_title_then_writes_body_and_rejects_drive_operations() { let docs = Arc::new(Docs::default().document("a", "Alpha")); let connector = GoogleDocsConnector::with_documents(GoogleDocsConfig::new("t"), docs.clone()); let create = PushPlan::new(vec![], vec![PushOperation::CreateEntity { parent_id: RemoteId::new("root"), parent_kind: None, parent_workspace: false, title: "New".into(), properties: BTreeMap::new(), body: "Body".into(), source_path: Default::default() }]); let ids = vec![PushOperationId("p:0".into())]; let push = PushId("p".into()); let mount = MountId::new("m"); let result = connector.apply(ApplyPlanRequest { push_id: &push, mount_id: &mount, plan: &create, operation_ids: &ids, remote_preconditions: &[], local_root: None }).unwrap(); assert_eq!(result.changed_remote_ids, [RemoteId::new("created")]); assert!(matches!(result.effects.as_slice(), [locality_core::journal::JournalApplyEffect::CreatedEntity { entity_id, .. }] if entity_id == &RemoteId::new("created"))); assert_eq!(*docs.create_title.lock().unwrap(), Some("New".into())); assert_eq!(*docs.creates.lock().unwrap(), 1); assert_eq!(*docs.batches.lock().unwrap(), 1); let move_plan = PushPlan::new(vec![RemoteId::new("a")], vec![PushOperation::ArchiveEntity { entity_id: RemoteId::new("a") }]); assert!(connector.apply(ApplyPlanRequest { push_id: &push, mount_id: &mount, plan: &move_plan, operation_ids: &ids, remote_preconditions: &[], local_root: None }).is_err()); assert_eq!(*docs.batches.lock().unwrap(), 1); }
+    #[test] fn mixed_plan_and_non_root_create_fail_before_any_docs_call() { let docs = Arc::new(Docs::default().document("a", "Alpha")); let connector = GoogleDocsConnector::with_documents(GoogleDocsConfig::new("t").with_document_ids(vec!["a".into()]), docs.clone()); let plan = PushPlan::new(vec![RemoteId::new("a")], vec![PushOperation::AppendBlock { parent_id: RemoteId::new("a"), after: None, content: "allowed".into() }, PushOperation::ArchiveEntity { entity_id: RemoteId::new("a") }]); let ids = vec![PushOperationId("p:0".into()), PushOperationId("p:1".into())]; let push = PushId("p".into()); let mount = MountId::new("m"); assert!(connector.apply(ApplyPlanRequest { push_id: &push, mount_id: &mount, plan: &plan, operation_ids: &ids, remote_preconditions: &[], local_root: None }).is_err()); let non_root = PushPlan::new(vec![], vec![PushOperation::CreateEntity { parent_id: RemoteId::new("a"), parent_kind: None, parent_workspace: false, title: "nested".into(), properties: BTreeMap::new(), body: String::new(), source_path: Default::default() }]); assert!(connector.apply(ApplyPlanRequest { push_id: &push, mount_id: &mount, plan: &non_root, operation_ids: &ids[..1], remote_preconditions: &[], local_root: None }).is_err()); assert_eq!(*docs.gets.lock().unwrap(), 0); assert_eq!(*docs.creates.lock().unwrap(), 0); assert_eq!(*docs.batches.lock().unwrap(), 0); }
 }
 
 impl std::fmt::Debug for GoogleDocsConfig {
@@ -107,6 +109,17 @@ impl GoogleDocsConnector {
         &self.config
     }
 
+    fn require_selected(&self, remote_id: &RemoteId) -> LocalityResult<()> {
+        if self.config.document_ids.iter().any(|id| id == remote_id.as_str()) {
+            Ok(())
+        } else {
+            Err(LocalityError::Guardrail(format!(
+                "google docs document `{}` is not selected for this mount",
+                remote_id.as_str()
+            )))
+        }
+    }
+
 }
 
 impl Connector for GoogleDocsConnector {
@@ -152,6 +165,7 @@ impl Connector for GoogleDocsConnector {
     }
 
     fn observe(&self, request: ObserveRequest) -> LocalityResult<RemoteObservation> {
+        self.require_selected(&request.remote_id)?;
         let document = self.docs.get_document(request.remote_id.as_str())?;
         Ok(RemoteObservation::new(request.mount_id, RemoteId::new(document.document_id.clone()), EntityKind::Page, document.title.clone(), page_document_path(Path::new(&slugify_title(&document.title))))
             .with_raw_metadata_json(document_metadata_json(&document))
@@ -159,6 +173,7 @@ impl Connector for GoogleDocsConnector {
     }
 
     fn fetch(&self, request: FetchRequest) -> LocalityResult<NativeEntity> {
+        self.require_selected(&request.remote_id)?;
         let document = self.docs.get_document(request.remote_id.as_str())?;
         let raw = serde_json::to_vec(&document).map_err(|error| {
             LocalityError::Io(format!("google docs native encode failed: {error}"))
@@ -187,10 +202,14 @@ impl Connector for GoogleDocsConnector {
     }
 
     fn check_concurrency(&self, request: ApplyPlanRequest<'_>) -> LocalityResult<()> {
+        preflight_plan(request.plan, &self.config.document_ids)?;
+        preflight_preconditions(request.remote_preconditions, &self.config.document_ids)?;
         check_remote_preconditions(self.docs.as_ref(), &request)
     }
 
     fn apply(&self, request: ApplyPlanRequest<'_>) -> LocalityResult<ApplyPlanResult> {
+        preflight_plan(request.plan, &self.config.document_ids)?;
+        preflight_preconditions(request.remote_preconditions, &self.config.document_ids)?;
         apply_plan(self.docs.as_ref(), request)
     }
 
@@ -335,6 +354,44 @@ fn project_selected_documents(docs: &dyn GoogleDocsApi, mount_id: &locality_core
                 remote_edited_at: Some(document_remote_version(&document)),
                 stub_frontmatter: Some(document_frontmatter(&document)),
             }).collect())
+}
+
+/// Reject an entire plan before checking remote versions or issuing any Docs call.
+fn preflight_plan(plan: &PushPlan, selected_ids: &[String]) -> LocalityResult<()> {
+    let selected = |id: &str| selected_ids.iter().any(|selected_id| selected_id == id);
+    for entity_id in &plan.affected_entities {
+        if !selected(entity_id.as_str()) {
+            return Err(LocalityError::Guardrail(format!("google docs document `{}` is not selected for this mount", entity_id.as_str())));
+        }
+    }
+    for operation in &plan.operations {
+        match operation {
+            PushOperation::UpdateBlock { block_id, .. }
+            | PushOperation::ReplaceBlock { block_id, .. }
+            | PushOperation::ArchiveBlock { block_id } => {
+                let range = GoogleBlockRange::parse(block_id)?;
+                if !selected(&range.document_id) { return Err(LocalityError::Guardrail(format!("google docs document `{}` is not selected for this mount", range.document_id))); }
+            }
+            PushOperation::AppendBlock { parent_id, after, .. } => {
+                if !selected(parent_id.as_str()) { return Err(LocalityError::Guardrail(format!("google docs document `{}` is not selected for this mount", parent_id.as_str()))); }
+                if let Some(after) = after { let range = GoogleBlockRange::parse(after)?; if range.document_id != parent_id.0 { return Err(LocalityError::Guardrail("google docs append block belongs to a different document".to_string())); } }
+            }
+            PushOperation::CreateEntity { parent_id, parent_workspace, .. } if parent_id.as_str() == "root" && !parent_workspace => {}
+            PushOperation::CreateEntity { .. } => return Err(LocalityError::Unsupported("google docs connector can only create documents at the mount root")),
+            PushOperation::UpdateEntityBody { .. } => return Err(LocalityError::Unsupported("whole-entity body updates for Google Docs")),
+            _ => return Err(LocalityError::Unsupported("Google Docs mounts only support body edits and root document creation")),
+        }
+    }
+    Ok(())
+}
+
+fn preflight_preconditions(preconditions: &[locality_core::push::RemotePrecondition], selected_ids: &[String]) -> LocalityResult<()> {
+    for precondition in preconditions {
+        if !selected_ids.iter().any(|id| id == precondition.remote_id.as_str()) {
+            return Err(LocalityError::Guardrail(format!("google docs document `{}` is not selected for this mount", precondition.remote_id.as_str())));
+        }
+    }
+    Ok(())
 }
 
 fn apply_plan(
