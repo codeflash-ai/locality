@@ -2370,6 +2370,7 @@ dependencies = [
  "locality-platform",
  "locality-slack",
  "locality-store",
+ "locality-telemetry",
  "localityd",
  "notify",
  "serde",
@@ -2551,6 +2552,18 @@ dependencies = [
  "tempfile",
  "unicode-normalization 0.1.24",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "locality-telemetry"
+version = "0.4.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

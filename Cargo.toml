@@ -8,6 +8,7 @@ members = [
   "crates/locality-engine",
   "crates/locality-protocol",
   "crates/locality-platform",
+  "crates/locality-telemetry",
   "crates/locality-store",
   "crates/locality-auth-core",
   "crates/locality-notion",
@@ -34,6 +35,7 @@ locality-connector = { path = "crates/locality-connector" }
 locality-engine = { path = "crates/locality-engine" }
 locality-protocol = { path = "crates/locality-protocol" }
 locality-platform = { path = "crates/locality-platform" }
+locality-telemetry = { path = "crates/locality-telemetry" }
 locality-store = { path = "crates/locality-store" }
 locality-auth-core = { path = "crates/locality-auth-core" }
 locality-notion = { path = "crates/locality-notion" }

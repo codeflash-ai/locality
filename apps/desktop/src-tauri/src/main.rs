@@ -123,6 +123,7 @@ use locality_store::{
 };
 #[cfg(test)]
 use locality_store::{ConnectorProfileId, ConnectorProfileRecord, ConnectorProfileRepository};
+use locality_telemetry::{EventProperties, Outcome, Severity, TelemetryClient, TelemetryConfig};
 use localityd::autosave::auto_save_timestamp;
 use localityd::durable_fs::{
     copy_new_file_durable, copy_new_file_durable_allow_cloud_placeholder, create_dir_all_durable,
@@ -294,6 +295,8 @@ struct DesktopSettings {
     launch_at_login: bool,
     show_menu_bar: bool,
     #[serde(default)]
+    share_telemetry: bool,
+    #[serde(default)]
     onboarding_completed: bool,
 }
 
@@ -302,6 +305,7 @@ impl Default for DesktopSettings {
         Self {
             launch_at_login: true,
             show_menu_bar: true,
+            share_telemetry: false,
             onboarding_completed: false,
         }
     }
@@ -602,6 +606,7 @@ static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static DESKTOP_SNAPSHOT_CACHE: OnceLock<Mutex<DesktopSnapshotCache>> = OnceLock::new();
 static SURFACE_REFRESH_STATE: OnceLock<Mutex<SurfaceRefreshState>> = OnceLock::new();
 static LAUNCH_AT_LOGIN_STATE: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
+static DESKTOP_TELEMETRY: OnceLock<Option<TelemetryClient>> = OnceLock::new();
 static LIVE_MODE_REMOTE_PULL_CURSOR: OnceLock<Mutex<usize>> = OnceLock::new();
 static LIVE_MODE_REMOTE_PULL_SCAN_TIMES: OnceLock<Mutex<BTreeMap<MountId, Instant>>> =
     OnceLock::new();
@@ -4074,6 +4079,7 @@ async fn set_desktop_setting(app: AppHandle, change: DesktopSettingChange) -> Ac
             }
         }
         "show_menu_bar" => set_menu_bar_visible(&app, change.enabled).unwrap_or_else(action_error),
+        "share_telemetry" => set_share_telemetry(change.enabled).unwrap_or_else(action_error),
         _ => ActionReport {
             ok: false,
             message: format!("Unknown desktop setting `{}`.", change.key),
@@ -5276,7 +5282,19 @@ fn record_desktop_activity(
     }
     let contents = serde_json::to_string_pretty(&items)
         .map_err(|error| format!("Could not serialize desktop activity: {error}"))?;
-    fs::write(&path, contents).map_err(|error| format!("Could not write desktop activity: {error}"))
+    fs::write(&path, contents)
+        .map_err(|error| format!("Could not write desktop activity: {error}"))?;
+    if let Some(telemetry) = desktop_telemetry() {
+        let _ = telemetry.capture(
+            "activity.completed",
+            EventProperties {
+                kind: Some(kind.to_string()),
+                outcome: Some(Outcome::Succeeded),
+                ..EventProperties::default()
+            },
+        );
+    }
+    Ok(())
 }
 
 fn journal_activity_timestamp(journal: &JournalEntry) -> Option<String> {
@@ -5937,6 +5955,7 @@ fn desktop_settings() -> DesktopSettings {
     DesktopSettings {
         launch_at_login: cached_launch_at_login_enabled(persisted.launch_at_login),
         show_menu_bar: persisted.show_menu_bar,
+        share_telemetry: persisted.share_telemetry,
         onboarding_completed: persisted.onboarding_completed,
     }
 }
@@ -6031,6 +6050,37 @@ fn set_menu_bar_visible(app: &AppHandle, visible: bool) -> Result<ActionReport, 
             "Locality is shown in the menu bar.".to_string()
         } else {
             "Locality is hidden from the menu bar.".to_string()
+        },
+    })
+}
+
+fn set_share_telemetry(enabled: bool) -> Result<ActionReport, String> {
+    let mut settings = load_desktop_settings().unwrap_or_default();
+    settings.share_telemetry = enabled;
+    save_desktop_settings(&settings)?;
+
+    if let Some(telemetry) = desktop_telemetry() {
+        telemetry.set_enabled(enabled);
+        if enabled {
+            let _ = telemetry.capture(
+                "telemetry.preference_changed",
+                EventProperties {
+                    outcome: Some(Outcome::Succeeded),
+                    ..EventProperties::default()
+                },
+            );
+            flush_desktop_telemetry_async();
+        } else {
+            let _ = telemetry.purge();
+        }
+    }
+
+    Ok(ActionReport {
+        ok: true,
+        message: if enabled {
+            "Anonymous usage and error reporting is on.".to_string()
+        } else {
+            "Anonymous usage and error reporting is off. Queued events were removed.".to_string()
         },
     })
 }
@@ -6817,7 +6867,101 @@ fn action_error(message: String) -> ActionReport {
 fn desktop_log(level: &str, event: &str, message: impl AsRef<str>) {
     let message = message.as_ref();
     let _ = append_service_log(&default_state_root(), "desktop", level, event, message);
+    if let Some(telemetry) = desktop_telemetry() {
+        let severity = match level {
+            "error" => Severity::Error,
+            "warn" => Severity::Warning,
+            _ => Severity::Info,
+        };
+        let _ = telemetry.capture(
+            "diagnostic.recorded",
+            EventProperties {
+                code: Some(event.to_string()),
+                severity: Some(severity),
+                ..EventProperties::default()
+            },
+        );
+    }
     eprintln!("loc desktop [{event}] {message}");
+}
+
+fn desktop_telemetry() -> Option<&'static TelemetryClient> {
+    DESKTOP_TELEMETRY
+        .get_or_init(|| {
+            let settings = load_desktop_settings().unwrap_or_default();
+            TelemetryClient::new(TelemetryConfig {
+                state_root: default_state_root(),
+                endpoint: desktop_telemetry_endpoint(),
+                enabled: settings.share_telemetry,
+                app: "desktop",
+                version: env!("CARGO_PKG_VERSION"),
+                build_id: current_desktop_build_id(),
+            })
+            .ok()
+        })
+        .as_ref()
+}
+
+fn desktop_telemetry_endpoint() -> Option<String> {
+    env::var("LOCALITY_TELEMETRY_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            option_env!("LOCALITY_TELEMETRY_ENDPOINT")
+                .filter(|value| !value.trim().is_empty())
+                .map(ToString::to_string)
+        })
+}
+
+fn flush_desktop_telemetry_async() {
+    if desktop_telemetry().is_some() {
+        thread::spawn(|| {
+            if let Some(telemetry) = desktop_telemetry() {
+                let _ = telemetry.flush();
+            }
+        });
+    }
+}
+
+fn start_desktop_telemetry_delivery() {
+    flush_desktop_telemetry_async();
+    thread::spawn(|| {
+        loop {
+            thread::sleep(Duration::from_secs(30));
+            if let Some(telemetry) = desktop_telemetry() {
+                let _ = telemetry.flush();
+            }
+        }
+    });
+}
+
+fn install_desktop_panic_telemetry() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        if let Some(telemetry) = desktop_telemetry() {
+            let (source_file, source_line) = panic_info
+                .location()
+                .map(|location| {
+                    let filename = location
+                        .file()
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or("unknown");
+                    (Some(filename.to_string()), Some(location.line()))
+                })
+                .unwrap_or((None, None));
+            let _ = telemetry.capture(
+                "app.panic",
+                EventProperties {
+                    severity: Some(Severity::Fatal),
+                    source_file,
+                    source_line,
+                    ..EventProperties::default()
+                },
+            );
+        }
+        previous(panic_info);
+    }));
 }
 
 fn mount_access_root(mount: &MountConfig) -> PathBuf {
@@ -14178,7 +14322,7 @@ mod tests {
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
 
     use super::{
-        ActionReport, DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION,
+        ActionReport, DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, DesktopSettings,
         LIVE_MODE_REMOTE_FAST_FORWARD_LEASE, LIVE_MODE_RUNNER_ACTIVE_INTERVAL,
         LIVE_MODE_RUNNER_PERIODIC_RECHECK, MonitorScreenBounds, PendingChange, ScreenBounds,
         TerminalCliLinkState, TrayVisualState, VirtualProjectionRefreshAction,
@@ -21242,6 +21386,17 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn legacy_desktop_settings_default_telemetry_off() {
+        let settings: DesktopSettings = serde_json::from_str(
+            r#"{"launchAtLogin":true,"showMenuBar":true,"onboardingCompleted":true}"#,
+        )
+        .expect("legacy desktop settings");
+
+        assert!(!settings.share_telemetry);
+        assert!(settings.onboarding_completed);
+    }
+
     struct TestTempDir {
         path: PathBuf,
     }
@@ -21480,6 +21635,7 @@ fn sample_snapshot() -> DesktopSnapshot {
         settings: DesktopSettings {
             launch_at_login: true,
             show_menu_bar: true,
+            share_telemetry: false,
             onboarding_completed: false,
         },
         pending_changes: sample_pending_changes(),
@@ -22066,6 +22222,8 @@ fn main() {
         return;
     }
 
+    install_desktop_panic_telemetry();
+
     let background_launch = desktop_launch_requested_background();
     let smoke_test_requested = desktop_smoke_test_requested();
     let single_instance_guard = if desktop_single_instance_required(smoke_test_requested) {
@@ -22103,6 +22261,7 @@ fn main() {
     };
 
     desktop_log("info", "app.start", "Locality desktop starting");
+    start_desktop_telemetry_delivery();
     let builder = tauri::Builder::default()
         .manage(single_instance::DesktopSingleInstanceState::new(
             single_instance_guard,

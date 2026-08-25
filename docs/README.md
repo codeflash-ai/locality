@@ -15,6 +15,8 @@ Use this directory for repo-facing documentation that helps contributors underst
   capability-gated durable freshness wait-attempt wire contract.
 - [`connector-development.md`](connector-development.md): connector manifest,
   host-hook, fixture, security-boundary, and add-a-connector contract.
+- [`telemetry.md`](telemetry.md): opt-in anonymous event contract, durable
+  delivery, privacy boundary, and deployment configuration.
 
 ## Static collaboration artifacts
 

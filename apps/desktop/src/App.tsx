@@ -201,6 +201,7 @@ type DesktopSnapshot = {
   settings: {
     launchAtLogin: boolean;
     showMenuBar: boolean;
+    shareTelemetry: boolean;
   };
   pendingChanges: PendingChange[];
   recentFiles: LocatedItem[];
@@ -480,6 +481,7 @@ const sampleSnapshot: DesktopSnapshot = {
   settings: {
     launchAtLogin: true,
     showMenuBar: true,
+    shareTelemetry: false,
   },
   pendingChanges: [
     {
@@ -6067,7 +6069,7 @@ function SettingsView({
 
   useEffect(() => {
     setLocalSettings(snapshot.settings);
-  }, [snapshot.settings.launchAtLogin, snapshot.settings.showMenuBar]);
+  }, [snapshot.settings.launchAtLogin, snapshot.settings.showMenuBar, snapshot.settings.shareTelemetry]);
 
   async function repairRuntime() {
     if (!runtimeNeedsRepair) {
@@ -6109,7 +6111,7 @@ function SettingsView({
     setDiagnosticMessage(report.message);
   }
 
-  async function updateDesktopSetting(key: "launch_at_login" | "show_menu_bar", enabled: boolean) {
+  async function updateDesktopSetting(key: "launch_at_login" | "show_menu_bar" | "share_telemetry", enabled: boolean) {
     setBusySetting(key);
     setSettingsMessage("");
     const previous = localSettings;
@@ -6117,6 +6119,7 @@ function SettingsView({
       ...localSettings,
       launchAtLogin: key === "launch_at_login" ? enabled : localSettings.launchAtLogin,
       showMenuBar: key === "show_menu_bar" ? enabled : localSettings.showMenuBar,
+      shareTelemetry: key === "share_telemetry" ? enabled : localSettings.shareTelemetry,
     });
     try {
       const report = await callCommand<ActionReport>(
@@ -6337,6 +6340,16 @@ function SettingsView({
                 busy={busySetting === "show_menu_bar"}
                 onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
               />
+              <ToggleRow
+                title="Share anonymous usage and error reports"
+                enabled={localSettings.shareTelemetry}
+                busy={busySetting === "share_telemetry"}
+                onToggle={(enabled) => void updateDesktopSetting("share_telemetry", enabled)}
+              />
+              <p className="quiet-note">
+                Sends feature outcomes and machine-readable error codes. File contents, paths,
+                titles, queries, account details, and error messages stay local.
+              </p>
               <SettingRow title="Default Notion folder" value={`${sourceDefaultPathPrefix()}/notion`} />
               {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
             </section>

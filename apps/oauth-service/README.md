@@ -323,6 +323,16 @@ Run checks:
 npm run check
 ```
 
+## Anonymous telemetry ingestion
+
+`POST /v1/telemetry/batch` accepts the versioned, allowlisted Locality desktop
+event contract and forwards it to PostHog. The endpoint rejects unknown fields,
+free-form values, batches over 50 events, and request bodies over 64 KiB. It does
+not accept local log messages, file paths, account data, or content.
+
+Configure `LOCALITY_POSTHOG_PROJECT_KEY` as a Worker secret. Optionally set
+`LOCALITY_POSTHOG_HOST`; it defaults to `https://us.i.posthog.com`.
+
 ## Required Configuration
 
 - `LOCALITY_BROKER_PUBLIC_BASE_URL`: HTTPS public origin for the broker, for
