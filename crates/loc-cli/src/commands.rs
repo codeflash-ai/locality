@@ -11685,7 +11685,7 @@ mod tests {
                 vec![
                     "Usage: loc mount google-docs",
                     "Mount Google Docs content",
-                    "--workspace-folder",
+                    "--connection",
                 ],
             ),
             (
