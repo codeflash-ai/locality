@@ -1127,6 +1127,37 @@ describe("auth broker", () => {
     expect(get).not.toHaveBeenCalled();
   });
 
+  it("rejects a non-canonical Slack refresh handle before routing to a Durable Object", async () => {
+    const validHandle = await encryptJsonHandle(
+      {
+        v: 1,
+        connector: "slack",
+        refresh_token: "slack-refresh-token",
+        issued_at: Math.floor(Date.now() / 1000)
+      },
+      env.LOCALITY_REFRESH_HANDLE_KEY!
+    );
+    const idFromName = vi.fn();
+    const get = vi.fn();
+    env.LOCALITY_SLACK_REFRESH_COORDINATOR = {
+      idFromName,
+      get
+    } as unknown as DurableObjectNamespace;
+
+    const response = await app.request(
+      "/v1/oauth/slack/refresh",
+      slackRefreshRequest(`${validHandle}.suffix`),
+      env
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "invalid_refresh_handle" }
+    });
+    expect(idFromName).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
+  });
+
   it("replays a successful Slack refresh when the client retries the same single-use handle", async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const request = new URLSearchParams(init?.body as string);

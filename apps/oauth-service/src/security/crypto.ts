@@ -66,15 +66,21 @@ export async function encryptJsonHandle(value: unknown, secret: string): Promise
 }
 
 export async function decryptJsonHandle<T>(handle: string, secret: string): Promise<T> {
-  const [prefix, ivText, ciphertextText] = handle.split(".");
-  if (prefix !== "locrh_v1" || !ivText || !ciphertextText) {
+  const parts = handle.split(".");
+  const [prefix, ivText, ciphertextText] = parts;
+  if (parts.length !== 3 || prefix !== "locrh_v1" || !ivText || !ciphertextText) {
+    throw new Error("invalid refresh handle");
+  }
+  const iv = base64UrlDecode(ivText);
+  const ciphertext = base64UrlDecode(ciphertextText);
+  if (base64UrlEncode(iv) !== ivText || base64UrlEncode(ciphertext) !== ciphertextText) {
     throw new Error("invalid refresh handle");
   }
   const key = await aesKey(secret);
   const plaintext = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: toArrayBuffer(base64UrlDecode(ivText)) },
+    { name: "AES-GCM", iv: toArrayBuffer(iv) },
     key,
-    toArrayBuffer(base64UrlDecode(ciphertextText))
+    toArrayBuffer(ciphertext)
   );
   return JSON.parse(decoder.decode(plaintext)) as T;
 }
