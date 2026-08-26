@@ -107,6 +107,31 @@ such as `summary`, `start`, `end`, and `location`, and the full Google Calendar
 event resource under `google_calendar.event`. The Markdown body is the event
 description.
 
+## Hosted Portable Ingestion
+
+The public connector supports hosted portable ingestion for the primary
+calendar only. The portable scope root is exactly
+`google-calendar:primary`; other calendar roots are rejected.
+
+Portable bootstrap requires a persisted explicit `--after`/`--before` date
+window. It uses those fixed dates for the full primary-calendar inventory and
+returns them in the connector checkpoint. A mount using the local rolling
+30-day-back/180-day-forward default is rejected before any Google Calendar API
+call, because its scope is not stable enough for hosted inventory.
+
+Portable bootstrap is initial-inventory only and rejects supplied checkpoints.
+It expands all pages in the fixed window, skips cancelled events, deduplicates
+identical remote IDs across pagination, and rejects conflicting duplicate
+identity, version, or path observations. Portable fetch also requires that same
+persisted window and rejects cancelled or out-of-window events before emitting
+an artifact. Bootstrap emits read-only event source objects with canonical event
+remote versions. When `max_changes` truncates the inventory, the result is incomplete with
+`google_calendar_bootstrap_max_changes_exceeded`; provider and pagination
+errors are returned rather than treated as complete. Portable fetch validates
+that the returned event remains a primary-calendar event with the requested
+remote ID. Portable render stores the native event JSON as the canonical
+artifact and emits one read/search-only Markdown projection.
+
 ## Write Policy
 
 `events/` is read-only. File Provider and source write policy should reject
