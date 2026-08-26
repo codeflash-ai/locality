@@ -26,16 +26,26 @@ broker -> provider token endpoint with client_secret
 broker -> loc CLI with new access token and new refresh handle
 ```
 
+Slack refresh tokens rotate on every exchange and are single-use. Slack handle
+refreshes are coordinated by a Durable Object keyed by the opaque handle. The
+broker persists an encrypted successful response for ten minutes before
+returning it, so a retry after a lost response receives the same rotated token
+pair without consuming the old Slack refresh token twice. Concurrent requests
+for the same handle are coalesced.
+
 Provider OAuth apps should register only the broker HTTPS callback URLs, such as
 `https://oauth.locality.example/v1/oauth/notion/callback`. The localhost URL is
 only the desktop completion URL used after the broker receives and verifies the
 provider callback.
 
-The current stateless broker uses the signed session token as the OAuth `state`,
-so `session` and `state` match in `/start` and `/exchange` payloads.
+The broker uses the signed session token as the OAuth `state`, so `session` and
+`state` match in `/start` and `/exchange` payloads.
 
-The broker does not persist page content or tokens. In `handle` mode, it returns
-an encrypted opaque refresh handle instead of the raw provider refresh token.
+The broker does not persist page content. In `handle` mode, it returns an
+encrypted opaque refresh handle instead of the raw provider refresh token.
+The Slack refresh coordinator temporarily persists only an encrypted successful
+refresh response for retry recovery; its alarm removes that response after ten
+minutes.
 
 ## API
 
@@ -362,8 +372,9 @@ Optional connector overrides:
 
 Recommended first deployment target: Cloudflare Workers.
 
-This service is stateless, TypeScript-native, latency-insensitive, and only
-needs provider secrets plus outbound HTTPS. Workers fit that shape well. Use
+This service is TypeScript-native, latency-insensitive, and only needs provider
+secrets, outbound HTTPS, and the configured Slack refresh Durable Object.
+Workers fit that shape well. Use
 `wrangler secret put` for secrets, keep only non-sensitive defaults in
 `wrangler.toml`, and let
 `.github/workflows/oauth-service-deploy.yml` deploy on `main` once

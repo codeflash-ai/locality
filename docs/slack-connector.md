@@ -150,6 +150,13 @@ harness performs its forced refresh before it starts daemon and FUSE consumers,
 then validates and exports the replacement credential before continuing with
 the mounted-filesystem scenario.
 
+Runtime credential resolution refreshes Slack five minutes before the recorded
+access-token expiry. The public OAuth broker also serializes requests for each
+opaque Slack refresh handle and keeps an encrypted successful response for ten
+minutes. If the client loses the first response, its retry receives that
+response rather than attempting to consume Slack's single-use refresh token
+again.
+
 Set `LOCALITY_SLACK_LIVE_TYPES` when the target conversation is not covered by
 the default `private_channel,im,mpim` type set. Do not set `public_channel` for
 this live test.

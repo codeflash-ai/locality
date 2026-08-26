@@ -29,6 +29,7 @@ pub const SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE: &str =
 pub const SLACK_OAUTH_SCOPES: &[&str] = SLACK_LOCAL_BROKER_SCOPES;
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
+const SLACK_REFRESH_SAFETY_WINDOW_SECONDS: u64 = 5 * 60;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSlackCredential {
@@ -137,8 +138,9 @@ impl StoredSlackCredential {
     }
 
     pub fn expires_soon(&self, now: u64) -> bool {
-        self.expires_at
-            .is_some_and(|expires_at| expires_at <= now.saturating_add(60))
+        self.expires_at.is_some_and(|expires_at| {
+            expires_at <= now.saturating_add(SLACK_REFRESH_SAFETY_WINDOW_SECONDS)
+        })
     }
 }
 
@@ -361,6 +363,24 @@ mod tests {
         assert!(!capabilities.supports_media_download);
         assert!(!capabilities.supports_undo);
         assert!(!capabilities.supports_batch_observation);
+    }
+
+    #[test]
+    fn refreshes_with_a_five_minute_safety_window() {
+        let acquired_at = 1_000;
+        let credential = StoredSlackCredential::from_broker_token(
+            OAuthBrokerToken {
+                expires_in: Some(3_600),
+                ..broker_token(slack_scopes())
+            },
+            "slack-client-id".to_string(),
+            "https://oauth.locality.test".to_string(),
+            acquired_at,
+        )
+        .expect("valid Slack credential");
+
+        assert!(!credential.expires_soon(acquired_at + 3_299));
+        assert!(credential.expires_soon(acquired_at + 3_300));
     }
 
     #[test]

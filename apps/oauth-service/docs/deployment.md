@@ -2,9 +2,11 @@
 
 ## Recommended: Cloudflare Workers
 
-The broker is a small stateless HTTP service. Cloudflare Workers is the best
-initial fit because it runs TypeScript directly, supports environment secrets,
-and does not require operating a server.
+The broker is a small HTTP service. Cloudflare Workers is the best initial fit
+because it runs TypeScript directly, supports environment secrets and Durable
+Objects, and does not require operating a server. The checked-in
+`wrangler.toml` creates the `LOCALITY_SLACK_REFRESH_COORDINATOR` Durable Object
+binding and its SQLite-backed class migration.
 
 Production setup:
 
@@ -70,6 +72,10 @@ configured, deploy:
 ```sh
 wrangler deploy
 ```
+
+The first deployment containing the Slack refresh coordinator applies the
+Durable Object migration declared in `wrangler.toml`. Do not remove or rename
+that migration tag after it has reached an environment.
 
 Use a stable production URL such as:
 
