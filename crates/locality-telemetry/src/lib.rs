@@ -513,6 +513,7 @@ mod tests {
 
         let body = server.join().expect("server");
         assert_eq!(body["schema_version"], 1);
+        assert_eq!(body["events"].as_array().expect("events").len(), 1);
         assert_eq!(body["events"][0]["name"], "activity.completed");
         assert_eq!(body["events"][0]["properties"]["kind"], "connect");
         assert!(body["events"][0].get("message").is_none());
