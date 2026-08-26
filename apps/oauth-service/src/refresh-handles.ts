@@ -53,18 +53,7 @@ export async function resolveRefreshToken(
   body: RefreshRequest
 ): Promise<string> {
   if (body.refresh_token_handle) {
-    try {
-      const payload = await decryptJsonHandle<RefreshHandlePayload>(
-        body.refresh_token_handle,
-        requireRefreshHandleSecret(env)
-      );
-      if (payload.v !== 1 || payload.connector !== connector) {
-        throw new Error("invalid refresh handle payload");
-      }
-      return payload.refresh_token;
-    } catch {
-      throw badRequest("invalid_refresh_handle", "refresh_token_handle is invalid");
-    }
+    return (await decodeRefreshTokenHandle(env, connector, body.refresh_token_handle)).refresh_token;
   }
   if (tokenMode(env) !== "raw") {
     throw badRequest("missing_refresh_handle", "refresh_token_handle is required");
@@ -73,6 +62,14 @@ export async function resolveRefreshToken(
     throw badRequest("missing_field", "refresh_token is required");
   }
   return body.refresh_token;
+}
+
+export async function validateRefreshTokenHandle(
+  env: BrokerEnv,
+  connector: ConnectorId,
+  refreshTokenHandle: string
+): Promise<void> {
+  await decodeRefreshTokenHandle(env, connector, refreshTokenHandle);
 }
 
 export function tokenMode(env: BrokerEnv): "handle" | "raw" {
@@ -89,4 +86,26 @@ function requireRefreshHandleSecret(env: BrokerEnv): string {
     throw configError("LOCALITY_REFRESH_HANDLE_KEY must be configured");
   }
   return secret;
+}
+
+async function decodeRefreshTokenHandle(
+  env: BrokerEnv,
+  connector: ConnectorId,
+  refreshTokenHandle: string
+): Promise<RefreshHandlePayload> {
+  const secret = requireRefreshHandleSecret(env);
+  try {
+    const payload = await decryptJsonHandle<RefreshHandlePayload>(refreshTokenHandle, secret);
+    if (
+      payload.v !== 1 ||
+      payload.connector !== connector ||
+      typeof payload.refresh_token !== "string" ||
+      payload.refresh_token.trim() === ""
+    ) {
+      throw new Error("invalid refresh handle payload");
+    }
+    return payload;
+  } catch {
+    throw badRequest("invalid_refresh_handle", "refresh_token_handle is invalid");
+  }
 }

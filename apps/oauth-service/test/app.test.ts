@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import app from "../src/app";
-import { hmacSha256Base64Url, utf8Base64Url } from "../src/security/crypto";
+import { encryptJsonHandle, hmacSha256Base64Url, utf8Base64Url } from "../src/security/crypto";
 import { SlackRefreshCoordinatorCore } from "../src/slack-refresh-coordinator";
 import type { BrokerEnv } from "../src/types";
 
@@ -35,21 +35,41 @@ interface BrokerTokenResponse {
 class MemoryDurableObjectStorage {
   readonly values = new Map<string, unknown>();
   alarm: number | Date | undefined;
+  failSetAlarm = false;
 
   async get<T>(key: string): Promise<T | undefined> {
     return this.values.get(key) as T | undefined;
-  }
-
-  async put<T>(key: string, value: T): Promise<void> {
-    this.values.set(key, value);
   }
 
   async deleteAll(): Promise<void> {
     this.values.clear();
   }
 
-  async setAlarm(scheduledTime: number | Date): Promise<void> {
-    this.alarm = scheduledTime;
+  async transaction<T>(
+    closure: (txn: {
+      put<V>(key: string, value: V): Promise<void>;
+      setAlarm(scheduledTime: number | Date): Promise<void>;
+    }) => Promise<T>
+  ): Promise<T> {
+    const values = new Map(this.values);
+    let alarm = this.alarm;
+    const result = await closure({
+      put: async <V>(key: string, value: V) => {
+        values.set(key, value);
+      },
+      setAlarm: async (scheduledTime: number | Date) => {
+        if (this.failSetAlarm) {
+          throw new Error("failed to set alarm");
+        }
+        alarm = scheduledTime;
+      }
+    });
+    this.values.clear();
+    for (const [key, value] of values) {
+      this.values.set(key, value);
+    }
+    this.alarm = alarm;
+    return result;
   }
 }
 
@@ -1085,6 +1105,28 @@ describe("auth broker", () => {
     expect(refreshRequest.get("refresh_token")).toBe("slack-refresh-token");
   });
 
+  it("rejects an invalid Slack refresh handle before routing to a Durable Object", async () => {
+    const idFromName = vi.fn();
+    const get = vi.fn();
+    env.LOCALITY_SLACK_REFRESH_COORDINATOR = {
+      idFromName,
+      get
+    } as unknown as DurableObjectNamespace;
+
+    const response = await app.request(
+      "/v1/oauth/slack/refresh",
+      slackRefreshRequest("locrh_v1.invalid.invalid"),
+      env
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "invalid_refresh_handle" }
+    });
+    expect(idFromName).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
+  });
+
   it("replays a successful Slack refresh when the client retries the same single-use handle", async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const request = new URLSearchParams(init?.body as string);
@@ -1193,6 +1235,39 @@ describe("auth broker", () => {
     expect(failed.status).toBe(502);
     expect(retry.status).toBe(200);
     expect(refreshCalls).toBe(2);
+  });
+
+  it("rolls back a cached Slack refresh when scheduling its expiry alarm fails", async () => {
+    const storage = new MemoryDurableObjectStorage();
+    storage.failSetAlarm = true;
+    const coordinator = new SlackRefreshCoordinatorCore(storage, env);
+    const refreshTokenHandle = await encryptJsonHandle(
+      {
+        v: 1,
+        connector: "slack",
+        refresh_token: "slack-refresh-token",
+        issued_at: Math.floor(Date.now() / 1000)
+      },
+      env.LOCALITY_REFRESH_HANDLE_KEY!
+    );
+    const fetchMock = vi.fn(async () =>
+      Response.json({
+        ok: true,
+        access_token: "new-xoxb-access-token",
+        refresh_token: "new-slack-refresh-token",
+        expires_in: 43200
+      })
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const response = await coordinator.fetch(
+      new Request("https://slack-refresh.locality.internal/refresh", slackRefreshRequest(refreshTokenHandle))
+    );
+
+    expect(response.status).toBe(500);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(storage.values.size).toBe(0);
+    expect(storage.alarm).toBeUndefined();
   });
 
   it("rejects unconfigured Slack redirect URIs", async () => {

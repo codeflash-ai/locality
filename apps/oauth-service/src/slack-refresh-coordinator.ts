@@ -15,11 +15,15 @@ interface CachedRefresh {
   expires_at: number;
 }
 
+interface SlackRefreshCoordinatorTransaction {
+  put<T>(key: string, value: T): Promise<void>;
+  setAlarm(scheduledTime: number | Date): Promise<void>;
+}
+
 interface SlackRefreshCoordinatorStorage {
   get<T>(key: string): Promise<T | undefined>;
-  put<T>(key: string, value: T): Promise<void>;
   deleteAll(): Promise<void>;
-  setAlarm(scheduledTime: number | Date): Promise<void>;
+  transaction<T>(closure: (txn: SlackRefreshCoordinatorTransaction) => Promise<T>): Promise<T>;
 }
 
 /**
@@ -95,8 +99,10 @@ export class SlackRefreshCoordinatorCore {
       expires_at: expiresAt
     } satisfies CachedRefresh;
 
-    await this.storage.put(SUCCESS_KEY, cached);
-    await this.storage.setAlarm(expiresAt * 1000);
+    await this.storage.transaction(async (txn) => {
+      await txn.put(SUCCESS_KEY, cached);
+      await txn.setAlarm(expiresAt * 1000);
+    });
     return cached;
   }
 

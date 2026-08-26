@@ -16,7 +16,13 @@ import { exchangeGmailCode, gmailAuthorizeUrl, refreshGmailToken, type GmailToke
 import { googleClientId } from "./oauth/google";
 import { exchangeNotionCode, notionAuthorizeUrl, refreshNotionToken, type NotionTokenResponse } from "./oauth/notion";
 import { exchangeSlackCode, refreshSlackToken, slackAuthorizeUrl } from "./oauth/slack";
-import { resolveRefreshToken, shapeRefreshToken, tokenMode, type RefreshRequest } from "./refresh-handles";
+import {
+  resolveRefreshToken,
+  shapeRefreshToken,
+  tokenMode,
+  validateRefreshTokenHandle,
+  type RefreshRequest
+} from "./refresh-handles";
 import { randomBase64Url } from "./security/crypto";
 import {
   providerCallbackUri,
@@ -363,6 +369,7 @@ app.post("/v1/oauth/slack/exchange", async (c) => {
 app.post("/v1/oauth/slack/refresh", async (c) => {
   const body = await requiredJson<RefreshRequest>(c.req.raw);
   if (body.refresh_token_handle) {
+    await validateRefreshTokenHandle(c.env, "slack", body.refresh_token_handle);
     const namespace = c.env.LOCALITY_SLACK_REFRESH_COORDINATOR;
     if (!namespace) {
       throw configError("LOCALITY_SLACK_REFRESH_COORDINATOR must be configured for Slack refresh handles");
