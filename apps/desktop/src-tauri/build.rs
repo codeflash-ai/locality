@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LOCALITY_BUILD_ID_OVERRIDE");
     println!("cargo:rerun-if-env-changed=LOCALITY_DESKTOP_BUILD_ID_OVERRIDE");
     println!("cargo:rerun-if-env-changed=LOCALITY_DISTRIBUTION_CHANNEL");
+    println!("cargo:rerun-if-env-changed=LOCALITY_TELEMETRY_ENDPOINT");
     println!("cargo:rerun-if-changed=build.rs");
     let workspace = workspace_root();
     println!(
@@ -23,6 +24,9 @@ fn main() {
     let distribution_channel =
         env::var("LOCALITY_DISTRIBUTION_CHANNEL").unwrap_or_else(|_| "direct".to_string());
     println!("cargo:rustc-env=LOCALITY_DISTRIBUTION_CHANNEL={distribution_channel}");
+    if let Ok(endpoint) = env::var("LOCALITY_TELEMETRY_ENDPOINT") {
+        println!("cargo:rustc-env=LOCALITY_TELEMETRY_ENDPOINT={endpoint}");
+    }
 
     tauri_build::build();
 }

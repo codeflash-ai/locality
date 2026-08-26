@@ -25,6 +25,8 @@ export interface BrokerEnv {
   LOCALITY_SLACK_REDIRECT_URIS?: string;
   LOCALITY_SLACK_AUTH_BASE_URL?: string;
   LOCALITY_SLACK_API_BASE_URL?: string;
+  LOCALITY_POSTHOG_HOST?: string;
+  LOCALITY_POSTHOG_PROJECT_KEY?: string;
 }
 
 export type ConnectorId = "notion" | "google-docs" | "google-calendar" | "gmail" | "slack";

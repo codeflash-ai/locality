@@ -56,7 +56,9 @@ const env: BrokerEnv = {
   LOCALITY_SLACK_CLIENT_SECRET: "slack-client-secret",
   LOCALITY_SLACK_API_BASE_URL: "https://slack-api.example.test",
   LOCALITY_SLACK_AUTH_BASE_URL: "https://slack-auth.example.test",
-  LOCALITY_SLACK_REDIRECT_URIS: "http://localhost:8757/oauth/slack/callback"
+  LOCALITY_SLACK_REDIRECT_URIS: "http://localhost:8757/oauth/slack/callback",
+  LOCALITY_POSTHOG_HOST: "https://telemetry.example.test",
+  LOCALITY_POSTHOG_PROJECT_KEY: "phc_test"
 };
 
 describe("auth broker", () => {
@@ -71,6 +73,106 @@ describe("auth broker", () => {
     globalThis.fetch = originalFetch;
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it("validates and forwards an anonymous telemetry batch", async () => {
+    const upstream = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response("{}", { status: 200 })
+    );
+    globalThis.fetch = upstream as typeof fetch;
+    const event = {
+      schema_version: 1,
+      event_id: "abcdef0123456789abcdef0123456789-0000000000000001",
+      occurred_at_ms: Date.now(),
+      anonymous_id: "abcdef0123456789abcdef0123456789",
+      session_id: "0123456789abcdef0123456789abcdef",
+      app: "desktop",
+      version: "0.4.0",
+      build_id: "build-1",
+      os: "macos",
+      arch: "aarch64",
+      name: "diagnostic.recorded",
+      properties: { code: "notion_access.failed", severity: "warning" }
+    };
+
+    const response = await app.request(
+      "/v1/telemetry/batch",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ schema_version: 1, events: [event] })
+      },
+      env
+    );
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ accepted: 1 });
+    expect(upstream).toHaveBeenCalledOnce();
+    const [url, init] = upstream.mock.calls[0]!;
+    expect(url).toBe("https://telemetry.example.test/batch/");
+    const forwarded = JSON.parse(String(init?.body));
+    expect(forwarded.batch[0]).toMatchObject({
+      event: "diagnostic.recorded",
+      properties: {
+        distinct_id: event.anonymous_id,
+        $insert_id: event.event_id,
+        $process_person_profile: false,
+        code: "notion_access.failed",
+        severity: "warning"
+      }
+    });
+  });
+
+  it("rejects telemetry fields that could carry arbitrary user data", async () => {
+    const response = await app.request(
+      "/v1/telemetry/batch",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          schema_version: 1,
+          events: [
+            {
+              schema_version: 1,
+              event_id: "abcdef0123456789abcdef0123456789-0000000000000001",
+              occurred_at_ms: Date.now(),
+              anonymous_id: "abcdef0123456789abcdef0123456789",
+              session_id: "0123456789abcdef0123456789abcdef",
+              app: "desktop",
+              version: "0.4.0",
+              build_id: "build-1",
+              os: "macos",
+              arch: "aarch64",
+              name: "diagnostic.recorded",
+              properties: { message: "customer file contents" }
+            }
+          ]
+        })
+      },
+      env
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "invalid_telemetry" }
+    });
+  });
+
+  it("rejects oversized telemetry batches before forwarding", async () => {
+    const upstream = vi.fn();
+    globalThis.fetch = upstream as typeof fetch;
+    const response = await app.request(
+      "/v1/telemetry/batch",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ schema_version: 1, events: [], padding: "x".repeat(65 * 1024) })
+      },
+      env
+    );
+
+    expect(response.status).toBe(413);
+    expect(upstream).not.toHaveBeenCalled();
   });
 
   it("publishes Gmail in broker discovery", async () => {

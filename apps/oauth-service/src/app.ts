@@ -26,6 +26,7 @@ import {
   validateSlackRedirectUri
 } from "./security/redirects";
 import { nowSeconds, signSession, verifySession, type OAuthSessionPayloadV2 } from "./security/session";
+import { ingestTelemetry } from "./telemetry";
 import type { ApiErrorBody, BrokerEnv, ConnectorId } from "./types";
 
 const SESSION_TTL_SECONDS = 10 * 60;
@@ -57,6 +58,11 @@ interface RefreshHandlePayload {
 const app = new Hono<{ Bindings: BrokerEnv }>();
 
 app.get("/healthz", (c) => c.json({ ok: true }));
+
+app.post("/v1/telemetry/batch", async (c) => {
+  const result = await ingestTelemetry(c.req.raw, c.env);
+  return c.json(result, 202);
+});
 
 app.get("/.well-known/loc-auth-broker", (c) =>
   c.json({

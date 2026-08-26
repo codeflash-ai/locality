@@ -28,6 +28,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ inputs.tag }}
       PUBLISH_CHANNEL: app-store
+      LOCALITY_TELEMETRY_ENDPOINT: ${{ vars.LOCALITY_TELEMETRY_ENDPOINT }}
       MAS_VALIDATE_WITH_APPLE: ${{ inputs.validate_with_apple && '1' || '0' }}
       MAS_UPLOAD: ${{ inputs.upload && '1' || '0' }}
       MAS_APP_CERTIFICATE_P12_BASE64: ${{ secrets.MAS_APP_CERTIFICATE_P12_BASE64 }}

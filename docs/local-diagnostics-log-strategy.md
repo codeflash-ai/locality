@@ -15,6 +15,10 @@ support debug Locality without leaking workspace data or slowing normal sync.
 - Never store bearer tokens, OAuth secrets, Notion page bodies, Markdown file
   contents, or credential references that can be decoded into secrets.
 
+This local diagnostics trail is separate from the opt-in, tightly allowlisted
+anonymous product telemetry described in [`telemetry.md`](telemetry.md). Enabling
+telemetry does not upload these logs or their free-form messages.
+
 ## Event Sources
 
 Locality already has partial activity and journal data. The next reliable shape is
