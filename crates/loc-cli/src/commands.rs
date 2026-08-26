@@ -75,7 +75,6 @@ use localityd::durable_fs::{
 };
 use localityd::execution::PushJobReport;
 use localityd::file_provider as daemon_file_provider;
-use localityd::google_docs::resolve_google_docs_connector_for_mount;
 use localityd::granola::resolve_granola_connector_for_mount;
 use localityd::hydration::write_parent_database_schema_cache;
 use localityd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
@@ -691,12 +690,6 @@ struct MountGoogleDocsArgs {
         help = "Local directory where the mount should be registered."
     )]
     path: String,
-    #[arg(
-        long,
-        value_name = "name-or-id",
-        help = "Google Drive workspace folder name, id, or folder URL."
-    )]
-    workspace_folder: String,
     #[arg(long, value_name = "id", help = "Connection id to use for this mount.")]
     connection: Option<String>,
     #[arg(
@@ -1433,8 +1426,6 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                 MountCommand::GoogleDocs(options) => {
                     args.push("google-docs".to_string());
                     args.push(options.path.clone());
-                    args.push("--workspace-folder".to_string());
-                    args.push(options.workspace_folder.clone());
                     push_optional_flag_value(
                         &mut args,
                         "--connection",
@@ -4929,47 +4920,17 @@ fn mount_remote_root_id(
             Ok(remote_root_id)
         }
         GOOGLE_DOCS_CONNECTOR_ID => {
-            if has_flag(args, "--workspace") || flag_value(args, "--root-page").is_some() {
+            if has_flag(args, "--workspace")
+                || flag_value(args, "--root-page").is_some()
+                || flag_value(args, "--workspace-folder").is_some()
+            {
                 return Err(CommandError::new(
                     "mount",
                     "usage",
-                    "loc mount google-docs uses --workspace-folder <name-or-id>, not Notion root flags",
+                    "loc mount google-docs discovers all accessible Google Docs and does not accept root flags",
                 ));
             }
-            let Some(workspace_folder) = flag_value(args, "--workspace-folder") else {
-                return Err(CommandError::new(
-                    "mount",
-                    "usage",
-                    "loc mount google-docs requires --workspace-folder <name-or-id>",
-                ));
-            };
-            let temp_mount = MountConfig {
-                mount_id: mount_id.clone(),
-                connector: descriptor.id().to_string(),
-                root: PathBuf::from(root),
-                remote_root_id: None,
-                connection_id: connection_id.clone(),
-                read_only,
-                projection: projection.clone(),
-                settings_json: "{}".to_string(),
-            };
-            let credentials = open_credential_store(state_root);
-            let connector =
-                resolve_google_docs_connector_for_mount(store, credentials.as_ref(), &temp_mount)
-                    .map_err(|error| connector_resolve_command_error("mount", error))?;
-            let folder_id = connector.resolve_workspace_folder(workspace_folder).map_err(
-                |error| {
-                    CommandError::new(
-                        "mount",
-                        "workspace_folder_error",
-                        format!(
-                            "failed to resolve Google Docs workspace folder `{workspace_folder}`: {error}"
-                        ),
-                    )
-                    .with_suggested_command("loc connect google-docs")
-                },
-            )?;
-            Ok(Some(folder_id))
+            Ok(None)
         }
         GMAIL_CONNECTOR_ID => {
             if has_flag(args, "--workspace")
@@ -10368,7 +10329,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-calendar <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]\n       loc mount linear <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]",
+        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-calendar <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]\n       loc mount linear <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -11724,7 +11685,7 @@ mod tests {
                 vec![
                     "Usage: loc mount google-docs",
                     "Mount Google Docs content",
-                    "--workspace-folder",
+                    "--connection",
                 ],
             ),
             (

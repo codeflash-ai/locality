@@ -34,7 +34,6 @@ use crate::render::{
 #[derive(Clone, PartialEq, Eq)]
 pub struct GoogleDocsConfig {
     pub access_token: String,
-    pub workspace_folder_id: Option<RemoteId>,
 }
 
 impl std::fmt::Debug for GoogleDocsConfig {
@@ -42,7 +41,6 @@ impl std::fmt::Debug for GoogleDocsConfig {
         formatter
             .debug_struct("GoogleDocsConfig")
             .field("access_token", &"<redacted>")
-            .field("workspace_folder_id", &self.workspace_folder_id)
             .finish()
     }
 }
@@ -51,12 +49,11 @@ impl GoogleDocsConfig {
     pub fn new(access_token: impl Into<String>) -> Self {
         Self {
             access_token: access_token.into(),
-            workspace_folder_id: None,
         }
     }
 
-    pub fn with_workspace_folder_id(mut self, workspace_folder_id: RemoteId) -> Self {
-        self.workspace_folder_id = Some(workspace_folder_id);
+    #[deprecated(note = "Google Docs mounts are account-wide")]
+    pub fn with_workspace_folder_id(self, _workspace_folder_id: RemoteId) -> Self {
         self
     }
 }
@@ -71,7 +68,6 @@ pub struct GoogleDocsConnector {
 impl std::fmt::Debug for GoogleDocsConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GoogleDocsConnector")
-            .field("workspace_folder_id", &self.config.workspace_folder_id)
             .field("access_token", &"<redacted>")
             .finish()
     }
@@ -97,91 +93,6 @@ impl GoogleDocsConnector {
 
     pub fn config(&self) -> &GoogleDocsConfig {
         &self.config
-    }
-
-    pub fn with_workspace_folder_id(&self, workspace_folder_id: RemoteId) -> Self {
-        let mut config = self.config.clone();
-        config.workspace_folder_id = Some(workspace_folder_id);
-        Self {
-            config,
-            drive: Arc::clone(&self.drive),
-            docs: Arc::clone(&self.docs),
-        }
-    }
-
-    pub fn resolve_workspace_folder(&self, workspace_folder: &str) -> LocalityResult<RemoteId> {
-        let workspace_folder = workspace_folder.trim();
-        if workspace_folder.is_empty() {
-            return Err(LocalityError::InvalidState(
-                "google docs workspace folder cannot be empty".to_string(),
-            ));
-        }
-
-        if let Some(folder_id) = extract_google_drive_folder_id(workspace_folder) {
-            return self.verify_workspace_folder_id(&folder_id);
-        }
-        if looks_like_google_drive_id(workspace_folder) {
-            match self.verify_workspace_folder_id(workspace_folder) {
-                Ok(folder_id) => return Ok(folder_id),
-                Err(LocalityError::RemoteNotFound(_)) => {}
-                Err(error) => return Err(error),
-            }
-        }
-
-        if let Some(folder) = self.find_workspace_folder_by_name(workspace_folder)? {
-            return Ok(RemoteId::new(folder.id));
-        }
-        let created = self
-            .drive
-            .create_file(DriveCreateFileRequest::folder(workspace_folder, None))?;
-        if !created.is_folder() || created.trashed {
-            return Err(LocalityError::InvalidState(format!(
-                "google docs workspace folder create returned non-folder `{}`",
-                created.id
-            )));
-        }
-        Ok(RemoteId::new(created.id))
-    }
-
-    fn verify_workspace_folder_id(&self, folder_id: &str) -> LocalityResult<RemoteId> {
-        let file = self.drive.get_file(folder_id)?;
-        if file.trashed {
-            return Err(LocalityError::RemoteNotFound(format!(
-                "google docs workspace folder `{folder_id}` is trashed"
-            )));
-        }
-        if !file.is_folder() {
-            return Err(LocalityError::Guardrail(format!(
-                "google docs workspace root `{folder_id}` is not a Google Drive folder"
-            )));
-        }
-        Ok(RemoteId::new(file.id))
-    }
-
-    fn find_workspace_folder_by_name(&self, name: &str) -> LocalityResult<Option<DriveFile>> {
-        let mut cursor = None;
-        let mut matches = Vec::new();
-        loop {
-            let page = self
-                .drive
-                .list_workspace_folders_by_name(name, cursor.as_deref())?;
-            matches.extend(
-                page.files
-                    .into_iter()
-                    .filter(|file| file.is_folder() && !file.trashed),
-            );
-            if page.next_page_token.is_none() {
-                break;
-            }
-            cursor = page.next_page_token;
-        }
-        matches.sort_by(|left, right| {
-            left.name
-                .to_lowercase()
-                .cmp(&right.name.to_lowercase())
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        Ok(matches.into_iter().next())
     }
 }
 
@@ -220,28 +131,20 @@ impl Connector for GoogleDocsConnector {
     }
 
     fn enumerate(&self, request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>> {
-        let root_id = self.workspace_folder_id()?;
-        enumerate_drive_tree(
-            self.drive.as_ref(),
-            &request.mount_id,
-            root_id.as_str(),
-            Path::new(""),
-        )
+        list_accessible_google_docs(self.drive.as_ref(), &request.mount_id)
     }
 
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {
-        let parent_id = match request.container {
-            locality_connector::ChildContainer::Root => self.workspace_folder_id()?.0.clone(),
-            locality_connector::ChildContainer::PageChildren(remote_id)
-            | locality_connector::ChildContainer::DatabaseRows(remote_id)
-            | locality_connector::ChildContainer::DirectoryChildren(remote_id) => remote_id.0,
-        };
-        Ok(ListChildrenResult::complete(list_drive_children(
-            self.drive.as_ref(),
-            &request.mount_id,
-            &parent_id,
-            &request.parent_path,
-        )?))
+        match request.container {
+            locality_connector::ChildContainer::Root => Ok(ListChildrenResult::complete(
+                list_accessible_google_docs(self.drive.as_ref(), &request.mount_id)?,
+            )),
+            locality_connector::ChildContainer::PageChildren(_)
+            | locality_connector::ChildContainer::DatabaseRows(_)
+            | locality_connector::ChildContainer::DirectoryChildren(_) => {
+                Ok(ListChildrenResult::complete(Vec::new()))
+            }
+        }
     }
 
     fn observe(&self, request: ObserveRequest) -> LocalityResult<RemoteObservation> {
@@ -482,16 +385,6 @@ fn drive_file_search_metadata(file: &DriveFile) -> SearchMetadata {
     metadata
 }
 
-impl GoogleDocsConnector {
-    fn workspace_folder_id(&self) -> LocalityResult<&RemoteId> {
-        self.config.workspace_folder_id.as_ref().ok_or_else(|| {
-            LocalityError::InvalidState(
-                "google docs mount is missing workspace folder id".to_string(),
-            )
-        })
-    }
-}
-
 fn check_remote_preconditions(
     drive: &dyn GoogleDriveApi,
     docs: &dyn GoogleDocsApi,
@@ -541,41 +434,14 @@ fn remote_version_from_apis(
     Ok(combined_remote_version(&file, revision.as_deref()))
 }
 
-fn enumerate_drive_tree(
+fn list_accessible_google_docs(
     drive: &dyn GoogleDriveApi,
     mount_id: &locality_core::model::MountId,
-    parent_id: &str,
-    parent_path: &Path,
-) -> LocalityResult<Vec<TreeEntry>> {
-    let mut entries = Vec::new();
-    let children = list_drive_children(drive, mount_id, parent_id, parent_path)?;
-    for entry in children {
-        let is_directory = entry.kind == EntityKind::Directory;
-        let remote_id = entry.remote_id.clone();
-        let dir_path = entry.path.clone();
-        entries.push(entry);
-        if is_directory {
-            entries.extend(enumerate_drive_tree(
-                drive,
-                mount_id,
-                remote_id.as_str(),
-                &dir_path,
-            )?);
-        }
-    }
-    Ok(entries)
-}
-
-fn list_drive_children(
-    drive: &dyn GoogleDriveApi,
-    mount_id: &locality_core::model::MountId,
-    parent_id: &str,
-    parent_path: &Path,
 ) -> LocalityResult<Vec<TreeEntry>> {
     let mut cursor = None;
     let mut files = Vec::new();
     loop {
-        let page = drive.list_children(parent_id, cursor.as_deref())?;
+        let page = drive.list_accessible_google_docs(cursor.as_deref())?;
         files.extend(page.files.into_iter().filter(|file| !file.trashed));
         if page.next_page_token.is_none() {
             break;
@@ -588,7 +454,7 @@ fn list_drive_children(
             .cmp(&right.name.to_lowercase())
             .then_with(|| left.id.cmp(&right.id))
     });
-    Ok(project_drive_children(mount_id, parent_path, files))
+    Ok(project_drive_children(mount_id, Path::new(""), files))
 }
 
 fn project_drive_children(
@@ -835,29 +701,10 @@ fn apply_plan(
                     });
                 }
             }
-            PushOperation::MoveEntity {
-                entity_id,
-                new_parent_id,
-                new_title,
-                ..
-            } => {
-                let file = drive.get_file(entity_id.as_str())?;
-                let remove_parents = file.parents.join(",");
-                drive.update_file(
-                    entity_id.as_str(),
-                    DriveUpdateFileRequest::move_and_rename(
-                        new_title,
-                        new_parent_id.0.clone(),
-                        remove_parents,
-                    ),
-                )?;
-                changed.insert(entity_id.clone());
-                effects.push(JournalApplyEffect::MovedEntity {
-                    operation_id,
-                    operation_index: index,
-                    entity_id: entity_id.clone(),
-                    parent_id: new_parent_id.clone(),
-                });
+            PushOperation::MoveEntity { .. } => {
+                return Err(LocalityError::Unsupported(
+                    "google docs account-wide mounts do not support moving documents",
+                ));
             }
             PushOperation::CreateEntity {
                 parent_id,
@@ -866,15 +713,13 @@ fn apply_plan(
                 body,
                 ..
             } => {
-                if *parent_workspace {
+                let created = drive.create_file(if *parent_workspace || parent_id.0 == "workspace" {
+                    DriveCreateFileRequest::google_doc_at_root(title)
+                } else {
                     return Err(LocalityError::Unsupported(
-                        "google docs connector cannot create workspace-private pages",
+                        "google docs account-wide mount only creates documents at the mount root",
                     ));
-                }
-                let created = drive.create_file(DriveCreateFileRequest::google_doc(
-                    title,
-                    parent_id.0.clone(),
-                ))?;
+                })?;
                 if !body.trim().is_empty() {
                     let document = docs
                         .get_document(created.id.as_str())
@@ -3187,13 +3032,6 @@ pub fn extract_google_drive_folder_id(value: &str) -> Option<String> {
     None
 }
 
-fn looks_like_google_drive_id(value: &str) -> bool {
-    value.len() >= 10
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -3220,23 +3058,13 @@ mod tests {
     };
 
     #[test]
-    fn enumerate_projects_workspace_folders_and_docs_as_page_directories() {
-        let drive = Arc::new(
-            FakeDrive::default()
-                .with_children(
-                    "workspace",
-                    vec![folder("folder-1", "Marketing", "workspace")],
-                )
-                .with_children(
-                    "folder-1",
-                    vec![
-                        doc_file("doc-1", "Launch Brief", "folder-1"),
-                        doc_file("doc-2", "Nested Doc", "folder-1"),
-                    ],
-                ),
-        );
+    fn enumerate_projects_all_accessible_docs_at_mount_root() {
+        let drive = Arc::new(FakeDrive::default().with_accessible_docs(vec![
+            doc_file("doc-1", "Launch Brief", "folder-a"),
+            doc_file("doc-2", "Launch Brief", "shared-drive-folder"),
+        ]));
         let connector = GoogleDocsConnector::with_apis(
-            GoogleDocsConfig::new("token").with_workspace_folder_id(RemoteId::new("workspace")),
+            GoogleDocsConfig::new("token"),
             drive,
             Arc::new(FakeDocs::default()),
         );
@@ -3246,27 +3074,17 @@ mod tests {
                 mount_id: MountId::new("google-docs-main"),
                 cursor: None,
             })
-            .expect("enumerate");
+            .expect("enumerate account-wide docs");
 
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].kind, EntityKind::Directory);
-        assert_eq!(entries[0].path, std::path::Path::new("marketing"));
-        assert_eq!(entries[1].kind, EntityKind::Page);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.kind == EntityKind::Page));
+        assert_eq!(
+            entries[0].path,
+            std::path::Path::new("launch-brief/page.md")
+        );
         assert_eq!(
             entries[1].path,
-            std::path::Path::new("marketing/launch-brief/page.md")
-        );
-        assert_eq!(
-            entries[1]
-                .stub_frontmatter
-                .as_ref()
-                .unwrap()
-                .contains("google-docs"),
-            true
-        );
-        assert_eq!(
-            entries[2].path,
-            std::path::Path::new("marketing/nested-doc/page.md")
+            std::path::Path::new("launch-brief doc2/page.md")
         );
     }
 
@@ -3549,8 +3367,11 @@ mod tests {
             "rev-2",
             "Hello\n",
         )));
-        let connector =
-            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive.clone(),
+            docs.clone(),
+        );
         let plan = PushPlan::new(
             vec![RemoteId::new("doc-1")],
             vec![PushOperation::UpdateBlock {
@@ -3589,8 +3410,11 @@ mod tests {
             "rev-1",
             "Age: 4 years\u{000b}Weight: 33 pounds\n",
         )));
-        let connector =
-            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive.clone(),
+            docs.clone(),
+        );
         let plan = PushPlan::new(
             vec![RemoteId::new("doc-1")],
             vec![PushOperation::UpdateBlock {
@@ -6085,7 +5909,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_move_entity_renames_and_replaces_drive_parent() {
+    fn apply_rejects_move_entity_in_flat_account_mount() {
         let drive = Arc::new(
             FakeDrive::default()
                 .with_file(doc_file("doc-1", "Launch Brief", "folder-old"))
@@ -6113,7 +5937,7 @@ mod tests {
             &plan.operations[0],
         )];
 
-        let result = connector
+        let error = connector
             .apply(ApplyPlanRequest {
                 push_id: &push_id,
                 mount_id: &MountId::new("google-docs-main"),
@@ -6122,66 +5946,19 @@ mod tests {
                 remote_preconditions: &[],
                 local_root: None,
             })
-            .expect("apply move entity");
+            .expect_err("flat account mount must reject moves");
 
-        assert_eq!(result.changed_remote_ids, vec![RemoteId::new("doc-1")]);
-        assert_eq!(result.effects.len(), 1);
-        let update = drive
-            .last_update
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("move update");
-        assert_eq!(update.0, "doc-1");
-        assert_eq!(update.1.name.as_deref(), Some("Archived Brief"));
-        assert_eq!(update.1.add_parents.as_deref(), Some("folder-new"));
-        assert_eq!(update.1.remove_parents.as_deref(), Some("folder-old"));
-    }
-
-    #[test]
-    fn resolve_workspace_folder_reuses_matching_named_folder() {
-        let drive = Arc::new(FakeDrive::default().with_workspace_folders(
-            "Locality Workspace",
-            vec![folder("folder-1", "Locality Workspace", "root")],
-        ));
-        let connector = GoogleDocsConnector::with_apis(
-            GoogleDocsConfig::new("token"),
-            drive.clone(),
-            Arc::new(FakeDocs::default()),
+        assert!(
+            matches!(error, locality_core::LocalityError::Unsupported(_)),
+            "{error:?}"
         );
-
-        let folder_id = connector
-            .resolve_workspace_folder("Locality Workspace")
-            .expect("resolve workspace folder");
-
-        assert_eq!(folder_id, RemoteId::new("folder-1"));
-        assert!(drive.last_created.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn resolve_workspace_folder_creates_missing_named_folder() {
-        let drive = Arc::new(FakeDrive::default());
-        let connector = GoogleDocsConnector::with_apis(
-            GoogleDocsConfig::new("token"),
-            drive.clone(),
-            Arc::new(FakeDocs::default()),
-        );
-
-        let folder_id = connector
-            .resolve_workspace_folder("Locality Workspace")
-            .expect("create workspace folder");
-
-        assert_eq!(folder_id, RemoteId::new("created-folder"));
-        let created = drive.last_created.lock().unwrap().clone().expect("create");
-        assert_eq!(created.name, "Locality Workspace");
-        assert_eq!(created.mime_type, crate::drive_dto::DRIVE_FOLDER_MIME_TYPE);
+        assert!(drive.last_update.lock().unwrap().is_none());
     }
 
     #[derive(Debug, Default)]
     struct FakeDrive {
         files: Mutex<std::collections::BTreeMap<String, DriveFile>>,
-        children: Mutex<std::collections::BTreeMap<String, Vec<DriveFile>>>,
-        workspace_folders: Mutex<std::collections::BTreeMap<String, Vec<DriveFile>>>,
+        accessible_docs: Mutex<Vec<DriveFile>>,
         last_created: Mutex<Option<DriveCreateFileRequest>>,
         last_update: Mutex<Option<(String, DriveUpdateFileRequest)>>,
     }
@@ -6192,31 +5969,14 @@ mod tests {
             self
         }
 
-        fn with_children(self, parent: &str, files: Vec<DriveFile>) -> Self {
+        fn with_accessible_docs(self, files: Vec<DriveFile>) -> Self {
             for file in &files {
                 self.files
                     .lock()
                     .unwrap()
                     .insert(file.id.clone(), file.clone());
             }
-            self.children
-                .lock()
-                .unwrap()
-                .insert(parent.to_string(), files);
-            self
-        }
-
-        fn with_workspace_folders(self, name: &str, files: Vec<DriveFile>) -> Self {
-            for file in &files {
-                self.files
-                    .lock()
-                    .unwrap()
-                    .insert(file.id.clone(), file.clone());
-            }
-            self.workspace_folders
-                .lock()
-                .unwrap()
-                .insert(name.to_string(), files);
+            *self.accessible_docs.lock().unwrap() = files;
             self
         }
     }
@@ -6233,34 +5993,21 @@ mod tests {
 
         fn list_children(
             &self,
-            parent_id: &str,
+            _parent_id: &str,
             _page_token: Option<&str>,
         ) -> locality_core::LocalityResult<DriveFileList> {
             Ok(DriveFileList {
-                files: self
-                    .children
-                    .lock()
-                    .unwrap()
-                    .get(parent_id)
-                    .cloned()
-                    .unwrap_or_default(),
+                files: Vec::new(),
                 next_page_token: None,
             })
         }
 
-        fn list_workspace_folders_by_name(
+        fn list_accessible_google_docs(
             &self,
-            name: &str,
             _page_token: Option<&str>,
         ) -> locality_core::LocalityResult<DriveFileList> {
             Ok(DriveFileList {
-                files: self
-                    .workspace_folders
-                    .lock()
-                    .unwrap()
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_default(),
+                files: self.accessible_docs.lock().unwrap().clone(),
                 next_page_token: None,
             })
         }

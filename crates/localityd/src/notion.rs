@@ -29,6 +29,10 @@ static ENV_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectorResolveError {
     MountMissing(String),
+    MountLayoutOutdated {
+        message: String,
+        suggested_command: String,
+    },
     UnsupportedConnector(String),
     MissingConnection {
         message: String,
@@ -54,6 +58,7 @@ impl ConnectorResolveError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::MountMissing(_) => "mount_not_found",
+            Self::MountLayoutOutdated { .. } => "update_required",
             Self::UnsupportedConnector(_) => "unsupported_connector",
             Self::MissingConnection { .. } => "missing_connection",
             Self::AuthRequired { .. } => "auth_required",
@@ -66,6 +71,7 @@ impl ConnectorResolveError {
     pub fn message(&self) -> String {
         match self {
             Self::MountMissing(path) => format!("no mount contains `{path}`"),
+            Self::MountLayoutOutdated { message, .. } => message.clone(),
             Self::UnsupportedConnector(connector) => {
                 format!("connector `{connector}` is not supported by this build")
             }
@@ -99,6 +105,9 @@ impl ConnectorResolveError {
                 suggested_command, ..
             }
             | Self::AuthProfileUnavailable {
+                suggested_command, ..
+            }
+            | Self::MountLayoutOutdated {
                 suggested_command, ..
             } => Some(suggested_command),
             _ => None,

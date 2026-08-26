@@ -3,7 +3,7 @@ title: "Google Docs connector"
 description: "How Google Docs and Drive folders map into Locality."
 ---
 
-The Google Docs connector mounts a configured Google Drive workspace folder.
+The Google Docs connector mounts every Google Doc accessible to the connected account.
 
 ## Connect
 
@@ -14,26 +14,24 @@ loc connect google-docs --name google-docs-default
 ## Mount
 
 ```bash
-loc mount google-docs ~/Locality/google-docs-main --workspace-folder "Locality" --projection plain-files
+loc mount google-docs ~/Locality/google-docs-main --projection plain-files
 loc pull ~/Locality/google-docs-main
 ```
 
-`--workspace-folder` accepts a folder name, ID, or folder URL.
+Docs from My Drive, shared with you, and accessible Shared Drives appear together at the mount root.
 
 ## Projection
 
 ```text
 google-docs-main/
-  planning/
-    launch-brief/
-      page.md
-  product/
-    roadmap/
-      page.md
+  launch-brief/
+    page.md
+  roadmap/
+    page.md
 ```
 
-- Drive folders become directories;
 - Google Docs documents become page directories with `page.md`;
+- Drive folder hierarchy is intentionally not projected;
 - non-Google-Docs Drive files are ignored by the V1 connector.
 
 ## Supported content

@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 
 use crate::docs_dto::{BatchUpdateDocumentRequest, GoogleDocument};
 use crate::drive_dto::{
-    DRIVE_FOLDER_MIME_TYPE, DriveCreateFileRequest, DriveFile, DriveFileList,
+    DRIVE_GOOGLE_DOC_MIME_TYPE, DriveCreateFileRequest, DriveFile, DriveFileList,
     DriveUpdateFileRequest,
 };
 
@@ -26,11 +26,25 @@ pub trait GoogleDriveApi: std::fmt::Debug + Send + Sync {
         parent_id: &str,
         page_token: Option<&str>,
     ) -> LocalityResult<DriveFileList>;
+    fn list_accessible_google_docs(
+        &self,
+        page_token: Option<&str>,
+    ) -> LocalityResult<DriveFileList> {
+        let _ = page_token;
+        Err(LocalityError::Unsupported(
+            "google drive client does not support account-wide Google Docs discovery",
+        ))
+    }
+    #[deprecated(note = "workspace-folder discovery is retired")]
     fn list_workspace_folders_by_name(
         &self,
-        name: &str,
-        page_token: Option<&str>,
-    ) -> LocalityResult<DriveFileList>;
+        _name: &str,
+        _page_token: Option<&str>,
+    ) -> LocalityResult<DriveFileList> {
+        Err(LocalityError::Unsupported(
+            "workspace-folder discovery is retired",
+        ))
+    }
     fn create_file(&self, request: DriveCreateFileRequest) -> LocalityResult<DriveFile>;
     fn update_file(
         &self,
@@ -63,12 +77,9 @@ pub fn drive_children_query(parent_id: &str, page_token: Option<&str>) -> DriveL
     }
 }
 
-pub fn drive_workspace_folder_query(name: &str, page_token: Option<&str>) -> DriveListQuery {
+pub fn drive_accessible_google_docs_query(page_token: Option<&str>) -> DriveListQuery {
     DriveListQuery {
-        q: format!(
-            "mimeType = '{DRIVE_FOLDER_MIME_TYPE}' and name = '{}' and trashed = false",
-            drive_query_literal(name)
-        ),
+        q: format!("mimeType = '{DRIVE_GOOGLE_DOC_MIME_TYPE}' and trashed = false"),
         fields: format!("nextPageToken, files({DRIVE_FILE_FIELDS})"),
         page_token: page_token.map(str::to_string),
     }
@@ -196,16 +207,17 @@ impl GoogleDriveApi for HttpGoogleApiClient {
         self.get_json(format!("{}/files", self.drive_base_url), query_pairs)
     }
 
-    fn list_workspace_folders_by_name(
+    fn list_accessible_google_docs(
         &self,
-        name: &str,
         page_token: Option<&str>,
     ) -> LocalityResult<DriveFileList> {
-        let query = drive_workspace_folder_query(name, page_token);
+        let query = drive_accessible_google_docs_query(page_token);
         let mut query_pairs = vec![
             ("q".to_string(), query.q),
             ("fields".to_string(), query.fields),
-            ("spaces".to_string(), "drive".to_string()),
+            ("corpora".to_string(), "allDrives".to_string()),
+            ("includeItemsFromAllDrives".to_string(), "true".to_string()),
+            ("supportsAllDrives".to_string(), "true".to_string()),
         ];
         if let Some(page_token) = query.page_token {
             query_pairs.push(("pageToken".to_string(), page_token));
@@ -304,16 +316,26 @@ fn ensure_reqwest_crypto_provider() {
     });
 }
 
-fn drive_query_literal(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('\'', "\\'")
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        DriveListQuery, drive_children_query, drive_workspace_folder_query,
+        DriveListQuery, drive_accessible_google_docs_query, drive_children_query,
         google_docs_batch_update_url,
     };
+
+    #[test]
+    fn accessible_google_docs_query_lists_untrashed_documents() {
+        let query = drive_accessible_google_docs_query(Some("cursor-1"));
+
+        assert_eq!(
+            query,
+            DriveListQuery {
+                q: "mimeType = 'application/vnd.google-apps.document' and trashed = false".to_string(),
+                fields: "nextPageToken, files(id, name, mimeType, parents, modifiedTime, version, trashed)".to_string(),
+                page_token: Some("cursor-1".to_string()),
+            }
+        );
+    }
 
     #[test]
     fn drive_children_query_filters_immediate_untrashed_children() {
@@ -334,20 +356,6 @@ mod tests {
         assert_eq!(
             google_docs_batch_update_url("https://docs.googleapis.com", "doc-1"),
             "https://docs.googleapis.com/v1/documents/doc-1:batchUpdate"
-        );
-    }
-
-    #[test]
-    fn workspace_folder_query_filters_by_exact_untrashed_folder_name() {
-        let query = drive_workspace_folder_query("Locality's Workspace", None);
-
-        assert_eq!(
-            query,
-            DriveListQuery {
-                q: "mimeType = 'application/vnd.google-apps.folder' and name = 'Locality\\'s Workspace' and trashed = false".to_string(),
-                fields: "nextPageToken, files(id, name, mimeType, parents, modifiedTime, version, trashed)".to_string(),
-                page_token: None,
-            }
         );
     }
 }

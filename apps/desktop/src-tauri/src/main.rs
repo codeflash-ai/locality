@@ -139,7 +139,6 @@ use localityd::durable_fs::{
     remove_dir_all_durable_if_identity_windows, remove_empty_dir_durable_if_identity_windows,
 };
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
-use localityd::google_docs::resolve_google_docs_connector_for_mount;
 use localityd::hydration::HydrationSource;
 use localityd::ipc::{
     DaemonBuildInfo, DaemonDebugQueueStatus, DaemonRequest, DaemonStatusReport, send_request,
@@ -487,7 +486,6 @@ struct CreateDesktopMountRequest {
     connection_id: Option<String>,
     read_only: bool,
     notion_root_page: Option<String>,
-    google_docs_workspace_folder: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1451,7 +1449,6 @@ async fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
             connection_id: None,
             read_only: false,
             notion_root_page: None,
-            google_docs_workspace_folder: None,
         },
     )
     .await
@@ -1587,7 +1584,6 @@ fn connect_granola_blocking(api_key: String) -> Result<String, String> {
         connection_id: Some(report.connection_id),
         read_only: !desktop_mount_is_editable_by_default("granola"),
         notion_root_page: None,
-        google_docs_workspace_folder: None,
     })
 }
 
@@ -1638,7 +1634,6 @@ fn connect_linear_blocking(api_key: String) -> Result<String, String> {
         connection_id: Some(report.connection_id),
         read_only: !desktop_mount_is_editable_by_default("linear"),
         notion_root_page: None,
-        google_docs_workspace_folder: None,
     })
 }
 
@@ -2299,7 +2294,6 @@ fn run_workspace_mount_onboarding_blocking(
         connection_id: None,
         read_only: false,
         notion_root_page: None,
-        google_docs_workspace_folder: None,
     }) {
         Ok(message) => workspace_mount_onboarding_report(
             MacosWorkspaceMountOnboardingState::Created,
@@ -7838,36 +7832,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| RemoteId::new(value.to_string())),
-        "google-docs" => {
-            let workspace = request
-                .google_docs_workspace_folder
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    "Google Docs mounts need a workspace folder name or ID.".to_string()
-                })?;
-            let temp_mount = MountConfig {
-                mount_id: mount_id.clone(),
-                connector: connector.clone(),
-                root: root.clone(),
-                remote_root_id: None,
-                connection_id: connection_id.clone(),
-                read_only,
-                projection: projection.clone(),
-                settings_json: "{}".to_string(),
-            };
-            let credentials = open_credential_store(&state_root);
-            let connector =
-                resolve_google_docs_connector_for_mount(&store, credentials.as_ref(), &temp_mount)
-                    .map_err(|error| error.message())?;
-            let folder_id = connector
-                .resolve_workspace_folder(workspace)
-                .map_err(|error| {
-                    format!("Failed to resolve Google Docs workspace folder `{workspace}`: {error}")
-                })?;
-            Some(folder_id)
-        }
+        "google-docs" => None,
         GOOGLE_CALENDAR_CONNECTOR_ID | "gmail" | "granola" | "linear" | SLACK_CONNECTOR_ID => None,
         _ => unreachable!("unsupported desktop connector should be rejected before mount setup"),
     };
@@ -15105,7 +15070,6 @@ mod tests {
             connection_id: None,
             read_only: false,
             notion_root_page: Some("should-not-be-used".to_string()),
-            google_docs_workspace_folder: Some("should-not-be-used".to_string()),
         });
 
         if let Err(error) = &result {

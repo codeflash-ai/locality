@@ -2102,9 +2102,6 @@ function Onboarding({
           connectionId: null,
           readOnly: connector === "granola" || connector === "slack",
           notionRootPage: null,
-          googleDocsWorkspaceFolder: connector === "google-docs"
-            ? googleDocsWorkspaceFolder.trim() || "Locality"
-            : null,
         },
       },
       { ok: true, message: `Mounted demo ${sourceDisplayName(connector)} source.` },
@@ -2115,11 +2112,6 @@ function Onboarding({
     if (selectedConnectorBusy) {
       return;
     }
-    if (connector === "google-docs" && !googleDocsWorkspaceFolder.trim()) {
-      setOauthError("Enter a Google Drive folder name, URL, or ID.");
-      return;
-    }
-
     setOauthError("");
     setLoginCopyMessage("");
     setMountOnboarding(null);
@@ -2622,30 +2614,13 @@ function Onboarding({
                 />
               </label>
             )}
-            {selectedOnboardingConnector === "google-docs" && !connectionReadyNow && (
-              <label className="source-inline-field onboarding-source-field">
-                <span>Drive folder</span>
-                <input
-                  value={googleDocsWorkspaceFolder}
-                  placeholder="Folder name, URL, or ID"
-                  disabled={oauthInFlight}
-                  onChange={(event) => setGoogleDocsWorkspaceFolder(event.target.value)}
-                />
-              </label>
-            )}
             <div className="button-row onboarding-nav-actions">
               <SecondaryButton disabled={!canLeaveConnectorStep} onClick={goBackFromOnboarding}>
                 Back
               </SecondaryButton>
               <PrimaryButton icon={<ConnectorIcon connector={selectedOnboardingConnector} />}
                 busy={selectedConnectorBusy && !connectionReadyNow}
-                disabled={
-                  !connectionReadyNow &&
-                  (
-                    (sourceRequiresApiKey(selectedOnboardingConnector) && !selectedApiKey.trim()) ||
-                    (selectedOnboardingConnector === "google-docs" && !googleDocsWorkspaceFolder.trim())
-                  )
-                }
+                disabled={!connectionReadyNow && sourceRequiresApiKey(selectedOnboardingConnector) && !selectedApiKey.trim()}
                 onClick={
                   connectionReadyNow
                     ? () => setStep(connectorSkipsMountStep(selectedOnboardingConnector) ? 5 : 4)
@@ -3563,9 +3538,6 @@ function MountsView({
                 connectionId: null,
                 readOnly: connector === "granola" || connector === "slack",
                 notionRootPage: null,
-                googleDocsWorkspaceFolder: connector === "google-docs"
-                  ? googleDocsWorkspaceFolder?.trim() || "Locality"
-                  : null,
               },
             },
         { ok: true, message: "Created demo mount." },
@@ -3992,7 +3964,7 @@ function AddSourceDialog({
     {
       id: "google-docs",
       name: "Google Docs",
-      description: "Docs and Drive folders through the same local file workflow.",
+      description: "All accessible Google Docs as local Markdown files.",
       status: sourceConnectorStatus(snapshot, "google-docs"),
       keywords: ["google", "docs", "gdocs", "drive", "documents"],
       mounted: sourceMounted(snapshot, "google-docs"),
@@ -4171,7 +4143,7 @@ function AddSourceDialog({
                       </>
                     ) : connector.id === "google-docs" ? (
                       <>
-                        <SettingRow title="Workspace folder" value={googleDocsWorkspaceFolder || "Locality"} />
+                        <SettingRow title="Content" value="All accessible Google Docs" />
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
                       </>
                     ) : connector.id === "google-calendar" ? (
@@ -4202,16 +4174,6 @@ function AddSourceDialog({
                       </>
                     )}
                   </div>
-                  {connector.id === "google-docs" && !connector.mounted && (
-                    <label className="source-inline-field">
-                      <span>Drive folder</span>
-                      <input
-                        value={googleDocsWorkspaceFolder}
-                        placeholder="Folder name, URL, or ID"
-                        onChange={(event) => setGoogleDocsWorkspaceFolder(event.target.value)}
-                      />
-                    </label>
-                  )}
                   {apiKeyConnector && !connector.mounted && needsConnection && (
                     <>
                       <label className="source-inline-field">
@@ -4268,7 +4230,7 @@ function AddSourceDialog({
                     <PrimaryButton
                       compact
                       busy={connectorBusy}
-                      disabled={disabled || (connector.id === "google-docs" && !googleDocsWorkspaceFolder.trim())}
+                      disabled={disabled}
                       icon={sourceActionIcon(connector.id, needsConnection)}
                       onClick={() => onAction(connector.id, { googleDocsWorkspaceFolder })}
                     >
