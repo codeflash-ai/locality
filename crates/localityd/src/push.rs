@@ -5330,7 +5330,7 @@ fn direct_source_root_create_diagnostic(
         )));
     }
 
-    if mount.remote_root_id.is_none() {
+    if mount.remote_root_id.is_none() && mount.connector != "google-docs" {
         return Some(PushPrepareError::Core(LocalityError::InvalidState(
             format!(
                 "mount `{mount_id}` has no known remote root id, so `{path}` cannot be created at the mount root; reconnect or re-mount `{connector}` to refresh mount metadata.",
@@ -5350,6 +5350,9 @@ fn source_root_create_parent_entity(
 ) -> Option<EntityRecord> {
     if !is_direct_source_root_create_path(relative_path) {
         return None;
+    }
+    if mount.connector == "google-docs" && mount.remote_root_id.is_none() {
+        return Some(workspace_create_parent(mount));
     }
     let remote_id = mount.remote_root_id.as_ref()?;
     let descriptor = source_descriptor(&mount.connector);

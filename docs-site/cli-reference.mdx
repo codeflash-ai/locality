@@ -207,21 +207,19 @@ loc pull ~/Locality/notion-page
 
 ### `loc mount google-docs`
 
-Register Google Docs content under a Drive workspace folder.
+Register all Google Docs accessible to the connected account.
 
 ```bash
-loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection <mode>] [--read-only]
+loc mount google-docs <path> [--connection <id>] [--mount-id <id>] [--projection <mode>] [--read-only]
 ```
 
-Use this when a Google Drive folder is the workspace boundary for Locality. The
-folder can be specified by name, id, or folder URL.
+Docs are projected flat at the mount root, including accessible Shared Drive and shared Docs.
 
 Key arguments:
 
 | Argument | Meaning |
 | --- | --- |
 | `<path>` | Local directory to register as the mount. |
-| `--workspace-folder <name-or-id>` | Google Drive folder name, folder id, or folder URL. |
 | `--connection <id>` | Saved Google Docs connection to use. |
 | `--mount-id <id>` | Stable mount id. Defaults to a Google Docs mount id when safe. |
 | `--projection <mode>` | Platform-specific projection mode. |
@@ -230,8 +228,8 @@ Key arguments:
 Examples:
 
 ```bash
-loc mount google-docs ~/Locality/google-docs-main --workspace-folder "Locality" --projection plain-files
-loc mount google-docs ~/Locality/google-docs-main --workspace-folder <folder-id> --connection google-docs-default
+loc mount google-docs ~/Locality/google-docs-main --projection plain-files
+loc mount google-docs ~/Locality/google-docs-main --connection google-docs-default
 loc pull ~/Locality/google-docs-main
 ```
 

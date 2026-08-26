@@ -34,6 +34,7 @@ where
             mount.connector.clone(),
         ));
     }
+    ensure_account_wide_mount(mount)?;
 
     if let Some(connection_id) = &mount.connection_id {
         let connection = store
@@ -66,7 +67,7 @@ where
 
 fn connector_from_connection(
     credentials: &dyn CredentialStore,
-    mount: &MountConfig,
+    _mount: &MountConfig,
     connection: &ConnectionRecord,
 ) -> Result<GoogleDocsConnector, ConnectorResolveError> {
     if connection.status != "active" {
@@ -77,11 +78,21 @@ fn connector_from_connection(
     }
 
     let token = connection_access_token(credentials, connection)?;
-    let mut config = GoogleDocsConfig::new(token);
-    if let Some(remote_root_id) = &mount.remote_root_id {
-        config = config.with_workspace_folder_id(remote_root_id.clone());
+    Ok(GoogleDocsConnector::new(GoogleDocsConfig::new(token)))
+}
+
+fn ensure_account_wide_mount(mount: &MountConfig) -> Result<(), ConnectorResolveError> {
+    if mount.remote_root_id.is_none() {
+        return Ok(());
     }
-    Ok(GoogleDocsConnector::new(config))
+    Err(ConnectorResolveError::MountLayoutOutdated {
+        message: format!(
+            "Google Docs mount `{}` uses the retired workspace-folder layout. Unmount it and run `loc mount google-docs {}`.",
+            mount.mount_id.0,
+            mount.root.display(),
+        ),
+        suggested_command: format!("loc mount google-docs {}", mount.root.display()),
+    })
 }
 
 fn connection_access_token(
@@ -287,15 +298,11 @@ impl SourcePushValidator for GoogleDocsConnector {
 }
 
 impl SourceAdapter for GoogleDocsConnector {
-    fn scoped_to_mount(&self, mount: &MountConfig) -> Self
+    fn scoped_to_mount(&self, _mount: &MountConfig) -> Self
     where
         Self: Sized + Clone,
     {
-        mount
-            .remote_root_id
-            .as_ref()
-            .map(|root| self.with_workspace_folder_id(root.clone()))
-            .unwrap_or_else(|| self.clone())
+        self.clone()
     }
 }
 
@@ -425,11 +432,8 @@ impl HydrationSource for GoogleDocsConnector {
 
 impl crate::reconcile::ScheduledPullSource for GoogleDocsConnector {
     fn enumerate_mount(&self, mount: &MountConfig) -> LocalityResult<Vec<TreeEntry>> {
-        let connector = match &mount.remote_root_id {
-            Some(root) => self.with_workspace_folder_id(root.clone()),
-            None => self.clone(),
-        };
-        connector.enumerate(locality_connector::EnumerateRequest {
+        ensure_account_wide_mount(mount).map_err(LocalityError::from)?;
+        self.enumerate(locality_connector::EnumerateRequest {
             mount_id: mount.mount_id.clone(),
             cursor: None,
         })

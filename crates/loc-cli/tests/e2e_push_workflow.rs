@@ -3884,24 +3884,16 @@ fn seed_missing_credential_dirty_page(seeded: &MissingCredentialMount) -> PathBu
 }
 
 #[test]
-fn google_docs_workspace_folder_pull_stubs_nested_docs_without_hydrating_folder() {
+fn google_docs_account_mount_pulls_flat_doc_stubs_without_hydration() {
     let fixture = E2eFixture::new();
     let mount_id = MountId::new("google-docs-main");
     let mut store = InMemoryStateStore::new();
     let drive = Arc::new(
-        FakeGoogleDrive::default()
-            .with_children(
-                "workspace-folder",
-                vec![google_drive_folder(
-                    "folder-1",
-                    "Marketing",
-                    "workspace-folder",
-                )],
-            )
-            .with_children(
-                "folder-1",
-                vec![google_drive_doc("doc-1", "Launch Brief", "folder-1")],
-            ),
+        FakeGoogleDrive::default().with_accessible_docs(vec![google_drive_doc(
+            "doc-1",
+            "Launch Brief",
+            "folder-1",
+        )]),
     );
     let docs = Arc::new(FakeGoogleDocs::default().with_document(google_document(
         "doc-1",
@@ -3909,11 +3901,8 @@ fn google_docs_workspace_folder_pull_stubs_nested_docs_without_hydrating_folder(
         "rev-1",
         "Launch body.\n",
     )));
-    let connector = GoogleDocsConnector::with_apis(
-        GoogleDocsConfig::new("token").with_workspace_folder_id(RemoteId::new("workspace-folder")),
-        drive,
-        docs.clone(),
-    );
+    let connector =
+        GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
 
     run_mount(
         &mut store,
@@ -3921,24 +3910,24 @@ fn google_docs_workspace_folder_pull_stubs_nested_docs_without_hydrating_folder(
             mount_id: mount_id.clone(),
             connector: "google-docs".to_string(),
             root: fixture.root.clone(),
-            remote_root_id: Some(RemoteId::new("workspace-folder")),
+            remote_root_id: None,
             connection_id: Some(ConnectionId::new("google-docs-work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
             settings_json: "{}".to_string(),
         },
     )
-    .expect("mount Google Docs workspace folder");
+    .expect("mount account-wide Google Docs");
 
     let pull =
         run_pull(&mut store, &connector, &fixture.root).expect("pull Google Docs workspace folder");
 
     assert!(pull.ok, "{pull:#?}");
-    assert_eq!(pull.enumerated, 2, "{pull:#?}");
+    assert_eq!(pull.enumerated, 1, "{pull:#?}");
     assert_eq!(pull.stubbed, 1, "{pull:#?}");
     assert_eq!(
         pull.hydrated, 0,
-        "workspace folder pulls must not try to hydrate folder entries as docs: {pull:#?}"
+        "account mount pulls must not hydrate docs: {pull:#?}"
     );
     assert_eq!(
         docs.get_count(),
@@ -3946,15 +3935,13 @@ fn google_docs_workspace_folder_pull_stubs_nested_docs_without_hydrating_folder(
         "pulling a Google Drive workspace folder should leave nested docs online-only"
     );
 
-    let folder_path = fixture.root.join("marketing");
-    let page_path = fixture.root.join("marketing/launch-brief/page.md");
-    assert!(folder_path.is_dir(), "folder should be projected");
+    let page_path = fixture.root.join("launch-brief/page.md");
     let stub = fs::read_to_string(&page_path).expect("read Google Docs stub");
     assert!(stub.contains("loc:\n  id: doc-1"), "{stub}");
     assert!(stub.contains("title: Launch Brief"), "{stub}");
     assert!(
         !stub.contains("Launch body."),
-        "root workspace pull should create an online-only stub, not hydrate the doc body: {stub}"
+        "account-wide pull should create an online-only stub, not hydrate the doc body: {stub}"
     );
 }
 
@@ -3963,25 +3950,21 @@ fn google_docs_mount_pull_edit_push_reconciles_clean_with_real_connector() {
     let fixture = E2eFixture::new();
     let mount_id = MountId::new("google-docs-main");
     let mut store = InMemoryStateStore::new();
-    let drive = Arc::new(FakeGoogleDrive::default().with_children(
-        "workspace-folder",
-        vec![google_drive_doc(
+    let drive = Arc::new(
+        FakeGoogleDrive::default().with_accessible_docs(vec![google_drive_doc(
             "doc-1",
             "Launch Brief",
             "workspace-folder",
-        )],
-    ));
+        )]),
+    );
     let docs = Arc::new(FakeGoogleDocs::default().with_document(google_document(
         "doc-1",
         "Launch Brief",
         "rev-1",
         "Original line.\n",
     )));
-    let connector = GoogleDocsConnector::with_apis(
-        GoogleDocsConfig::new("token").with_workspace_folder_id(RemoteId::new("workspace-folder")),
-        drive,
-        docs.clone(),
-    );
+    let connector =
+        GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
 
     run_mount(
         &mut store,
@@ -3989,7 +3972,7 @@ fn google_docs_mount_pull_edit_push_reconciles_clean_with_real_connector() {
             mount_id: mount_id.clone(),
             connector: "google-docs".to_string(),
             root: fixture.root.clone(),
-            remote_root_id: Some(RemoteId::new("workspace-folder")),
+            remote_root_id: None,
             connection_id: Some(ConnectionId::new("google-docs-work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
@@ -4063,11 +4046,8 @@ fn google_docs_mount_create_push_reconciles_clean_with_real_connector() {
     let mut store = InMemoryStateStore::new();
     let drive = Arc::new(FakeGoogleDrive::default());
     let docs = Arc::new(FakeGoogleDocs::default());
-    let connector = GoogleDocsConnector::with_apis(
-        GoogleDocsConfig::new("token").with_workspace_folder_id(RemoteId::new("workspace-folder")),
-        drive.clone(),
-        docs.clone(),
-    );
+    let connector =
+        GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive.clone(), docs.clone());
 
     run_mount(
         &mut store,
@@ -4075,7 +4055,7 @@ fn google_docs_mount_create_push_reconciles_clean_with_real_connector() {
             mount_id: mount_id.clone(),
             connector: "google-docs".to_string(),
             root: fixture.root.clone(),
-            remote_root_id: Some(RemoteId::new("workspace-folder")),
+            remote_root_id: None,
             connection_id: Some(ConnectionId::new("google-docs-work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
@@ -4103,11 +4083,7 @@ fn google_docs_mount_create_push_reconciles_clean_with_real_connector() {
     assert_eq!(diff.action, "confirm_plan", "{diff:#?}");
     let plan = diff.plan.as_ref().expect("Google Docs create plan");
     assert_eq!(plan.summary.entities_created, 1, "{plan:#?}");
-    assert_eq!(
-        plan.affected_entities,
-        vec!["workspace-folder"],
-        "{plan:#?}"
-    );
+    assert_eq!(plan.affected_entities, vec!["workspace"], "{plan:#?}");
 
     let push = run_push_with_daemon(
         &mut store,
@@ -4132,11 +4108,7 @@ fn google_docs_mount_create_push_reconciles_clean_with_real_connector() {
         .get_file("created-doc-1")
         .expect("created Google Docs Drive file");
     assert_eq!(created_file.name, "Draft Plan");
-    assert_eq!(created_file.parents, vec!["workspace-folder"]);
-    let workspace_children = drive
-        .list_children("workspace-folder", None)
-        .expect("workspace children after Google Docs create");
-    assert_eq!(workspace_children.files, vec![created_file]);
+    assert!(created_file.parents.is_empty());
 
     let created_doc = docs
         .get_document("created-doc-1")
@@ -16531,21 +16503,19 @@ impl PortableMediaCaptureFetcher for CountingHostedMediaFetcher {
 struct FakeGoogleDrive {
     files: Mutex<BTreeMap<String, DriveFile>>,
     children: Mutex<BTreeMap<String, Vec<DriveFile>>>,
+    accessible_docs: Mutex<Vec<DriveFile>>,
     create_count: AtomicU64,
 }
 
 impl FakeGoogleDrive {
-    fn with_children(self, parent_id: &str, children: Vec<DriveFile>) -> Self {
-        for child in &children {
+    fn with_accessible_docs(self, docs: Vec<DriveFile>) -> Self {
+        for doc in &docs {
             self.files
                 .lock()
                 .expect("google drive files")
-                .insert(child.id.clone(), child.clone());
+                .insert(doc.id.clone(), doc.clone());
         }
-        self.children
-            .lock()
-            .expect("google drive children")
-            .insert(parent_id.to_string(), children);
+        *self.accessible_docs.lock().expect("accessible docs") = docs;
         self
     }
 }
@@ -16577,6 +16547,20 @@ impl GoogleDriveApi for FakeGoogleDrive {
         })
     }
 
+    fn list_accessible_google_docs(
+        &self,
+        _page_token: Option<&str>,
+    ) -> locality_core::LocalityResult<DriveFileList> {
+        Ok(DriveFileList {
+            files: self
+                .accessible_docs
+                .lock()
+                .expect("accessible docs")
+                .clone(),
+            next_page_token: None,
+        })
+    }
+
     fn list_workspace_folders_by_name(
         &self,
         _name: &str,
@@ -16595,17 +16579,16 @@ impl GoogleDriveApi for FakeGoogleDrive {
         } else {
             "created-doc"
         };
-        let parent = request
-            .parents
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "root".to_string());
-        let created = google_drive_file(
+        let parent = request.parents.first().cloned();
+        let mut created = google_drive_file(
             &format!("{id_prefix}-{create_number}"),
             &request.name,
             &request.mime_type,
-            &parent,
+            parent.as_deref().unwrap_or("root"),
         );
+        if parent.is_none() {
+            created.parents.clear();
+        }
         self.files
             .lock()
             .expect("google drive files")
@@ -16613,7 +16596,7 @@ impl GoogleDriveApi for FakeGoogleDrive {
         self.children
             .lock()
             .expect("google drive children")
-            .entry(parent)
+            .entry(parent.unwrap_or_else(|| "root".to_string()))
             .or_default()
             .push(created.clone());
         Ok(created)
@@ -16705,10 +16688,6 @@ impl GoogleDocsApi for FakeGoogleDocs {
         documents.insert(document_id.to_string(), document.clone());
         Ok(document)
     }
-}
-
-fn google_drive_folder(id: &str, name: &str, parent: &str) -> DriveFile {
-    google_drive_file(id, name, DRIVE_FOLDER_MIME_TYPE, parent)
 }
 
 fn google_drive_doc(id: &str, name: &str, parent: &str) -> DriveFile {

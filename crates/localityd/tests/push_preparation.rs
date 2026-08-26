@@ -2480,7 +2480,7 @@ fn prepare_push_direct_root_create_on_notion_reports_actionable_error() {
 }
 
 #[test]
-fn prepare_push_direct_root_create_reports_missing_remote_root_id() {
+fn prepare_push_direct_google_docs_root_create_uses_synthetic_workspace_parent() {
     let fixture = PrepareFixture::new();
     let store = fixture.store("google-docs");
     let path = fixture.write_raw(
@@ -2488,18 +2488,14 @@ fn prepare_push_direct_root_create_reports_missing_remote_root_id() {
         "---\ntitle: Daily Practice\n---\nPlan body.\n",
     );
 
-    let error = prepare_push(&store, &job(path), None, &LocalSourceValidator)
-        .expect_err("root create without a remote root id should be rejected");
-
-    match error {
-        PushPrepareError::Core(LocalityError::InvalidState(message)) => {
-            assert!(
-                message.contains("no known remote root id"),
-                "unexpected message: {message}"
-            );
-        }
-        other => panic!("expected an actionable InvalidState error, got {other:?}"),
-    }
+    let prepared = prepare_push(&store, &job(path), None, &LocalSourceValidator)
+        .expect("account-wide Google Docs root create should prepare");
+    let plan = prepared.pipeline.plan.expect("create plan");
+    assert!(matches!(
+        &plan.operations[0],
+        locality_core::planner::PushOperation::CreateEntity { parent_id, .. }
+            if parent_id == &RemoteId::new("workspace")
+    ));
 }
 
 #[test]

@@ -69,6 +69,14 @@ impl DriveCreateFileRequest {
         }
     }
 
+    pub fn google_doc_at_root(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            mime_type: DRIVE_GOOGLE_DOC_MIME_TYPE.to_string(),
+            parents: Vec::new(),
+        }
+    }
+
     pub fn folder(name: impl Into<String>, parent_id: Option<&str>) -> Self {
         Self {
             name: name.into(),
