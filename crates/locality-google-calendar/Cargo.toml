@@ -1,6 +1,6 @@
 [package]
 name = "locality-google-calendar"
-version = "0.3.11"
+version = "0.4.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
