@@ -327,6 +327,9 @@ Runtime child-refresh behavior:
 - Completed refreshes may invalidate platform provider caches.
 - Changed child sets can queue descendant refreshes for already-known child
   directories.
+- Connectors may declare eager background hydration. For Slack, each successful
+  child refresh queues directly listed unhydrated page files (`users.md` and
+  conversation `recent.md` files) as durable low-priority prefetch work.
 
 ### Daemon Startup And Reload Priming
 
@@ -703,7 +706,10 @@ Current priority groups:
 - Normal: `Policy`, `RemoteFastForward`
 - Low: `Prefetch`
 
-Production code currently has no non-test enqueue of `Prefetch`.
+Slack background discovery enqueues `Prefetch` for unhydrated `users.md` and
+`recent.md` files. Before making a provider call, prefetch hydration uses the
+deferred-cooldown execution policy so rate-limited work yields back to the
+daemon and retries from its durable hydration job.
 
 The runtime schedules work in this order:
 

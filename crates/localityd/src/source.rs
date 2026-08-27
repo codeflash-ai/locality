@@ -188,12 +188,20 @@ pub struct SourceDescriptor {
     body_diff_mode: BodyDiffMode,
     virtual_rename_policy: VirtualRenamePolicy,
     max_background_discovery_workers: usize,
+    background_hydration_policy: BackgroundHydrationPolicy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VirtualRenamePolicy {
     FilenameDerived,
     PreserveCanonical,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackgroundHydrationPolicy {
+    #[default]
+    OnDemand,
+    Eager,
 }
 
 impl SourceDescriptor {
@@ -255,6 +263,10 @@ impl SourceDescriptor {
 
     pub fn max_background_discovery_workers(&self) -> usize {
         self.max_background_discovery_workers
+    }
+
+    pub fn background_hydration_policy(&self) -> BackgroundHydrationPolicy {
+        self.background_hydration_policy
     }
 }
 
@@ -450,6 +462,7 @@ fn notion_source_descriptor() -> SourceDescriptor {
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
         max_background_discovery_workers: 3,
+        background_hydration_policy: BackgroundHydrationPolicy::OnDemand,
     }
 }
 
@@ -470,6 +483,7 @@ fn google_docs_source_descriptor() -> SourceDescriptor {
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
         max_background_discovery_workers: 4,
+        background_hydration_policy: BackgroundHydrationPolicy::OnDemand,
     }
 }
 
@@ -490,6 +504,7 @@ fn google_calendar_source_descriptor() -> SourceDescriptor {
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
         max_background_discovery_workers: 4,
+        background_hydration_policy: BackgroundHydrationPolicy::OnDemand,
     }
 }
 
@@ -510,6 +525,7 @@ fn gmail_source_descriptor() -> SourceDescriptor {
         body_diff_mode: BodyDiffMode::WholeEntity,
         virtual_rename_policy: VirtualRenamePolicy::PreserveCanonical,
         max_background_discovery_workers: 4,
+        background_hydration_policy: BackgroundHydrationPolicy::OnDemand,
     }
 }
 
@@ -530,6 +546,7 @@ fn granola_source_descriptor() -> SourceDescriptor {
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
         max_background_discovery_workers: 3,
+        background_hydration_policy: BackgroundHydrationPolicy::OnDemand,
     }
 }
 
@@ -550,6 +567,7 @@ fn slack_source_descriptor() -> SourceDescriptor {
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
         max_background_discovery_workers: 1,
+        background_hydration_policy: BackgroundHydrationPolicy::Eager,
     }
 }
 
@@ -628,6 +646,7 @@ fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
         max_background_discovery_workers: 1,
+        background_hydration_policy: BackgroundHydrationPolicy::OnDemand,
     }
 }
 
@@ -648,6 +667,7 @@ fn linear_source_descriptor() -> SourceDescriptor {
         body_diff_mode: BodyDiffMode::WholeEntity,
         virtual_rename_policy: VirtualRenamePolicy::PreserveCanonical,
         max_background_discovery_workers: 3,
+        background_hydration_policy: BackgroundHydrationPolicy::OnDemand,
     }
 }
 

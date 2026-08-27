@@ -37,7 +37,9 @@ None.
 
 ## Open Design Questions Carried From `plan.md`
 
-- Hydration aggressiveness remains configurable. The code defaults to the 90-day policy and no eager-under-size threshold.
+- General workspace hydration aggressiveness remains configurable. The code
+  defaults to the 90-day policy and no eager-under-size threshold; Slack opts
+  into connector-specific low-priority eager background hydration.
 - `_view.csv` remains read-only unless the plan is updated.
 - Journals now store core shadow preimages and apply effects for undo planning; native connector preimages remain undecided.
 - `loc` remains the working title.

@@ -28,6 +28,7 @@ use locality_store::{
 use crate::hydration::HydrationEngine;
 use crate::scheduler::PullSchedulerTick;
 use crate::shadow_match::parsed_matches_shadow;
+use crate::source::{BackgroundHydrationPolicy, source_descriptor};
 use crate::virtual_fs::{repair_legacy_macos_content_root, virtual_fs_content_root};
 
 const GMAIL_CONNECTOR_ID: &str = "gmail";
@@ -100,6 +101,18 @@ impl FetchScheduleStrategy for DefaultFetchScheduleStrategy {
 
         if is_remote_root_entry(request.mount, request.entry) {
             return policy_hydration();
+        }
+
+        if source_descriptor(&request.mount.connector).background_hydration_policy()
+            == BackgroundHydrationPolicy::Eager
+            && request.existing.is_none_or(|existing| {
+                matches!(
+                    existing.hydration,
+                    HydrationState::Virtual | HydrationState::Stub
+                )
+            })
+        {
+            return prefetch_hydration();
         }
 
         if should_eager_hydrate(request.page_count as u32, request.policy) {
@@ -728,6 +741,12 @@ fn rename_page_projection_if_needed(
 fn policy_hydration() -> EntityFetchPlan {
     EntityFetchPlan {
         queue_hydration: Some(HydrationReason::Policy),
+    }
+}
+
+fn prefetch_hydration() -> EntityFetchPlan {
+    EntityFetchPlan {
+        queue_hydration: Some(HydrationReason::Prefetch),
     }
 }
 

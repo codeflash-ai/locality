@@ -116,6 +116,57 @@ fn scheduled_pull_refreshes_projection_and_queues_default_policy_hydration() {
 }
 
 #[test]
+fn scheduled_pull_eagerly_prefetches_unhydrated_slack_pages() {
+    let root = temp_root("scheduled-pull-slack-eager");
+    let mount_id = MountId::new("slack-main");
+    let mount = MountConfig::new(mount_id.clone(), "slack", root.clone());
+    let mut source = FakeScheduledPullSource::default();
+    source.insert_entries(
+        &mount_id,
+        vec![
+            TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("slack-conversation:C123"),
+                kind: EntityKind::Directory,
+                title: "general".to_string(),
+                path: PathBuf::from("channels/general-C123"),
+                hydration: HydrationState::Virtual,
+                content_hash: None,
+                remote_edited_at: None,
+                stub_frontmatter: None,
+            },
+            page_entry(
+                &mount_id,
+                "slack-recent:C123",
+                "recent",
+                "channels/general-C123/recent.md",
+                "2026-08-27T00:00:00Z",
+            ),
+        ],
+    );
+    let mut supervisor = supervisor_with_mounts([mount]);
+
+    supervisor.start().expect("start supervisor");
+    let report = supervisor
+        .advance_and_execute_scheduled_pull(
+            AdvanceScheduledPullJob::new(Duration::ZERO),
+            &source,
+            &DefaultFetchScheduleStrategy,
+        )
+        .expect("scheduled pull");
+
+    assert_eq!(report.enumerated, 2);
+    assert_eq!(report.queued_hydrations, 1);
+    let request = supervisor
+        .hydration()
+        .peek_ready()
+        .expect("Slack prefetch request");
+    assert_eq!(request.remote_id, RemoteId::new("slack-recent:C123"));
+    assert_eq!(request.reason, HydrationReason::Prefetch);
+    assert_eq!(request.path, root.join("channels/general-C123/recent.md"));
+}
+
+#[test]
 fn scheduled_pull_macos_file_provider_keeps_unhydrated_pages_online_only() {
     assert_virtual_projection_keeps_unhydrated_pages_online_only(
         ProjectionMode::MacosFileProvider,

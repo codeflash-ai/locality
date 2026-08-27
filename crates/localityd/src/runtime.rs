@@ -75,7 +75,10 @@ use crate::reconcile::{
 };
 use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::shadow_match::parsed_matches_shadow;
-use crate::source::{ResolvedSourceSet, resolve_source_for_mount_id, resolve_source_for_path};
+use crate::source::{
+    BackgroundHydrationPolicy, ResolvedSourceSet, resolve_source_for_mount_id,
+    resolve_source_for_path, source_descriptor,
+};
 use crate::virtual_fs::{
     MOUNT_POINT_PREFIX, ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind,
     VirtualFsRefreshChildrenReport, commit_virtual_fs_write, create_virtual_fs_directory,
@@ -663,6 +666,11 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         let connector =
             resolve_source_for_mount_id(&store, credentials.as_ref(), &request.mount_id)
                 .map_err(LocalityError::from)?;
+        let connector = if request.reason == HydrationReason::Prefetch {
+            connector.with_execution_policy(ConnectorExecutionPolicy::DeferProviderCooldown)
+        } else {
+            connector
+        };
         let output_root = hydration_output_root_for_projection(&store, &state_root, &request)?;
         let mut executor = if let Some(output_root) = output_root {
             HydrationExecutor::new_with_output_root(&mut store, &connector, output_root)
@@ -2200,6 +2208,7 @@ impl RuntimeState {
                 if report.changed {
                     self.signal_macos_file_provider_container(mount_id, container_identifier);
                 }
+                self.queue_eager_background_hydrations(mount_id, container_identifier);
                 if depth != PERIODIC_DISCOVERY_DEPTH {
                     self.queue_child_refresh_descendants(mount_id, container_identifier, depth);
                 }
@@ -2954,6 +2963,23 @@ impl RuntimeState {
         }
     }
 
+    fn queue_eager_background_hydrations(&mut self, mount_id: &str, container_identifier: &str) {
+        match eager_background_hydration_requests_for_container(
+            &self.config.state_root,
+            mount_id,
+            container_identifier,
+        ) {
+            Ok(requests) => {
+                for request in requests {
+                    self.queue_hydration(request);
+                }
+            }
+            Err(error) => eprintln!(
+                "localityd could not queue eager background hydration for `{mount_id}:{container_identifier}`: {error}"
+            ),
+        }
+    }
+
     fn child_container_identifiers(
         &self,
         mount_id: &str,
@@ -3335,6 +3361,73 @@ impl RuntimeState {
                 .unwrap_or(u64::MAX),
         }
     }
+}
+
+fn eager_background_hydration_requests_for_container(
+    state_root: &Path,
+    mount_id: &str,
+    container_identifier: &str,
+) -> locality_core::LocalityResult<Vec<HydrationRequest>> {
+    let store = SqliteStateStore::open(state_root.to_path_buf()).map_err(LocalityError::from)?;
+    let mount_id = MountId::new(mount_id);
+    let mount = store
+        .get_mount(&mount_id)
+        .map_err(LocalityError::from)?
+        .ok_or_else(|| LocalityError::InvalidState(format!("mount `{}` is missing", mount_id.0)))?;
+    if source_descriptor(&mount.connector).background_hydration_policy()
+        != BackgroundHydrationPolicy::Eager
+    {
+        return Ok(Vec::new());
+    }
+
+    let pending = store
+        .list_hydration_jobs()
+        .map_err(LocalityError::from)?
+        .into_iter()
+        .map(|job| (job.mount_id, job.remote_id))
+        .collect::<BTreeSet<_>>();
+    let content_root = virtual_fs_content_root(state_root, &mount_id);
+    let children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &mount_id,
+        container_identifier,
+    )?;
+    let mut requests = Vec::new();
+    for child in children.children {
+        if child.kind != VirtualFsItemKind::File
+            || child.entity_kind != Some(EntityKind::Page)
+            || !matches!(
+                child.hydration,
+                Some(HydrationState::Virtual | HydrationState::Stub)
+            )
+        {
+            continue;
+        }
+        let Some(remote_id) = child.remote_id.map(RemoteId::new) else {
+            continue;
+        };
+        if pending.contains(&(mount_id.clone(), remote_id.clone())) {
+            continue;
+        }
+        let entity = store
+            .get_entity(&mount_id, &remote_id)
+            .map_err(LocalityError::from)?
+            .ok_or_else(|| {
+                LocalityError::InvalidState(format!(
+                    "eager hydration target `{}` is missing from mount `{}`",
+                    remote_id.0, mount_id.0
+                ))
+            })?;
+        requests.push(HydrationRequest::new(
+            mount_id.clone(),
+            remote_id,
+            mount.root.join(entity.path),
+            HydrationState::Hydrated,
+            HydrationReason::Prefetch,
+        ));
+    }
+    Ok(requests)
 }
 
 fn debug_mutating_request_item(request: &MutatingRequest) -> DaemonDebugQueueItem {
@@ -5842,10 +5935,11 @@ mod tests {
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
         ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
-        FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, JournalRepository,
-        MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository, MetadataDiscoveryPriority,
-        MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountRepository, ProjectionMode,
-        RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
+        FreshnessStateRecord, FreshnessStateRepository, HydrationJobRepository, InMemoryStateStore,
+        JournalRepository, MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository,
+        MetadataDiscoveryPriority, MountConfig, MountLiveModeRecord, MountLiveModeRepository,
+        MountRepository, ProjectionMode, RemoteObservationRecord, RemoteObservationRepository,
+        ShadowRepository, SqliteStateStore,
     };
 
     use crate::execution::PushJobReport;
@@ -6660,6 +6754,84 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn successful_slack_child_refresh_queues_persisted_eager_prefetch() {
+        let state_root = temp_runtime_root("runtime-slack-eager-prefetch");
+        let mount_id = MountId::new("slack-main");
+        let mount_root = temp_runtime_root("runtime-slack-eager-prefetch-mount");
+        let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "slack", mount_root.clone())
+                    .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save Slack mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("slack-conversation:C123"),
+                EntityKind::Directory,
+                "general",
+                "channels/general-C123",
+            ))
+            .expect("save conversation");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("slack-recent:C123"),
+                    EntityKind::Page,
+                    "recent",
+                    "channels/general-C123/recent.md",
+                )
+                .with_hydration(HydrationState::Stub),
+            )
+            .expect("save recent page");
+        drop(store);
+
+        let mut runtime = runtime_state_for_root(state_root.clone());
+        runtime.handle_child_refresh_result(
+            "slack-main",
+            "slack-conversation:C123",
+            ChildRefreshPriority::Background,
+            2,
+            &Ok(VirtualFsRefreshChildrenReport::default()),
+        );
+
+        let request = runtime
+            .hydration
+            .peek_ready()
+            .expect("Slack background prefetch");
+        assert_eq!(request.mount_id, mount_id);
+        assert_eq!(request.remote_id, RemoteId::new("slack-recent:C123"));
+        assert_eq!(request.reason, HydrationReason::Prefetch);
+        assert_eq!(
+            request.path,
+            mount_root.join("channels/general-C123/recent.md")
+        );
+        runtime.handle_child_refresh_result(
+            "slack-main",
+            "slack-conversation:C123",
+            ChildRefreshPriority::Interactive,
+            2,
+            &Ok(VirtualFsRefreshChildrenReport::default()),
+        );
+        assert_eq!(
+            runtime.hydration.debug_requests(10).len(),
+            1,
+            "a persisted prefetch must not be queued twice"
+        );
+        let jobs = SqliteStateStore::open(state_root.clone())
+            .expect("reopen store")
+            .list_hydration_jobs()
+            .expect("list hydration jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].reason, HydrationReason::Prefetch);
+
+        let _ = std::fs::remove_dir_all(state_root);
+        let _ = std::fs::remove_dir_all(mount_root);
     }
 
     #[test]

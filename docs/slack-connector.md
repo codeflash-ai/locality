@@ -107,6 +107,15 @@ Thread reply bodies are expanded when `recent.md` hydrates, so reply-only edits
 become visible on the next hydration or explicit pull without making background
 freshness block on `conversations.replies`.
 
+Slack mounts eagerly hydrate in the background. As daemon discovery walks the
+virtual conversation tree, each unhydrated `users.md` and `recent.md` file is
+queued as low-priority prefetch work. Plain-file mounts enqueue the same work
+during scheduled reconciliation. Hydration jobs are durable across daemon
+restarts, and an interactive file open or explicit pull takes priority over the
+backlog. Background fetches defer when the provider gate is cooling down, so a
+large workspace hydrates progressively at the configured Slack history rate
+instead of blocking foreground daemon work.
+
 ## Write policy
 
 Slack mounts are read-only. Locality rejects edits, creates, renames, moves,
