@@ -126,6 +126,13 @@ impl ConnectorNetworkGate {
             .expect("unbounded network admission does not time out")
     }
 
+    /// Attempt fair admission once without waiting for quota, cooldown, or
+    /// in-flight capacity to become available.
+    pub fn try_acquire(&self) -> Option<NetworkPermit> {
+        self.orchestrator
+            .acquire(&self.config, Some(Duration::ZERO))
+    }
+
     /// Wait for fair admission for at most `max_wait`.
     ///
     /// A timed-out waiter is removed from the scope rotation before this
@@ -273,11 +280,6 @@ impl NetworkOrchestrator {
         }
 
         loop {
-            if max_wait.is_some_and(|limit| started.elapsed() >= limit) {
-                cancel_waiter(&mut state, &scope);
-                self.inner.changed.notify_all();
-                return None;
-            }
             let now = Instant::now();
             for scope_state in state.scopes.values_mut() {
                 scope_state.refill(now);
@@ -315,6 +317,12 @@ impl NetworkOrchestrator {
                     scope,
                     waited: started.elapsed(),
                 });
+            }
+
+            if max_wait.is_some_and(|limit| started.elapsed() >= limit) {
+                cancel_waiter(&mut state, &scope);
+                self.inner.changed.notify_all();
+                return None;
             }
 
             let mut delay = state
@@ -578,6 +586,23 @@ mod tests {
         let started = Instant::now();
         assert!(gate.acquire_for(Duration::from_millis(5)).is_none());
         assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(gate.status().waiting, 0);
+    }
+
+    #[test]
+    fn nonblocking_admission_takes_available_token_then_defers() {
+        let orchestrator = NetworkOrchestrator::new(1);
+        let gate = ConnectorNetworkGate::new(
+            orchestrator,
+            ConnectorNetworkConfig::new("nonblocking", 1.0 / 60.0, 1.0),
+        );
+
+        let permit = gate.try_acquire().expect("initial token");
+        drop(permit);
+        let started = Instant::now();
+
+        assert!(gate.try_acquire().is_none());
+        assert!(started.elapsed() < Duration::from_millis(500));
         assert_eq!(gate.status().waiting, 0);
     }
 

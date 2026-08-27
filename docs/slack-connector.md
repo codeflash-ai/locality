@@ -113,8 +113,10 @@ queued as low-priority prefetch work. Plain-file mounts enqueue the same work
 during scheduled reconciliation. Hydration jobs are durable across daemon
 restarts, and an interactive file open or explicit pull takes priority over the
 backlog. Background fetches defer when the provider gate is cooling down, so a
-large workspace hydrates progressively at the configured Slack history rate
-instead of blocking foreground daemon work.
+large workspace hydrates progressively at the configured Slack history rate.
+They also use nonblocking quota admission: when the next token or in-flight slot
+is unavailable, the durable job is returned to the daemon before the worker can
+delay foreground work.
 
 ## Write policy
 
