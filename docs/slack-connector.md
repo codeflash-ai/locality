@@ -118,8 +118,11 @@ Before a prefetch starts using each Slack quota scope, admission is nonblocking:
 if no token or in-flight slot is available, the durable job returns to the
 daemon before delaying foreground work. Once admitted, requests within that
 operation pace normally so pagination and thread expansion can finish without
-discarding progress. A successful foreground materialization cancels any queued
-or deferred hydration for the same file.
+discarding progress. A foreground hydration cancels queued or deferred work for
+the same file; a cached read removes only obsolete prefetch work and preserves
+remote-refresh jobs. Successful pulls prune prefetches whose entities are
+already hydrated or no longer exist, and queued jobs whose entities were pruned
+terminate before making a connector request.
 
 ## Write policy
 

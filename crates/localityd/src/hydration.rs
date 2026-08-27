@@ -672,6 +672,25 @@ impl HydrationQueue {
         removed
     }
 
+    pub fn remove_target_with_reason(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+        reason: &HydrationReason,
+    ) -> bool {
+        let key = HydrationKey::new(mount_id.clone(), remote_id.clone());
+        if self
+            .pending
+            .get(&key)
+            .is_none_or(|request| &request.reason != reason)
+        {
+            return false;
+        }
+        self.pending.remove(&key);
+        self.order.retain(|queued| queued != &key);
+        true
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
