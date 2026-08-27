@@ -6101,9 +6101,7 @@ mod tests {
     use locality_core::freshness::{
         ChangeHintKind, FreshnessTier, RemoteObservation, RemoteVersion, SyncJob, SyncJobKind,
     };
-    #[cfg(target_os = "macos")]
-    use locality_core::hydration::HydrationReason;
-    use locality_core::hydration::HydrationRequest;
+    use locality_core::hydration::{HydrationReason, HydrationRequest};
     use locality_core::journal::{
         JournalApplyEffect, JournalEntry, JournalLocalProjectionItem, JournalMetadata,
         JournalStatus, PushId, PushOperationId,
