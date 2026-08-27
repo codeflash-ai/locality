@@ -1,5 +1,6 @@
+use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use locality_connector::ConnectorExecutionPolicy;
@@ -73,6 +74,7 @@ pub struct HttpSlackApiClient {
     base_url: String,
     client: Client,
     execution_policy: ConnectorExecutionPolicy,
+    network_admission: SlackNetworkAdmission,
 }
 
 impl fmt::Debug for HttpSlackApiClient {
@@ -116,6 +118,7 @@ impl HttpSlackApiClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             client,
             execution_policy,
+            network_admission: SlackNetworkAdmission::default(),
         }
     }
 
@@ -132,7 +135,8 @@ impl HttpSlackApiClient {
         for attempt in 0..=SLACK_RATE_LIMIT_RETRIES {
             let gate = slack_rate_gate(rate_gate);
             let _network_permit =
-                acquire_slack_network_permit(gate, self.execution_policy, method)?;
+                self.network_admission
+                    .acquire(gate, self.execution_policy, rate_gate, method)?;
             let mut request = self
                 .client
                 .request(http_method.clone(), format!("{}/{}", self.base_url, method))
@@ -338,7 +342,7 @@ impl SlackOk for SlackUsersListResponse {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SlackRateGate {
     Metadata,
     History,
@@ -464,14 +468,42 @@ fn slack_rate_gate(rate_gate: SlackRateGate) -> &'static ConnectorNetworkGate {
     }
 }
 
-fn acquire_slack_network_permit(
+#[derive(Clone, Debug, Default)]
+struct SlackNetworkAdmission {
+    admitted_deferred_scopes: Arc<Mutex<BTreeSet<SlackRateGate>>>,
+}
+
+impl SlackNetworkAdmission {
+    fn acquire(
+        &self,
+        gate: &ConnectorNetworkGate,
+        execution_policy: ConnectorExecutionPolicy,
+        rate_gate: SlackRateGate,
+        method: &str,
+    ) -> LocalityResult<NetworkPermit> {
+        if !execution_policy.defers_provider_cooldown()
+            || self
+                .admitted_deferred_scopes
+                .lock()
+                .expect("Slack admission lock")
+                .contains(&rate_gate)
+        {
+            return Ok(gate.acquire());
+        }
+
+        let permit = try_acquire_slack_network_permit(gate, method)?;
+        self.admitted_deferred_scopes
+            .lock()
+            .expect("Slack admission lock")
+            .insert(rate_gate);
+        Ok(permit)
+    }
+}
+
+fn try_acquire_slack_network_permit(
     gate: &ConnectorNetworkGate,
-    execution_policy: ConnectorExecutionPolicy,
     method: &str,
 ) -> LocalityResult<NetworkPermit> {
-    if !execution_policy.defers_provider_cooldown() {
-        return Ok(gate.acquire());
-    }
     gate.try_acquire().ok_or_else(|| {
         let status = gate.status();
         let retry_after = status.cooldown_remaining.unwrap_or_else(|| {
@@ -610,29 +642,47 @@ mod tests {
     }
 
     #[test]
-    fn deferred_execution_does_not_wait_for_history_quota_refill() {
+    fn deferred_execution_allows_admitted_multi_request_operation_to_finish() {
         let gate = ConnectorNetworkGate::new(
             locality_connector::network::NetworkOrchestrator::new(1),
-            ConnectorNetworkConfig::new("slack-history-test", 1.0 / 60.0, 1.0),
+            ConnectorNetworkConfig::new("slack-history-test", 50.0, 1.0),
         );
+        let admission = SlackNetworkAdmission::default();
         drop(
-            acquire_slack_network_permit(
-                &gate,
-                ConnectorExecutionPolicy::DeferProviderCooldown,
-                "conversations.history",
-            )
-            .expect("initial history token"),
+            admission
+                .acquire(
+                    &gate,
+                    ConnectorExecutionPolicy::DeferProviderCooldown,
+                    SlackRateGate::History,
+                    "conversations.history",
+                )
+                .expect("initial history token"),
         );
+        gate.record_cooldown(Duration::from_millis(20));
         let started = std::time::Instant::now();
 
-        let error = acquire_slack_network_permit(
-            &gate,
-            ConnectorExecutionPolicy::DeferProviderCooldown,
-            "conversations.history",
-        )
-        .expect_err("exhausted history quota must defer");
+        drop(
+            admission
+                .acquire(
+                    &gate,
+                    ConnectorExecutionPolicy::DeferProviderCooldown,
+                    SlackRateGate::History,
+                    "conversations.history",
+                )
+                .expect("an admitted operation may wait for its next page"),
+        );
 
+        assert!(started.elapsed() >= Duration::from_millis(10));
         assert!(started.elapsed() < Duration::from_millis(500));
+        let fresh_operation = SlackNetworkAdmission::default();
+        let error = fresh_operation
+            .acquire(
+                &gate,
+                ConnectorExecutionPolicy::DeferProviderCooldown,
+                SlackRateGate::History,
+                "conversations.history",
+            )
+            .expect_err("a new operation must not wait for history quota");
         match error {
             LocalityError::RateLimited {
                 provider,
@@ -640,7 +690,7 @@ mod tests {
                 message,
             } => {
                 assert_eq!(provider, "slack");
-                assert!(retry_after > Duration::from_secs(59));
+                assert!(retry_after > Duration::ZERO);
                 assert_eq!(
                     message,
                     "Slack API conversations.history quota admission deferred"
@@ -660,12 +710,14 @@ mod tests {
         gate.record_cooldown(Duration::from_secs(120));
         let started = std::time::Instant::now();
 
-        let error = acquire_slack_network_permit(
-            &gate,
-            ConnectorExecutionPolicy::DeferProviderCooldown,
-            "conversations.history",
-        )
-        .expect_err("active cooldown must defer");
+        let error = SlackNetworkAdmission::default()
+            .acquire(
+                &gate,
+                ConnectorExecutionPolicy::DeferProviderCooldown,
+                SlackRateGate::History,
+                "conversations.history",
+            )
+            .expect_err("active cooldown must defer");
 
         assert!(started.elapsed() < Duration::from_millis(500));
         assert!(matches!(

@@ -114,9 +114,12 @@ during scheduled reconciliation. Hydration jobs are durable across daemon
 restarts, and an interactive file open or explicit pull takes priority over the
 backlog. Background fetches defer when the provider gate is cooling down, so a
 large workspace hydrates progressively at the configured Slack history rate.
-They also use nonblocking quota admission: when the next token or in-flight slot
-is unavailable, the durable job is returned to the daemon before the worker can
-delay foreground work.
+Before a prefetch starts using each Slack quota scope, admission is nonblocking:
+if no token or in-flight slot is available, the durable job returns to the
+daemon before delaying foreground work. Once admitted, requests within that
+operation pace normally so pagination and thread expansion can finish without
+discarding progress. A successful foreground materialization cancels any queued
+or deferred hydration for the same file.
 
 ## Write policy
 

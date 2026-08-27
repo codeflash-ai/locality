@@ -663,6 +663,15 @@ impl HydrationQueue {
             .contains_key(&HydrationKey::new(mount_id.clone(), remote_id.clone()))
     }
 
+    pub fn remove_target(&mut self, mount_id: &MountId, remote_id: &RemoteId) -> bool {
+        let key = HydrationKey::new(mount_id.clone(), remote_id.clone());
+        let removed = self.pending.remove(&key).is_some();
+        if removed {
+            self.order.retain(|queued| queued != &key);
+        }
+        removed
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
