@@ -2104,7 +2104,6 @@ fn resolving_google_docs_mount_uses_active_connection_credentials() {
         GOOGLE_DOCS_CONNECTOR_ID,
         "/tmp/locality/google-docs",
     )
-    .with_remote_root_id(RemoteId::new("workspace-folder"))
     .with_connection_id(connection_id);
 
     let source =
@@ -2168,7 +2167,6 @@ fn resolving_expired_google_docs_credential_refreshes_with_broker_handle() {
         GOOGLE_DOCS_CONNECTOR_ID,
         "/tmp/locality/google-docs",
     )
-    .with_remote_root_id(RemoteId::new("workspace-folder"))
     .with_connection_id(connection_id);
 
     let source = resolve_source_for_mount(&store, &credentials, &mount).expect("resolve source");
@@ -2238,7 +2236,6 @@ fn resolving_expired_google_docs_credential_rejects_refresh_unsupported_scope() 
         GOOGLE_DOCS_CONNECTOR_ID,
         "/tmp/locality/google-docs",
     )
-    .with_remote_root_id(RemoteId::new("workspace-folder"))
     .with_connection_id(connection_id);
 
     let error = resolve_source_for_mount(&store, &credentials, &mount)
@@ -2300,7 +2297,6 @@ fn resolving_expired_google_docs_credential_with_stopped_local_broker_requires_r
         GOOGLE_DOCS_CONNECTOR_ID,
         "/tmp/locality/google-docs",
     )
-    .with_remote_root_id(RemoteId::new("workspace-folder"))
     .with_connection_id(connection_id);
 
     let error =
