@@ -110,6 +110,7 @@ const CHILD_REFRESH_RETRY_MAX_DELAY: Duration = Duration::from_secs(300);
 const PERIODIC_DISCOVERY_DEPTH: u32 = u32::MAX;
 const DEBUG_QUEUE_ITEM_LIMIT: usize = 25;
 const SCHEDULED_PULL_RETRY_MAX_DELAY: Duration = Duration::from_secs(300);
+const PROVIDER_RETRY_MAX_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn child_refresh_retry_delay(attempts: u32) -> Duration {
     let exponent = attempts.saturating_sub(1).min(31);
@@ -141,6 +142,11 @@ fn scheduled_pull_retry_delay(provider_delay: Duration, attempt: u32) -> Duratio
         .subsec_nanos() as u64
         ^ u64::from(attempt).wrapping_mul(0x9E37_79B9);
     base.saturating_add(Duration::from_millis(seed % (jitter_window_ms + 1)))
+}
+
+fn provider_retry_deadline(now: Instant, delay: Duration) -> Instant {
+    now.checked_add(delay.min(PROVIDER_RETRY_MAX_DELAY))
+        .unwrap_or(now)
 }
 
 impl DaemonRuntimeHandle {
@@ -2597,7 +2603,7 @@ impl RuntimeState {
             merge_deferred_hydration_request(&mut request, queued);
         }
 
-        let retry_at = Instant::now() + delay;
+        let retry_at = provider_retry_deadline(Instant::now(), delay);
         let merged_request = if let Some(existing) =
             self.deferred_hydration.iter_mut().find(|deferred| {
                 deferred.request.mount_id == request.mount_id
@@ -2646,18 +2652,35 @@ impl RuntimeState {
             }
         }
 
-        if let Some(deferred) = self.deferred_hydration.iter_mut().find(|deferred| {
+        if let Some(index) = self.deferred_hydration.iter().position(|deferred| {
             deferred.request.mount_id == request.mount_id
                 && deferred.request.remote_id == request.remote_id
         }) {
+            if is_foreground_hydration_reason(&request.reason) {
+                let mut deferred = self.deferred_hydration.remove(index);
+                merge_deferred_hydration_request(&mut deferred.request, request);
+                self.refresh_next_hydration_retry();
+                let queued = self.hydration.queue_request(deferred.request.clone());
+                self.persist_hydration_request(deferred.request);
+                return queued;
+            }
+            let deferred = &mut self.deferred_hydration[index];
             merge_deferred_hydration_request(&mut deferred.request, request);
             let merged_request = deferred.request.clone();
             self.persist_hydration_request(merged_request);
             return false;
         }
 
-        let queued = self.hydration.queue_request(request.clone());
-        self.persist_hydration_request(request);
+        let mount_id = request.mount_id.clone();
+        let remote_id = request.remote_id.clone();
+        let queued = self.hydration.queue_request(request);
+        if let Some(merged_request) = self
+            .hydration
+            .request_for_target(&mount_id, &remote_id)
+            .cloned()
+        {
+            self.persist_hydration_request(merged_request);
+        }
         queued
     }
 
@@ -3578,6 +3601,13 @@ impl RuntimeState {
     }
 }
 
+fn is_foreground_hydration_reason(reason: &HydrationReason) -> bool {
+    matches!(
+        reason,
+        HydrationReason::ExplicitPull | HydrationReason::FileOpen | HydrationReason::StubRead
+    )
+}
+
 fn eager_background_hydration_requests_for_container(
     state_root: &Path,
     mount_id: &str,
@@ -3595,12 +3625,6 @@ fn eager_background_hydration_requests_for_container(
         return Ok(Vec::new());
     }
 
-    let pending = store
-        .list_hydration_jobs()
-        .map_err(LocalityError::from)?
-        .into_iter()
-        .map(|job| (job.mount_id, job.remote_id))
-        .collect::<BTreeSet<_>>();
     let content_root = virtual_fs_content_root(state_root, &mount_id);
     let children = virtual_fs_children_with_content_root(
         &store,
@@ -3622,9 +3646,6 @@ fn eager_background_hydration_requests_for_container(
         let Some(remote_id) = child.remote_id.map(RemoteId::new) else {
             continue;
         };
-        if pending.contains(&(mount_id.clone(), remote_id.clone())) {
-            continue;
-        }
         let entity = store
             .get_entity(&mount_id, &remote_id)
             .map_err(LocalityError::from)?
@@ -6173,9 +6194,10 @@ mod tests {
     use super::{
         ActiveChildRefresh, ActiveRuntimeJob, ChildRefreshPriority, ChildRefreshQueue,
         ChildRefreshRequest, DaemonRequest, DefaultRuntimeJobRunner, JobCompletion,
-        ProjectionRefreshRequest, RemoteDiscoveryHint, RuntimeJobRunner, RuntimeState,
-        child_refresh_retry_delay, dispatch_gmail_push_projection_refresh, execute_file_event,
-        execute_observe_entity_job, locality_error_code, observable_remote_identifier,
+        PROVIDER_RETRY_MAX_DELAY, ProjectionRefreshRequest, RemoteDiscoveryHint, RuntimeJobRunner,
+        RuntimeState, child_refresh_retry_delay, dispatch_gmail_push_projection_refresh,
+        execute_file_event, execute_observe_entity_job, locality_error_code,
+        observable_remote_identifier, provider_retry_deadline,
         refresh_macos_file_provider_after_gmail_push_with, remote_fast_forward_discovery_hints,
         repair_clean_remote_deleted_projections, response_file_opened_observe_jobs,
     };
@@ -6810,6 +6832,77 @@ mod tests {
         assert_eq!(jobs[0].path, state_root.join("channels/current/recent.md"));
 
         let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn foreground_hydration_promotes_deferred_prefetch_immediately() {
+        let state_root = temp_runtime_root("runtime-promote-deferred-prefetch");
+        let mount_id = MountId::new("slack-main");
+        SqliteStateStore::open(state_root.clone())
+            .expect("open store")
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "slack",
+                state_root.join("slack-main"),
+            ))
+            .expect("save mount");
+        let mut runtime = runtime_state_for_root(state_root.clone());
+
+        for (remote_id, reason) in [
+            ("slack-recent:C123", HydrationReason::FileOpen),
+            ("slack-users", HydrationReason::StubRead),
+        ] {
+            let remote_id = RemoteId::new(remote_id);
+            runtime.defer_hydration_retry_after(
+                HydrationRequest::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    state_root.join("old.md"),
+                    HydrationState::Hydrated,
+                    HydrationReason::Prefetch,
+                ),
+                Duration::from_secs(60),
+            );
+            assert!(runtime.queue_hydration(HydrationRequest::new(
+                mount_id.clone(),
+                remote_id.clone(),
+                state_root.join("current.md"),
+                HydrationState::Hydrated,
+                reason.clone(),
+            )));
+
+            let queued = runtime
+                .hydration
+                .request_for_target(&mount_id, &remote_id)
+                .expect("foreground request should be ready");
+            assert_eq!(queued.reason, reason);
+            assert_eq!(queued.path, state_root.join("current.md"));
+        }
+
+        assert!(runtime.deferred_hydration.is_empty());
+        assert_eq!(runtime.next_hydration_retry, None);
+        let jobs = SqliteStateStore::open(state_root.clone())
+            .expect("reopen store")
+            .list_hydration_jobs()
+            .expect("list hydration jobs");
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|job| matches!(
+            job.reason,
+            HydrationReason::FileOpen | HydrationReason::StubRead
+        )));
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn provider_retry_deadline_bounds_untrusted_delay() {
+        let now = Instant::now();
+
+        assert_eq!(
+            provider_retry_deadline(now, Duration::MAX),
+            now.checked_add(PROVIDER_RETRY_MAX_DELAY)
+                .expect("bounded provider retry delay")
+        );
     }
 
     #[test]
@@ -7572,6 +7665,13 @@ mod tests {
             request.path,
             mount_root.join("channels/general-C123/recent.md")
         );
+        assert!(!runtime.queue_hydration(HydrationRequest::new(
+            mount_id.clone(),
+            RemoteId::new("slack-recent:C123"),
+            mount_root.join("channels/general-C123/recent.md"),
+            HydrationState::Hydrated,
+            HydrationReason::FileOpen,
+        )));
         runtime.handle_child_refresh_result(
             "slack-main",
             "slack-conversation:C123",
@@ -7589,7 +7689,7 @@ mod tests {
             .list_hydration_jobs()
             .expect("list hydration jobs");
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].reason, HydrationReason::Prefetch);
+        assert_eq!(jobs[0].reason, HydrationReason::FileOpen);
 
         let _ = std::fs::remove_dir_all(state_root);
         let _ = std::fs::remove_dir_all(mount_root);

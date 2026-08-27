@@ -663,6 +663,15 @@ impl HydrationQueue {
             .contains_key(&HydrationKey::new(mount_id.clone(), remote_id.clone()))
     }
 
+    pub(crate) fn request_for_target(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> Option<&HydrationRequest> {
+        self.pending
+            .get(&HydrationKey::new(mount_id.clone(), remote_id.clone()))
+    }
+
     pub fn remove_target(&mut self, mount_id: &MountId, remote_id: &RemoteId) -> bool {
         self.take_target(mount_id, remote_id).is_some()
     }
