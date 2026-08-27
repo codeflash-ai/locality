@@ -709,7 +709,10 @@ Current priority groups:
 Slack background discovery enqueues `Prefetch` for unhydrated `users.md` and
 `recent.md` files. Before making a provider call, prefetch hydration uses the
 deferred-cooldown execution policy so rate-limited work yields back to the
-daemon and retries from its durable hydration job.
+daemon and retries from its durable hydration job. An explicitly configured
+eager page-count policy retains normal `Policy` priority; connector prefetch is
+only the fallback. Repeated discoveries for a deferred target update that
+request in place without bypassing its provider retry deadline.
 
 The runtime schedules work in this order:
 

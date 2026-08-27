@@ -103,6 +103,10 @@ impl FetchScheduleStrategy for DefaultFetchScheduleStrategy {
             return policy_hydration();
         }
 
+        if should_eager_hydrate(request.page_count as u32, request.policy) {
+            return policy_hydration();
+        }
+
         if source_descriptor(&request.mount.connector).background_hydration_policy()
             == BackgroundHydrationPolicy::Eager
             && request.existing.is_none_or(|existing| {
@@ -113,10 +117,6 @@ impl FetchScheduleStrategy for DefaultFetchScheduleStrategy {
             })
         {
             return prefetch_hydration();
-        }
-
-        if should_eager_hydrate(request.page_count as u32, request.policy) {
-            return policy_hydration();
         }
 
         if request
@@ -909,6 +909,41 @@ mod tests {
         fn enumerate_mount(&self, _mount: &MountConfig) -> LocalityResult<Vec<TreeEntry>> {
             Ok(self.entries.clone())
         }
+    }
+
+    #[test]
+    fn configured_eager_hydration_outranks_connector_prefetch() {
+        let mount = MountConfig::new(MountId::new("slack-main"), "slack", "/tmp/slack-main");
+        let entry = TreeEntry {
+            mount_id: mount.mount_id.clone(),
+            remote_id: RemoteId::new("slack-recent:C123"),
+            kind: EntityKind::Page,
+            title: "recent".to_string(),
+            path: PathBuf::from("channels/general-C123/recent.md"),
+            hydration: HydrationState::Stub,
+            content_hash: None,
+            remote_edited_at: None,
+            stub_frontmatter: None,
+        };
+        let tick = PullSchedulerTick {
+            poll_active: true,
+            poll_cold: false,
+        };
+        let policy = HydrationPolicy {
+            eager_under_page_count: Some(10),
+            ..HydrationPolicy::default()
+        };
+
+        let plan = DefaultFetchScheduleStrategy.entity_plan(EntityFetchSchedule {
+            mount: &mount,
+            entry: &entry,
+            existing: None,
+            page_count: 1,
+            tick: &tick,
+            policy: &policy,
+        });
+
+        assert_eq!(plan.queue_hydration, Some(HydrationReason::Policy));
     }
 
     #[test]

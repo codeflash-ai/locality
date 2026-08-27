@@ -59,7 +59,7 @@ use crate::freshness::{
 };
 use crate::hydration::{
     HydrationEngine, HydrationExecutor, HydrationOutcome, HydrationPriority, HydrationQueue,
-    hydration_priority,
+    hydration_priority, merge_hydration_request,
 };
 use crate::ipc::{
     DaemonActiveJobStatus, DaemonDebugQueueItem, DaemonDebugQueueSection, DaemonDebugQueueStatus,
@@ -1464,6 +1464,12 @@ struct DeferredHydration {
     retry_at: Instant,
 }
 
+fn merge_deferred_hydration_request(existing: &mut HydrationRequest, incoming: HydrationRequest) {
+    let latest_path = incoming.path.clone();
+    merge_hydration_request(existing, incoming);
+    existing.path = latest_path;
+}
+
 #[derive(Clone, Debug)]
 struct ActiveRuntimeJob {
     kind: String,
@@ -2583,11 +2589,31 @@ impl RuntimeState {
         self.defer_hydration_retry_after(request, self.config.hydration_retry_delay);
     }
 
-    fn defer_hydration_retry_after(&mut self, request: HydrationRequest, delay: Duration) {
-        self.deferred_hydration.push(DeferredHydration {
-            request,
-            retry_at: Instant::now() + delay,
-        });
+    fn defer_hydration_retry_after(&mut self, mut request: HydrationRequest, delay: Duration) {
+        if let Some(queued) = self
+            .hydration
+            .take_target(&request.mount_id, &request.remote_id)
+        {
+            merge_deferred_hydration_request(&mut request, queued);
+        }
+
+        let retry_at = Instant::now() + delay;
+        let merged_request = if let Some(existing) =
+            self.deferred_hydration.iter_mut().find(|deferred| {
+                deferred.request.mount_id == request.mount_id
+                    && deferred.request.remote_id == request.remote_id
+            }) {
+            merge_deferred_hydration_request(&mut existing.request, request);
+            existing.retry_at = existing.retry_at.max(retry_at);
+            existing.request.clone()
+        } else {
+            self.deferred_hydration.push(DeferredHydration {
+                request: request.clone(),
+                retry_at,
+            });
+            request
+        };
+        self.persist_hydration_request(merged_request);
         self.refresh_next_hydration_retry();
     }
 
@@ -2620,15 +2646,28 @@ impl RuntimeState {
             }
         }
 
-        let queued = self.hydration.queue_request(request.clone());
+        if let Some(deferred) = self.deferred_hydration.iter_mut().find(|deferred| {
+            deferred.request.mount_id == request.mount_id
+                && deferred.request.remote_id == request.remote_id
+        }) {
+            merge_deferred_hydration_request(&mut deferred.request, request);
+            let merged_request = deferred.request.clone();
+            self.persist_hydration_request(merged_request);
+            return false;
+        }
 
+        let queued = self.hydration.queue_request(request.clone());
+        self.persist_hydration_request(request);
+        queued
+    }
+
+    fn persist_hydration_request(&self, request: HydrationRequest) {
         match SqliteStateStore::open(self.config.state_root.clone())
             .and_then(|mut store| store.upsert_hydration_job(HydrationJobRecord::from(request)))
         {
             Ok(()) => {}
             Err(error) => eprintln!("localityd failed to persist hydration request: {error}"),
         }
-        queued
     }
 
     fn remote_fast_forward_target_is_already_queued(&self, request: &HydrationRequest) -> bool {
@@ -6680,6 +6719,95 @@ mod tests {
                 .hydration
                 .contains_target(&request.mount_id, &request.remote_id)
         );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn deferred_hydration_coalesces_same_target_updates() {
+        let state_root = temp_runtime_root("runtime-coalesce-deferred-hydration");
+        let mount_id = MountId::new("slack-main");
+        let remote_id = RemoteId::new("slack-recent:C123");
+        SqliteStateStore::open(state_root.clone())
+            .expect("open store")
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "slack",
+                state_root.join("slack-main"),
+            ))
+            .expect("save mount");
+        let mut runtime = runtime_state_for_root(state_root.clone());
+        let original = HydrationRequest::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            state_root.join("channels/old/recent.md"),
+            HydrationState::Hydrated,
+            HydrationReason::Prefetch,
+        );
+        runtime.defer_hydration_retry_after(original, Duration::from_secs(60));
+        let original_retry_at = runtime.deferred_hydration[0].retry_at;
+        let renamed = HydrationRequest::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            state_root.join("channels/new/recent.md"),
+            HydrationState::Hydrated,
+            HydrationReason::Prefetch,
+        );
+
+        assert!(!runtime.queue_hydration(renamed));
+        assert!(runtime.hydration.is_empty());
+        assert_eq!(runtime.deferred_hydration.len(), 1);
+        assert_eq!(
+            runtime.deferred_hydration[0].request.path,
+            state_root.join("channels/new/recent.md")
+        );
+        assert_eq!(runtime.deferred_hydration[0].retry_at, original_retry_at);
+
+        let promoted = HydrationRequest::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            state_root.join("channels/newest/recent.md"),
+            HydrationState::Hydrated,
+            HydrationReason::Policy,
+        );
+        assert!(!runtime.queue_hydration(promoted));
+        assert_eq!(runtime.deferred_hydration.len(), 1);
+        assert_eq!(
+            runtime.deferred_hydration[0].request.reason,
+            HydrationReason::Policy
+        );
+        assert_eq!(
+            runtime.deferred_hydration[0].request.path,
+            state_root.join("channels/newest/recent.md")
+        );
+        assert_eq!(runtime.deferred_hydration[0].retry_at, original_retry_at);
+
+        let later_retry = HydrationRequest::new(
+            mount_id,
+            remote_id,
+            state_root.join("channels/current/recent.md"),
+            HydrationState::Hydrated,
+            HydrationReason::Prefetch,
+        );
+        runtime.defer_hydration_retry_after(later_retry, Duration::from_secs(120));
+
+        assert_eq!(runtime.deferred_hydration.len(), 1);
+        assert_eq!(
+            runtime.deferred_hydration[0].request.reason,
+            HydrationReason::Policy
+        );
+        assert_eq!(
+            runtime.deferred_hydration[0].request.path,
+            state_root.join("channels/current/recent.md")
+        );
+        assert!(runtime.deferred_hydration[0].retry_at > original_retry_at);
+        let jobs = SqliteStateStore::open(state_root.clone())
+            .expect("reopen store")
+            .list_hydration_jobs()
+            .expect("list hydration jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].reason, HydrationReason::Policy);
+        assert_eq!(jobs[0].path, state_root.join("channels/current/recent.md"));
 
         let _ = std::fs::remove_dir_all(state_root);
     }

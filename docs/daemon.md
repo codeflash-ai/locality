@@ -437,6 +437,8 @@ The queue preserves deterministic behavior:
 
 - high-priority work drains before policy and prefetch work;
 - duplicate lower-priority requests do not move a higher-priority request down;
+- repeated discovery coalesces into an existing deferred target without bypassing
+  its retry deadline, while refreshing the target's current path;
 - failed drain attempts requeue the failed request instead of dropping it.
 
 ## Hydration Execution

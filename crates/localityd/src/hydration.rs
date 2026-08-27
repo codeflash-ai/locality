@@ -664,9 +664,17 @@ impl HydrationQueue {
     }
 
     pub fn remove_target(&mut self, mount_id: &MountId, remote_id: &RemoteId) -> bool {
+        self.take_target(mount_id, remote_id).is_some()
+    }
+
+    pub(crate) fn take_target(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> Option<HydrationRequest> {
         let key = HydrationKey::new(mount_id.clone(), remote_id.clone());
-        let removed = self.pending.remove(&key).is_some();
-        if removed {
+        let removed = self.pending.remove(&key);
+        if removed.is_some() {
             self.order.retain(|queued| queued != &key);
         }
         removed
@@ -706,7 +714,7 @@ impl HydrationQueue {
         }
 
         if let Some(existing) = self.pending.get_mut(&key) {
-            merge_request(existing, request);
+            merge_hydration_request(existing, request);
         }
 
         false
@@ -842,7 +850,7 @@ impl HydrationKey {
     }
 }
 
-fn merge_request(existing: &mut HydrationRequest, incoming: HydrationRequest) {
+pub(crate) fn merge_hydration_request(existing: &mut HydrationRequest, incoming: HydrationRequest) {
     let existing_priority = hydration_priority(&existing.reason);
     let incoming_priority = hydration_priority(&incoming.reason);
     let target_state = strongest_target_state(&existing.target_state, &incoming.target_state);
