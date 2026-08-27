@@ -1436,7 +1436,7 @@ struct RuntimeState {
     pending_file_provider_children: BTreeMap<ChildRefreshKey, Vec<FileProviderChildrenWaiter>>,
     hydration: HydrationQueue,
     freshness: FreshnessQueue,
-    deferred_hydration: Vec<HydrationRequest>,
+    deferred_hydration: Vec<DeferredHydration>,
     next_hydration_retry: Option<Instant>,
     pending_scheduled_tick: Option<PullSchedulerTick>,
     pending_scheduled_pull_attempt: u32,
@@ -1456,6 +1456,12 @@ struct DeferredScheduledPull {
     attempt: u32,
     retry_at: Instant,
     status: DaemonProviderCooldownStatus,
+}
+
+#[derive(Clone, Debug)]
+struct DeferredHydration {
+    request: HydrationRequest,
+    retry_at: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -2099,7 +2105,7 @@ impl RuntimeState {
                 previous_shadow,
             } => match result {
                 Ok(outcome) => {
-                    self.cancel_hydration_target(&request.mount_id, &request.remote_id);
+                    self.complete_hydration_request(&request);
                     if outcome == HydrationOutcome::Hydrated {
                         self.refresh_visible_projection_after_remote_fast_forward(
                             &request,
@@ -2110,6 +2116,14 @@ impl RuntimeState {
                             previous_shadow.as_ref(),
                         );
                     }
+                }
+                Err(error @ LocalityError::RateLimited { retry_after, .. }) => {
+                    eprintln!(
+                        "localityd hydration failed for `{}`: {error}",
+                        request.path.display()
+                    );
+                    self.record_hydration_failure(&request, error.to_string());
+                    self.defer_hydration_retry_after(request, retry_after);
                 }
                 Err(error) => {
                     eprintln!(
@@ -2285,11 +2299,15 @@ impl RuntimeState {
             .next_hydration_retry
             .is_some_and(|retry_at| now >= retry_at)
         {
-            let retry_requests = std::mem::take(&mut self.deferred_hydration);
-            for request in retry_requests {
-                self.queue_hydration(request);
+            let deferred = std::mem::take(&mut self.deferred_hydration);
+            for deferred in deferred {
+                if now >= deferred.retry_at {
+                    self.queue_hydration(deferred.request);
+                } else {
+                    self.deferred_hydration.push(deferred);
+                }
             }
-            self.next_hydration_retry = None;
+            self.refresh_next_hydration_retry();
         }
 
         if self
@@ -2562,12 +2580,23 @@ impl RuntimeState {
     }
 
     fn defer_hydration_retry(&mut self, request: HydrationRequest) {
-        self.deferred_hydration.push(request);
-        let retry_at = Instant::now() + self.config.hydration_retry_delay;
-        self.next_hydration_retry = Some(
-            self.next_hydration_retry
-                .map_or(retry_at, |current| current.min(retry_at)),
-        );
+        self.defer_hydration_retry_after(request, self.config.hydration_retry_delay);
+    }
+
+    fn defer_hydration_retry_after(&mut self, request: HydrationRequest, delay: Duration) {
+        self.deferred_hydration.push(DeferredHydration {
+            request,
+            retry_at: Instant::now() + delay,
+        });
+        self.refresh_next_hydration_retry();
+    }
+
+    fn refresh_next_hydration_retry(&mut self) {
+        self.next_hydration_retry = self
+            .deferred_hydration
+            .iter()
+            .map(|deferred| deferred.retry_at)
+            .min();
     }
 
     fn queue_hydration(&mut self, request: HydrationRequest) -> bool {
@@ -3057,12 +3086,38 @@ impl RuntimeState {
 
     fn cancel_hydration_target(&mut self, mount_id: &MountId, remote_id: &RemoteId) {
         self.hydration.remove_target(mount_id, remote_id);
-        self.deferred_hydration
-            .retain(|request| request.mount_id != *mount_id || request.remote_id != *remote_id);
-        if self.deferred_hydration.is_empty() {
-            self.next_hydration_retry = None;
-        }
+        self.deferred_hydration.retain(|deferred| {
+            deferred.request.mount_id != *mount_id || deferred.request.remote_id != *remote_id
+        });
+        self.refresh_next_hydration_retry();
         self.delete_hydration_target(mount_id, remote_id);
+    }
+
+    fn complete_hydration_request(&mut self, completed: &HydrationRequest) {
+        if completed.reason != HydrationReason::Prefetch {
+            self.hydration.remove_target_with_reason(
+                &completed.mount_id,
+                &completed.remote_id,
+                &HydrationReason::Prefetch,
+            );
+            self.deferred_hydration.retain(|deferred| {
+                deferred.request.mount_id != completed.mount_id
+                    || deferred.request.remote_id != completed.remote_id
+                    || deferred.request.reason != HydrationReason::Prefetch
+            });
+            self.refresh_next_hydration_retry();
+        }
+
+        let target_is_still_queued = self
+            .hydration
+            .contains_target(&completed.mount_id, &completed.remote_id)
+            || self.deferred_hydration.iter().any(|deferred| {
+                deferred.request.mount_id == completed.mount_id
+                    && deferred.request.remote_id == completed.remote_id
+            });
+        if !target_is_still_queued {
+            self.delete_hydration_target(&completed.mount_id, &completed.remote_id);
+        }
     }
 
     fn reconcile_materialization_hydration(&mut self, response: &DaemonResponse) {
@@ -3085,19 +3140,16 @@ impl RuntimeState {
     fn cancel_prefetch_target(&mut self, mount_id: &MountId, remote_id: &RemoteId) {
         self.hydration
             .remove_target_with_reason(mount_id, remote_id, &HydrationReason::Prefetch);
-        self.deferred_hydration.retain(|request| {
-            request.mount_id != *mount_id
-                || request.remote_id != *remote_id
-                || request.reason != HydrationReason::Prefetch
+        self.deferred_hydration.retain(|deferred| {
+            deferred.request.mount_id != *mount_id
+                || deferred.request.remote_id != *remote_id
+                || deferred.request.reason != HydrationReason::Prefetch
         });
-        if self.deferred_hydration.is_empty() {
-            self.next_hydration_retry = None;
-        }
+        self.refresh_next_hydration_retry();
         let target_is_still_queued = self.hydration.contains_target(mount_id, remote_id)
-            || self
-                .deferred_hydration
-                .iter()
-                .any(|request| request.mount_id == *mount_id && request.remote_id == *remote_id);
+            || self.deferred_hydration.iter().any(|deferred| {
+                deferred.request.mount_id == *mount_id && deferred.request.remote_id == *remote_id
+            });
         if target_is_still_queued {
             return;
         }
@@ -3126,7 +3178,11 @@ impl RuntimeState {
             }
         };
         let mut requests = self.hydration.debug_requests(usize::MAX);
-        requests.extend(self.deferred_hydration.iter().cloned());
+        requests.extend(
+            self.deferred_hydration
+                .iter()
+                .map(|deferred| deferred.request.clone()),
+        );
         let mut obsolete = BTreeSet::new();
         for request in requests {
             if request.reason != HydrationReason::Prefetch {
@@ -3307,7 +3363,7 @@ impl RuntimeState {
                 .deferred_hydration
                 .iter()
                 .take(DEBUG_QUEUE_ITEM_LIMIT)
-                .cloned()
+                .map(|deferred| deferred.request.clone())
                 .map(debug_hydration_item)
                 .collect(),
         });
@@ -6038,7 +6094,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use locality_core::LocalityError;
     use locality_core::canonical::render_canonical_markdown;
@@ -6357,8 +6413,9 @@ mod tests {
                     .hydration
                     .contains_target(&mount_id, &RemoteId::new(remote_id))
             );
-            assert!(runtime.deferred_hydration.iter().all(|request| {
-                request.mount_id != mount_id || request.remote_id != RemoteId::new(remote_id)
+            assert!(runtime.deferred_hydration.iter().all(|deferred| {
+                deferred.request.mount_id != mount_id
+                    || deferred.request.remote_id != RemoteId::new(remote_id)
             }));
             if deferred {
                 assert!(runtime.next_hydration_retry.is_none());
@@ -6493,6 +6550,137 @@ mod tests {
                 .list_hydration_jobs()
                 .expect("list hydration jobs")
                 .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn active_prefetch_completion_preserves_newer_foreground_hydration() {
+        let state_root = temp_runtime_root("runtime-preserve-newer-foreground-hydration");
+        let mount_id = MountId::new("slack-main");
+        let remote_id = RemoteId::new("slack-recent:C123");
+        SqliteStateStore::open(state_root.clone())
+            .expect("open store")
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "slack",
+                state_root.join("slack-main"),
+            ))
+            .expect("save mount");
+        let mut runtime = runtime_state_for_root(state_root.clone());
+        let prefetch = HydrationRequest::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            state_root.join("C123.md"),
+            HydrationState::Hydrated,
+            locality_core::hydration::HydrationReason::Prefetch,
+        );
+        assert!(runtime.queue_hydration(prefetch));
+        let active_prefetch = runtime.hydration.pop_ready().expect("active prefetch");
+        let foreground = HydrationRequest::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            state_root.join("C123.md"),
+            HydrationState::Hydrated,
+            locality_core::hydration::HydrationReason::ExplicitPull,
+        );
+        assert!(runtime.queue_hydration(foreground.clone()));
+
+        runtime.shutdown_requested = true;
+        runtime.handle_completion(JobCompletion::Hydration {
+            request: active_prefetch,
+            result: Ok(crate::hydration::HydrationOutcome::Hydrated),
+            previous_shadow: None,
+        });
+
+        assert_eq!(runtime.hydration.pop_ready(), Some(foreground.clone()));
+        let jobs = SqliteStateStore::open(state_root.clone())
+            .expect("reopen store")
+            .list_hydration_jobs()
+            .expect("list hydration jobs");
+        assert_eq!(jobs, vec![HydrationJobRecord::from(foreground)]);
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn rate_limited_hydration_respects_provider_retry_delay() {
+        let state_root = temp_runtime_root("runtime-provider-hydration-delay");
+        let mount_id = MountId::new("slack-main");
+        let remote_id = RemoteId::new("slack-recent:C123");
+        SqliteStateStore::open(state_root.clone())
+            .expect("open store")
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "slack",
+                state_root.join("slack-main"),
+            ))
+            .expect("save mount");
+        let mut runtime = runtime_state_for_root(state_root.clone());
+        runtime.config.hydration_retry_delay = Duration::from_millis(1);
+        let request = HydrationRequest::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            state_root.join("C123.md"),
+            HydrationState::Hydrated,
+            locality_core::hydration::HydrationReason::Prefetch,
+        );
+        assert!(runtime.queue_hydration(request.clone()));
+        assert_eq!(runtime.hydration.pop_ready(), Some(request.clone()));
+        let retry_after = Duration::from_secs(60);
+        let before_completion = Instant::now();
+
+        runtime.handle_completion(JobCompletion::Hydration {
+            request: request.clone(),
+            result: Err(LocalityError::RateLimited {
+                provider: "slack".to_string(),
+                retry_after,
+                message: "history cooldown".to_string(),
+            }),
+            previous_shadow: None,
+        });
+
+        assert_eq!(runtime.deferred_hydration.len(), 1);
+        assert_eq!(runtime.deferred_hydration[0].request, request);
+        assert!(runtime.deferred_hydration[0].retry_at >= before_completion + retry_after);
+        assert_eq!(
+            runtime.next_hydration_retry,
+            Some(runtime.deferred_hydration[0].retry_at)
+        );
+        let jobs = SqliteStateStore::open(state_root.clone())
+            .expect("reopen store")
+            .list_hydration_jobs()
+            .expect("list hydration jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].attempts, 1);
+        assert_eq!(
+            jobs[0].reason,
+            locality_core::hydration::HydrationReason::Prefetch
+        );
+
+        let ordinary_retry = HydrationRequest::new(
+            mount_id,
+            RemoteId::new("slack-users"),
+            state_root.join("users.md"),
+            HydrationState::Hydrated,
+            locality_core::hydration::HydrationReason::Policy,
+        );
+        runtime.defer_hydration_retry_after(ordinary_retry.clone(), Duration::ZERO);
+        runtime.shutdown_requested = true;
+        runtime.handle_timeout();
+
+        assert_eq!(runtime.deferred_hydration.len(), 1);
+        assert_eq!(runtime.deferred_hydration[0].request, request);
+        assert!(
+            runtime
+                .hydration
+                .contains_target(&ordinary_retry.mount_id, &ordinary_retry.remote_id)
+        );
+        assert!(
+            !runtime
+                .hydration
+                .contains_target(&request.mount_id, &request.remote_id)
         );
 
         let _ = std::fs::remove_dir_all(state_root);

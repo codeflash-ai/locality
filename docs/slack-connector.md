@@ -116,11 +116,13 @@ backlog. Background fetches defer when the provider gate is cooling down, so a
 large workspace hydrates progressively at the configured Slack history rate.
 Before a prefetch starts using each Slack quota scope, admission is nonblocking:
 if no token or in-flight slot is available, the durable job returns to the
-daemon before delaying foreground work. Once admitted, requests within that
-operation pace normally so pagination and thread expansion can finish without
-discarding progress. A foreground hydration cancels queued or deferred work for
-the same file; a cached read removes only obsolete prefetch work and preserves
-remote-refresh jobs. Successful pulls prune prefetches whose entities are
+daemon until the provider's requested retry time without delaying foreground
+work. Once admitted, requests within that operation pace normally so pagination
+and thread expansion can finish without discarding progress. A foreground
+hydration cancels queued or deferred prefetch work for the same file; completion
+of an older prefetch preserves newer foreground and remote-refresh jobs. A
+cached read removes only obsolete prefetch work and preserves remote-refresh
+jobs. Successful pulls prune prefetches whose entities are
 already hydrated or no longer exist, and queued jobs whose entities were pruned
 terminate before making a connector request.
 
