@@ -4,7 +4,7 @@
 
 - Do not ship provider client secrets in the Locality CLI.
 - Keep the local desktop OAuth UX seamless.
-- Avoid broker-side persistence of user content or tokens in the initial design.
+- Avoid broker-side persistence of user content and minimize any token state.
 - Make the broker reusable for future confidential OAuth connectors.
 
 ## Non-Goals
@@ -38,6 +38,11 @@ The broker supports two refresh modes:
   callback URLs.
 - Production handle mode keeps provider refresh tokens inside encrypted opaque
   handles before returning them to local clients.
+- Slack refreshes are serialized per opaque handle. A successful response is
+  encrypted before being persisted and is replayable for ten minutes, closing
+  the common failure window where Slack consumes its single-use refresh token
+  but the client loses the response. The coordinator alarm deletes the cached
+  response after the replay window.
 - Upstream OAuth error bodies are not returned to callers.
 
 ## Abuse Model

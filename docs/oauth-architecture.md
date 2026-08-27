@@ -42,6 +42,11 @@ broker -> http://localhost:8757/oauth/<connector>/callback
 token request using the HTTPS provider callback URI, not the localhost
 completion URI.
 
+Slack access tokens use rotating, single-use refresh tokens. The public broker
+coordinates each opaque Slack refresh handle with a Durable Object and briefly
+persists the encrypted successful response. This makes client retries safe when
+the provider accepted a refresh but the network dropped the response.
+
 ## Hosted Flow
 
 Hosted connector OAuth stays in `locality-internal`. It creates hash-only admin

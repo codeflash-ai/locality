@@ -15,8 +15,15 @@ import {
 import { exchangeGmailCode, gmailAuthorizeUrl, refreshGmailToken, type GmailTokenResponse } from "./oauth/gmail";
 import { googleClientId } from "./oauth/google";
 import { exchangeNotionCode, notionAuthorizeUrl, refreshNotionToken, type NotionTokenResponse } from "./oauth/notion";
-import { exchangeSlackCode, refreshSlackToken, slackAuthorizeUrl, type SlackTokenResponse } from "./oauth/slack";
-import { randomBase64Url, decryptJsonHandle, encryptJsonHandle } from "./security/crypto";
+import { exchangeSlackCode, refreshSlackToken, slackAuthorizeUrl } from "./oauth/slack";
+import {
+  resolveRefreshToken,
+  shapeRefreshToken,
+  tokenMode,
+  validateRefreshTokenHandle,
+  type RefreshRequest
+} from "./refresh-handles";
+import { randomBase64Url } from "./security/crypto";
 import {
   providerCallbackUri,
   validateGmailRedirectUri,
@@ -26,6 +33,7 @@ import {
   validateSlackRedirectUri
 } from "./security/redirects";
 import { nowSeconds, signSession, verifySession, type OAuthSessionPayloadV2 } from "./security/session";
+import { shapeSlackTokenResponse } from "./slack-token-response";
 import { ingestTelemetry } from "./telemetry";
 import type { ApiErrorBody, BrokerEnv, ConnectorId } from "./types";
 
@@ -41,18 +49,6 @@ interface ExchangeRequest {
   state?: string;
   code?: string;
   redirect_uri?: string;
-}
-
-interface RefreshRequest {
-  refresh_token?: string;
-  refresh_token_handle?: string;
-}
-
-interface RefreshHandlePayload {
-  v: 1;
-  connector: ConnectorId;
-  refresh_token: string;
-  issued_at: number;
 }
 
 const app = new Hono<{ Bindings: BrokerEnv }>();
@@ -372,6 +368,19 @@ app.post("/v1/oauth/slack/exchange", async (c) => {
 
 app.post("/v1/oauth/slack/refresh", async (c) => {
   const body = await requiredJson<RefreshRequest>(c.req.raw);
+  if (body.refresh_token_handle) {
+    await validateRefreshTokenHandle(c.env, "slack", body.refresh_token_handle);
+    const namespace = c.env.LOCALITY_SLACK_REFRESH_COORDINATOR;
+    if (!namespace) {
+      throw configError("LOCALITY_SLACK_REFRESH_COORDINATOR must be configured for Slack refresh handles");
+    }
+    const id = namespace.idFromName(body.refresh_token_handle);
+    return namespace.get(id).fetch("https://slack-refresh.locality.internal/refresh", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  }
   const refreshToken = await resolveRefreshToken(c.env, "slack", body);
   const token = await refreshSlackToken(c.env, refreshToken);
   return c.json(await shapeSlackTokenResponse(c.env, token));
@@ -446,25 +455,6 @@ async function shapeGmailTokenResponse(env: BrokerEnv, token: GmailTokenResponse
   };
 }
 
-async function shapeSlackTokenResponse(env: BrokerEnv, token: SlackTokenResponse) {
-  const refresh = await shapeRefreshToken(env, "slack", token.refresh_token);
-  const scopes = token.scope?.split(/[,\s]+/).filter(Boolean) ?? [];
-  const workspace = token.team ?? token.enterprise;
-  return {
-    connector: "slack",
-    access_token: token.access_token,
-    token_type: token.token_type,
-    expires_in: token.expires_in,
-    scopes,
-    account_id: workspace?.id,
-    account_label: workspace?.name,
-    workspace_id: workspace?.id,
-    workspace_name: workspace?.name,
-    bot_id: token.bot_user_id,
-    ...refresh
-  };
-}
-
 function connectorFromParam(value: string): ConnectorId {
   if (
     value === "notion" ||
@@ -529,53 +519,6 @@ function boundedCallbackValue(value: string, field: string): string {
   return value;
 }
 
-async function shapeRefreshToken(env: BrokerEnv, connector: ConnectorId, refreshToken: string | undefined) {
-  if (!refreshToken) {
-    return {};
-  }
-  if (tokenMode(env) === "raw") {
-    return {
-      refresh_token_kind: "raw",
-      refresh_token: refreshToken
-    };
-  }
-  const secret = requireOperationalSecret(env.LOCALITY_REFRESH_HANDLE_KEY, "LOCALITY_REFRESH_HANDLE_KEY");
-  const handle = await encryptJsonHandle(
-    {
-      v: 1,
-      connector,
-      refresh_token: refreshToken,
-      issued_at: nowSeconds()
-    } satisfies RefreshHandlePayload,
-    secret
-  );
-  return {
-    refresh_token_kind: "handle",
-    refresh_token_handle: handle
-  };
-}
-
-async function resolveRefreshToken(env: BrokerEnv, connector: ConnectorId, body: RefreshRequest): Promise<string> {
-  if (body.refresh_token_handle) {
-    try {
-      const payload = await decryptJsonHandle<RefreshHandlePayload>(
-        body.refresh_token_handle,
-        requireOperationalSecret(env.LOCALITY_REFRESH_HANDLE_KEY, "LOCALITY_REFRESH_HANDLE_KEY")
-      );
-      if (payload.v !== 1 || payload.connector !== connector) {
-        throw new Error("invalid refresh handle payload");
-      }
-      return payload.refresh_token;
-    } catch {
-      throw badRequest("invalid_refresh_handle", "refresh_token_handle is invalid");
-    }
-  }
-  if (tokenMode(env) !== "raw") {
-    throw badRequest("missing_refresh_handle", "refresh_token_handle is required");
-  }
-  return requireString(body.refresh_token, "refresh_token");
-}
-
 async function optionalJson<T>(request: Request): Promise<T> {
   if (!request.headers.get("content-type")?.includes("application/json")) {
     return {} as T;
@@ -596,14 +539,6 @@ function requireString(value: string | undefined, field: string): string {
     throw badRequest("missing_field", `${field} is required`);
   }
   return value;
-}
-
-function tokenMode(env: BrokerEnv): "handle" | "raw" {
-  const mode = env.LOCALITY_TOKEN_MODE ?? (env.LOCALITY_REFRESH_HANDLE_KEY ? "handle" : "raw");
-  if (mode !== "handle" && mode !== "raw") {
-    throw configError("LOCALITY_TOKEN_MODE must be either handle or raw");
-  }
-  return mode;
 }
 
 function requireOperationalSecret(value: string | undefined, name: string): string {

@@ -3,6 +3,14 @@ main = "src/index.ts"
 compatibility_date = "2026-06-11"
 workers_dev = true
 
+[[durable_objects.bindings]]
+name = "LOCALITY_SLACK_REFRESH_COORDINATOR"
+class_name = "SlackRefreshCoordinator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SlackRefreshCoordinator"]
+
 [observability]
 enabled = true
 
