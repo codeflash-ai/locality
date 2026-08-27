@@ -23,8 +23,8 @@ use locality_store::{
     InMemoryStateStore, MountConfig,
 };
 use localityd::source::{
-    LocalSourceValidator, ResolvedSource, ResolvedSourceSet, SourcePushValidator,
-    SourceValidationContext, VirtualRenamePolicy, resolve_source_for_mount,
+    BackgroundHydrationPolicy, LocalSourceValidator, ResolvedSource, ResolvedSourceSet,
+    SourcePushValidator, SourceValidationContext, VirtualRenamePolicy, resolve_source_for_mount,
     source_create_decision_for_parent_path, source_descriptor, source_display_name,
     source_move_decision_for_parent_path, source_write_decision_for_path,
     supported_source_connectors,
@@ -50,6 +50,10 @@ fn notion_descriptor_exposes_cli_and_mount_metadata() {
     assert_eq!(descriptor.source_root_create_parent_kind(), None);
     assert_eq!(descriptor.periodic_discovery_interval(), None);
     assert_eq!(descriptor.max_background_discovery_workers(), 3);
+    assert_eq!(
+        descriptor.background_hydration_policy(),
+        BackgroundHydrationPolicy::OnDemand
+    );
 }
 
 #[test]
@@ -217,6 +221,10 @@ fn slack_descriptor_is_read_only_and_oauth() {
     );
     assert_eq!(descriptor.periodic_discovery_interval(), None);
     assert_eq!(descriptor.max_background_discovery_workers(), 1);
+    assert_eq!(
+        descriptor.background_hydration_policy(),
+        BackgroundHydrationPolicy::Eager
+    );
 }
 
 #[test]

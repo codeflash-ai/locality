@@ -425,10 +425,20 @@ many mounts without coalescing unrelated entities. Duplicate requests merge into
 one pending request. Explicit pulls and stub reads outrank policy hydration,
 which outranks prefetch work.
 
+Connector descriptors can opt into eager background hydration. Slack uses this
+policy: virtual child discovery queues each directly listed unhydrated Markdown
+page as prefetch work, while scheduled reconciliation does the same for
+plain-file mounts. Prefetch provider calls defer for the provider's requested
+cooldown so the daemon can continue serving higher-priority work. Completion of
+an in-flight prefetch preserves newer same-target foreground or remote-refresh
+work that arrived while the fetch was running.
+
 The queue preserves deterministic behavior:
 
 - high-priority work drains before policy and prefetch work;
 - duplicate lower-priority requests do not move a higher-priority request down;
+- repeated discovery coalesces into an existing deferred target without bypassing
+  its retry deadline, while refreshing the target's current path;
 - failed drain attempts requeue the failed request instead of dropping it.
 
 ## Hydration Execution

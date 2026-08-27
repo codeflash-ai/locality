@@ -663,6 +663,51 @@ impl HydrationQueue {
             .contains_key(&HydrationKey::new(mount_id.clone(), remote_id.clone()))
     }
 
+    pub(crate) fn request_for_target(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> Option<&HydrationRequest> {
+        self.pending
+            .get(&HydrationKey::new(mount_id.clone(), remote_id.clone()))
+    }
+
+    pub fn remove_target(&mut self, mount_id: &MountId, remote_id: &RemoteId) -> bool {
+        self.take_target(mount_id, remote_id).is_some()
+    }
+
+    pub(crate) fn take_target(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> Option<HydrationRequest> {
+        let key = HydrationKey::new(mount_id.clone(), remote_id.clone());
+        let removed = self.pending.remove(&key);
+        if removed.is_some() {
+            self.order.retain(|queued| queued != &key);
+        }
+        removed
+    }
+
+    pub fn remove_target_with_reason(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+        reason: &HydrationReason,
+    ) -> bool {
+        let key = HydrationKey::new(mount_id.clone(), remote_id.clone());
+        if self
+            .pending
+            .get(&key)
+            .is_none_or(|request| &request.reason != reason)
+        {
+            return false;
+        }
+        self.pending.remove(&key);
+        self.order.retain(|queued| queued != &key);
+        true
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
@@ -678,7 +723,7 @@ impl HydrationQueue {
         }
 
         if let Some(existing) = self.pending.get_mut(&key) {
-            merge_request(existing, request);
+            merge_hydration_request(existing, request);
         }
 
         false
@@ -814,7 +859,7 @@ impl HydrationKey {
     }
 }
 
-fn merge_request(existing: &mut HydrationRequest, incoming: HydrationRequest) {
+pub(crate) fn merge_hydration_request(existing: &mut HydrationRequest, incoming: HydrationRequest) {
     let existing_priority = hydration_priority(&existing.reason);
     let incoming_priority = hydration_priority(&incoming.reason);
     let target_state = strongest_target_state(&existing.target_state, &incoming.target_state);

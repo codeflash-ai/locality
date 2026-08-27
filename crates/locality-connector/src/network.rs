@@ -122,8 +122,15 @@ impl ConnectorNetworkGate {
 
     pub fn acquire(&self) -> NetworkPermit {
         self.orchestrator
-            .acquire(&self.config, None)
+            .acquire(&self.config, None, false)
             .expect("unbounded network admission does not time out")
+    }
+
+    /// Attempt fair admission once without waiting for quota, cooldown, or
+    /// in-flight capacity to become available.
+    pub fn try_acquire(&self) -> Option<NetworkPermit> {
+        self.orchestrator
+            .acquire(&self.config, Some(Duration::ZERO), true)
     }
 
     /// Wait for fair admission for at most `max_wait`.
@@ -131,7 +138,8 @@ impl ConnectorNetworkGate {
     /// A timed-out waiter is removed from the scope rotation before this
     /// returns, so an expired hydration job cannot leave phantom pressure.
     pub fn acquire_for(&self, max_wait: Duration) -> Option<NetworkPermit> {
-        self.orchestrator.acquire(&self.config, Some(max_wait))
+        self.orchestrator
+            .acquire(&self.config, Some(max_wait), false)
     }
 
     pub fn record_cooldown(&self, delay: Duration) {
@@ -259,6 +267,7 @@ impl NetworkOrchestrator {
         &self,
         config: &ConnectorNetworkConfig,
         max_wait: Option<Duration>,
+        allow_initial_probe: bool,
     ) -> Option<NetworkPermit> {
         let started = Instant::now();
         let scope = config.quota_scope.clone();
@@ -272,8 +281,9 @@ impl NetworkOrchestrator {
             state.rotation.push_back(scope.clone());
         }
 
+        let mut initial_probe = allow_initial_probe;
         loop {
-            if max_wait.is_some_and(|limit| started.elapsed() >= limit) {
+            if !initial_probe && max_wait.is_some_and(|limit| started.elapsed() >= limit) {
                 cancel_waiter(&mut state, &scope);
                 self.inner.changed.notify_all();
                 return None;
@@ -315,6 +325,13 @@ impl NetworkOrchestrator {
                     scope,
                     waited: started.elapsed(),
                 });
+            }
+
+            initial_probe = false;
+            if max_wait.is_some_and(|limit| started.elapsed() >= limit) {
+                cancel_waiter(&mut state, &scope);
+                self.inner.changed.notify_all();
+                return None;
             }
 
             let mut delay = state
@@ -579,6 +596,35 @@ mod tests {
         assert!(gate.acquire_for(Duration::from_millis(5)).is_none());
         assert!(started.elapsed() < Duration::from_millis(100));
         assert_eq!(gate.status().waiting, 0);
+    }
+
+    #[test]
+    fn nonblocking_admission_takes_available_token_then_defers() {
+        let orchestrator = NetworkOrchestrator::new(1);
+        let gate = ConnectorNetworkGate::new(
+            orchestrator,
+            ConnectorNetworkConfig::new("nonblocking", 1.0 / 60.0, 1.0),
+        );
+
+        let permit = gate.try_acquire().expect("initial token");
+        drop(permit);
+        let started = Instant::now();
+
+        assert!(gate.try_acquire().is_none());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(gate.status().waiting, 0);
+    }
+
+    #[test]
+    fn zero_deadline_does_not_consume_an_available_token() {
+        let orchestrator = NetworkOrchestrator::new(1);
+        let gate = ConnectorNetworkGate::new(
+            orchestrator,
+            ConnectorNetworkConfig::new("zero-deadline", 1.0, 1.0),
+        );
+
+        assert!(gate.acquire_for(Duration::ZERO).is_none());
+        assert!(gate.try_acquire().is_some());
     }
 
     #[test]
