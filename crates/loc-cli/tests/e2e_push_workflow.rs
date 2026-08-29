@@ -16544,6 +16544,7 @@ impl GoogleDriveApi for FakeGoogleDrive {
                 .cloned()
                 .unwrap_or_default(),
             next_page_token: None,
+            incomplete_search: false,
         })
     }
 
@@ -16558,6 +16559,7 @@ impl GoogleDriveApi for FakeGoogleDrive {
                 .expect("accessible docs")
                 .clone(),
             next_page_token: None,
+            incomplete_search: false,
         })
     }
 

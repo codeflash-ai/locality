@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, ListChildrenRequest,
-    ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
+    ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity, PortableBootstrapRequest,
+    PortableChangeBatch, PortableFetchRequest, PortableFetchResult, PortableRenderRequest,
+    PortableRenderResult,
 };
 use locality_core::freshness::{RemoteObservation, RemoteVersion};
 use locality_core::journal::JournalApplyEffect;
@@ -63,12 +66,17 @@ pub struct GoogleDocsConnector {
     config: GoogleDocsConfig,
     drive: Arc<dyn GoogleDriveApi>,
     docs: Arc<dyn GoogleDocsApi>,
+    portable_workspace_folder_id: Option<RemoteId>,
 }
 
 impl std::fmt::Debug for GoogleDocsConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GoogleDocsConnector")
             .field("access_token", &"<redacted>")
+            .field(
+                "portable_workspace_folder_id",
+                &self.portable_workspace_folder_id,
+            )
             .finish()
     }
 }
@@ -88,11 +96,29 @@ impl GoogleDocsConnector {
             config,
             drive,
             docs,
+            portable_workspace_folder_id: None,
         }
     }
 
     pub fn config(&self) -> &GoogleDocsConfig {
         &self.config
+    }
+
+    pub fn with_portable_workspace_folder_id(mut self, workspace_folder_id: RemoteId) -> Self {
+        self.portable_workspace_folder_id = Some(workspace_folder_id);
+        self
+    }
+
+    pub fn portable_workspace_folder_id(&self) -> Option<&RemoteId> {
+        self.portable_workspace_folder_id.as_ref()
+    }
+
+    pub(crate) fn drive_api(&self) -> &dyn GoogleDriveApi {
+        self.drive.as_ref()
+    }
+
+    pub(crate) fn docs_api(&self) -> &dyn GoogleDocsApi {
+        self.docs.as_ref()
     }
 }
 
@@ -132,6 +158,13 @@ impl Connector for GoogleDocsConnector {
 
     fn enumerate(&self, request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>> {
         list_accessible_google_docs(self.drive.as_ref(), &request.mount_id)
+    }
+
+    fn bootstrap_portable(
+        &self,
+        request: PortableBootstrapRequest,
+    ) -> LocalityResult<PortableChangeBatch> {
+        crate::portable::bootstrap_google_docs_portable(self, request)
     }
 
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {
@@ -210,12 +243,23 @@ impl Connector for GoogleDocsConnector {
         })
     }
 
+    fn fetch_portable(&self, request: PortableFetchRequest) -> LocalityResult<PortableFetchResult> {
+        crate::portable::fetch_google_docs_portable(self, request)
+    }
+
     fn render(&self, entity: &NativeEntity) -> LocalityResult<CanonicalDocument> {
         let bundle =
             serde_json::from_slice::<GoogleDocsNativeBundle>(&entity.raw).map_err(|error| {
                 LocalityError::Io(format!("google docs native decode failed: {error}"))
             })?;
         render_google_document(&bundle).map(|rendered| rendered.document)
+    }
+
+    fn render_portable(
+        &self,
+        request: &PortableRenderRequest,
+    ) -> LocalityResult<PortableRenderResult> {
+        crate::portable::render_google_docs_portable(self, request)
     }
 
     fn parse(&self, document: &CanonicalDocument) -> LocalityResult<ParsedEntity> {
@@ -442,6 +486,9 @@ fn list_accessible_google_docs(
     let mut files = Vec::new();
     loop {
         let page = drive.list_accessible_google_docs(cursor.as_deref())?;
+        if page.incomplete_search {
+            return Err(incomplete_drive_search_error());
+        }
         files.extend(page.files.into_iter().filter(|file| !file.trashed));
         if page.next_page_token.is_none() {
             break;
@@ -457,7 +504,15 @@ fn list_accessible_google_docs(
     Ok(project_drive_children(mount_id, Path::new(""), files))
 }
 
-fn project_drive_children(
+pub(crate) fn incomplete_drive_search_error() -> LocalityError {
+    LocalityError::RateLimited {
+        provider: "google-drive".to_string(),
+        retry_after: Duration::from_secs(1),
+        message: "Google Drive returned an incomplete search result; retry enumeration".to_string(),
+    }
+}
+
+pub(crate) fn project_drive_children(
     mount_id: &locality_core::model::MountId,
     parent_path: &Path,
     files: Vec<DriveFile>,
@@ -3040,10 +3095,13 @@ mod tests {
 
     use locality_connector::{
         ApplyPlanRequest, Connector, EnumerateRequest, FetchRequest, ObserveRequest,
+        PortableBootstrapRequest, PortableFetchReason, PortableFetchRequest, PortableRenderRequest,
+        PortableSourceScope,
     };
     use locality_core::journal::{PushId, PushOperationId};
     use locality_core::model::{EntityKind, MountId, RemoteId};
     use locality_core::planner::{PushOperation, PushPlan};
+    use locality_core::portable::{LogicalPath, SourceConnectionId};
     use locality_core::push::RemotePrecondition;
     use locality_core::search::RAW_SEARCH_METADATA_KEY;
 
@@ -3056,6 +3114,298 @@ mod tests {
     use crate::drive_dto::{
         DriveCreateFileRequest, DriveFile, DriveFileList, DriveUpdateFileRequest,
     };
+
+    #[test]
+    fn portable_root_does_not_break_google_docs_config_struct_literals() {
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig {
+                access_token: "token".to_string(),
+            },
+            Arc::new(FakeDrive::default().with_file(folder("drive-folder-1", "Workspace", "root"))),
+            Arc::new(FakeDocs::default()),
+        )
+        .with_portable_workspace_folder_id(RemoteId::new("drive-folder-1"));
+
+        assert_eq!(
+            connector.portable_workspace_folder_id(),
+            Some(&RemoteId::new("drive-folder-1"))
+        );
+    }
+
+    #[test]
+    fn portable_bootstrap_rejects_unsupported_scoped_children() {
+        let mut unsupported = doc_file("sheet-1", "Budget", "drive-folder-1");
+        unsupported.mime_type = "application/vnd.google-apps.spreadsheet".to_string();
+        let drive = Arc::new(
+            FakeDrive::default()
+                .with_file(folder("drive-folder-1", "Workspace", "root"))
+                .with_child_page(
+                    "drive-folder-1",
+                    None,
+                    DriveFileList {
+                        files: vec![unsupported],
+                        next_page_token: None,
+                        incomplete_search: false,
+                    },
+                ),
+        );
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive,
+            Arc::new(FakeDocs::default()),
+        )
+        .with_portable_workspace_folder_id(RemoteId::new("drive-folder-1"));
+
+        let error = connector
+            .bootstrap_portable(PortableBootstrapRequest {
+                source_connection_id: SourceConnectionId::new("hosted-google-docs"),
+                scope: PortableSourceScope::explicit_roots([RemoteId::new("drive-folder-1")]),
+                checkpoint: None,
+                max_changes: 100,
+            })
+            .expect_err("unsupported scoped child must reject the bootstrap");
+
+        assert!(matches!(error, locality_core::LocalityError::Guardrail(_)));
+        assert!(error.to_string().contains("sheet-1"));
+    }
+
+    #[test]
+    fn portable_bootstrap_rejects_inventory_larger_than_one_batch() {
+        let drive = Arc::new(
+            FakeDrive::default()
+                .with_file(folder("drive-folder-1", "Workspace", "root"))
+                .with_child_page(
+                    "drive-folder-1",
+                    None,
+                    DriveFileList {
+                        files: vec![
+                            doc_file("doc-1", "First", "drive-folder-1"),
+                            doc_file("doc-2", "Second", "drive-folder-1"),
+                        ],
+                        next_page_token: None,
+                        incomplete_search: false,
+                    },
+                ),
+        );
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive,
+            Arc::new(FakeDocs::default()),
+        )
+        .with_portable_workspace_folder_id(RemoteId::new("drive-folder-1"));
+
+        let error = connector
+            .bootstrap_portable(PortableBootstrapRequest {
+                source_connection_id: SourceConnectionId::new("hosted-google-docs"),
+                scope: PortableSourceScope::explicit_roots([RemoteId::new("drive-folder-1")]),
+                checkpoint: None,
+                max_changes: 1,
+            })
+            .expect_err("bootstrap must not publish a truncated batch without continuation");
+
+        assert!(matches!(
+            error,
+            locality_core::LocalityError::Unsupported(_)
+        ));
+        assert!(error.to_string().contains("max_changes"));
+    }
+
+    #[test]
+    fn portable_bootstrap_retries_incomplete_drive_search() {
+        let drive = Arc::new(
+            FakeDrive::default()
+                .with_file(folder("drive-folder-1", "Workspace", "root"))
+                .with_child_page(
+                    "drive-folder-1",
+                    None,
+                    DriveFileList {
+                        files: Vec::new(),
+                        incomplete_search: true,
+                        next_page_token: None,
+                    },
+                ),
+        );
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive,
+            Arc::new(FakeDocs::default()),
+        )
+        .with_portable_workspace_folder_id(RemoteId::new("drive-folder-1"));
+
+        let error = connector
+            .bootstrap_portable(PortableBootstrapRequest {
+                source_connection_id: SourceConnectionId::new("hosted-google-docs"),
+                scope: PortableSourceScope::explicit_roots([RemoteId::new("drive-folder-1")]),
+                checkpoint: None,
+                max_changes: 100,
+            })
+            .expect_err("incomplete Drive search must reject portable bootstrap");
+
+        assert!(matches!(
+            error,
+            locality_core::LocalityError::RateLimited { .. }
+        ));
+        assert!(error.to_string().contains("incomplete search"));
+    }
+
+    #[test]
+    fn portable_bootstrap_fails_closed_on_incomplete_search_from_later_page() {
+        let drive = Arc::new(
+            FakeDrive::default()
+                .with_file(folder("drive-folder-1", "Workspace", "root"))
+                .with_child_page(
+                    "drive-folder-1",
+                    None,
+                    DriveFileList {
+                        files: vec![doc_file("doc-1", "First", "drive-folder-1")],
+                        incomplete_search: false,
+                        next_page_token: Some("page-2".to_string()),
+                    },
+                )
+                .with_child_page(
+                    "drive-folder-1",
+                    Some("page-2"),
+                    DriveFileList {
+                        files: vec![doc_file("doc-2", "Second", "drive-folder-1")],
+                        incomplete_search: true,
+                        next_page_token: None,
+                    },
+                ),
+        );
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive,
+            Arc::new(FakeDocs::default()),
+        )
+        .with_portable_workspace_folder_id(RemoteId::new("drive-folder-1"));
+
+        let error = connector
+            .bootstrap_portable(PortableBootstrapRequest {
+                source_connection_id: SourceConnectionId::new("hosted-google-docs"),
+                scope: PortableSourceScope::explicit_roots([RemoteId::new("drive-folder-1")]),
+                checkpoint: None,
+                max_changes: 100,
+            })
+            .expect_err("later incomplete Drive page must reject portable bootstrap");
+
+        assert!(matches!(
+            error,
+            locality_core::LocalityError::RateLimited { .. }
+        ));
+        assert!(error.to_string().contains("incomplete search"));
+    }
+
+    #[test]
+    fn portable_bootstrap_fails_closed_when_drive_repeats_page_token() {
+        let drive = Arc::new(
+            FakeDrive::default()
+                .with_file(folder("drive-folder-1", "Workspace", "root"))
+                .with_child_page(
+                    "drive-folder-1",
+                    None,
+                    DriveFileList {
+                        files: vec![doc_file("doc-1", "First", "drive-folder-1")],
+                        incomplete_search: false,
+                        next_page_token: Some("page-2".to_string()),
+                    },
+                )
+                .with_child_page(
+                    "drive-folder-1",
+                    Some("page-2"),
+                    DriveFileList {
+                        files: vec![doc_file("doc-2", "Second", "drive-folder-1")],
+                        incomplete_search: false,
+                        next_page_token: Some("page-2".to_string()),
+                    },
+                ),
+        );
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive,
+            Arc::new(FakeDocs::default()),
+        )
+        .with_portable_workspace_folder_id(RemoteId::new("drive-folder-1"));
+
+        let error = connector
+            .bootstrap_portable(PortableBootstrapRequest {
+                source_connection_id: SourceConnectionId::new("hosted-google-docs"),
+                scope: PortableSourceScope::explicit_roots([RemoteId::new("drive-folder-1")]),
+                checkpoint: None,
+                max_changes: 100,
+            })
+            .expect_err("repeated page token must reject portable bootstrap");
+
+        assert!(matches!(error, locality_core::LocalityError::Io(_)));
+        assert!(error.to_string().contains("repeated page token `page-2`"));
+    }
+
+    #[test]
+    fn portable_workspace_folder_bootstraps_fetches_and_renders_document() {
+        let drive = Arc::new(
+            FakeDrive::default()
+                .with_file(folder("drive-folder-1", "Workspace", "root"))
+                .with_child_page(
+                    "drive-folder-1",
+                    None,
+                    DriveFileList {
+                        files: vec![doc_file("doc-1", "Launch Brief", "drive-folder-1")],
+                        next_page_token: None,
+                        incomplete_search: false,
+                    },
+                ),
+        );
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Launch Brief",
+            "rev-1",
+            "Agenda\n",
+        )));
+        let connector = GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs)
+            .with_portable_workspace_folder_id(RemoteId::new("drive-folder-1"));
+        let source_connection_id = SourceConnectionId::new("hosted-google-docs");
+
+        let batch = connector
+            .bootstrap_portable(PortableBootstrapRequest {
+                source_connection_id: source_connection_id.clone(),
+                scope: PortableSourceScope::explicit_roots([RemoteId::new("drive-folder-1")]),
+                checkpoint: None,
+                max_changes: 100,
+            })
+            .expect("portable bootstrap");
+
+        assert!(batch.completeness.is_complete());
+        assert_eq!(batch.changes.len(), 1);
+        assert_eq!(
+            batch.changes[0].source_object.remote_id,
+            RemoteId::new("doc-1")
+        );
+
+        let fetched = connector
+            .fetch_portable(PortableFetchRequest {
+                source_connection_id: source_connection_id.clone(),
+                remote_id: RemoteId::new("doc-1"),
+                reason: PortableFetchReason::Bootstrap,
+            })
+            .expect("portable fetch");
+        assert!(fetched.completeness.is_complete());
+
+        let rendered = connector
+            .render_portable(&PortableRenderRequest {
+                source_connection_id,
+                logical_path: batch.changes[0]
+                    .logical_path
+                    .clone()
+                    .unwrap_or_else(|| LogicalPath::new("launch-brief.md").expect("logical path")),
+                native: fetched.native,
+                format_version: 1,
+            })
+            .expect("portable render");
+        assert!(rendered.completeness.is_complete());
+        assert!(rendered.projections.iter().any(|projection| {
+            std::str::from_utf8(&projection.artifact.body)
+                .is_ok_and(|body| body.contains("connector: google-docs"))
+        }));
+    }
 
     #[test]
     fn enumerate_projects_all_accessible_docs_at_mount_root() {
@@ -5958,6 +6308,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeDrive {
         files: Mutex<std::collections::BTreeMap<String, DriveFile>>,
+        child_pages: Mutex<std::collections::BTreeMap<(String, Option<String>), DriveFileList>>,
         accessible_docs: Mutex<Vec<DriveFile>>,
         last_created: Mutex<Option<DriveCreateFileRequest>>,
         last_update: Mutex<Option<(String, DriveUpdateFileRequest)>>,
@@ -5979,6 +6330,25 @@ mod tests {
             *self.accessible_docs.lock().unwrap() = files;
             self
         }
+
+        fn with_child_page(
+            self,
+            parent_id: &str,
+            page_token: Option<&str>,
+            page: DriveFileList,
+        ) -> Self {
+            for file in &page.files {
+                self.files
+                    .lock()
+                    .unwrap()
+                    .insert(file.id.clone(), file.clone());
+            }
+            self.child_pages.lock().unwrap().insert(
+                (parent_id.to_string(), page_token.map(str::to_string)),
+                page,
+            );
+            self
+        }
     }
 
     impl GoogleDriveApi for FakeDrive {
@@ -5993,13 +6363,20 @@ mod tests {
 
         fn list_children(
             &self,
-            _parent_id: &str,
-            _page_token: Option<&str>,
+            parent_id: &str,
+            page_token: Option<&str>,
         ) -> locality_core::LocalityResult<DriveFileList> {
-            Ok(DriveFileList {
-                files: Vec::new(),
-                next_page_token: None,
-            })
+            Ok(self
+                .child_pages
+                .lock()
+                .unwrap()
+                .get(&(parent_id.to_string(), page_token.map(str::to_string)))
+                .cloned()
+                .unwrap_or(DriveFileList {
+                    files: Vec::new(),
+                    next_page_token: None,
+                    incomplete_search: false,
+                }))
         }
 
         fn list_accessible_google_docs(
@@ -6009,6 +6386,7 @@ mod tests {
             Ok(DriveFileList {
                 files: self.accessible_docs.lock().unwrap().clone(),
                 next_page_token: None,
+                incomplete_search: false,
             })
         }
 
