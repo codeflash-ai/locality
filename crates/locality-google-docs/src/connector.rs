@@ -3249,6 +3249,97 @@ mod tests {
     }
 
     #[test]
+    fn portable_bootstrap_fails_closed_on_incomplete_search_from_later_page() {
+        let drive = Arc::new(
+            FakeDrive::default()
+                .with_file(folder("drive-folder-1", "Workspace", "root"))
+                .with_child_page(
+                    "drive-folder-1",
+                    None,
+                    DriveFileList {
+                        files: vec![doc_file("doc-1", "First", "drive-folder-1")],
+                        incomplete_search: false,
+                        next_page_token: Some("page-2".to_string()),
+                    },
+                )
+                .with_child_page(
+                    "drive-folder-1",
+                    Some("page-2"),
+                    DriveFileList {
+                        files: vec![doc_file("doc-2", "Second", "drive-folder-1")],
+                        incomplete_search: true,
+                        next_page_token: None,
+                    },
+                ),
+        );
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive,
+            Arc::new(FakeDocs::default()),
+        )
+        .with_portable_workspace_folder_id(RemoteId::new("drive-folder-1"));
+
+        let error = connector
+            .bootstrap_portable(PortableBootstrapRequest {
+                source_connection_id: SourceConnectionId::new("hosted-google-docs"),
+                scope: PortableSourceScope::explicit_roots([RemoteId::new("drive-folder-1")]),
+                checkpoint: None,
+                max_changes: 100,
+            })
+            .expect_err("later incomplete Drive page must reject portable bootstrap");
+
+        assert!(matches!(
+            error,
+            locality_core::LocalityError::RateLimited { .. }
+        ));
+        assert!(error.to_string().contains("incomplete search"));
+    }
+
+    #[test]
+    fn portable_bootstrap_fails_closed_when_drive_repeats_page_token() {
+        let drive = Arc::new(
+            FakeDrive::default()
+                .with_file(folder("drive-folder-1", "Workspace", "root"))
+                .with_child_page(
+                    "drive-folder-1",
+                    None,
+                    DriveFileList {
+                        files: vec![doc_file("doc-1", "First", "drive-folder-1")],
+                        incomplete_search: false,
+                        next_page_token: Some("page-2".to_string()),
+                    },
+                )
+                .with_child_page(
+                    "drive-folder-1",
+                    Some("page-2"),
+                    DriveFileList {
+                        files: vec![doc_file("doc-2", "Second", "drive-folder-1")],
+                        incomplete_search: false,
+                        next_page_token: Some("page-2".to_string()),
+                    },
+                ),
+        );
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive,
+            Arc::new(FakeDocs::default()),
+        )
+        .with_portable_workspace_folder_id(RemoteId::new("drive-folder-1"));
+
+        let error = connector
+            .bootstrap_portable(PortableBootstrapRequest {
+                source_connection_id: SourceConnectionId::new("hosted-google-docs"),
+                scope: PortableSourceScope::explicit_roots([RemoteId::new("drive-folder-1")]),
+                checkpoint: None,
+                max_changes: 100,
+            })
+            .expect_err("repeated page token must reject portable bootstrap");
+
+        assert!(matches!(error, locality_core::LocalityError::Io(_)));
+        assert!(error.to_string().contains("repeated page token `page-2`"));
+    }
+
+    #[test]
     fn portable_workspace_folder_bootstraps_fetches_and_renders_document() {
         let drive = Arc::new(
             FakeDrive::default()

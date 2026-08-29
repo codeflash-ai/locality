@@ -234,7 +234,10 @@ impl GoogleDriveApi for HttpGoogleApiClient {
         self.post_json(
             format!("{}/files", self.drive_base_url),
             &request,
-            vec![("fields".to_string(), DRIVE_FILE_FIELDS.to_string())],
+            vec![
+                ("fields".to_string(), DRIVE_FILE_FIELDS.to_string()),
+                ("supportsAllDrives".to_string(), "true".to_string()),
+            ],
         )
     }
 
@@ -243,7 +246,10 @@ impl GoogleDriveApi for HttpGoogleApiClient {
         file_id: &str,
         request: DriveUpdateFileRequest,
     ) -> LocalityResult<DriveFile> {
-        let mut query = vec![("fields".to_string(), DRIVE_FILE_FIELDS.to_string())];
+        let mut query = vec![
+            ("fields".to_string(), DRIVE_FILE_FIELDS.to_string()),
+            ("supportsAllDrives".to_string(), "true".to_string()),
+        ];
         if let Some(add_parents) = request.add_parents.clone() {
             query.push(("addParents".to_string(), add_parents));
         }
@@ -341,6 +347,7 @@ mod tests {
     };
     use crate::connector::{GoogleDocsConfig, GoogleDocsConnector};
     use crate::docs_dto::{BatchUpdateDocumentRequest, GoogleDocument};
+    use crate::drive_dto::{DriveCreateFileRequest, DriveUpdateFileRequest};
 
     #[test]
     fn accessible_google_docs_query_lists_untrashed_documents() {
@@ -387,6 +394,43 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains("corpora=allDrives"));
         assert!(requests[0].contains("incompleteSearch"));
+    }
+
+    #[test]
+    fn create_file_requests_shared_drive_support() {
+        let (base_url, requests, server) =
+            spawn_drive_server([drive_document_response("doc-1", "shared-root")]);
+        let client =
+            HttpGoogleApiClient::with_base_urls("access-token", base_url, "http://unused.test");
+
+        client
+            .create_file(DriveCreateFileRequest::google_doc(
+                "Shared Doc",
+                "shared-root",
+            ))
+            .expect("create response");
+
+        let requests = requests.recv().expect("requests");
+        server.join().expect("server exits");
+        assert_eq!(requests.len(), 1);
+        assert_drive_flags(&requests[0], "/files?");
+    }
+
+    #[test]
+    fn update_file_requests_shared_drive_support() {
+        let (base_url, requests, server) =
+            spawn_drive_server([drive_document_response("doc-1", "shared-root")]);
+        let client =
+            HttpGoogleApiClient::with_base_urls("access-token", base_url, "http://unused.test");
+
+        client
+            .update_file("doc-1", DriveUpdateFileRequest::rename("Renamed"))
+            .expect("update response");
+
+        let requests = requests.recv().expect("requests");
+        server.join().expect("server exits");
+        assert_eq!(requests.len(), 1);
+        assert_drive_flags(&requests[0], "/files/doc-1?");
     }
 
     #[test]
