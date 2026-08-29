@@ -23,6 +23,7 @@ pub trait GoogleCalendarApi: std::fmt::Debug + Send + Sync {
         calendar_id: &str,
         time_min: &str,
         time_max: &str,
+        max_results: u32,
         page_token: Option<&str>,
     ) -> LocalityResult<CalendarEventList>;
 
@@ -110,11 +111,12 @@ impl GoogleCalendarApi for HttpGoogleCalendarApiClient {
         calendar_id: &str,
         time_min: &str,
         time_max: &str,
+        max_results: u32,
         page_token: Option<&str>,
     ) -> LocalityResult<CalendarEventList> {
         self.get_json(
             calendar_events_url(&self.base_url, calendar_id),
-            event_list_query(time_min, time_max, page_token),
+            event_list_query(time_min, time_max, max_results, page_token),
         )
     }
 
@@ -158,6 +160,7 @@ pub fn calendar_event_url(base_url: &str, calendar_id: &str, event_id: &str) -> 
 pub fn event_list_query(
     time_min: &str,
     time_max: &str,
+    max_results: u32,
     page_token: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut query = vec![
@@ -165,7 +168,7 @@ pub fn event_list_query(
         ("timeMax".to_string(), time_max.to_string()),
         ("singleEvents".to_string(), "true".to_string()),
         ("orderBy".to_string(), "startTime".to_string()),
-        ("maxResults".to_string(), "250".to_string()),
+        ("maxResults".to_string(), max_results.to_string()),
     ];
     if let Some(page_token) = page_token {
         query.push(("pageToken".to_string(), page_token.to_string()));
@@ -431,6 +434,7 @@ mod tests {
         let query = event_list_query(
             "2026-06-16T00:00:00Z",
             "2027-01-12T00:00:00Z",
+            250,
             Some("page-2"),
         );
 
@@ -491,6 +495,7 @@ mod tests {
                 "team@example.com",
                 "2026-06-16T00:00:00Z",
                 "2027-01-12T00:00:00Z",
+                250,
                 Some("page-2"),
             )
             .expect("events");
