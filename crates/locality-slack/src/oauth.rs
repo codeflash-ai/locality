@@ -172,6 +172,59 @@ impl fmt::Display for SlackOAuthScopeError {
 
 impl std::error::Error for SlackOAuthScopeError {}
 
+/// Classification for a Slack OAuth broker failure that a hosted caller can
+/// safely use to decide whether the source needs reconnecting or retrying.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlackOAuthBrokerErrorKind {
+    InvalidGrant,
+    Authorization,
+    Rejected,
+    Retryable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlackOAuthBrokerError {
+    kind: SlackOAuthBrokerErrorKind,
+    status: Option<u16>,
+}
+
+impl SlackOAuthBrokerError {
+    pub fn kind(&self) -> SlackOAuthBrokerErrorKind {
+        self.kind
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        self.kind == SlackOAuthBrokerErrorKind::Retryable
+    }
+}
+
+impl fmt::Display for SlackOAuthBrokerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let status = self
+            .status
+            .map(|status| format!(" HTTP {status}"))
+            .unwrap_or_default();
+        write!(
+            f,
+            "slack oauth broker {} failure{status}",
+            match self.kind {
+                SlackOAuthBrokerErrorKind::InvalidGrant => "invalid grant",
+                SlackOAuthBrokerErrorKind::Authorization => "authorization",
+                SlackOAuthBrokerErrorKind::Rejected => "request rejected",
+                SlackOAuthBrokerErrorKind::Retryable => "retryable",
+            }
+        )
+    }
+}
+
+impl std::error::Error for SlackOAuthBrokerError {}
+
+impl From<SlackOAuthBrokerError> for LocalityError {
+    fn from(error: SlackOAuthBrokerError) -> Self {
+        LocalityError::Io(error.to_string())
+    }
+}
+
 pub fn validate_slack_oauth_scopes(scopes: &[String]) -> Result<(), SlackOAuthScopeError> {
     let allowed = SLACK_OAUTH_SCOPES.iter().copied().collect::<BTreeSet<_>>();
     for scope in scopes {
@@ -237,6 +290,13 @@ impl HttpSlackOAuthBrokerClient {
         self.post_json("/v1/oauth/slack/refresh", request)
     }
 
+    pub fn refresh_token_classified(
+        &self,
+        request: &OAuthBrokerRefresh,
+    ) -> Result<OAuthBrokerToken, SlackOAuthBrokerError> {
+        self.post_json_classified("/v1/oauth/slack/refresh", request)
+    }
+
     fn post_json<T, B>(&self, path: &str, body: &B) -> LocalityResult<T>
     where
         T: DeserializeOwned,
@@ -261,6 +321,61 @@ impl HttpSlackOAuthBrokerClient {
                 "slack oauth broker response decode failed: {error}"
             ))
         })
+    }
+
+    fn post_json_classified<T, B>(&self, path: &str, body: &B) -> Result<T, SlackOAuthBrokerError>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let response = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .json(body)
+            .send()
+            .map_err(|_| SlackOAuthBrokerError {
+                kind: SlackOAuthBrokerErrorKind::Retryable,
+                status: None,
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let error_code = response
+                .json::<SlackOAuthBrokerFailureResponse>()
+                .ok()
+                .and_then(|body| body.error.or(body.code));
+            return Err(SlackOAuthBrokerError {
+                kind: classify_slack_oauth_broker_failure(status.as_u16(), error_code.as_deref()),
+                status: Some(status.as_u16()),
+            });
+        }
+        response.json().map_err(|_| SlackOAuthBrokerError {
+            kind: SlackOAuthBrokerErrorKind::Retryable,
+            status: Some(status.as_u16()),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct SlackOAuthBrokerFailureResponse {
+    error: Option<String>,
+    code: Option<String>,
+}
+
+fn classify_slack_oauth_broker_failure(
+    status: u16,
+    error_code: Option<&str>,
+) -> SlackOAuthBrokerErrorKind {
+    match error_code {
+        Some("invalid_grant") => SlackOAuthBrokerErrorKind::InvalidGrant,
+        Some(
+            "access_denied" | "invalid_scope" | "insufficient_scope" | "missing_scope"
+            | "not_authed" | "token_revoked",
+        ) => SlackOAuthBrokerErrorKind::Authorization,
+        _ if matches!(status, 401 | 403) => SlackOAuthBrokerErrorKind::Authorization,
+        _ if status == 408 || status == 425 || status == 429 || status >= 500 => {
+            SlackOAuthBrokerErrorKind::Retryable
+        }
+        _ => SlackOAuthBrokerErrorKind::Rejected,
     }
 }
 
@@ -477,5 +592,85 @@ mod tests {
         assert!(message.contains("slack oauth broker returned HTTP 400 Bad Request"));
         assert!(!message.contains("secret-code"));
         assert!(!message.contains("opaque-refresh-handle"));
+    }
+
+    fn classified_refresh_error(status: &str, body: &str) -> SlackOAuthBrokerError {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test broker");
+        let broker_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let status = status.to_string();
+        let body = body.to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).expect("read request");
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .expect("write response");
+        });
+        let error = HttpSlackOAuthBrokerClient::new(broker_url)
+            .refresh_token_classified(&OAuthBrokerRefresh {
+                connector: "slack".to_string(),
+                refresh_token_handle: Some("opaque-refresh-handle".to_string()),
+            })
+            .expect_err("broker refresh should fail");
+        server.join().expect("server thread");
+        error
+    }
+
+    #[test]
+    fn classified_refresh_marks_invalid_grant_for_reconnect() {
+        let error = classified_refresh_error(
+            "400 Bad Request",
+            r#"{"error":"invalid_grant","refresh_token_handle":"secret"}"#,
+        );
+
+        assert_eq!(error.kind(), SlackOAuthBrokerErrorKind::InvalidGrant);
+        assert!(!error.is_retryable());
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn classified_refresh_marks_scope_failures_as_authorization() {
+        let error = classified_refresh_error(
+            "400 Bad Request",
+            r#"{"code":"insufficient_scope","refresh_token_handle":"secret"}"#,
+        );
+
+        assert_eq!(error.kind(), SlackOAuthBrokerErrorKind::Authorization);
+        assert!(!error.is_retryable());
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn classified_refresh_marks_broker_5xx_as_retryable() {
+        let error = classified_refresh_error(
+            "503 Service Unavailable",
+            r#"{"error":"temporary_failure","refresh_token_handle":"secret"}"#,
+        );
+
+        assert_eq!(error.kind(), SlackOAuthBrokerErrorKind::Retryable);
+        assert!(error.is_retryable());
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn classified_refresh_marks_transport_errors_as_retryable() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve unused port");
+        let broker_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        drop(listener);
+
+        let error = HttpSlackOAuthBrokerClient::new(broker_url)
+            .refresh_token_classified(&OAuthBrokerRefresh {
+                connector: "slack".to_string(),
+                refresh_token_handle: Some("opaque-refresh-handle".to_string()),
+            })
+            .expect_err("unreachable broker should fail");
+
+        assert_eq!(error.kind(), SlackOAuthBrokerErrorKind::Retryable);
+        assert!(error.is_retryable());
+        assert!(!error.to_string().contains("opaque-refresh-handle"));
     }
 }
