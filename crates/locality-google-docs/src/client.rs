@@ -186,7 +186,10 @@ impl GoogleDriveApi for HttpGoogleApiClient {
     fn get_file(&self, file_id: &str) -> LocalityResult<DriveFile> {
         self.get_json(
             format!("{}/files/{file_id}", self.drive_base_url),
-            vec![("fields".to_string(), DRIVE_FILE_FIELDS.to_string())],
+            vec![
+                ("fields".to_string(), DRIVE_FILE_FIELDS.to_string()),
+                ("supportsAllDrives".to_string(), "true".to_string()),
+            ],
         )
     }
 
@@ -200,6 +203,8 @@ impl GoogleDriveApi for HttpGoogleApiClient {
             ("q".to_string(), query.q),
             ("fields".to_string(), query.fields),
             ("spaces".to_string(), "drive".to_string()),
+            ("includeItemsFromAllDrives".to_string(), "true".to_string()),
+            ("supportsAllDrives".to_string(), "true".to_string()),
         ];
         if let Some(page_token) = query.page_token {
             query_pairs.push(("pageToken".to_string(), page_token));
@@ -318,10 +323,24 @@ fn ensure_reqwest_crypto_provider() {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DriveListQuery, drive_accessible_google_docs_query, drive_children_query,
-        google_docs_batch_update_url,
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+
+    use locality_connector::{
+        Connector, PortableBootstrapRequest, PortableFetchReason, PortableFetchRequest,
+        PortableSourceScope,
     };
+    use locality_core::model::RemoteId;
+    use locality_core::portable::SourceConnectionId;
+
+    use super::{
+        DriveListQuery, GoogleDocsApi, HttpGoogleApiClient, drive_accessible_google_docs_query,
+        drive_children_query, google_docs_batch_update_url,
+    };
+    use crate::connector::{GoogleDocsConfig, GoogleDocsConnector};
+    use crate::docs_dto::{BatchUpdateDocumentRequest, GoogleDocument};
 
     #[test]
     fn accessible_google_docs_query_lists_untrashed_documents() {
@@ -357,5 +376,157 @@ mod tests {
             google_docs_batch_update_url("https://docs.googleapis.com", "doc-1"),
             "https://docs.googleapis.com/v1/documents/doc-1:batchUpdate"
         );
+    }
+
+    #[test]
+    fn shared_drive_scoped_portable_bootstrap_sends_drive_flags() {
+        let (base_url, requests, server) = spawn_drive_server([
+            drive_folder_response("shared-root"),
+            r#"{"files":[]}"#.to_string(),
+        ]);
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("access-token"),
+            Arc::new(HttpGoogleApiClient::with_base_urls(
+                "access-token",
+                base_url,
+                "http://unused.test",
+            )),
+            Arc::new(FakeDocs),
+        )
+        .with_portable_workspace_folder_id(RemoteId::new("shared-root"));
+
+        connector
+            .bootstrap_portable(PortableBootstrapRequest {
+                source_connection_id: SourceConnectionId::new("hosted-google-docs"),
+                scope: PortableSourceScope::explicit_roots([RemoteId::new("shared-root")]),
+                checkpoint: None,
+                max_changes: 100,
+            })
+            .expect("portable bootstrap");
+
+        let requests = requests.recv().expect("requests");
+        server.join().expect("server exits");
+        assert_eq!(requests.len(), 2);
+        assert_drive_flags(&requests[0], "/files/shared-root");
+        assert_drive_flags(&requests[1], "/files?");
+        assert!(requests[1].contains("includeItemsFromAllDrives=true"));
+    }
+
+    #[test]
+    fn shared_drive_scoped_portable_fetch_sends_drive_flags() {
+        let (base_url, requests, server) = spawn_drive_server([
+            drive_folder_response("shared-root"),
+            drive_document_response("doc-1", "shared-root"),
+        ]);
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("access-token"),
+            Arc::new(HttpGoogleApiClient::with_base_urls(
+                "access-token",
+                base_url,
+                "http://unused.test",
+            )),
+            Arc::new(FakeDocs),
+        )
+        .with_portable_workspace_folder_id(RemoteId::new("shared-root"));
+
+        connector
+            .fetch_portable(PortableFetchRequest {
+                source_connection_id: SourceConnectionId::new("hosted-google-docs"),
+                remote_id: RemoteId::new("doc-1"),
+                reason: PortableFetchReason::Bootstrap,
+            })
+            .expect("portable fetch");
+
+        let requests = requests.recv().expect("requests");
+        server.join().expect("server exits");
+        assert_eq!(requests.len(), 2);
+        assert_drive_flags(&requests[0], "/files/shared-root");
+        assert_drive_flags(&requests[1], "/files/doc-1");
+    }
+
+    #[derive(Debug)]
+    struct FakeDocs;
+
+    impl GoogleDocsApi for FakeDocs {
+        fn get_document(
+            &self,
+            _document_id: &str,
+        ) -> locality_core::LocalityResult<GoogleDocument> {
+            Ok(GoogleDocument {
+                document_id: "doc-1".to_string(),
+                revision_id: Some("revision-1".to_string()),
+                ..GoogleDocument::default()
+            })
+        }
+
+        fn batch_update_document(
+            &self,
+            _document_id: &str,
+            _request: BatchUpdateDocumentRequest,
+        ) -> locality_core::LocalityResult<GoogleDocument> {
+            unreachable!("portable tests do not update documents")
+        }
+    }
+
+    fn assert_drive_flags(request: &str, path: &str) {
+        let target = request.split_whitespace().nth(1).expect("request target");
+        assert!(target.starts_with(path), "unexpected target: {target}");
+        assert!(
+            target.contains("supportsAllDrives=true"),
+            "missing supportsAllDrives: {target}"
+        );
+    }
+
+    fn drive_folder_response(id: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","name":"Shared Root","mimeType":"application/vnd.google-apps.folder","parents":[],"modifiedTime":"2026-08-29T00:00:00Z","version":"1","trashed":false}}"#
+        )
+    }
+
+    fn drive_document_response(id: &str, parent: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","name":"Shared Doc","mimeType":"application/vnd.google-apps.document","parents":["{parent}"],"modifiedTime":"2026-08-29T00:00:00Z","version":"1","trashed":false}}"#
+        )
+    }
+
+    fn spawn_drive_server(
+        responses: impl IntoIterator<Item = String>,
+    ) -> (String, mpsc::Receiver<Vec<String>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let responses = responses.into_iter().collect::<Vec<_>>();
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::with_capacity(responses.len());
+            for body in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                requests.push(read_http_request(&mut stream));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+            requests_tx.send(requests).expect("send requests");
+        });
+        (base_url, requests_rx, server)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let bytes_read = stream.read(&mut buffer).expect("read request");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(request).expect("utf8 request")
     }
 }
