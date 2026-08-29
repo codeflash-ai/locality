@@ -1,4 +1,4 @@
-import { configError, upstreamError } from "../http/errors";
+import { configError, HttpError, upstreamError } from "../http/errors";
 import type { BrokerEnv } from "../types";
 
 export const SLACK_OAUTH_SCOPES = [
@@ -93,14 +93,29 @@ async function slackTokenRequest(
     },
     body: params.toString()
   });
-  if (!response.ok) {
-    throw upstreamError(`Slack OAuth returned HTTP ${response.status}`);
-  }
-  const token = (await response.json()) as SlackTokenResponse;
-  if (!token.ok) {
-    throw upstreamError("Slack OAuth failed");
+  const token = (await response.json().catch(() => undefined)) as SlackTokenResponse | undefined;
+  if (!response.ok || !token?.ok) {
+    throw slackOAuthFailure(token?.error, response.status, response.ok);
   }
   return token;
+}
+
+function slackOAuthFailure(providerError: string | undefined, status: number, responseWasOk: boolean): HttpError {
+  const code = providerError?.trim().split(/\s+/, 1)[0];
+  switch (code) {
+    case "invalid_grant":
+      return new HttpError(400, code, "Slack OAuth refresh token is no longer valid");
+    case "invalid_scope":
+    case "insufficient_scope":
+    case "missing_scope":
+      return new HttpError(403, code, "Slack OAuth authorization is insufficient");
+    case "access_denied":
+    case "not_authed":
+    case "token_revoked":
+      return new HttpError(401, code, "Slack OAuth authorization is no longer valid");
+    default:
+      return upstreamError(responseWasOk ? "Slack OAuth failed" : `Slack OAuth returned HTTP ${status}`);
+  }
 }
 
 function slackClientId(env: BrokerEnv): string {

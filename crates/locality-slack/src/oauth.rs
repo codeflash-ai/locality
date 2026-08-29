@@ -342,7 +342,7 @@ impl HttpSlackOAuthBrokerClient {
             let error_code = response
                 .json::<SlackOAuthBrokerFailureResponse>()
                 .ok()
-                .and_then(|body| body.error.or(body.code));
+                .and_then(SlackOAuthBrokerFailureResponse::error_code);
             return Err(SlackOAuthBrokerError {
                 kind: classify_slack_oauth_broker_failure(status.as_u16(), error_code.as_deref()),
                 status: Some(status.as_u16()),
@@ -357,8 +357,32 @@ impl HttpSlackOAuthBrokerClient {
 
 #[derive(Deserialize)]
 struct SlackOAuthBrokerFailureResponse {
-    error: Option<String>,
+    error: Option<SlackOAuthBrokerFailure>,
     code: Option<String>,
+}
+
+impl SlackOAuthBrokerFailureResponse {
+    fn error_code(self) -> Option<String> {
+        self.error
+            .and_then(SlackOAuthBrokerFailure::code)
+            .or(self.code)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SlackOAuthBrokerFailure {
+    LegacyCode(String),
+    Error { code: Option<String> },
+}
+
+impl SlackOAuthBrokerFailure {
+    fn code(self) -> Option<String> {
+        match self {
+            Self::LegacyCode(code) => Some(code),
+            Self::Error { code } => code,
+        }
+    }
 }
 
 fn classify_slack_oauth_broker_failure(
@@ -633,10 +657,34 @@ mod tests {
     }
 
     #[test]
+    fn classified_refresh_decodes_nested_broker_invalid_grant() {
+        let error = classified_refresh_error(
+            "400 Bad Request",
+            r#"{"error":{"code":"invalid_grant","message":"provider refresh token: secret"}}"#,
+        );
+
+        assert_eq!(error.kind(), SlackOAuthBrokerErrorKind::InvalidGrant);
+        assert!(!error.is_retryable());
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
     fn classified_refresh_marks_scope_failures_as_authorization() {
         let error = classified_refresh_error(
             "400 Bad Request",
             r#"{"code":"insufficient_scope","refresh_token_handle":"secret"}"#,
+        );
+
+        assert_eq!(error.kind(), SlackOAuthBrokerErrorKind::Authorization);
+        assert!(!error.is_retryable());
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn classified_refresh_decodes_nested_broker_authorization_failure() {
+        let error = classified_refresh_error(
+            "403 Forbidden",
+            r#"{"error":{"code":"insufficient_scope","message":"missing secret scope"}}"#,
         );
 
         assert_eq!(error.kind(), SlackOAuthBrokerErrorKind::Authorization);
