@@ -1880,6 +1880,37 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_portable_rejects_legacy_api_before_initial_or_resumed_provider_work() {
+        let api = Arc::new(LegacyGoogleCalendarApi::default());
+        let settings = GoogleCalendarMountSettings::with_date_window("2026-07-01", "2026-07-31")
+            .expect("settings");
+        let connector = GoogleCalendarConnector::with_api(
+            GoogleCalendarConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+        let request = |checkpoint| PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("calendar-connection"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("google-calendar:primary")]),
+            checkpoint,
+            max_changes: 1,
+        };
+
+        let initial = connector
+            .bootstrap_portable(request(None))
+            .expect_err("legacy API must reject initial portable bootstrap");
+        assert!(initial.to_string().contains("bounded event listing"));
+
+        let resumed = connector
+            .bootstrap_portable(request(Some(PortableCheckpoint {
+                format_version: 3,
+                opaque: r#"{"scope_root":"google-calendar:primary","source_connection_id":"calendar-connection","after":"2026-07-01","before":"2026-07-31","page_token":"page-2","seen_page_tokens":[],"complete":false}"#.to_string(),
+            })))
+            .expect_err("legacy API must reject resumed portable bootstrap");
+        assert!(resumed.to_string().contains("bounded event listing"));
+        assert!(api.list_calls.lock().expect("calls").is_empty());
+    }
+
+    #[test]
     fn bootstrap_portable_resumes_calendar_page_tokens_with_bounded_page_size() {
         let api = Arc::new(FakeGoogleCalendarApi::default());
         {
@@ -3063,6 +3094,46 @@ google_calendar:
     #[derive(Default, Debug)]
     struct FakeGoogleCalendarApi {
         calls: Mutex<FakeCalls>,
+    }
+
+    #[derive(Debug, Default)]
+    struct LegacyGoogleCalendarApi {
+        list_calls: Mutex<Vec<ListEventsCall>>,
+    }
+
+    impl GoogleCalendarApi for LegacyGoogleCalendarApi {
+        fn list_events(
+            &self,
+            calendar_id: &str,
+            time_min: &str,
+            time_max: &str,
+            page_token: Option<&str>,
+        ) -> locality_core::LocalityResult<CalendarEventList> {
+            self.list_calls.lock().expect("calls").push(ListEventsCall {
+                calendar_id: calendar_id.to_string(),
+                time_min: time_min.to_string(),
+                time_max: time_max.to_string(),
+                page_token: page_token.map(str::to_string),
+            });
+            Ok(CalendarEventList::default())
+        }
+
+        fn get_event(
+            &self,
+            _calendar_id: &str,
+            _event_id: &str,
+        ) -> locality_core::LocalityResult<CalendarEvent> {
+            unreachable!("not used by legacy portable bootstrap test")
+        }
+
+        fn insert_event(
+            &self,
+            _calendar_id: &str,
+            _request: CalendarEventCreateRequest,
+            _create_conference: bool,
+        ) -> locality_core::LocalityResult<CalendarEvent> {
+            unreachable!("not used by legacy portable bootstrap test")
+        }
     }
 
     #[derive(Debug)]

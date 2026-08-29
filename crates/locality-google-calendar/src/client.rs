@@ -29,14 +29,15 @@ pub trait GoogleCalendarApi: std::fmt::Debug + Send + Sync {
 
     fn list_events_bounded(
         &self,
-        calendar_id: &str,
-        time_min: &str,
-        time_max: &str,
-        max_results: u32,
-        page_token: Option<&str>,
+        _calendar_id: &str,
+        _time_min: &str,
+        _time_max: &str,
+        _max_results: u32,
+        _page_token: Option<&str>,
     ) -> LocalityResult<CalendarEventList> {
-        let _ = max_results;
-        self.list_events(calendar_id, time_min, time_max, page_token)
+        Err(LocalityError::Unsupported(
+            "Google Calendar API implementation does not support bounded event listing",
+        ))
     }
 
     fn get_event(&self, calendar_id: &str, event_id: &str) -> LocalityResult<CalendarEvent>;
@@ -530,27 +531,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_google_calendar_api_uses_default_bounded_list_method() {
+    fn legacy_google_calendar_api_rejects_bounded_listing_without_provider_work() {
         let api = LegacyGoogleCalendarApi::default();
 
-        api.list_events_bounded(
-            "primary",
-            "2026-06-16T00:00:00Z",
-            "2027-01-12T00:00:00Z",
-            1,
-            Some("page-2"),
-        )
-        .expect("default bounded list");
+        let error = api
+            .list_events_bounded(
+                "primary",
+                "2026-06-16T00:00:00Z",
+                "2027-01-12T00:00:00Z",
+                1,
+                Some("page-2"),
+            )
+            .expect_err("legacy APIs cannot guarantee a bounded response");
 
-        assert_eq!(
-            *api.list_calls.lock().expect("calls"),
-            vec![(
-                "primary".to_string(),
-                "2026-06-16T00:00:00Z".to_string(),
-                "2027-01-12T00:00:00Z".to_string(),
-                Some("page-2".to_string()),
-            )]
-        );
+        assert!(error.to_string().contains("bounded event listing"));
+        assert!(api.list_calls.lock().expect("calls").is_empty());
     }
 
     #[test]
