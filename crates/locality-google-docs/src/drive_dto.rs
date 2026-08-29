@@ -48,6 +48,8 @@ pub struct DriveFileList {
     pub files: Vec<DriveFile>,
     #[serde(default)]
     pub next_page_token: Option<String>,
+    #[serde(default)]
+    pub incomplete_search: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +175,7 @@ mod tests {
         let decoded: DriveFileList = serde_json::from_value(payload).expect("decode list");
 
         assert_eq!(decoded.next_page_token.as_deref(), Some("cursor-2"));
+        assert!(!decoded.incomplete_search);
         assert!(decoded.files[0].is_folder());
         assert!(decoded.files[1].is_google_doc());
         assert_eq!(

@@ -72,7 +72,7 @@ pub struct DriveListQuery {
 pub fn drive_children_query(parent_id: &str, page_token: Option<&str>) -> DriveListQuery {
     DriveListQuery {
         q: format!("'{parent_id}' in parents and trashed = false"),
-        fields: format!("nextPageToken, files({DRIVE_FILE_FIELDS})"),
+        fields: format!("nextPageToken, incompleteSearch, files({DRIVE_FILE_FIELDS})"),
         page_token: page_token.map(str::to_string),
     }
 }
@@ -80,7 +80,7 @@ pub fn drive_children_query(parent_id: &str, page_token: Option<&str>) -> DriveL
 pub fn drive_accessible_google_docs_query(page_token: Option<&str>) -> DriveListQuery {
     DriveListQuery {
         q: format!("mimeType = '{DRIVE_GOOGLE_DOC_MIME_TYPE}' and trashed = false"),
-        fields: format!("nextPageToken, files({DRIVE_FILE_FIELDS})"),
+        fields: format!("nextPageToken, incompleteSearch, files({DRIVE_FILE_FIELDS})"),
         page_token: page_token.map(str::to_string),
     }
 }
@@ -336,8 +336,8 @@ mod tests {
     use locality_core::portable::SourceConnectionId;
 
     use super::{
-        DriveListQuery, GoogleDocsApi, HttpGoogleApiClient, drive_accessible_google_docs_query,
-        drive_children_query, google_docs_batch_update_url,
+        DriveListQuery, GoogleDocsApi, GoogleDriveApi, HttpGoogleApiClient,
+        drive_accessible_google_docs_query, drive_children_query, google_docs_batch_update_url,
     };
     use crate::connector::{GoogleDocsConfig, GoogleDocsConnector};
     use crate::docs_dto::{BatchUpdateDocumentRequest, GoogleDocument};
@@ -350,7 +350,7 @@ mod tests {
             query,
             DriveListQuery {
                 q: "mimeType = 'application/vnd.google-apps.document' and trashed = false".to_string(),
-                fields: "nextPageToken, files(id, name, mimeType, parents, modifiedTime, version, trashed)".to_string(),
+                fields: "nextPageToken, incompleteSearch, files(id, name, mimeType, parents, modifiedTime, version, trashed)".to_string(),
                 page_token: Some("cursor-1".to_string()),
             }
         );
@@ -364,10 +364,29 @@ mod tests {
             query,
             DriveListQuery {
                 q: "'folder-1' in parents and trashed = false".to_string(),
-                fields: "nextPageToken, files(id, name, mimeType, parents, modifiedTime, version, trashed)".to_string(),
+                fields: "nextPageToken, incompleteSearch, files(id, name, mimeType, parents, modifiedTime, version, trashed)".to_string(),
                 page_token: Some("cursor-1".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn all_drives_list_requests_and_decodes_incomplete_search() {
+        let (base_url, requests, server) =
+            spawn_drive_server([r#"{"incompleteSearch":true,"files":[]}"#.to_string()]);
+        let client =
+            HttpGoogleApiClient::with_base_urls("access-token", base_url, "http://unused.test");
+
+        let page = client
+            .list_accessible_google_docs(None)
+            .expect("list response");
+
+        let requests = requests.recv().expect("requests");
+        server.join().expect("server exits");
+        assert!(page.incomplete_search);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("corpora=allDrives"));
+        assert!(requests[0].contains("incompleteSearch"));
     }
 
     #[test]
@@ -410,6 +429,7 @@ mod tests {
         assert_drive_flags(&requests[0], "/files/shared-root");
         assert_drive_flags(&requests[1], "/files?");
         assert!(requests[1].contains("includeItemsFromAllDrives=true"));
+        assert!(requests[1].contains("incompleteSearch"));
     }
 
     #[test]

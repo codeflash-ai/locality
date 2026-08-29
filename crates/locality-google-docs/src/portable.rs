@@ -15,7 +15,9 @@ use locality_core::portable::{
 use locality_core::{LocalityError, LocalityResult};
 
 use crate::client::GoogleDriveApi;
-use crate::connector::{GoogleDocsConnector, project_drive_children};
+use crate::connector::{
+    GoogleDocsConnector, incomplete_drive_search_error, project_drive_children,
+};
 use crate::drive_dto::DriveFile;
 use crate::render::{GoogleDocsNativeBundle, combined_remote_version, render_google_document};
 
@@ -303,6 +305,9 @@ fn list_portable_drive_children(
     let mut files = BTreeMap::new();
     loop {
         let page = drive.list_children(parent_id, cursor.as_deref())?;
+        if page.incomplete_search {
+            return Err(incomplete_drive_search_error());
+        }
         for file in page.files.into_iter().filter(|file| !file.trashed) {
             if !file.is_folder() && !file.is_google_doc() {
                 return Err(LocalityError::Guardrail(format!(

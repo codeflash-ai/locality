@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
@@ -485,6 +486,9 @@ fn list_accessible_google_docs(
     let mut files = Vec::new();
     loop {
         let page = drive.list_accessible_google_docs(cursor.as_deref())?;
+        if page.incomplete_search {
+            return Err(incomplete_drive_search_error());
+        }
         files.extend(page.files.into_iter().filter(|file| !file.trashed));
         if page.next_page_token.is_none() {
             break;
@@ -498,6 +502,14 @@ fn list_accessible_google_docs(
             .then_with(|| left.id.cmp(&right.id))
     });
     Ok(project_drive_children(mount_id, Path::new(""), files))
+}
+
+pub(crate) fn incomplete_drive_search_error() -> LocalityError {
+    LocalityError::RateLimited {
+        provider: "google-drive".to_string(),
+        retry_after: Duration::from_secs(1),
+        message: "Google Drive returned an incomplete search result; retry enumeration".to_string(),
+    }
 }
 
 pub(crate) fn project_drive_children(
@@ -3133,6 +3145,7 @@ mod tests {
                     DriveFileList {
                         files: vec![unsupported],
                         next_page_token: None,
+                        incomplete_search: false,
                     },
                 ),
         );
@@ -3170,6 +3183,7 @@ mod tests {
                             doc_file("doc-2", "Second", "drive-folder-1"),
                         ],
                         next_page_token: None,
+                        incomplete_search: false,
                     },
                 ),
         );
@@ -3197,6 +3211,44 @@ mod tests {
     }
 
     #[test]
+    fn portable_bootstrap_retries_incomplete_drive_search() {
+        let drive = Arc::new(
+            FakeDrive::default()
+                .with_file(folder("drive-folder-1", "Workspace", "root"))
+                .with_child_page(
+                    "drive-folder-1",
+                    None,
+                    DriveFileList {
+                        files: Vec::new(),
+                        incomplete_search: true,
+                        next_page_token: None,
+                    },
+                ),
+        );
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive,
+            Arc::new(FakeDocs::default()),
+        )
+        .with_portable_workspace_folder_id(RemoteId::new("drive-folder-1"));
+
+        let error = connector
+            .bootstrap_portable(PortableBootstrapRequest {
+                source_connection_id: SourceConnectionId::new("hosted-google-docs"),
+                scope: PortableSourceScope::explicit_roots([RemoteId::new("drive-folder-1")]),
+                checkpoint: None,
+                max_changes: 100,
+            })
+            .expect_err("incomplete Drive search must reject portable bootstrap");
+
+        assert!(matches!(
+            error,
+            locality_core::LocalityError::RateLimited { .. }
+        ));
+        assert!(error.to_string().contains("incomplete search"));
+    }
+
+    #[test]
     fn portable_workspace_folder_bootstraps_fetches_and_renders_document() {
         let drive = Arc::new(
             FakeDrive::default()
@@ -3207,6 +3259,7 @@ mod tests {
                     DriveFileList {
                         files: vec![doc_file("doc-1", "Launch Brief", "drive-folder-1")],
                         next_page_token: None,
+                        incomplete_search: false,
                     },
                 ),
         );
@@ -6231,6 +6284,7 @@ mod tests {
                 .unwrap_or(DriveFileList {
                     files: Vec::new(),
                     next_page_token: None,
+                    incomplete_search: false,
                 }))
         }
 
@@ -6241,6 +6295,7 @@ mod tests {
             Ok(DriveFileList {
                 files: self.accessible_docs.lock().unwrap().clone(),
                 next_page_token: None,
+                incomplete_search: false,
             })
         }
 
