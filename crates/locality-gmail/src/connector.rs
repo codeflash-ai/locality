@@ -51,7 +51,7 @@ const SENT_FOLDER_ID: &str = "gmail-folder:sent";
 const DRAFT_FOLDER_ID: &str = "gmail-folder:draft";
 const OUTBOX_FOLDER_ID: &str = "gmail-folder:outbox";
 const GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID: &str = "gmail";
-const GMAIL_PORTABLE_CHECKPOINT_VERSION: u16 = 2;
+const GMAIL_PORTABLE_CHECKPOINT_VERSION: u16 = 3;
 const GMAIL_PORTABLE_NATIVE_KIND: &str = "gmail_portable_mail";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +75,7 @@ enum GmailPortableBootstrapPhase {
 #[serde(deny_unknown_fields)]
 struct GmailPortableCheckpointState {
     scope_root: String,
+    source_connection_id: String,
     phase: GmailPortableBootstrapPhase,
     page_token: Option<String>,
     #[serde(default)]
@@ -245,13 +246,17 @@ impl Connector for GmailConnector {
                 "Gmail portable bootstrap max_changes must be greater than 0".to_string(),
             ));
         }
-        let state =
-            decode_gmail_portable_checkpoint(request.checkpoint.as_ref(), &self.config.settings)?;
+        let state = decode_gmail_portable_checkpoint(
+            request.checkpoint.as_ref(),
+            &self.config.settings,
+            &request.source_connection_id,
+        )?;
         if self.config.settings.gmail.view == GmailProjectionView::Threads {
             return Ok(PortableChangeBatch {
                 changes: Vec::new(),
                 next_checkpoint: encode_gmail_portable_checkpoint(&GmailPortableCheckpointState {
                     scope_root: GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID.to_string(),
+                    source_connection_id: request.source_connection_id.as_str().to_string(),
                     phase: GmailPortableBootstrapPhase::Complete,
                     page_token: None,
                     seen_page_tokens: Vec::new(),
@@ -290,10 +295,18 @@ impl Connector for GmailConnector {
                         self.api
                             .get_message_metadata(&message_ref.id)
                             .map(|message| {
-                                message_entry(&mount_id, Path::new(mailbox), mailbox, message)
+                                portable_message_entry(
+                                    &mount_id,
+                                    Path::new(mailbox),
+                                    mailbox,
+                                    message,
+                                )
                             })
                     })
-                    .collect::<LocalityResult<Vec<_>>>()?;
+                    .collect::<LocalityResult<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
                 (entries, page.next_page_token)
             }
             GmailPortableBootstrapPhase::Draft => {
@@ -998,10 +1011,12 @@ fn logical_path_from_tree_path(path: &Path) -> LocalityResult<LogicalPath> {
 fn decode_gmail_portable_checkpoint(
     checkpoint: Option<&PortableCheckpoint>,
     settings: &GmailMountSettings,
+    source_connection_id: &SourceConnectionId,
 ) -> LocalityResult<GmailPortableCheckpointState> {
     let state = match checkpoint {
         None => GmailPortableCheckpointState {
             scope_root: GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID.to_string(),
+            source_connection_id: source_connection_id.as_str().to_string(),
             phase: GmailPortableBootstrapPhase::Inbox,
             page_token: None,
             seen_page_tokens: Vec::new(),
@@ -1032,6 +1047,12 @@ fn decode_gmail_portable_checkpoint(
     if state.scope_root != GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID {
         return Err(LocalityError::InvalidState(
             "Gmail portable bootstrap checkpoint scope does not match request".to_string(),
+        ));
+    }
+    if state.source_connection_id != source_connection_id.as_str() {
+        return Err(LocalityError::InvalidState(
+            "Gmail portable bootstrap checkpoint source connection does not match request"
+                .to_string(),
         ));
     }
     if state.phase == GmailPortableBootstrapPhase::Complete {
@@ -1737,6 +1758,23 @@ fn message_entry(
         remote_edited_at: Some(version),
         stub_frontmatter: Some(message_frontmatter(&bundle)),
     }
+}
+
+fn portable_message_entry(
+    mount_id: &MountId,
+    parent_path: &Path,
+    mailbox: &str,
+    message: GmailMessage,
+) -> Option<TreeEntry> {
+    let canonical_mailbox = if message.label_ids.iter().any(|label| label == "INBOX") {
+        "inbox"
+    } else if message.label_ids.iter().any(|label| label == "SENT") {
+        "sent"
+    } else {
+        mailbox
+    };
+    (canonical_mailbox == mailbox)
+        .then(|| message_entry(mount_id, parent_path, canonical_mailbox, message))
 }
 
 fn draft_entry(
@@ -2699,7 +2737,7 @@ mod tests {
             source_connection_id: SourceConnectionId::new("gmail-connection"),
             scope: PortableSourceScope::explicit_roots([RemoteId::new("gmail")]),
             checkpoint: Some(PortableCheckpoint {
-                format_version: 2,
+                format_version: 3,
                 opaque: opaque.to_string(),
             }),
             max_changes: 1,
@@ -2711,16 +2749,16 @@ mod tests {
         assert!(malformed.to_string().contains("checkpoint"));
 
         let mismatched = connector
-            .bootstrap_portable(request(r#"{"scope_root":"other","phase":"inbox","page_token":null,"seen_page_tokens":[],"after":null,"before":null}"#))
+            .bootstrap_portable(request(r#"{"scope_root":"other","source_connection_id":"gmail-connection","phase":"inbox","page_token":null,"seen_page_tokens":[],"after":null,"before":null}"#))
             .expect_err("mismatched checkpoint scope must fail");
         assert!(mismatched.to_string().contains("scope"));
 
         let cyclic = connector
-            .bootstrap_portable(request(r#"{"scope_root":"gmail","phase":"inbox","page_token":"again","seen_page_tokens":["again"],"after":null,"before":null}"#))
+            .bootstrap_portable(request(r#"{"scope_root":"gmail","source_connection_id":"gmail-connection","phase":"inbox","page_token":"again","seen_page_tokens":["again"],"after":null,"before":null}"#))
             .expect_err("cyclic checkpoint must fail");
         assert!(cyclic.to_string().contains("repeated"));
         let terminal = connector
-            .bootstrap_portable(request(r#"{"scope_root":"gmail","phase":"complete","page_token":null,"seen_page_tokens":[],"after":null,"before":null}"#))
+            .bootstrap_portable(request(r#"{"scope_root":"gmail","source_connection_id":"gmail-connection","phase":"complete","page_token":null,"seen_page_tokens":[],"after":null,"before":null}"#))
             .expect_err("repeated terminal checkpoint must fail");
         assert!(terminal.to_string().contains("terminal"));
         let calls = api.calls.lock().expect("calls");
@@ -2871,6 +2909,83 @@ mod tests {
     }
 
     #[test]
+    fn gmail_bootstrap_portable_emits_shared_message_once_across_all_phases() {
+        let api = Arc::new(FakeGmailApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            for label in ["INBOX", "SENT"] {
+                calls.paged_message_ids.insert(
+                    (label.to_string(), None),
+                    GmailMessageList {
+                        messages: vec![GmailMessageRef {
+                            id: "shared-msg".to_string(),
+                            thread_id: Some("shared-thread".to_string()),
+                        }],
+                        next_page_token: None,
+                        result_size_estimate: Some(1),
+                    },
+                );
+            }
+            calls.paged_drafts.insert(
+                None,
+                GmailDraftList {
+                    drafts: Vec::new(),
+                    next_page_token: None,
+                    result_size_estimate: Some(0),
+                },
+            );
+            calls.message_labels.insert(
+                "shared-msg".to_string(),
+                vec!["INBOX".to_string(), "SENT".to_string()],
+            );
+        }
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
+        let request = |checkpoint, source_connection_id| PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new(source_connection_id),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("gmail")]),
+            checkpoint,
+            max_changes: 1,
+        };
+
+        let first = connector
+            .bootstrap_portable(request(None, "gmail-connection"))
+            .expect("inbox page");
+        let second = connector
+            .bootstrap_portable(request(Some(first.next_checkpoint), "gmail-connection"))
+            .expect("sent page");
+        let third = connector
+            .bootstrap_portable(request(Some(second.next_checkpoint), "gmail-connection"))
+            .expect("draft page");
+
+        assert_eq!(first.changes.len(), 1);
+        assert!(second.changes.is_empty());
+        assert!(third.changes.is_empty());
+        assert!(third.completeness.is_complete());
+    }
+
+    #[test]
+    fn gmail_bootstrap_portable_rejects_checkpoint_from_another_source() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let request = |checkpoint, source_connection_id| PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new(source_connection_id),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("gmail")]),
+            checkpoint,
+            max_changes: 1,
+        };
+
+        let first = connector
+            .bootstrap_portable(request(None, "gmail-a"))
+            .expect("first page");
+        let error = connector
+            .bootstrap_portable(request(Some(first.next_checkpoint), "gmail-b"))
+            .expect_err("cross-source checkpoint must fail");
+
+        assert!(error.to_string().contains("source connection"));
+        assert_eq!(api.calls.lock().expect("calls").list_max_results, vec![1]);
+    }
+
+    #[test]
     fn gmail_bootstrap_portable_thread_view_fails_closed_without_provider_work() {
         let api = Arc::new(FakeGmailApi::default());
         let settings =
@@ -2923,7 +3038,7 @@ mod tests {
                 source_connection_id: SourceConnectionId::new("gmail-connection"),
                 scope: PortableSourceScope::explicit_roots([RemoteId::new("gmail")]),
                 checkpoint: Some(PortableCheckpoint {
-                    format_version: 2,
+                    format_version: 3,
                     opaque: "not-json".to_string(),
                 }),
                 max_changes: 100,

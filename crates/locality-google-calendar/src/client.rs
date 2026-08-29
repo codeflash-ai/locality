@@ -14,6 +14,7 @@ use crate::dto::{CalendarEvent, CalendarEventCreateRequest, CalendarEventList};
 pub const DEFAULT_GOOGLE_CALENDAR_API_BASE_URL: &str = "https://www.googleapis.com";
 const GOOGLE_CALENDAR_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const GOOGLE_CALENDAR_ERROR_SUMMARY_LIMIT: usize = 1000;
+pub const DEFAULT_GOOGLE_CALENDAR_LIST_MAX_RESULTS: u32 = 250;
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
@@ -23,9 +24,20 @@ pub trait GoogleCalendarApi: std::fmt::Debug + Send + Sync {
         calendar_id: &str,
         time_min: &str,
         time_max: &str,
-        max_results: u32,
         page_token: Option<&str>,
     ) -> LocalityResult<CalendarEventList>;
+
+    fn list_events_bounded(
+        &self,
+        calendar_id: &str,
+        time_min: &str,
+        time_max: &str,
+        max_results: u32,
+        page_token: Option<&str>,
+    ) -> LocalityResult<CalendarEventList> {
+        let _ = max_results;
+        self.list_events(calendar_id, time_min, time_max, page_token)
+    }
 
     fn get_event(&self, calendar_id: &str, event_id: &str) -> LocalityResult<CalendarEvent>;
 
@@ -111,12 +123,25 @@ impl GoogleCalendarApi for HttpGoogleCalendarApiClient {
         calendar_id: &str,
         time_min: &str,
         time_max: &str,
+        page_token: Option<&str>,
+    ) -> LocalityResult<CalendarEventList> {
+        self.get_json(
+            calendar_events_url(&self.base_url, calendar_id),
+            event_list_query(time_min, time_max, page_token),
+        )
+    }
+
+    fn list_events_bounded(
+        &self,
+        calendar_id: &str,
+        time_min: &str,
+        time_max: &str,
         max_results: u32,
         page_token: Option<&str>,
     ) -> LocalityResult<CalendarEventList> {
         self.get_json(
             calendar_events_url(&self.base_url, calendar_id),
-            event_list_query(time_min, time_max, max_results, page_token),
+            event_list_query_bounded(time_min, time_max, max_results, page_token),
         )
     }
 
@@ -158,6 +183,19 @@ pub fn calendar_event_url(base_url: &str, calendar_id: &str, event_id: &str) -> 
 }
 
 pub fn event_list_query(
+    time_min: &str,
+    time_max: &str,
+    page_token: Option<&str>,
+) -> Vec<(String, String)> {
+    event_list_query_bounded(
+        time_min,
+        time_max,
+        DEFAULT_GOOGLE_CALENDAR_LIST_MAX_RESULTS,
+        page_token,
+    )
+}
+
+pub fn event_list_query_bounded(
     time_min: &str,
     time_max: &str,
     max_results: u32,
@@ -415,6 +453,7 @@ fn percent_encode_path_segment(value: &str) -> String {
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::Mutex;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -422,7 +461,7 @@ mod tests {
     use locality_core::LocalityError;
     use serde_json::{Value, json};
 
-    use crate::dto::{CalendarEventCreateRequest, EventDateTime};
+    use crate::dto::{CalendarEvent, CalendarEventCreateRequest, CalendarEventList, EventDateTime};
 
     use super::{
         GoogleCalendarApi, HttpGoogleCalendarApiClient, calendar_event_url, calendar_events_url,
@@ -434,7 +473,6 @@ mod tests {
         let query = event_list_query(
             "2026-06-16T00:00:00Z",
             "2027-01-12T00:00:00Z",
-            250,
             Some("page-2"),
         );
 
@@ -448,6 +486,70 @@ mod tests {
                 ("maxResults".to_string(), "250".to_string()),
                 ("pageToken".to_string(), "page-2".to_string()),
             ]
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct LegacyGoogleCalendarApi {
+        list_calls: Mutex<Vec<(String, String, String, Option<String>)>>,
+    }
+
+    impl GoogleCalendarApi for LegacyGoogleCalendarApi {
+        fn list_events(
+            &self,
+            calendar_id: &str,
+            time_min: &str,
+            time_max: &str,
+            page_token: Option<&str>,
+        ) -> locality_core::LocalityResult<CalendarEventList> {
+            self.list_calls.lock().expect("calls").push((
+                calendar_id.to_string(),
+                time_min.to_string(),
+                time_max.to_string(),
+                page_token.map(str::to_string),
+            ));
+            Ok(CalendarEventList::default())
+        }
+
+        fn get_event(
+            &self,
+            _calendar_id: &str,
+            _event_id: &str,
+        ) -> locality_core::LocalityResult<CalendarEvent> {
+            unreachable!("not used by compatibility test")
+        }
+
+        fn insert_event(
+            &self,
+            _calendar_id: &str,
+            _request: CalendarEventCreateRequest,
+            _create_conference: bool,
+        ) -> locality_core::LocalityResult<CalendarEvent> {
+            unreachable!("not used by compatibility test")
+        }
+    }
+
+    #[test]
+    fn legacy_google_calendar_api_uses_default_bounded_list_method() {
+        let api = LegacyGoogleCalendarApi::default();
+
+        api.list_events_bounded(
+            "primary",
+            "2026-06-16T00:00:00Z",
+            "2027-01-12T00:00:00Z",
+            1,
+            Some("page-2"),
+        )
+        .expect("default bounded list");
+
+        assert_eq!(
+            *api.list_calls.lock().expect("calls"),
+            vec![(
+                "primary".to_string(),
+                "2026-06-16T00:00:00Z".to_string(),
+                "2027-01-12T00:00:00Z".to_string(),
+                Some("page-2".to_string()),
+            )]
         );
     }
 
@@ -495,7 +597,6 @@ mod tests {
                 "team@example.com",
                 "2026-06-16T00:00:00Z",
                 "2027-01-12T00:00:00Z",
-                250,
                 Some("page-2"),
             )
             .expect("events");
