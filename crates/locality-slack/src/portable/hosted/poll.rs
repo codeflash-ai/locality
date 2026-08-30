@@ -762,8 +762,9 @@ impl HostedSlackPollCheckpointV1 {
             next.checkpoint_format_version = HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2;
             next.minimum_reader_version = HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2;
         }
-        let compact_incremental =
-            next.checkpoint_format_version >= HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4;
+        let compact_incremental = next.checkpoint_format_version
+            >= HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4
+            && next.poll_kind == HostedSlackPollKindV2::Incremental;
         let expectation_is_from_this_catch_up = page.phase
             != HostedSlackPollPhaseV1::CatchUpReplies
             || catch_up_history_contains_root(&next, &page.root_message_id)?
@@ -1435,7 +1436,9 @@ fn prepare_reply_phase(
                 pending.push(root);
             }
         }
-        if checkpoint.checkpoint_format_version < HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4 {
+        if checkpoint.checkpoint_format_version < HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4
+            || checkpoint.poll_kind != HostedSlackPollKindV2::Incremental
+        {
             let applied_pages = checkpoint
                 .evidence
                 .iter()

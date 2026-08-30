@@ -1,16 +1,18 @@
-use locality_protocol::{HostedSlackChannelSelector, ProviderSourceScopeSelector};
+use locality_protocol::{
+    HostedSlackChannelSelector, ProviderSourceScopeSelector, SlackChannelSharingClassification,
+};
 use locality_slack::portable::hosted::{
     HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3, HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
-    HostedSlackHistoryMessageV1, HostedSlackHistoryPageV1, HostedSlackHistoryPageV2,
-    HostedSlackPageApplyOutcomeV1, HostedSlackPollCheckpointV1, HostedSlackPollError,
-    HostedSlackPollEvidenceV1, HostedSlackPollKindV1, HostedSlackPollKindV2,
+    HostedSlackConversationKindV1, HostedSlackHistoryMessageV1, HostedSlackHistoryPageV1,
+    HostedSlackHistoryPageV2, HostedSlackPageApplyOutcomeV1, HostedSlackPollCheckpointV1,
+    HostedSlackPollError, HostedSlackPollEvidenceV1, HostedSlackPollKindV1, HostedSlackPollKindV2,
     HostedSlackPollOutputV1, HostedSlackPollPhaseV1, HostedSlackRepliesPageV1,
     HostedSlackRepliesPageV2, MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1,
     MAX_HOSTED_SLACK_CURSOR_BYTES_V1, MAX_HOSTED_SLACK_POLL_PAGE_BYTES_V1,
     MAX_HOSTED_SLACK_POLL_PAGE_MESSAGES_V1, RawHostedSlackMessage, RawHostedSlackNativeSnapshot,
     decode_hosted_slack_history_page_v1, decode_hosted_slack_poll_checkpoint_v1,
     decode_hosted_slack_poll_checkpoint_v2, decode_hosted_slack_poll_checkpoint_v3,
-    decode_hosted_slack_replies_page_v1,
+    decode_hosted_slack_poll_checkpoint_v4, decode_hosted_slack_replies_page_v1,
 };
 use serde::Serialize;
 
@@ -1008,6 +1010,51 @@ fn catch_up_sweeps_old_roots_and_captures_late_non_broadcast_replies() {
             .messages()
             .iter()
             .any(|message| message.text() == "Late non-broadcast reply")
+    );
+}
+
+#[test]
+fn bootstrap_catch_up_checkpoint_retains_replayable_page_evidence() {
+    let mut selector = selector();
+    selector.channel_id = "D08DIRECT1".to_string();
+    selector.sharing = SlackChannelSharingClassification::Private;
+    let mut channel = raw_snapshot().channel;
+    channel.id = selector.channel_id.clone();
+    channel.conversation_kind = HostedSlackConversationKindV1::Im;
+    channel.sharing = SlackChannelSharingClassification::Private;
+    let mut checkpoint = HostedSlackPollCheckpointV1::new(
+        &selector,
+        channel,
+        HostedSlackPollKindV1::Bootstrap,
+        "2026-06-01T00:00:00Z".to_string(),
+        "2026-05-28T20:00:00Z".to_string(),
+    )
+    .expect("DM bootstrap checkpoint");
+    let mut historical = history_page();
+    historical.channel_id = selector.channel_id.clone();
+    historical.sharing = SlackChannelSharingClassification::Private;
+    historical.next_cursor = None;
+    historical.messages.clear();
+    historical.users.clear();
+    historical.files.clear();
+    checkpoint
+        .apply_history_page(&historical)
+        .expect("terminal DM history page");
+    checkpoint
+        .begin_catch_up("2026-06-02T00:00:00Z".to_string())
+        .expect("bootstrap catch-up cut");
+    let mut catch_up = historical;
+    catch_up.phase = HostedSlackPollPhaseV1::CatchUpHistory;
+    catch_up.poll_cut_at = Some("2026-06-02T00:00:00Z".to_string());
+    catch_up.observed_at = "2026-06-02T00:00:05Z".to_string();
+    checkpoint
+        .apply_history_page(&catch_up)
+        .expect("bootstrap catch-up page");
+
+    let encoded = serde_json::to_vec(&checkpoint).expect("encode bootstrap checkpoint");
+    assert_eq!(
+        decode_hosted_slack_poll_checkpoint_v4(&encoded),
+        Ok(checkpoint)
     );
 }
 
