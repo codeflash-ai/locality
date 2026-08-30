@@ -2615,8 +2615,14 @@ fn provider_discovered_channel(
     let channel_id = channel.id.clone();
     let conversation_kind = hosted_conversation_kind_from_wire(&channel)?;
     let name = hosted_conversation_name(&channel, conversation_kind)?;
-    let topic = channel.topic.as_ref().map(|value| value.value.clone());
-    let purpose = channel.purpose.as_ref().map(|value| value.value.clone());
+    let topic = channel
+        .topic
+        .as_ref()
+        .map(|value| sanitize_provider_metadata(&value.value));
+    let purpose = channel
+        .purpose
+        .as_ref()
+        .map(|value| sanitize_provider_metadata(&value.value));
     let created = channel
         .created
         .ok_or(HostedSlackProviderError::InvalidResponse("channel created"))?;
@@ -2652,6 +2658,19 @@ fn provider_discovered_channel(
         is_member: authority.is_member,
         is_archived,
     })
+}
+
+fn sanitize_provider_metadata(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn hosted_conversation_kind(
@@ -4083,6 +4102,26 @@ mod tests {
         assert_eq!(
             discovered.channel.conversation_kind,
             HostedSlackConversationKindV1::PrivateChannel
+        );
+    }
+
+    #[test]
+    fn provider_discovered_channel_normalizes_control_characters_in_metadata() {
+        let mut wire = discovered_channel_wire("C08METADATA1", true, false, false, false);
+        wire.topic = Some(ConversationTextWire {
+            value: "Build\tsafely".to_owned(),
+        });
+        wire.purpose = Some(ConversationTextWire {
+            value: "Engineering\nteam".to_owned(),
+        });
+
+        let discovered =
+            provider_discovered_channel(wire, "T08LOCALITY1").expect("normalized discovery");
+
+        assert_eq!(discovered.channel.topic.as_deref(), Some("Build safely"));
+        assert_eq!(
+            discovered.channel.purpose.as_deref(),
+            Some("Engineering team")
         );
     }
 
