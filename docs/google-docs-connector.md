@@ -81,24 +81,30 @@ Non-Google-Docs Drive files are ignored by the V1 connector.
 
 ## Hosted Portable Export
 
-Hosted portable export is available only for an explicit, configured Drive
-workspace-folder ID. The bootstrap request must name exactly that folder as its
-sole root; folder titles, missing roots, checkpoints, and zero-sized batches are
-rejected. Before listing the tree, Locality verifies that the configured ID still
-resolves to an active Drive folder with a provider version. This keeps a hosted
-export tied to a stable provider identity rather than a mutable folder name.
+Hosted portable export is available only when a connector is explicitly built
+with a portable Drive scope-root ID. This private export-only setting does not
+change account-wide desktop mounts, and the deprecated
+`GoogleDocsConfig::with_workspace_folder_id` remains a no-op. The bootstrap
+request must name exactly that folder as its sole root; folder titles, missing
+roots, checkpoints, and zero-sized batches are rejected. Before listing the
+tree, Locality verifies that the configured ID still resolves to an active Drive
+folder with a provider version. This keeps a hosted export tied to a stable
+provider identity rather than a mutable folder name.
 
 Bootstrap recursively lists Google Docs below that folder and emits each document
-with the configured folder as its owning scope-root edge. It marks the batch
-incomplete when `max_changes` truncates the inventory, rather than treating
-omitted documents as absent. Provider, pagination, or root-validation failures
-remain errors and never produce a complete portable result.
+with the configured folder as its owning scope-root edge. Because this connector
+does not yet have a resumable bootstrap continuation, it rejects an inventory
+that would exceed `max_changes` rather than publishing a partial result. Provider,
+pagination, or root-validation failures remain errors and never produce a
+complete portable result.
 
 Portable fetch accepts only active Google Docs whose Drive parent chain can be
 proven to reach the configured root. It returns a stable combined Drive and Docs
 revision and records the root ID in the portable native bundle. Rendering accepts
 only that bundle for the configured root and emits immutable JSON canonical data
-plus a Markdown `page.md` projection with read and search actions.
+plus a Markdown `page.md` projection with read and search actions. Drive root,
+child listing, fetch, create, and update calls send the Google Shared Drive
+support flags, so a scoped root can be in a Shared Drive.
 
 ## Hydration And Markdown
 

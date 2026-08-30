@@ -1268,6 +1268,70 @@ describe("auth broker", () => {
     expect(refreshCalls).toBe(2);
   });
 
+  it.each([
+    ["invalid grant", "invalid_grant", 400, "invalid_grant"],
+    ["scope failure", "insufficient_scope", 403, "insufficient_scope"],
+    ["authorization failure", "token_revoked", 401, "token_revoked"],
+    ["retryable upstream failure", "temporary_failure", 502, "upstream_oauth_error"]
+  ])("classifies Slack refresh %s without exposing provider details", async (_label, providerError, status, code) => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new URLSearchParams(init?.body as string);
+      if (request.get("grant_type") === "authorization_code") {
+        return Response.json({
+          ok: true,
+          access_token: "xoxb-access-token",
+          refresh_token: "slack-refresh-token",
+          expires_in: 43200
+        });
+      }
+      return Response.json({
+        ok: false,
+        error: `${providerError} slack-refresh-token slack-client-secret`
+      });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const response = await app.request(
+      "/v1/oauth/slack/refresh",
+      slackRefreshRequest(await exchangeSlackRefreshHandle()),
+      env
+    );
+
+    expect(response.status).toBe(status);
+    const body = await response.json();
+    expect(body).toMatchObject({ error: { code } });
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain("slack-refresh-token");
+    expect(serialized).not.toContain("slack-client-secret");
+  });
+
+  it("maps a non-JSON Slack upstream failure to a retryable redacted broker error", async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new URLSearchParams(init?.body as string);
+      if (request.get("grant_type") === "authorization_code") {
+        return Response.json({
+          ok: true,
+          access_token: "xoxb-access-token",
+          refresh_token: "slack-refresh-token",
+          expires_in: 43200
+        });
+      }
+      return new Response("Slack upstream outage: slack-refresh-token", { status: 503 });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const response = await app.request(
+      "/v1/oauth/slack/refresh",
+      slackRefreshRequest(await exchangeSlackRefreshHandle()),
+      env
+    );
+
+    expect(response.status).toBe(502);
+    const body = await response.json();
+    expect(body).toMatchObject({ error: { code: "upstream_oauth_error" } });
+    expect(JSON.stringify(body)).not.toContain("slack-refresh-token");
+  });
+
   it("rolls back a cached Slack refresh when scheduling its expiry alarm fails", async () => {
     const storage = new MemoryDurableObjectStorage();
     storage.failSetAlarm = true;

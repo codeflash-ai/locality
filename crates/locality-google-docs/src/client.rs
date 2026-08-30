@@ -186,7 +186,10 @@ impl GoogleDriveApi for HttpGoogleApiClient {
     fn get_file(&self, file_id: &str) -> LocalityResult<DriveFile> {
         self.get_json(
             format!("{}/files/{file_id}", self.drive_base_url),
-            vec![("fields".to_string(), DRIVE_FILE_FIELDS.to_string())],
+            vec![
+                ("fields".to_string(), DRIVE_FILE_FIELDS.to_string()),
+                ("supportsAllDrives".to_string(), "true".to_string()),
+            ],
         )
     }
 
@@ -200,6 +203,8 @@ impl GoogleDriveApi for HttpGoogleApiClient {
             ("q".to_string(), query.q),
             ("fields".to_string(), query.fields),
             ("spaces".to_string(), "drive".to_string()),
+            ("includeItemsFromAllDrives".to_string(), "true".to_string()),
+            ("supportsAllDrives".to_string(), "true".to_string()),
         ];
         if let Some(page_token) = query.page_token {
             query_pairs.push(("pageToken".to_string(), page_token));
@@ -229,7 +234,10 @@ impl GoogleDriveApi for HttpGoogleApiClient {
         self.post_json(
             format!("{}/files", self.drive_base_url),
             &request,
-            vec![("fields".to_string(), DRIVE_FILE_FIELDS.to_string())],
+            vec![
+                ("fields".to_string(), DRIVE_FILE_FIELDS.to_string()),
+                ("supportsAllDrives".to_string(), "true".to_string()),
+            ],
         )
     }
 
@@ -238,7 +246,10 @@ impl GoogleDriveApi for HttpGoogleApiClient {
         file_id: &str,
         request: DriveUpdateFileRequest,
     ) -> LocalityResult<DriveFile> {
-        let mut query = vec![("fields".to_string(), DRIVE_FILE_FIELDS.to_string())];
+        let mut query = vec![
+            ("fields".to_string(), DRIVE_FILE_FIELDS.to_string()),
+            ("supportsAllDrives".to_string(), "true".to_string()),
+        ];
         if let Some(add_parents) = request.add_parents.clone() {
             query.push(("addParents".to_string(), add_parents));
         }
@@ -318,10 +329,16 @@ fn ensure_reqwest_crypto_provider() {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
+
     use super::{
-        DriveListQuery, drive_accessible_google_docs_query, drive_children_query,
-        google_docs_batch_update_url,
+        DriveListQuery, GoogleDriveApi, HttpGoogleApiClient, drive_accessible_google_docs_query,
+        drive_children_query, google_docs_batch_update_url,
     };
+    use crate::drive_dto::{DriveCreateFileRequest, DriveUpdateFileRequest};
 
     #[test]
     fn accessible_google_docs_query_lists_untrashed_documents() {
@@ -352,10 +369,106 @@ mod tests {
     }
 
     #[test]
+    fn scoped_drive_requests_include_shared_drive_flags() {
+        let (base_url, requests, server) = spawn_drive_server([
+            r#"{"id":"shared-root","name":"Shared Root","mimeType":"application/vnd.google-apps.folder","parents":[],"modifiedTime":"2026-08-29T00:00:00Z","version":"1","trashed":false}"#.to_string(),
+            r#"{"files":[]}"#.to_string(),
+        ]);
+        let client =
+            HttpGoogleApiClient::with_base_urls("access-token", base_url, "http://unused.test");
+
+        client.get_file("shared-root").expect("get root");
+        client
+            .list_children("shared-root", None)
+            .expect("list root");
+
+        let requests = requests.recv().expect("requests");
+        server.join().expect("server exits");
+        assert_eq!(requests.len(), 2);
+        assert_drive_flags(&requests[0], "/files/shared-root?");
+        assert_drive_flags(&requests[1], "/files?");
+        assert!(requests[1].contains("includeItemsFromAllDrives=true"));
+    }
+
+    #[test]
+    fn drive_mutations_include_shared_drive_support() {
+        let document = r#"{"id":"doc-1","name":"Shared Doc","mimeType":"application/vnd.google-apps.document","parents":["shared-root"],"modifiedTime":"2026-08-29T00:00:00Z","version":"1","trashed":false}"#.to_string();
+        let (base_url, requests, server) = spawn_drive_server([document.clone(), document]);
+        let client =
+            HttpGoogleApiClient::with_base_urls("access-token", base_url, "http://unused.test");
+
+        client
+            .create_file(DriveCreateFileRequest::google_doc(
+                "Shared Doc",
+                "shared-root",
+            ))
+            .expect("create document");
+        client
+            .update_file("doc-1", DriveUpdateFileRequest::rename("Renamed"))
+            .expect("update document");
+
+        let requests = requests.recv().expect("requests");
+        server.join().expect("server exits");
+        assert_eq!(requests.len(), 2);
+        assert_drive_flags(&requests[0], "/files?");
+        assert_drive_flags(&requests[1], "/files/doc-1?");
+    }
+
+    #[test]
     fn docs_batch_update_url_targets_document_resource() {
         assert_eq!(
             google_docs_batch_update_url("https://docs.googleapis.com", "doc-1"),
             "https://docs.googleapis.com/v1/documents/doc-1:batchUpdate"
         );
+    }
+
+    fn assert_drive_flags(request: &str, path: &str) {
+        let target = request.split_whitespace().nth(1).expect("request target");
+        assert!(target.starts_with(path), "unexpected target: {target}");
+        assert!(
+            target.contains("supportsAllDrives=true"),
+            "missing supportsAllDrives: {target}"
+        );
+    }
+
+    fn spawn_drive_server(
+        responses: impl IntoIterator<Item = String>,
+    ) -> (String, mpsc::Receiver<Vec<String>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let responses = responses.into_iter().collect::<Vec<_>>();
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::with_capacity(responses.len());
+            for body in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                requests.push(read_http_request(&mut stream));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+            requests_tx.send(requests).expect("send requests");
+        });
+        (base_url, requests_rx, server)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let bytes_read = stream.read(&mut buffer).expect("read request");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(request).expect("utf8 request")
     }
 }

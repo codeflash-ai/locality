@@ -3,6 +3,7 @@ pub mod connector;
 pub mod docs_dto;
 pub mod drive_dto;
 pub mod oauth;
+pub mod portable;
 pub mod render;
 
 pub use connector::{GoogleDocsConfig, GoogleDocsConnector, extract_google_drive_folder_id};
