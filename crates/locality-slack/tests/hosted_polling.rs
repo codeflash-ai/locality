@@ -3,18 +3,16 @@ use locality_protocol::{
 };
 use locality_slack::portable::hosted::{
     HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3, HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
-    HostedSlackHistoryMessageV1, HostedSlackHistoryPageV1, HostedSlackHistoryPageV2,
-    HostedSlackPageApplyOutcomeV1, HostedSlackPollCheckpointV1, HostedSlackPollError,
-    HostedSlackPollEvidenceV1, HostedSlackPollKindV1, HostedSlackPollKindV2,
+    HostedSlackConversationKindV1, HostedSlackHistoryMessageV1, HostedSlackHistoryPageV1,
+    HostedSlackHistoryPageV2, HostedSlackPageApplyOutcomeV1, HostedSlackPollCheckpointV1,
+    HostedSlackPollError, HostedSlackPollEvidenceV1, HostedSlackPollKindV1, HostedSlackPollKindV2,
     HostedSlackPollOutputV1, HostedSlackPollPhaseV1, HostedSlackRepliesPageV1,
     HostedSlackRepliesPageV2, MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1,
-    HostedSlackConversationKindV1, MAX_HOSTED_SLACK_CURSOR_BYTES_V1,
-    MAX_HOSTED_SLACK_POLL_PAGE_BYTES_V1,
+    MAX_HOSTED_SLACK_CURSOR_BYTES_V1, MAX_HOSTED_SLACK_POLL_PAGE_BYTES_V1,
     MAX_HOSTED_SLACK_POLL_PAGE_MESSAGES_V1, RawHostedSlackMessage, RawHostedSlackNativeSnapshot,
     decode_hosted_slack_history_page_v1, decode_hosted_slack_poll_checkpoint_v1,
     decode_hosted_slack_poll_checkpoint_v2, decode_hosted_slack_poll_checkpoint_v3,
-    decode_hosted_slack_poll_checkpoint_v4,
-    decode_hosted_slack_replies_page_v1,
+    decode_hosted_slack_poll_checkpoint_v4, decode_hosted_slack_replies_page_v1,
 };
 use serde::Serialize;
 
