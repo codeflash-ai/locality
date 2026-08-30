@@ -2112,14 +2112,19 @@ impl HostedSlackDiscoveryProviderPort for HttpHostedSlackProvider {
                     HostedSlackProviderOperationV1::ConversationsList,
                 )
                 .await?;
-            let channels = response
+            let mut channels = Vec::new();
+            for channel in response
                 .channels
                 .ok_or(HostedSlackProviderError::InvalidResponse("channels"))?
-                .into_iter()
-                .map(|channel| {
-                    provider_discovered_channel(channel, &self.credential_identity.team_id)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            {
+                match provider_discovered_channel(channel, &self.credential_identity.team_id) {
+                    Ok(channel) => channels.push(channel),
+                    Err(HostedSlackProviderError::Unsupported(
+                        "Slack Connect channel identity in V1",
+                    )) => {}
+                    Err(error) => return Err(error),
+                }
+            }
             if channels.len() > HOSTED_SLACK_DISCOVERY_PAGE_LIMIT_V1 as usize {
                 return Err(HostedSlackProviderError::LimitExceeded(
                     "discovery page channels",
@@ -4265,24 +4270,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_and_readiness_reject_slack_connect_without_composite_identity() {
+    async fn discovery_skips_slack_connect_and_readiness_rejects_it_without_composite_identity() {
         let (base_url, _requests, server) = spawn_stub_server(vec![StubResponse {
             status: "200 OK",
             headers: Vec::new(),
             body: DISCOVERY_SLACK_CONNECT,
         }]);
         let provider = test_provider(base_url);
-        assert_eq!(
-            provider
-                .conversations_list(HostedSlackChannelDiscoveryRequestV1 {
-                    cursor: None,
-                    limit: HOSTED_SLACK_DISCOVERY_PAGE_LIMIT_V1,
-                })
-                .await,
-            Err(HostedSlackProviderError::Unsupported(
-                "Slack Connect channel identity in V1"
-            ))
-        );
+        let discovery = provider
+            .conversations_list(HostedSlackChannelDiscoveryRequestV1 {
+                cursor: None,
+                limit: HOSTED_SLACK_DISCOVERY_PAGE_LIMIT_V1,
+            })
+            .await
+            .expect("Slack Connect channels are excluded from discovery");
+        assert!(discovery.channels.is_empty());
         server.join().unwrap();
 
         let mut channel = indexed_discovered_channel(1);
