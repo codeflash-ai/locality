@@ -3425,8 +3425,7 @@ impl RuntimeState {
                 .deferred_hydration
                 .iter()
                 .take(DEBUG_QUEUE_ITEM_LIMIT)
-                .map(|deferred| deferred.request.clone())
-                .map(debug_hydration_item)
+                .map(debug_deferred_hydration_item)
                 .collect(),
         });
 
@@ -3755,6 +3754,15 @@ fn debug_hydration_item(request: HydrationRequest) -> DaemonDebugQueueItem {
         priority: Some(hydration_priority_label(hydration_priority(&request.reason)).to_string()),
         next_eligible_at: None,
     }
+}
+
+fn debug_deferred_hydration_item(deferred: &DeferredHydration) -> DaemonDebugQueueItem {
+    let mut item = debug_hydration_item(deferred.request.clone());
+    let delay = deferred.retry_at.saturating_duration_since(Instant::now());
+    let retry_at_unix_ms =
+        unix_time_ms().saturating_add(delay.as_millis().try_into().unwrap_or(u64::MAX));
+    item.next_eligible_at = Some(format!("unix_ms:{retry_at_unix_ms}"));
+    item
 }
 
 fn debug_freshness_item(debug: crate::freshness::FreshnessQueueDebugJob) -> DaemonDebugQueueItem {
@@ -4393,7 +4401,11 @@ pub fn workspace_virtual_freshness_jobs<S>(
     tick: &PullSchedulerTick,
 ) -> locality_core::LocalityResult<Vec<SyncJob>>
 where
-    S: AutoSaveRepository + EntityRepository + FreshnessStateRepository + MountLiveModeRepository,
+    S: AutoSaveRepository
+        + EntityRepository
+        + FreshnessStateRepository
+        + HydrationJobRepository
+        + MountLiveModeRepository,
 {
     if tick.is_idle() {
         return Ok(Vec::new());
@@ -4402,6 +4414,8 @@ where
     let mut candidates = Vec::new();
     let now_ms = freshness_unix_ms();
     let policy = FreshnessOptimizationPolicy::default();
+    let eager_hydration_backlog =
+        eager_hydration_backlog_mounts(store, mounts).map_err(LocalityError::from)?;
     let live_mode_enabled_by_mount = store
         .list_mount_live_modes()
         .map_err(LocalityError::from)?
@@ -4461,6 +4475,11 @@ where
             }
 
             let reason = workspace_freshness_reason(&entity, &freshness, selected_by_active_tick);
+            if reason == ChangeHintKind::BackgroundPoll
+                && eager_hydration_backlog.contains(&entity.mount_id)
+            {
+                continue;
+            }
             let tier = workspace_freshness_tier(
                 &entity,
                 &optimized.tier,
@@ -4498,6 +4517,34 @@ where
             )
             .with_tier(candidate.tier)
         })
+        .collect())
+}
+
+fn eager_hydration_backlog_mounts<S>(
+    store: &S,
+    mounts: &[MountConfig],
+) -> locality_store::StoreResult<BTreeSet<MountId>>
+where
+    S: HydrationJobRepository,
+{
+    let eager_mounts = mounts
+        .iter()
+        .filter(|mount| is_workspace_virtual_mount(mount))
+        .filter(|mount| {
+            source_descriptor(&mount.connector).background_hydration_policy()
+                == BackgroundHydrationPolicy::Eager
+        })
+        .map(|mount| mount.mount_id.clone())
+        .collect::<BTreeSet<_>>();
+    if eager_mounts.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    Ok(store
+        .list_hydration_jobs()?
+        .into_iter()
+        .filter(|job| eager_mounts.contains(&job.mount_id))
+        .map(|job| job.mount_id)
         .collect())
 }
 
@@ -6706,6 +6753,19 @@ mod tests {
         assert_eq!(
             runtime.next_hydration_retry,
             Some(runtime.deferred_hydration[0].retry_at)
+        );
+        let debug = runtime.debug_queue_status();
+        let deferred_section = debug
+            .sections
+            .iter()
+            .find(|section| section.name == "deferred_hydrations")
+            .expect("deferred hydration section");
+        assert_eq!(deferred_section.total, 1);
+        assert!(
+            deferred_section.items[0]
+                .next_eligible_at
+                .as_deref()
+                .is_some_and(|value| value.starts_with("unix_ms:"))
         );
         let jobs = SqliteStateStore::open(state_root.clone())
             .expect("reopen store")
