@@ -25,10 +25,9 @@ files and push the reviewed changes back into Notion.
 Onboarding also installs local agent guidance for detected agents such as Claude
 Code, Codex, Warp, Cursor-compatible tools, Gemini CLI, and Cline/Roo. See
 [agent-guidance.md](agent-guidance.md) for install targets and fallback
-behavior. The same installer also configures the local authenticated MCP
-fallback for supported agents and refreshes periodically while Locality is running,
-so agents installed after Locality can still discover the fallback without another
-setup flow.
+behavior. The same installer also configures the local MCP fallback for supported
+agents. Codex and Claude Desktop use the local `loc mcp` stdio transport; clients
+that require the daemon-hosted HTTP transport receive its per-install credential.
 
 ## Product Principles
 

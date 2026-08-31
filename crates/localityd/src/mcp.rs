@@ -53,11 +53,18 @@ pub struct McpServerConfig {
 }
 
 impl McpServerConfig {
-    pub fn discover(state_root: &Path) -> Result<Self, String> {
+    pub fn discover_http(state_root: &Path) -> Result<Self, String> {
         Ok(Self {
             loc_bin: discover_loc_binary(),
             token: ensure_mcp_token(state_root)?,
         })
+    }
+
+    pub fn discover_stdio() -> Self {
+        Self {
+            loc_bin: discover_loc_binary(),
+            token: String::new(),
+        }
     }
 
     #[cfg(test)]

@@ -130,7 +130,7 @@ fn load_mounts(config: &DaemonConfig) -> LocalityResult<Vec<MountConfig>> {
 fn start_mcp_listener(config: &DaemonConfig) {
     if let Some(addr) = config.mcp_addr {
         match TcpListener::bind(addr) {
-            Ok(listener) => match crate::mcp::McpServerConfig::discover(&config.state_root) {
+            Ok(listener) => match crate::mcp::McpServerConfig::discover_http(&config.state_root) {
                 Ok(mcp_config) => {
                     println!("localityd MCP listening on http://{addr}/mcp");
                     thread::spawn(move || crate::mcp::serve_http(listener, mcp_config));
