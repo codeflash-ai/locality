@@ -2280,7 +2280,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "loc-cli"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "chrono",
  "clap",
@@ -2310,7 +2310,7 @@ dependencies = [
 
 [[package]]
 name = "locality-auth-core"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -2318,7 +2318,7 @@ dependencies = [
 
 [[package]]
 name = "locality-cloud-files"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "locality-connector"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "jsonschema",
  "locality-core",
@@ -2345,7 +2345,7 @@ dependencies = [
 
 [[package]]
 name = "locality-core"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "caseless",
  "serde",
@@ -2357,7 +2357,7 @@ dependencies = [
 
 [[package]]
 name = "locality-desktop"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "libc",
  "loc-cli",
@@ -2385,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "locality-engine"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "locality-connector",
  "locality-core",
@@ -2394,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "locality-fuse"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "locality-gmail"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "base64 0.22.1",
  "locality-auth-core",
@@ -2426,7 +2426,7 @@ dependencies = [
 
 [[package]]
 name = "locality-google-calendar"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "chrono",
  "locality-auth-core",
@@ -2441,7 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "locality-google-docs"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "locality-auth-core",
  "locality-connector",
@@ -2454,7 +2454,7 @@ dependencies = [
 
 [[package]]
 name = "locality-granola"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "chrono",
  "locality-connector",
@@ -2467,7 +2467,7 @@ dependencies = [
 
 [[package]]
 name = "locality-linear"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "chrono",
  "locality-connector",
@@ -2481,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "locality-notion"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -2501,7 +2501,7 @@ dependencies = [
 
 [[package]]
 name = "locality-platform"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "libc",
  "locality-store",
@@ -2511,7 +2511,7 @@ dependencies = [
 
 [[package]]
 name = "locality-protocol"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "caseless",
  "locality-core",
@@ -2523,7 +2523,7 @@ dependencies = [
 
 [[package]]
 name = "locality-slack"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "chrono",
  "locality-auth-core",
@@ -2540,7 +2540,7 @@ dependencies = [
 
 [[package]]
 name = "locality-store"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "caseless",
  "fs2",
@@ -2556,7 +2556,7 @@ dependencies = [
 
 [[package]]
 name = "locality-telemetry"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "getrandom 0.3.4",
  "reqwest",
@@ -2568,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "localityd"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "base64 0.22.1",
  "cap-std",
