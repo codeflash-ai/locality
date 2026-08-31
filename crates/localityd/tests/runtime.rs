@@ -1069,6 +1069,68 @@ fn workspace_virtual_mount_does_not_queue_stub_or_virtual_pages() {
 }
 
 #[test]
+fn eager_hydration_backlog_suppresses_only_background_poll_freshness() {
+    let mount_id = MountId::new("slack-main");
+    let mount = MountConfig::new(
+        mount_id.clone(),
+        "slack",
+        temp_root("workspace-slack-prefetch-backlog"),
+    )
+    .projection(ProjectionMode::MacosFileProvider);
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save Slack mount");
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "slack-recent:hydrated",
+        "recent",
+        "channels/hydrated/recent.md",
+        HydrationState::Hydrated,
+    );
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "slack-recent:dirty",
+        "recent",
+        "channels/dirty/recent.md",
+        HydrationState::Dirty,
+    );
+    store
+        .upsert_hydration_job(HydrationJobRecord::from(HydrationRequest::new(
+            mount_id.clone(),
+            RemoteId::new("slack-recent:pending"),
+            "channels/pending/recent.md",
+            HydrationState::Hydrated,
+            HydrationReason::Prefetch,
+        )))
+        .expect("save hydration backlog");
+
+    let jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: true,
+        },
+    )
+    .expect("workspace freshness jobs");
+
+    assert!(
+        !jobs
+            .iter()
+            .any(|job| job.remote_id == Some(RemoteId::new("slack-recent:hydrated"))),
+        "cold background polls should not compete with eager hydration backlog"
+    );
+    assert!(
+        jobs.iter().any(|job| {
+            job.remote_id == Some(RemoteId::new("slack-recent:dirty"))
+                && job.reason == ChangeHintKind::LocalEdited
+        }),
+        "foreground correctness work must still run"
+    );
+}
+
+#[test]
 fn root_page_virtual_mount_is_not_queued_by_workspace_freshness_path() {
     let mount_id = MountId::new("notion-main");
     let mount = workspace_virtual_mount(&mount_id, "root-page-virtual")
