@@ -89,18 +89,27 @@ Open **Sources** and select an available provider. The connection buttons shown 
 
 The selection step depends on the provider:
 
-- For **Notion**, select pages or databases as top-level roots. You can select up to 16 roots, and child pages beneath them are included. If a shared root is not discovered, paste its Notion URL or ID.
+- For **Notion**, select the shared roots offered by your organization. The connector also supports an all-shared scope, which Locality Cloud is rolling out separately; until enabled, explicit root identifiers and the 16-root limit still apply.
+- For **Linear**, paste a personal API key created at [Linear API settings](https://linear.app/settings/api). The key is validated server-side and is never stored in browser storage or returned by the API.
 - For **Slack**, select the channels to include. Slack appears only in environments where hosted Slack is enabled.
 - Future providers can use their own content picker while keeping the same Data Grant and Workspace Profile flow described below.
 
 Finish the provider-specific setup and wait for the source to become **Ready** before creating access rules.
 
+Organizations with durable hydration enabled see the detailed discovery,
+hydration, publishing, and retry phases below. Other organizations see the
+existing **Ingesting** state while the same staged rollout is pending.
+
 | Source status | Meaning | What to do |
 | --- | --- | --- |
 | **Setup required** | Authorization succeeded, but content still needs to be selected | Finish the setup shown on the source card |
-| **Ingesting** | Locality is discovering, validating, or importing content | Keep the page open or return later and refresh |
+| **Ingesting** | Locality is importing the selected source | Return later and refresh the source status |
+| **Discovering content** | Locality is finding provider objects in the selected scope | Return later; discovery continues without the page open |
+| **Hydrating X / Y** | Locality is durably importing bounded pages | Progress survives worker restarts and lease changes |
+| **Publishing** | The complete durable scope is becoming the ready snapshot | Wait for **Ready** before creating dependent access |
+| **Retrying at _time_** | A transient provider or worker failure will retry automatically | No action is required unless retries are exhausted |
 | **Ready** | A usable snapshot is available | Continue to **Access** |
-| **Needs attention** | Setup, authorization, or freshness needs review | Read **Action required**, review setup, then refresh the status |
+| **Needs attention** | Automatic retries are exhausted or setup/authorization needs review | Read the safe reason, copy the diagnostic ID for support, then select **Retry** after fixing the cause |
 
 Each source card is an independent connection. Connect the same provider again only when you intentionally need separate authorization or a separate content boundary.
 
@@ -207,6 +216,10 @@ To refresh an existing generation-2 replica, run the same command with the exact
 Developers only see **Team** because that page contains everything they need for their assigned access. Owners and Admins see the organization-wide pages.
 
 ## Common questions
+
+### What is a diagnostic ID?
+
+It identifies one source operation without exposing provider content or credentials. Owners and Admins can copy it from **Operations** or a source card when asking support for help. Include the ID, source name, and approximate time; never include a provider API key.
 
 ### Why is Create key unavailable?
 

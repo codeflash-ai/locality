@@ -101,20 +101,53 @@ pub struct PortableEnumerateResult {
     pub next_cursor: Option<String>,
 }
 
-/// One explicit provider scope for portable bootstrap and synchronization.
+/// Selection mode for portable bootstrap and synchronization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortableSourceScopeMode {
+    /// The connector follows every item currently shared with the integration.
+    AllShared,
+    /// The connector is restricted to an explicit set of provider roots.
+    #[default]
+    RestrictedRoots,
+}
+
+impl PortableSourceScopeMode {
+    fn is_restricted_roots(&self) -> bool {
+        *self == Self::RestrictedRoots
+    }
+}
+
+/// Provider scope for portable bootstrap and synchronization.
 ///
-/// Roots are provider identities, not titles or projected paths. An empty root
-/// list is invalid for connectors, such as Notion, whose provider inventory API
-/// cannot prove exhaustive coverage.
+/// Roots are provider identities, not titles or projected paths. They are
+/// present only for the advanced `restricted_roots` mode. Existing serialized
+/// scopes remain restricted-root scopes because the mode defaults and is
+/// omitted for that legacy-compatible representation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortableSourceScope {
+    #[serde(
+        default,
+        skip_serializing_if = "PortableSourceScopeMode::is_restricted_roots"
+    )]
+    pub mode: PortableSourceScopeMode,
+    #[serde(default)]
     pub root_remote_ids: Vec<RemoteId>,
 }
 
 impl PortableSourceScope {
     pub fn explicit_roots(root_remote_ids: impl IntoIterator<Item = RemoteId>) -> Self {
         Self {
+            mode: PortableSourceScopeMode::RestrictedRoots,
             root_remote_ids: root_remote_ids.into_iter().collect(),
+        }
+    }
+
+    /// Select every item shared with the provider integration.
+    pub fn all_shared() -> Self {
+        Self {
+            mode: PortableSourceScopeMode::AllShared,
+            root_remote_ids: Vec::new(),
         }
     }
 }
@@ -350,7 +383,9 @@ impl PortableChangeBatchV2 {
                     "portable sync v2 batch contains duplicate covered root remote IDs".to_string(),
                 ));
             }
-            if !requested.contains(root_remote_id) {
+            if scope.mode == PortableSourceScopeMode::RestrictedRoots
+                && !requested.contains(root_remote_id)
+            {
                 return Err(locality_core::LocalityError::InvalidState(
                     "portable sync v2 batch covers a root outside the requested scope".to_string(),
                 ));
@@ -506,7 +541,9 @@ impl PortableSyncRequestV2 {
                 )
             })?;
             validate_portable_sync_v2_id(root_remote_id.as_str(), "owning root remote ID")?;
-            if !scope_roots.contains(root_remote_id) {
+            if self.scope.mode == PortableSourceScopeMode::RestrictedRoots
+                && !scope_roots.contains(root_remote_id)
+            {
                 return Err(locality_core::LocalityError::InvalidState(
                     "portable sync v2 hint owning root is outside the request scope".to_string(),
                 ));
@@ -545,10 +582,18 @@ fn validate_portable_sync_v2_id(value: &str, label: &str) -> LocalityResult<()> 
 fn validate_portable_sync_v2_scope(
     scope: &PortableSourceScope,
 ) -> LocalityResult<BTreeSet<&RemoteId>> {
-    if scope.root_remote_ids.is_empty() {
-        return Err(locality_core::LocalityError::InvalidState(
-            "portable sync v2 scope must contain at least one root".to_string(),
-        ));
+    match scope.mode {
+        PortableSourceScopeMode::AllShared if !scope.root_remote_ids.is_empty() => {
+            return Err(locality_core::LocalityError::InvalidState(
+                "portable all-shared scope must not contain explicit roots".to_string(),
+            ));
+        }
+        PortableSourceScopeMode::RestrictedRoots if scope.root_remote_ids.is_empty() => {
+            return Err(locality_core::LocalityError::InvalidState(
+                "portable sync v2 scope must contain at least one root".to_string(),
+            ));
+        }
+        PortableSourceScopeMode::AllShared | PortableSourceScopeMode::RestrictedRoots => {}
     }
     if scope.root_remote_ids.len() > PORTABLE_SYNC_V2_MAX_SCOPE_ROOTS {
         return Err(locality_core::LocalityError::InvalidState(format!(

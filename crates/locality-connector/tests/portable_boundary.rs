@@ -9,8 +9,8 @@ use locality_connector::{
     PORTABLE_SYNC_V2_MAX_SOURCE_KIND_BYTES, ParsedEntity, PortableBatchAuthority,
     PortableBootstrapRequest, PortableChangeBatch, PortableChangeBatchV2, PortableCheckpoint,
     PortableCompleteness, PortableEnumerateRequest, PortableFetchReason, PortableFetchRequest,
-    PortableSourceChange, PortableSourceScope, PortableSyncHint, PortableSyncHintV2,
-    PortableSyncMode, PortableSyncRequest, PortableSyncRequestV2,
+    PortableSourceChange, PortableSourceScope, PortableSourceScopeMode, PortableSyncHint,
+    PortableSyncHintV2, PortableSyncMode, PortableSyncRequest, PortableSyncRequestV2,
 };
 use locality_core::LocalityResult;
 use locality_core::model::{CanonicalDocument, EntityKind, TreeEntry};
@@ -202,6 +202,27 @@ fn legacy_portable_sync_wire_shape_remains_unchanged() {
             .expect("legacy portable batch JSON")
             .get("authority")
             .is_none()
+    );
+}
+
+#[test]
+fn portable_scope_supports_all_shared_without_changing_legacy_explicit_root_json() {
+    let all_shared = PortableSourceScope::all_shared();
+    assert_eq!(all_shared.mode, PortableSourceScopeMode::AllShared);
+    assert!(all_shared.root_remote_ids.is_empty());
+    assert_eq!(
+        serde_json::to_value(&all_shared).expect("all-shared scope JSON"),
+        json!({ "mode": "all_shared", "root_remote_ids": [] })
+    );
+
+    let legacy: PortableSourceScope = serde_json::from_value(json!({
+        "root_remote_ids": ["root-1"]
+    }))
+    .expect("legacy restricted-root scope");
+    assert_eq!(legacy.mode, PortableSourceScopeMode::RestrictedRoots);
+    assert_eq!(
+        serde_json::to_value(&legacy).expect("legacy scope JSON"),
+        json!({ "root_remote_ids": ["root-1"] })
     );
 }
 

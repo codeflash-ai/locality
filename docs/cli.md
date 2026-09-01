@@ -81,7 +81,7 @@ multiple environment-only credentials remain usage errors.
 
 For a remote Amika environment, the repository helper creates a fresh sandbox,
 checks out the current repository revision for scenario evidence, downloads the
-versioned Locality `v0.3.7` Linux package, verifies its pinned SHA-256, extracts
+current compatible Locality Linux package, verifies its release SHA-256, extracts
 the released `loc` binary without installing desktop dependencies, and streams
 a reusable Workspace Profile key from the Admin UI to `loc sandbox init` over
 standard input. After
@@ -132,6 +132,8 @@ printf '%s\n' "$LOCALITY_PROFILE_KEY" | \
 ```
 
 Revoke the temporary Workspace Profile key in Admin after testing.
+For the supported customer workflow, see the public [Amika integration
+guide](../docs-site/integrations/amika.mdx).
 An existing generation-2 root is owned by the exact Profile key bytes used to
 create it. Creating a new key for the same Workspace Profile does not authorize
 refresh of that old root. After revocation, use a fresh sandbox and materialize

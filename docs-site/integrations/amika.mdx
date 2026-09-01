@@ -1,0 +1,67 @@
+---
+title: "Use Locality Cloud with Amika"
+description: "Materialize an approved Locality workspace in an Amika sandbox without exposing your sandbox key."
+---
+
+This is a customer usage example. It does not imply a formal partnership or
+endorsement between Locality and Amika.
+
+## Before you begin
+
+An Owner or Admin completes the Locality Cloud flow:
+
+```text
+Source → Data Grant → Workspace Profile → assignment → sandbox key
+```
+
+Wait until every source used by the Workspace Profile is **Ready**. If a source
+is retrying or needs attention, resolve it from **Sources** or **Operations**
+before starting the sandbox.
+
+## Create the sandbox key
+
+Open **Team** (or **Access** if you are an Admin), choose the assigned Workspace
+Profile, and select **Create key**. Keep **Copy key** as your immediate next
+action: Locality shows the plaintext once and stores only its hash.
+
+Never place the key in a URL, command argument, source file, browser storage, or
+log. Read it through a hidden terminal prompt:
+
+```bash
+printf 'Paste your Locality sandbox key: ' >&2
+read -rs LOCALITY_PROFILE_KEY
+printf '\n' >&2
+```
+
+## Materialize in Amika
+
+Create a fresh Amika sandbox, connect to it, and install the current `loc`
+release for the sandbox platform. Then stream the key to `loc` over standard
+input:
+
+```bash
+printf '%s\n' "$LOCALITY_PROFILE_KEY" | \
+  loc sandbox init \
+    --api-url https://api.dev.locality.dev \
+    --root "$HOME/locality-snapshot" \
+    --profile-key-stdin
+unset LOCALITY_PROFILE_KEY
+```
+
+Point the agent at `$HOME/locality-snapshot` and ask it to read the generated
+guidance before working. The mounted snapshot is read-only and includes only
+the folders and actions approved by the Data Grants in the profile.
+
+## Troubleshooting
+
+- **Source is not ready:** wait for hydration and publishing to finish. If it
+  needs attention, retry after correcting the safe failure reason.
+- **Freshness requirement failed:** the profile requires a newer snapshot than
+  Locality could publish in time. Check the source operation and retry.
+- **Key was lost after creation:** do not repeat an uncertain create request.
+  Return to the profile; Locality recovers an ambiguous successful response by
+  its idempotency key. If the plaintext can no longer be recovered, revoke it
+  and create a replacement for a new sandbox root.
+- **Support is needed:** copy the source's diagnostic ID. It contains no
+  provider payload or credential and lets an operator correlate API, worker,
+  and database events.

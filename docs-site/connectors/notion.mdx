@@ -5,6 +5,17 @@ description: "How Notion pages, databases, blocks, media, and properties map int
 
 The Notion connector mounts content shared with the Locality integration.
 
+The connector contract supports **All content shared with Locality** as well as
+an explicit **restricted roots** scope. The hosted all-shared rollout is staged;
+until it is enabled for an organization, Locality Cloud continues to ask for
+explicit roots and applies the 16-root limit.
+
+The connector emits bounded change pages and resumable checkpoints. When the
+hosted durable-hydration rollout is enabled, the UI reports **Discovering
+content**, **Hydrating X / Y**, **Publishing**, and **Ready**. If automatic
+retries are exhausted, **Needs attention** includes a safe reason, manual
+**Retry**, and a diagnostic ID suitable for support.
+
 ## Connect
 
 ```bash
