@@ -2,8 +2,10 @@
 //!
 //! The wrapper implements [`Connector`] so the ordinary engine projection
 //! pipeline can use it, while inventory pagination and every fetch/render call
-//! share one private [`InitialHydrationBudget`]. Its continuation checkpoints
-//! are deliberately meaningful only to this live value.
+//! share one private [`InitialHydrationBudget`]. Continuation checkpoints are
+//! durable, redacted, and bound to the source connection, scope, and inventory
+//! so another worker lease can resume the job without replaying committed
+//! pages.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard};
@@ -28,14 +30,13 @@ use serde::{Deserialize, Serialize};
 use crate::NotionConnector;
 use crate::portable::{self, CanonicalRootSet};
 
-const SESSION_CHECKPOINT_FORMAT_VERSION: u16 = 4;
-const SESSION_CHECKPOINT_COMPONENT_VERSION: u16 = 1;
+const SESSION_CHECKPOINT_FORMAT_VERSION: u16 = 5;
+const SESSION_CHECKPOINT_COMPONENT_VERSION: u16 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EphemeralCheckpoint {
+struct DurableCheckpoint {
     component_version: u16,
-    session_nonce: String,
     source_connection_identity_sha256: String,
     canonical_root_set_sha256: String,
     inventory_sha256: String,
@@ -71,15 +72,15 @@ struct ExpectedFetchRef<'a> {
 
 /// Connector-compatible facade for exactly one initial-hydration job.
 ///
-/// Do not persist this value or its nonterminal checkpoints. Dropping it loses
-/// the random nonce and therefore invalidates every outstanding continuation.
+/// Hosts persist each nonterminal checkpoint after they durably commit its
+/// page. A replacement session can resume from that checkpoint after a worker
+/// timeout, lease loss, or transient provider failure.
 pub struct NotionInitialHydrationSession {
     connector: NotionConnector,
     budget: InitialHydrationBudget,
     source_connection_identity_sha256: String,
     roots: CanonicalRootSet,
     page_size: u32,
-    session_nonce: String,
     state: Mutex<SessionState>,
 }
 
@@ -103,18 +104,19 @@ impl NotionInitialHydrationSession {
         if page_size == 0 || !valid_sha256_identity(&source_connection_identity_sha256) {
             return Err(InitialHydrationError::ProviderResponseInvalid);
         }
-        let roots = portable::canonical_root_set(&connector.explicit_root_page_ids)
-            .map_err(InitialHydrationError::from_connector_error)?;
+        let roots = if connector.explicit_root_page_ids.is_empty() {
+            portable::all_shared_root_set()
+        } else {
+            portable::canonical_root_set(&connector.explicit_root_page_ids)
+                .map_err(InitialHydrationError::from_connector_error)?
+        };
         let budget = InitialHydrationBudget::new(limits)?;
-        let mut nonce = [0_u8; 32];
-        getrandom::fill(&mut nonce).map_err(|_| InitialHydrationError::ProviderUnavailable)?;
         Ok(Self {
             connector,
             budget,
             source_connection_identity_sha256,
             roots,
             page_size,
-            session_nonce: hex_lower(&nonce),
             state: Mutex::new(SessionState::default()),
         })
     }
@@ -142,30 +144,47 @@ impl NotionInitialHydrationSession {
                 "initial hydration session is no longer active",
             ));
         }
-        portable::validate_explicit_roots(
-            &self.connector.explicit_root_page_ids,
-            &request.scope.root_remote_ids,
-        )?;
+        match request.scope.mode {
+            locality_connector::PortableSourceScopeMode::RestrictedRoots => {
+                portable::validate_explicit_roots(
+                    &self.connector.explicit_root_page_ids,
+                    &request.scope.root_remote_ids,
+                )?;
+            }
+            locality_connector::PortableSourceScopeMode::AllShared => {
+                portable::validate_all_shared_scope(
+                    &self.connector.explicit_root_page_ids,
+                    &request.scope.root_remote_ids,
+                )?;
+            }
+        }
         if request.max_changes == 0 {
             return Err(session_error("initial hydration page size must be nonzero"));
         }
 
         if state.source_connection_id.is_none() {
-            if request.checkpoint.is_some() {
-                return Err(session_error(
-                    "fresh initial hydration session accepts no checkpoint",
-                ));
-            }
             self.preflight_change_page(request.max_changes)?;
             state.source_connection_id = Some(request.source_connection_id.clone());
-            let inventory = portable::inventory_bounded(
-                self.connector.api.as_ref(),
-                &request.source_connection_id,
-                &self.roots.roots,
-                self.connector.explicit_root_set,
-                &self.budget,
-            )
-            .map_err(hydration_error)?;
+            let inventory = match request.scope.mode {
+                locality_connector::PortableSourceScopeMode::RestrictedRoots => {
+                    portable::inventory_bounded(
+                        self.connector.api.as_ref(),
+                        &request.source_connection_id,
+                        &self.roots.roots,
+                        self.connector.explicit_root_set,
+                        &self.budget,
+                    )
+                    .map_err(hydration_error)?
+                }
+                locality_connector::PortableSourceScopeMode::AllShared => {
+                    portable::shared_inventory_bounded(
+                        self.connector.api.as_ref(),
+                        &request.source_connection_id,
+                        &self.budget,
+                    )
+                    .map_err(hydration_error)?
+                }
+            };
             let inventory_retained_bytes =
                 crate::hydration::encoded_len(&inventory).map_err(hydration_error)?;
             state.inventory_sha256 = Some(portable::inventory_sha256(
@@ -174,6 +193,9 @@ impl NotionInitialHydrationSession {
             ));
             state.inventory_retained_bytes = inventory_retained_bytes;
             state.inventory = inventory;
+            if let Some(checkpoint) = request.checkpoint.as_ref() {
+                state.next_index = self.validate_durable_checkpoint(state, checkpoint)?;
+            }
         } else {
             if state.source_connection_id.as_ref() != Some(&request.source_connection_id) {
                 return Err(session_error("initial hydration source connection changed"));
@@ -219,9 +241,8 @@ impl NotionInitialHydrationSession {
                 self.connector.explicit_root_set,
             )?
         } else {
-            encode_ephemeral_checkpoint(&EphemeralCheckpoint {
+            encode_durable_checkpoint(&DurableCheckpoint {
                 component_version: SESSION_CHECKPOINT_COMPONENT_VERSION,
-                session_nonce: self.session_nonce.clone(),
                 source_connection_identity_sha256: self.source_connection_identity_sha256.clone(),
                 canonical_root_set_sha256: self.roots.identity.clone(),
                 inventory_sha256: inventory_sha256.clone(),
@@ -301,12 +322,11 @@ impl NotionInitialHydrationSession {
                 "initial hydration checkpoint is replayed, skipped, or out of order",
             ));
         }
-        let decoded: EphemeralCheckpoint = serde_json::from_str(&supplied.opaque)
+        let decoded: DurableCheckpoint = serde_json::from_str(&supplied.opaque)
             .map_err(|_| session_error("initial hydration checkpoint is invalid"))?;
         let expected_index = u64::try_from(state.next_index)
             .map_err(|_| session_error("initial hydration index is too large"))?;
         if decoded.component_version != SESSION_CHECKPOINT_COMPONENT_VERSION
-            || decoded.session_nonce != self.session_nonce
             || decoded.source_connection_identity_sha256 != self.source_connection_identity_sha256
             || decoded.canonical_root_set_sha256 != self.roots.identity
             || decoded.inventory_sha256 != state.inventory_sha256.as_deref().unwrap_or_default()
@@ -317,6 +337,34 @@ impl NotionInitialHydrationSession {
             ));
         }
         Ok(())
+    }
+
+    fn validate_durable_checkpoint(
+        &self,
+        state: &SessionState,
+        supplied: &PortableCheckpoint,
+    ) -> LocalityResult<usize> {
+        if supplied.format_version != SESSION_CHECKPOINT_FORMAT_VERSION {
+            return Err(session_error(
+                "initial hydration resume checkpoint format is unsupported",
+            ));
+        }
+        let decoded: DurableCheckpoint = serde_json::from_str(&supplied.opaque)
+            .map_err(|_| session_error("initial hydration checkpoint is invalid"))?;
+        let next_index = usize::try_from(decoded.next_index)
+            .map_err(|_| session_error("initial hydration index is too large"))?;
+        if decoded.component_version != SESSION_CHECKPOINT_COMPONENT_VERSION
+            || decoded.source_connection_identity_sha256 != self.source_connection_identity_sha256
+            || decoded.canonical_root_set_sha256 != self.roots.identity
+            || decoded.inventory_sha256 != state.inventory_sha256.as_deref().unwrap_or_default()
+            || next_index == 0
+            || next_index >= state.inventory.len()
+        {
+            return Err(session_error(
+                "initial hydration checkpoint does not belong to this source, scope, and inventory",
+            ));
+        }
+        Ok(next_index)
     }
 
     fn fetch_once(&self, request: PortableFetchRequest) -> LocalityResult<PortableFetchResult> {
@@ -546,9 +594,7 @@ fn inventory_completeness(
     completeness
 }
 
-fn encode_ephemeral_checkpoint(
-    checkpoint: &EphemeralCheckpoint,
-) -> LocalityResult<PortableCheckpoint> {
+fn encode_durable_checkpoint(checkpoint: &DurableCheckpoint) -> LocalityResult<PortableCheckpoint> {
     let opaque = serde_json::to_string(checkpoint)
         .map_err(|_| session_error("initial hydration checkpoint encode failed"))?;
     Ok(PortableCheckpoint {
@@ -563,16 +609,6 @@ fn valid_sha256_identity(value: &str) -> bool {
         && value["sha256:".len()..]
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
 }
 
 fn hydration_error(error: InitialHydrationError) -> LocalityError {

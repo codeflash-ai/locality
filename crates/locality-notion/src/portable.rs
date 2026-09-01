@@ -1,8 +1,8 @@
-//! Portable explicit-root Notion synchronization.
+//! Portable Notion synchronization for all-shared and explicit-root scopes.
 //!
-//! The provider search endpoint is intentionally absent from this module. A
-//! search result is not an exhaustive Notion inventory, so portable coverage is
-//! available only for configured page or full-page database roots.
+//! Restricted scopes use configured page or full-page database roots.
+//! All-shared scopes begin at the complete integration-visible provider
+//! inventory and include every reachable shared page and database.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -12,8 +12,8 @@ use locality_connector::{
     PortableBootstrapRequest, PortableChangeBatch, PortableChangeBatchV2, PortableCheckpoint,
     PortableCompleteness, PortableContentArtifact, PortableFetchRequest, PortableFetchResult,
     PortableIncompleteReason, PortableProjectionArtifact, PortableRenderRequest,
-    PortableRenderResult, PortableSourceChange, PortableSyncHintV2, PortableSyncMode,
-    PortableSyncRequest, PortableSyncRequestV2,
+    PortableRenderResult, PortableSourceChange, PortableSourceScopeMode, PortableSyncHintV2,
+    PortableSyncMode, PortableSyncRequest, PortableSyncRequestV2,
 };
 use locality_core::canonical::render_canonical_markdown;
 use locality_core::model::{EntityKind, MountId, RemoteId};
@@ -43,7 +43,7 @@ use crate::media::{
     validate_portable_external_media_url,
 };
 use crate::projection::{ExplicitRootTreeEntry, enumerate_explicit_root_trees_bounded};
-use crate::projection::{database_title, enumerate_explicit_root_trees};
+use crate::projection::{database_title, enumerate_explicit_root_trees, enumerate_shared_pages};
 use crate::render::{
     RenderOptions, page_title, render_native_entity, render_native_entity_with_options,
 };
@@ -131,14 +131,25 @@ pub(crate) fn bootstrap(
     explicit_root_set: bool,
     request: PortableBootstrapRequest,
 ) -> LocalityResult<PortableChangeBatch> {
-    let roots = validate_explicit_roots(configured_roots, &request.scope.root_remote_ids)?;
-    let inventory = inventory(
-        api,
-        &request.source_connection_id,
-        &roots.roots,
-        explicit_root_set,
-    )?;
-    let digest = inventory_sha256(&inventory, explicit_root_set);
+    let (roots, inventory, include_root_provenance) = match request.scope.mode {
+        PortableSourceScopeMode::RestrictedRoots => {
+            let roots = validate_explicit_roots(configured_roots, &request.scope.root_remote_ids)?;
+            let inventory = inventory(
+                api,
+                &request.source_connection_id,
+                &roots.roots,
+                explicit_root_set,
+            )?;
+            (roots, inventory, explicit_root_set)
+        }
+        PortableSourceScopeMode::AllShared => {
+            validate_all_shared_scope(configured_roots, &request.scope.root_remote_ids)?;
+            let roots = all_shared_root_set();
+            let inventory = shared_inventory(api, &request.source_connection_id)?;
+            (roots, inventory, false)
+        }
+    };
+    let digest = inventory_sha256(&inventory, include_root_provenance);
     let offset = match request.checkpoint.as_ref() {
         Some(checkpoint) => {
             let checkpoint = decode_checkpoint(checkpoint)?;
@@ -147,7 +158,7 @@ pub(crate) fn bootstrap(
                 CheckpointOperation::Bootstrap,
                 &roots,
                 Some(&digest),
-                explicit_root_set,
+                request.scope.mode == PortableSourceScopeMode::AllShared || explicit_root_set,
             )?;
             usize::try_from(checkpoint_offset(&checkpoint)).map_err(|_| {
                 LocalityError::InvalidState(
@@ -165,7 +176,7 @@ pub(crate) fn bootstrap(
         CheckpointOperation::Bootstrap,
         offset,
         request.max_changes,
-        explicit_root_set,
+        request.scope.mode == PortableSourceScopeMode::AllShared || explicit_root_set,
     )
 }
 
@@ -175,21 +186,32 @@ pub(crate) fn synchronize(
     explicit_root_set: bool,
     request: PortableSyncRequest,
 ) -> LocalityResult<PortableChangeBatch> {
-    let roots = validate_explicit_roots(configured_roots, &request.scope.root_remote_ids)?;
-    let inventory = inventory(
-        api,
-        &request.source_connection_id,
-        &roots.roots,
-        explicit_root_set,
-    )?;
-    let digest = inventory_sha256(&inventory, explicit_root_set);
+    let (roots, inventory, include_root_provenance) = match request.scope.mode {
+        PortableSourceScopeMode::RestrictedRoots => {
+            let roots = validate_explicit_roots(configured_roots, &request.scope.root_remote_ids)?;
+            let inventory = inventory(
+                api,
+                &request.source_connection_id,
+                &roots.roots,
+                explicit_root_set,
+            )?;
+            (roots, inventory, explicit_root_set)
+        }
+        PortableSourceScopeMode::AllShared => {
+            validate_all_shared_scope(configured_roots, &request.scope.root_remote_ids)?;
+            let roots = all_shared_root_set();
+            let inventory = shared_inventory(api, &request.source_connection_id)?;
+            (roots, inventory, false)
+        }
+    };
+    let digest = inventory_sha256(&inventory, include_root_provenance);
     let prior = decode_checkpoint(&request.checkpoint)?;
     validate_checkpoint(
         &prior,
         checkpoint_operation(&prior),
         &roots,
         None,
-        explicit_root_set,
+        request.scope.mode == PortableSourceScopeMode::AllShared || explicit_root_set,
     )?;
 
     let offset = if checkpoint_operation(&prior) == CheckpointOperation::Synchronize
@@ -220,7 +242,7 @@ pub(crate) fn synchronize(
         CheckpointOperation::Synchronize,
         offset,
         request.max_changes,
-        explicit_root_set,
+        request.scope.mode == PortableSourceScopeMode::AllShared || explicit_root_set,
     )
 }
 
@@ -242,7 +264,11 @@ pub(crate) fn synchronize_v2_hints(
         )));
     }
 
-    let roots = validate_sync_v2_roots(configured_roots, &request.scope.root_remote_ids)?;
+    let roots = validate_sync_v2_roots(
+        configured_roots,
+        &request.scope.root_remote_ids,
+        request.scope.mode,
+    )?;
     let mut canonical_hint_ids = BTreeSet::new();
     for hint in &request.hints {
         let canonical = normalize_notion_id(hint.remote_id.as_str());
@@ -313,7 +339,16 @@ pub(crate) fn synchronize_v2_hints(
 fn validate_sync_v2_roots(
     configured_roots: &[RemoteId],
     requested_roots: &[RemoteId],
+    mode: PortableSourceScopeMode,
 ) -> LocalityResult<SyncV2RootSet> {
+    if mode == PortableSourceScopeMode::AllShared {
+        validate_all_shared_scope(configured_roots, requested_roots)?;
+        return Ok(SyncV2RootSet {
+            exact_ids: Vec::new(),
+            canonical_ids: Vec::new(),
+            exact_by_canonical: BTreeMap::new(),
+        });
+    }
     if configured_roots.is_empty() {
         return Err(LocalityError::Unsupported(
             "Notion portable synchronization requires a configured explicit root set",
@@ -2816,6 +2851,26 @@ pub(crate) fn validate_explicit_roots(
     Ok(configured)
 }
 
+pub(crate) fn validate_all_shared_scope(
+    configured_roots: &[RemoteId],
+    requested_roots: &[RemoteId],
+) -> LocalityResult<()> {
+    if !configured_roots.is_empty() || !requested_roots.is_empty() {
+        return Err(LocalityError::InvalidState(
+            "Notion all-shared scope cannot be combined with explicit roots".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn all_shared_root_set() -> CanonicalRootSet {
+    CanonicalRootSet {
+        roots: Vec::new(),
+        normalized_ids: Vec::new(),
+        identity: canonical_root_identity(&[]),
+    }
+}
+
 pub(crate) fn canonical_root_set(roots: &[RemoteId]) -> LocalityResult<CanonicalRootSet> {
     if roots.is_empty() {
         return Err(LocalityError::InvalidState(
@@ -2867,6 +2922,21 @@ fn inventory(
     changes_from_inventory_entries(entries, source_connection_id, include_root_provenance)
 }
 
+fn shared_inventory(
+    api: &dyn NotionApi,
+    source_connection_id: &locality_core::portable::SourceConnectionId,
+) -> LocalityResult<Vec<PortableSourceChange>> {
+    let entries = enumerate_shared_pages(api, MountId::new("portable-notion"))?;
+    let projected = entries
+        .into_iter()
+        .map(|entry| ExplicitRootTreeEntry {
+            scope_root_remote_id: entry.remote_id.clone(),
+            entry,
+        })
+        .collect();
+    changes_from_inventory_entries(projected, source_connection_id, false)
+}
+
 pub(crate) fn inventory_bounded(
     api: &dyn NotionApi,
     source_connection_id: &locality_core::portable::SourceConnectionId,
@@ -2890,6 +2960,35 @@ pub(crate) fn inventory_bounded(
             .map_err(
                 locality_connector::hydration_budget::InitialHydrationError::from_connector_error,
             )?;
+    let retained_change_bytes = crate::hydration::encoded_len(&changes)?;
+    budget.replace_retained_bytes(retained_entry_bytes, retained_change_bytes)?;
+    Ok(changes)
+}
+
+pub(crate) fn shared_inventory_bounded(
+    api: &dyn NotionApi,
+    source_connection_id: &locality_core::portable::SourceConnectionId,
+    budget: &locality_connector::hydration_budget::InitialHydrationBudget,
+) -> locality_connector::hydration_budget::InitialHydrationResult<Vec<PortableSourceChange>> {
+    budget.check_deadline()?;
+    let entries = enumerate_shared_pages(api, MountId::new("portable-notion")).map_err(
+        locality_connector::hydration_budget::InitialHydrationError::from_connector_error,
+    )?;
+    let projected = entries
+        .into_iter()
+        .map(|entry| ExplicitRootTreeEntry {
+            scope_root_remote_id: entry.remote_id.clone(),
+            entry,
+        })
+        .collect::<Vec<_>>();
+    let retained_entry_bytes = crate::hydration::encoded_len(
+        &projected.iter().map(|item| &item.entry).collect::<Vec<_>>(),
+    )?;
+    budget.account_inventory(projected.len(), retained_entry_bytes)?;
+    budget.account_retained_bytes(retained_entry_bytes)?;
+    let changes = changes_from_inventory_entries(projected, source_connection_id, false).map_err(
+        locality_connector::hydration_budget::InitialHydrationError::from_connector_error,
+    )?;
     let retained_change_bytes = crate::hydration::encoded_len(&changes)?;
     budget.replace_retained_bytes(retained_entry_bytes, retained_change_bytes)?;
     Ok(changes)

@@ -8,6 +8,11 @@ team and workflow status.
 
 ## Connect
 
+Create a personal API key at [Linear API settings](https://linear.app/settings/api).
+Use a personal API key with access to the teams you want Locality to ingest;
+do not paste an OAuth client secret. Locality never stores the plaintext key in
+browser storage or writes it to logs.
+
 Create the default Linear API key connection:
 
 ```bash
@@ -16,6 +21,11 @@ printf '%s' "$LINEAR_API_KEY" | loc connect linear --api-key-stdin
 
 The default connection id is `linear-default`. OAuth is not advertised until
 Locality has a Linear OAuth broker flow.
+
+Connection failures are intentionally distinct: an invalid key asks you to
+replace it, insufficient permissions asks you to change the key's access,
+rate limiting reports when retry is safe, and temporary provider failures are
+retried automatically.
 
 ## Mount
 

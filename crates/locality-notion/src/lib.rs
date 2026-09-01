@@ -225,10 +225,10 @@ impl NotionConnector {
     }
 
     /// Start one fail-closed initial-hydration job over this connector's
-    /// configured explicit roots.
+    /// configured explicit roots or all content shared with the integration.
     ///
     /// `source_connection_identity_sha256` is produced by the trusted caller
-    /// and is the only connection identity serialized into ephemeral progress
+    /// and is the only connection identity serialized into durable progress
     /// checkpoints. The returned wrapper privately owns the shared budget used
     /// by enumeration, native fetch, hosted media, render, and projection.
     pub fn initial_hydration_session(

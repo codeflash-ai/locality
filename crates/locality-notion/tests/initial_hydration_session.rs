@@ -633,7 +633,7 @@ fn overlapping_database_and_selected_row_are_disjoint_bounded_scopes() {
 }
 
 #[test]
-fn checkpoints_are_session_bound_ordered_redacted_and_rejected_by_base_connector() {
+fn checkpoints_are_durable_ordered_redacted_and_rejected_by_base_connector() {
     let api = Arc::new(FixtureApi::new(&[CHILD_1, CHILD_2]));
     let connector = connector(api);
     let session = connector
@@ -642,7 +642,7 @@ fn checkpoints_are_session_bound_ordered_redacted_and_rejected_by_base_connector
     let first = session
         .bootstrap_portable(request(None, 10, "connection"))
         .expect("first page");
-    assert_eq!(first.next_checkpoint.format_version, 4);
+    assert_eq!(first.next_checkpoint.format_version, 5);
     let checkpoint_json: serde_json::Value =
         serde_json::from_str(&first.next_checkpoint.opaque).expect("checkpoint JSON");
     assert_eq!(
@@ -657,7 +657,6 @@ fn checkpoints_are_session_bound_ordered_redacted_and_rejected_by_base_connector
             "component_version",
             "inventory_sha256",
             "next_index",
-            "session_nonce",
             "source_connection_identity_sha256",
         ]
     );
@@ -670,18 +669,19 @@ fn checkpoints_are_session_bound_ordered_redacted_and_rejected_by_base_connector
             10,
             "connection",
         ))
-        .expect_err("ephemeral checkpoint must fail through base connector");
+        .expect_err("session checkpoint must fail through base connector");
 
     let other = connector
         .initial_hydration_session(CONNECTION_HASH, 1, limits(10_000))
         .expect("other session");
-    other
+    let resumed = other
         .bootstrap_portable(request(
             Some(first.next_checkpoint.clone()),
             10,
             "connection",
         ))
-        .expect_err("fresh and cross-session checkpoint");
+        .expect("fresh session resumes a durable checkpoint");
+    assert_eq!(resumed.changes.len(), 1);
 
     let second = session
         .bootstrap_portable(request(
@@ -847,7 +847,7 @@ fn bounded_media_keeps_checkpoint_and_projected_outputs_redacted() {
 }
 
 #[test]
-fn failure_restart_gets_a_new_nonce_and_limits_publish_no_checkpoint() {
+fn failure_restart_rebuilds_the_same_durable_checkpoint_and_limits_publish_no_checkpoint() {
     let api = Arc::new(FixtureApi::new(&[CHILD_1, CHILD_2]));
     let connector = connector(api.clone());
     let first_session = connector
@@ -866,7 +866,7 @@ fn failure_restart_gets_a_new_nonce_and_limits_publish_no_checkpoint() {
     let restarted_first = restarted
         .bootstrap_portable(request(None, 10, "connection"))
         .expect("restarted first");
-    assert_ne!(first.next_checkpoint, restarted_first.next_checkpoint);
+    assert_eq!(first.next_checkpoint, restarted_first.next_checkpoint);
     assert_eq!(api.call_count("bounded:page:"), 6);
 
     let mut tight = limits(10_000);
@@ -914,7 +914,7 @@ fn inventory_version_change_fails_before_render_or_terminal_checkpoint() {
     let first = session
         .bootstrap_portable(request(None, 10, "connection"))
         .expect("inventory page");
-    assert_eq!(first.next_checkpoint.format_version, 4);
+    assert_eq!(first.next_checkpoint.format_version, 5);
     let change = first.changes.first().expect("emitted change");
     api.mutate_page_version(
         change.source_object.remote_id.as_str(),

@@ -2078,6 +2078,47 @@ fn portable_bootstrap_resumes_and_completes_database_coverage() {
 }
 
 #[test]
+fn portable_all_shared_bootstrap_needs_no_explicit_roots_and_resumes() {
+    let connector = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(FixtureNotionApi::tree("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+    );
+    let scope = PortableSourceScope::all_shared();
+    let first = connector
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-all-shared"),
+            scope: scope.clone(),
+            checkpoint: None,
+            max_changes: 2,
+        })
+        .expect("first all-shared page");
+    assert_eq!(first.changes.len(), 2);
+    assert!(!first.completeness.is_complete());
+
+    let second = connector
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-all-shared"),
+            scope,
+            checkpoint: Some(first.next_checkpoint),
+            max_changes: 10,
+        })
+        .expect("resumed all-shared page");
+    assert!(!second.changes.is_empty());
+    assert!(second.completeness.is_complete());
+
+    let mixed_scope = connector.bootstrap_portable(PortableBootstrapRequest {
+        source_connection_id: SourceConnectionId::new("source-all-shared"),
+        scope: locality_connector::PortableSourceScope {
+            mode: locality_connector::PortableSourceScopeMode::AllShared,
+            root_remote_ids: vec![RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+        },
+        checkpoint: None,
+        max_changes: 10,
+    });
+    assert!(mixed_scope.is_err());
+}
+
+#[test]
 fn portable_bootstrap_requires_the_configured_explicit_root_without_search_fallback() {
     let root_page_id = RemoteId::new("page-1");
     let connector = NotionConnector::with_api(
