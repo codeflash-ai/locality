@@ -242,6 +242,11 @@ test-launch-readiness-wrappers: ## Validate launch-readiness wrapper defaults.
 	tests/launch_readiness_amika_split_wrapper.sh
 	tests/launch_readiness_aws_wrapper.sh
 	tests/init_amika_locality_snapshot.sh
+	tests/amika_standup_summary.sh
+
+.PHONY: test-amika-standup-summary
+test-amika-standup-summary: ## Validate the Amika standup summary runner.
+	tests/amika_standup_summary.sh
 
 .PHONY: test-init-amika-locality-snapshot
 test-init-amika-locality-snapshot: ## Validate secure Amika snapshot initialization and interruption cleanup.
