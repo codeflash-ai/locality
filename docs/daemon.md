@@ -104,9 +104,9 @@ agent sandboxes that cannot run the host `loc` binary directly; agents that can
 run `loc` should keep using the CLI. URL-based clients use the daemon HTTP
 endpoint with a per-install bearer token stored at `LOCALITY_STATE_DIR/mcp-token` or
 `~/.loc/mcp-token`; the desktop agent installer writes that token into supported
-local agent MCP config files. Claude Desktop is configured differently: it
-launches `loc mcp` and communicates over stdio because Claude Desktop's local
-MCP config expects a command-shaped local server. The endpoint does not do work
+local agent MCP config files. Codex and Claude Desktop are configured differently:
+they launch `loc mcp` and communicate over stdio, avoiding a duplicated HTTP
+credential in their local configuration. The endpoint does not do work
 while idle; the listener thread blocks on accept and only spawns the host `loc`
 binary for actual MCP tool calls. To avoid exposing this host bridge to
 arbitrary browser origins, requests with an `Origin` header are accepted only

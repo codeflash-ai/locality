@@ -59,13 +59,14 @@ CLI contract:
 ```
 
 This bridge is intended as a fallback, not the preferred path. Agents that can
-run `loc` directly should keep using the CLI. Claude Desktop is configured as a
-local stdio MCP server by launching `loc mcp`. Other supported local agents that
-accept URL-based MCP configs use the daemon-hosted HTTP endpoint, which requires
-a per-install capability token stored under the Locality state root and copied into
-their MCP configs by the desktop installer. Set `LOCALITY_MCP_ADDR=off` before
-starting `localityd` to disable the daemon-hosted MCP endpoint, or set
-`LOCALITY_MCP_ADDR=<host:port>` to move it.
+run `loc` directly should keep using the CLI. Codex and Claude Desktop are
+configured as local stdio MCP servers by launching `loc mcp`, so their MCP
+startup does not depend on the daemon's HTTP capability token. Other supported
+local agents that accept URL-based MCP configs use the daemon-hosted HTTP
+endpoint, which requires a per-install capability token stored under the
+Locality state root and copied into their MCP configs by the desktop installer.
+Set `LOCALITY_MCP_ADDR=off` before starting `localityd` to disable the
+daemon-hosted MCP endpoint, or set `LOCALITY_MCP_ADDR=<host:port>` to move it.
 
 On Windows, the desktop installer detects both the current MSIX Claude Desktop
 package and the legacy per-user EXE install before writing the config path that

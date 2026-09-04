@@ -1987,13 +1987,7 @@ fn print_sandbox_init_report(report: &SandboxInitReport) {
 }
 
 fn mcp() -> i32 {
-    let config = match localityd::mcp::McpServerConfig::discover(&default_state_root()) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("loc mcp: {error}");
-            return EXIT_INTERNAL;
-        }
-    };
+    let config = localityd::mcp::McpServerConfig::discover_stdio();
     match localityd::mcp::serve_stdio(config) {
         Ok(()) => EXIT_SUCCESS,
         Err(error) => {

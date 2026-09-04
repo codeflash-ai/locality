@@ -359,7 +359,7 @@ fn skill_path(home: &Path, skills_root: &str) -> PathBuf {
 fn install_mcp_target(spec: &McpTargetSpec, token: &str) -> AgentGuidanceTarget {
     let result = match spec.kind {
         McpInstallKind::ClaudeDesktopJson => install_claude_desktop_mcp_config(&spec.path),
-        McpInstallKind::CodexToml => install_codex_mcp_config(&spec.path, token),
+        McpInstallKind::CodexToml => install_codex_mcp_config(&spec.path),
         McpInstallKind::McpServersJson => install_mcp_servers_json_config(&spec.path, token),
         McpInstallKind::CopilotServersJson => {
             install_copilot_servers_json_config(&spec.path, token)
@@ -576,15 +576,21 @@ fn remove_codex_mcp_config(path: &Path) -> Result<&'static str, String> {
     Ok("removed")
 }
 
-fn install_codex_mcp_config(path: &Path, token: &str) -> Result<&'static str, String> {
+fn install_codex_mcp_config(path: &Path) -> Result<&'static str, String> {
     let existing = fs::read_to_string(path).unwrap_or_default();
     let stripped = remove_toml_table(&existing, "mcp_servers.loc");
-    let block = format!(
-        "[mcp_servers.{MCP_SERVER_NAME}]\nurl = \"{}\"\nhttp_headers = {{ Authorization = \"Bearer {token}\" }}\n",
-        mcp_endpoint()
-    );
+    let block = codex_mcp_server_toml(&loc_cli_command(), &default_state_root());
     let next = append_toml_block(&stripped, &block);
     write_private_if_changed(path, &next)
+}
+
+fn codex_mcp_server_toml(command: &str, state_root: &Path) -> String {
+    let command = serde_json::to_string(command).expect("string serialization cannot fail");
+    let state_root = serde_json::to_string(&state_root.display().to_string())
+        .expect("string serialization cannot fail");
+    format!(
+        "[mcp_servers.{MCP_SERVER_NAME}]\ncommand = {command}\nargs = [\"mcp\"]\n\n[mcp_servers.{MCP_SERVER_NAME}.env]\nLOCALITY_STATE_DIR = {state_root}\n"
+    )
 }
 
 fn remove_toml_table(contents: &str, table: &str) -> String {
@@ -1414,24 +1420,39 @@ mod tests {
     }
 
     #[test]
-    fn codex_mcp_config_replaces_existing_loc_table() {
+    fn codex_mcp_config_uses_stdio_and_replaces_authenticated_http_table() {
         let temp = temp_root("loc-agent-guidance-codex-mcp");
         let config = temp.join("config.toml");
         fs::write(
             &config,
-            "model = \"gpt\"\n\n[mcp_servers.loc]\nurl = \"old\"\n\n[mcp_servers.other]\nurl = \"keep\"\n",
+            "model = \"gpt\"\n\n[mcp_servers.loc]\nurl = \"old\"\n\n[mcp_servers.loc.http_headers]\nAuthorization = \"Bearer stale-token\"\n\n[mcp_servers.other]\nurl = \"keep\"\n",
         )
         .expect("write config");
 
-        install_codex_mcp_config(&config, "secret-token").expect("install config");
+        install_codex_mcp_config(&config).expect("install config");
         let contents = fs::read_to_string(&config).expect("read config");
 
         assert!(contents.contains("model = \"gpt\""));
         assert!(contents.contains("[mcp_servers.other]"));
         assert!(contents.contains("[mcp_servers.loc]"));
-        assert!(contents.contains("Authorization = \"Bearer secret-token\""));
+        assert!(contents.contains("command = "));
+        assert!(contents.contains("args = [\"mcp\"]"));
+        assert!(contents.contains("[mcp_servers.loc.env]"));
+        assert!(contents.contains("LOCALITY_STATE_DIR = "));
         assert!(!contents.contains("url = \"old\""));
+        assert!(!contents.contains("stale-token"));
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn codex_mcp_stdio_toml_is_canonical() {
+        assert_eq!(
+            codex_mcp_server_toml(
+                "/Applications/Locality.app/Contents/MacOS/loc",
+                Path::new("/Users/example/.loc"),
+            ),
+            "[mcp_servers.loc]\ncommand = \"/Applications/Locality.app/Contents/MacOS/loc\"\nargs = [\"mcp\"]\n\n[mcp_servers.loc.env]\nLOCALITY_STATE_DIR = \"/Users/example/.loc\"\n"
+        );
     }
 
     #[test]
