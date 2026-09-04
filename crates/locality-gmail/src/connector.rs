@@ -51,7 +51,7 @@ const SENT_FOLDER_ID: &str = "gmail-folder:sent";
 const DRAFT_FOLDER_ID: &str = "gmail-folder:draft";
 const OUTBOX_FOLDER_ID: &str = "gmail-folder:outbox";
 const GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID: &str = "gmail";
-const GMAIL_PORTABLE_CHECKPOINT_VERSION: u16 = 1;
+const GMAIL_PORTABLE_CHECKPOINT_VERSION: u16 = 3;
 const GMAIL_PORTABLE_NATIVE_KIND: &str = "gmail_portable_mail";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +60,28 @@ enum GmailPortableNativeBundle {
     Message(GmailNativeBundle),
     Thread(GmailThreadNativeBundle),
     ThreadMessage(GmailThreadMessageNativeBundle),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GmailPortableBootstrapPhase {
+    Inbox,
+    Sent,
+    Draft,
+    Complete,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GmailPortableCheckpointState {
+    scope_root: String,
+    source_connection_id: String,
+    phase: GmailPortableBootstrapPhase,
+    page_token: Option<String>,
+    #[serde(default)]
+    seen_page_tokens: Vec<String>,
+    after: Option<String>,
+    before: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -219,20 +241,28 @@ impl Connector for GmailConnector {
                 "Gmail portable bootstrap requires the gmail scope root",
             ));
         }
-        if request.checkpoint.is_some() {
-            return Err(LocalityError::Unsupported(
-                "Gmail portable bootstrap does not accept checkpoints",
-            ));
-        }
         if request.max_changes == 0 {
             return Err(LocalityError::InvalidState(
                 "Gmail portable bootstrap max_changes must be greater than 0".to_string(),
             ));
         }
+        let state = decode_gmail_portable_checkpoint(
+            request.checkpoint.as_ref(),
+            &self.config.settings,
+            &request.source_connection_id,
+        )?;
         if self.config.settings.gmail.view == GmailProjectionView::Threads {
             return Ok(PortableChangeBatch {
                 changes: Vec::new(),
-                next_checkpoint: gmail_portable_checkpoint(),
+                next_checkpoint: encode_gmail_portable_checkpoint(&GmailPortableCheckpointState {
+                    scope_root: GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID.to_string(),
+                    source_connection_id: request.source_connection_id.as_str().to_string(),
+                    phase: GmailPortableBootstrapPhase::Complete,
+                    page_token: None,
+                    seen_page_tokens: Vec::new(),
+                    after: None,
+                    before: None,
+                })?,
                 completeness: PortableCompleteness::incomplete(
                     PortableIncompleteReason::ConnectorLimitation {
                         code: "gmail_thread_view_portable_bootstrap_unsupported".to_string(),
@@ -242,60 +272,82 @@ impl Connector for GmailConnector {
             });
         }
 
+        let max_results = request.max_changes.min(GMAIL_PAGE_SIZE);
         let mount_id = MountId::new("gmail-portable");
-        let mut entries = Vec::new();
-        entries.extend(list_label_entries_exhaustive(
-            self.api.as_ref(),
-            &self.config.settings,
-            &mount_id,
-            "INBOX",
-            "inbox",
-            Path::new("inbox"),
+        let query = gmail_checkpoint_query(&state)?;
+        let (entries, next_page_token) = match state.phase {
+            GmailPortableBootstrapPhase::Inbox | GmailPortableBootstrapPhase::Sent => {
+                let (label_id, mailbox) = if state.phase == GmailPortableBootstrapPhase::Inbox {
+                    ("INBOX", "inbox")
+                } else {
+                    ("SENT", "sent")
+                };
+                let page = self.api.list_messages(
+                    label_id,
+                    max_results,
+                    state.page_token.as_deref(),
+                    query.as_deref(),
+                )?;
+                let entries = page
+                    .messages
+                    .into_iter()
+                    .map(|message_ref| {
+                        self.api
+                            .get_message_metadata(&message_ref.id)
+                            .map(|message| {
+                                portable_message_entry(
+                                    &mount_id,
+                                    Path::new(mailbox),
+                                    mailbox,
+                                    message,
+                                )
+                            })
+                    })
+                    .collect::<LocalityResult<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                (entries, page.next_page_token)
+            }
+            GmailPortableBootstrapPhase::Draft => {
+                let page = self.api.list_drafts(
+                    max_results,
+                    state.page_token.as_deref(),
+                    query.as_deref(),
+                )?;
+                let entries = page
+                    .drafts
+                    .into_iter()
+                    .map(|draft| {
+                        self.api.get_draft_full(&draft.id).and_then(|full| {
+                            draft_entry(&mount_id, Path::new("draft"), full.id, full.message)
+                        })
+                    })
+                    .collect::<LocalityResult<Vec<_>>>()?;
+                (entries, page.next_page_token)
+            }
+            GmailPortableBootstrapPhase::Complete => unreachable!("validated above"),
+        };
+        let changes = deduplicate_portable_changes_by_remote_id(portable_gmail_changes(
+            &request.source_connection_id,
+            entries,
         )?);
-        entries.extend(list_label_entries_exhaustive(
-            self.api.as_ref(),
-            &self.config.settings,
-            &mount_id,
-            "SENT",
-            "sent",
-            Path::new("sent"),
-        )?);
-        entries.extend(list_draft_entries_exhaustive(
-            self.api.as_ref(),
-            &self.config.settings,
-            &mount_id,
-            Path::new("draft"),
-        )?);
-        let mut changes = portable_gmail_changes(&request.source_connection_id, entries)?;
-        changes.sort_by(|left, right| {
-            left.logical_path
-                .as_ref()
-                .map(LogicalPath::as_str)
-                .cmp(&right.logical_path.as_ref().map(LogicalPath::as_str))
-                .then_with(|| {
-                    left.source_object
-                        .remote_id
-                        .cmp(&right.source_object.remote_id)
-                })
-        });
-        changes = deduplicate_portable_changes_by_remote_id(changes);
-
-        let complete = changes.len() <= request.max_changes as usize;
-        if !complete {
-            changes.truncate(request.max_changes as usize);
+        if changes.len() > request.max_changes as usize {
+            return Err(LocalityError::InvalidState(
+                "Gmail portable bootstrap provider page exceeded max_changes".to_string(),
+            ));
         }
+        let next_state = next_gmail_portable_checkpoint_state(state, next_page_token)?;
+        let complete = next_state.phase == GmailPortableBootstrapPhase::Complete;
         let completeness = if complete {
             PortableCompleteness::complete()
         } else {
-            PortableCompleteness::incomplete(PortableIncompleteReason::ConnectorLimitation {
-                code: "gmail_bootstrap_max_changes_exceeded".to_string(),
-                remote_id: Some(RemoteId::new(GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID)),
-            })
+            PortableCompleteness::incomplete(PortableIncompleteReason::CheckpointContinuation)
         };
 
         Ok(PortableChangeBatch {
             changes,
-            next_checkpoint: gmail_portable_checkpoint(),
+            next_checkpoint: encode_gmail_portable_checkpoint(&next_state)?,
             completeness,
         })
     }
@@ -956,12 +1008,143 @@ fn logical_path_from_tree_path(path: &Path) -> LocalityResult<LogicalPath> {
     })
 }
 
-fn gmail_portable_checkpoint() -> PortableCheckpoint {
-    PortableCheckpoint {
-        format_version: GMAIL_PORTABLE_CHECKPOINT_VERSION,
-        opaque: serde_json::json!({ "scope_root": GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID })
-            .to_string(),
+fn decode_gmail_portable_checkpoint(
+    checkpoint: Option<&PortableCheckpoint>,
+    settings: &GmailMountSettings,
+    source_connection_id: &SourceConnectionId,
+) -> LocalityResult<GmailPortableCheckpointState> {
+    let state = match checkpoint {
+        None => GmailPortableCheckpointState {
+            scope_root: GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID.to_string(),
+            source_connection_id: source_connection_id.as_str().to_string(),
+            phase: GmailPortableBootstrapPhase::Inbox,
+            page_token: None,
+            seen_page_tokens: Vec::new(),
+            after: settings
+                .gmail
+                .date_window
+                .as_ref()
+                .map(|window| window.after().as_str().to_string()),
+            before: settings
+                .gmail
+                .date_window
+                .as_ref()
+                .map(|window| window.before().as_str().to_string()),
+        },
+        Some(checkpoint) => {
+            if checkpoint.format_version != GMAIL_PORTABLE_CHECKPOINT_VERSION {
+                return Err(LocalityError::InvalidState(
+                    "Gmail portable bootstrap checkpoint format version is unsupported".to_string(),
+                ));
+            }
+            serde_json::from_str(&checkpoint.opaque).map_err(|error| {
+                LocalityError::InvalidState(format!(
+                    "Gmail portable bootstrap checkpoint is malformed: {error}"
+                ))
+            })?
+        }
+    };
+    if state.scope_root != GMAIL_PORTABLE_SCOPE_ROOT_REMOTE_ID {
+        return Err(LocalityError::InvalidState(
+            "Gmail portable bootstrap checkpoint scope does not match request".to_string(),
+        ));
     }
+    if state.source_connection_id != source_connection_id.as_str() {
+        return Err(LocalityError::InvalidState(
+            "Gmail portable bootstrap checkpoint source connection does not match request"
+                .to_string(),
+        ));
+    }
+    if state.phase == GmailPortableBootstrapPhase::Complete {
+        return Err(LocalityError::InvalidState(
+            "Gmail portable bootstrap checkpoint is already terminal".to_string(),
+        ));
+    }
+    if state.after.is_some() != state.before.is_some() {
+        return Err(LocalityError::InvalidState(
+            "Gmail portable bootstrap checkpoint date window is malformed".to_string(),
+        ));
+    }
+    if let (Some(after), Some(before)) = (&state.after, &state.before) {
+        crate::settings::GmailDateWindow::new(after, before).map_err(|error| {
+            LocalityError::InvalidState(format!(
+                "Gmail portable bootstrap checkpoint date window is malformed: {error}"
+            ))
+        })?;
+    }
+    let mut seen = BTreeSet::<String>::new();
+    for token in &state.seen_page_tokens {
+        if token.is_empty() || !seen.insert(token.clone()) {
+            return Err(LocalityError::InvalidState(
+                "Gmail portable bootstrap checkpoint contains repeated page token".to_string(),
+            ));
+        }
+    }
+    if state
+        .page_token
+        .as_deref()
+        .is_some_and(|token| token.is_empty() || seen.contains(token))
+    {
+        return Err(LocalityError::InvalidState(
+            "Gmail portable bootstrap checkpoint contains a repeated page token".to_string(),
+        ));
+    }
+    Ok(state)
+}
+
+fn gmail_checkpoint_query(state: &GmailPortableCheckpointState) -> LocalityResult<Option<String>> {
+    match (&state.after, &state.before) {
+        (None, None) => Ok(None),
+        (Some(after), Some(before)) => Ok(Some(
+            crate::settings::GmailDateWindow::new(after, before)?.query(),
+        )),
+        _ => Err(LocalityError::InvalidState(
+            "Gmail portable bootstrap checkpoint date window is malformed".to_string(),
+        )),
+    }
+}
+
+fn next_gmail_portable_checkpoint_state(
+    mut state: GmailPortableCheckpointState,
+    next_page_token: Option<String>,
+) -> LocalityResult<GmailPortableCheckpointState> {
+    if let Some(next) = next_page_token {
+        if next.is_empty()
+            || state.page_token.as_deref() == Some(next.as_str())
+            || state.seen_page_tokens.iter().any(|seen| seen == &next)
+        {
+            return Err(LocalityError::InvalidState(
+                "Gmail portable bootstrap provider pagination repeated page token".to_string(),
+            ));
+        }
+        if let Some(current) = state.page_token.take() {
+            state.seen_page_tokens.push(current);
+        }
+        state.page_token = Some(next);
+        return Ok(state);
+    }
+    state.phase = match state.phase {
+        GmailPortableBootstrapPhase::Inbox => GmailPortableBootstrapPhase::Sent,
+        GmailPortableBootstrapPhase::Sent => GmailPortableBootstrapPhase::Draft,
+        GmailPortableBootstrapPhase::Draft => GmailPortableBootstrapPhase::Complete,
+        GmailPortableBootstrapPhase::Complete => unreachable!("validated above"),
+    };
+    state.page_token = None;
+    state.seen_page_tokens.clear();
+    Ok(state)
+}
+
+fn encode_gmail_portable_checkpoint(
+    state: &GmailPortableCheckpointState,
+) -> LocalityResult<PortableCheckpoint> {
+    Ok(PortableCheckpoint {
+        format_version: GMAIL_PORTABLE_CHECKPOINT_VERSION,
+        opaque: serde_json::to_string(state).map_err(|error| {
+            LocalityError::Io(format!(
+                "Gmail portable bootstrap checkpoint encode failed: {error}"
+            ))
+        })?,
+    })
 }
 
 fn portable_bundle_from_native(
@@ -1389,24 +1572,6 @@ fn list_label_entries(
         .collect()
 }
 
-fn list_label_entries_exhaustive(
-    api: &dyn GmailApi,
-    settings: &GmailMountSettings,
-    mount_id: &MountId,
-    label_id: &str,
-    mailbox: &str,
-    parent_path: &Path,
-) -> LocalityResult<Vec<TreeEntry>> {
-    let messages = list_message_refs_exhaustive(api, settings, label_id)?;
-    messages
-        .into_iter()
-        .map(|message_ref| {
-            let message = api.get_message_metadata(&message_ref.id)?;
-            Ok(message_entry(mount_id, parent_path, mailbox, message))
-        })
-        .collect()
-}
-
 fn list_draft_entries(
     api: &dyn GmailApi,
     settings: &GmailMountSettings,
@@ -1423,34 +1588,6 @@ fn list_draft_entries(
     let mut seen_page_tokens = BTreeSet::new();
     loop {
         let list = api.list_drafts(GMAIL_PAGE_SIZE, page_token.as_deref(), Some(&query))?;
-        for draft in list.drafts {
-            entries.push(draft_ref_to_entry(api, mount_id, parent_path, draft)?);
-        }
-        let Some(next) = list.next_page_token else {
-            break;
-        };
-        if !seen_page_tokens.insert(next.clone()) {
-            return Err(LocalityError::InvalidState(format!(
-                "gmail pagination returned repeated page token `{next}` for drafts"
-            )));
-        }
-        page_token = Some(next);
-    }
-    Ok(entries)
-}
-
-fn list_draft_entries_exhaustive(
-    api: &dyn GmailApi,
-    settings: &GmailMountSettings,
-    mount_id: &MountId,
-    parent_path: &Path,
-) -> LocalityResult<Vec<TreeEntry>> {
-    let query = gmail_recent_query(settings);
-    let mut entries = Vec::new();
-    let mut page_token: Option<String> = None;
-    let mut seen_page_tokens = BTreeSet::new();
-    loop {
-        let list = api.list_drafts(GMAIL_PAGE_SIZE, page_token.as_deref(), query.as_deref())?;
         for draft in list.drafts {
             entries.push(draft_ref_to_entry(api, mount_id, parent_path, draft)?);
         }
@@ -1548,40 +1685,6 @@ fn list_message_refs(
     Ok(messages)
 }
 
-fn list_message_refs_exhaustive(
-    api: &dyn GmailApi,
-    settings: &GmailMountSettings,
-    label_id: &str,
-) -> LocalityResult<Vec<crate::dto::GmailMessageRef>> {
-    let query = settings
-        .gmail
-        .date_window
-        .as_ref()
-        .map(|window| window.query());
-    let mut page_token = None;
-    let mut seen_page_tokens = BTreeSet::new();
-    let mut messages = Vec::new();
-    loop {
-        let page = api.list_messages(
-            label_id,
-            GMAIL_PAGE_SIZE,
-            page_token.as_deref(),
-            query.as_deref(),
-        )?;
-        messages.extend(page.messages);
-        let Some(next) = page.next_page_token else {
-            break;
-        };
-        if !seen_page_tokens.insert(next.clone()) {
-            return Err(LocalityError::InvalidState(format!(
-                "gmail pagination returned repeated page token `{next}` for label `{label_id}`"
-            )));
-        }
-        page_token = Some(next);
-    }
-    Ok(messages)
-}
-
 fn gmail_recent_query(settings: &GmailMountSettings) -> Option<String> {
     settings
         .gmail
@@ -1655,6 +1758,23 @@ fn message_entry(
         remote_edited_at: Some(version),
         stub_frontmatter: Some(message_frontmatter(&bundle)),
     }
+}
+
+fn portable_message_entry(
+    mount_id: &MountId,
+    parent_path: &Path,
+    mailbox: &str,
+    message: GmailMessage,
+) -> Option<TreeEntry> {
+    let canonical_mailbox = if message.label_ids.iter().any(|label| label == "INBOX") {
+        "inbox"
+    } else if message.label_ids.iter().any(|label| label == "SENT") {
+        "sent"
+    } else {
+        mailbox
+    };
+    (canonical_mailbox == mailbox)
+        .then(|| message_entry(mount_id, parent_path, canonical_mailbox, message))
 }
 
 fn draft_entry(
@@ -2324,7 +2444,7 @@ mod tests {
     }
 
     #[test]
-    fn gmail_bootstrap_portable_lists_complete_mail_scope() {
+    fn gmail_bootstrap_portable_returns_inbox_page_before_continuation() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
 
@@ -2337,21 +2457,14 @@ mod tests {
             })
             .expect("portable bootstrap");
 
-        assert!(batch.completeness.is_complete());
+        assert!(!batch.completeness.is_complete());
         let mut remote_ids = batch
             .changes
             .iter()
             .map(|change| change.source_object.remote_id.as_str().to_string())
             .collect::<Vec<_>>();
         remote_ids.sort();
-        assert_eq!(
-            remote_ids,
-            vec![
-                "gmail-draft:draft-1".to_string(),
-                "inbox-msg-1".to_string(),
-                "sent-msg-1".to_string(),
-            ]
-        );
+        assert_eq!(remote_ids, vec!["inbox-msg-1".to_string()]);
         assert!(batch.changes.iter().all(|change| {
             change.source_object.kind == EntityKind::Page
                 && change.requires_fetch
@@ -2375,8 +2488,8 @@ mod tests {
         );
 
         let calls = api.calls.lock().expect("calls");
-        assert_eq!(calls.list_max_results, vec![100, 100]);
-        assert_eq!(calls.draft_list_max_results, vec![100]);
+        assert_eq!(calls.list_max_results, vec![100]);
+        assert!(calls.draft_list_max_results.is_empty());
     }
 
     #[test]
@@ -2414,9 +2527,9 @@ mod tests {
                 }),
                 max_changes: 100,
             })
-            .expect_err("checkpointed Gmail bootstrap must fail");
+            .expect_err("unknown checkpoint format must fail");
 
-        assert!(error.to_string().contains("does not accept checkpoints"));
+        assert!(error.to_string().contains("format version"));
         let calls = api.calls.lock().expect("calls");
         assert!(calls.list_max_results.is_empty());
         assert!(calls.draft_list_max_results.is_empty());
@@ -2447,7 +2560,7 @@ mod tests {
     }
 
     #[test]
-    fn gmail_bootstrap_portable_pages_all_message_and_draft_results() {
+    fn gmail_bootstrap_portable_returns_one_provider_page() {
         let api = Arc::new(FakeGmailApi::default());
         {
             let mut calls = api.calls.lock().expect("calls");
@@ -2536,72 +2649,200 @@ mod tests {
             })
             .expect("portable bootstrap");
 
-        assert!(batch.completeness.is_complete());
+        assert!(!batch.completeness.is_complete());
         let mut remote_ids = batch
             .changes
             .iter()
             .map(|change| change.source_object.remote_id.as_str().to_string())
             .collect::<Vec<_>>();
         remote_ids.sort();
-        assert_eq!(
-            remote_ids,
-            vec![
-                "gmail-draft:draft-1".to_string(),
-                "gmail-draft:draft-2".to_string(),
-                "inbox-msg-1".to_string(),
-                "inbox-msg-2".to_string(),
-                "sent-msg-1".to_string(),
-                "sent-msg-2".to_string(),
-            ]
-        );
+        assert_eq!(remote_ids, vec!["inbox-msg-1".to_string()]);
         let calls = api.calls.lock().expect("calls");
-        assert_eq!(
-            calls.list_page_tokens,
-            vec![
-                None,
-                Some("next-inbox".to_string()),
-                None,
-                Some("next-sent".to_string())
-            ]
+        assert_eq!(calls.list_page_tokens, vec![None]);
+        assert_eq!(calls.draft_list_page_tokens, Vec::<Option<String>>::new());
+    }
+
+    #[test]
+    fn gmail_bootstrap_portable_resumes_phases_with_frozen_date_window() {
+        let api = Arc::new(FakeGmailApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.paged_message_ids.insert(
+                ("INBOX".to_string(), None),
+                GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: "inbox-msg-1".to_string(),
+                        thread_id: Some("thread-inbox-1".to_string()),
+                    }],
+                    next_page_token: Some("inbox-page-2".to_string()),
+                    result_size_estimate: Some(2),
+                },
+            );
+            calls.paged_message_ids.insert(
+                ("INBOX".to_string(), Some("inbox-page-2".to_string())),
+                GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: "inbox-msg-2".to_string(),
+                        thread_id: Some("thread-inbox-2".to_string()),
+                    }],
+                    next_page_token: None,
+                    result_size_estimate: Some(2),
+                },
+            );
+        }
+        let settings =
+            GmailMountSettings::with_date_window("2026-07-01", "2026-07-15").expect("settings");
+        let connector = GmailConnector::with_api(
+            GmailConfig::new("token").with_settings(settings),
+            api.clone(),
         );
+        let request = |checkpoint| PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("gmail-connection"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("gmail")]),
+            checkpoint,
+            max_changes: 1,
+        };
+
+        let first = connector
+            .bootstrap_portable(request(None))
+            .expect("first portable page");
+        assert_eq!(first.changes.len(), 1);
+        assert!(!first.completeness.is_complete());
+
+        let changed_settings =
+            GmailMountSettings::with_date_window("2026-08-01", "2026-08-15").expect("settings");
+        let resumed_connector = GmailConnector::with_api(
+            GmailConfig::new("token").with_settings(changed_settings),
+            api.clone(),
+        );
+        let second = resumed_connector
+            .bootstrap_portable(request(Some(first.next_checkpoint)))
+            .expect("resumed portable page");
+        assert_eq!(second.changes.len(), 1);
+        assert!(!second.completeness.is_complete());
         assert_eq!(
-            calls.draft_list_page_tokens,
-            vec![None, Some("next-draft".to_string())]
+            api.calls.lock().expect("calls").list_queries,
+            vec![
+                "after:2026/07/01 before:2026/07/15".to_string(),
+                "after:2026/07/01 before:2026/07/15".to_string(),
+            ]
         );
     }
 
     #[test]
-    fn gmail_bootstrap_portable_marks_max_changes_truncation_incomplete() {
+    fn gmail_bootstrap_portable_rejects_malformed_and_cyclic_checkpoints_before_provider_work() {
         let api = Arc::new(FakeGmailApi::default());
-        let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let request = |opaque: &str| PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("gmail-connection"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("gmail")]),
+            checkpoint: Some(PortableCheckpoint {
+                format_version: 3,
+                opaque: opaque.to_string(),
+            }),
+            max_changes: 1,
+        };
+
+        let malformed = connector
+            .bootstrap_portable(request("not-json"))
+            .expect_err("malformed checkpoint must fail");
+        assert!(malformed.to_string().contains("checkpoint"));
+
+        let mismatched = connector
+            .bootstrap_portable(request(r#"{"scope_root":"other","source_connection_id":"gmail-connection","phase":"inbox","page_token":null,"seen_page_tokens":[],"after":null,"before":null}"#))
+            .expect_err("mismatched checkpoint scope must fail");
+        assert!(mismatched.to_string().contains("scope"));
+
+        let cyclic = connector
+            .bootstrap_portable(request(r#"{"scope_root":"gmail","source_connection_id":"gmail-connection","phase":"inbox","page_token":"again","seen_page_tokens":["again"],"after":null,"before":null}"#))
+            .expect_err("cyclic checkpoint must fail");
+        assert!(cyclic.to_string().contains("repeated"));
+        let terminal = connector
+            .bootstrap_portable(request(r#"{"scope_root":"gmail","source_connection_id":"gmail-connection","phase":"complete","page_token":null,"seen_page_tokens":[],"after":null,"before":null}"#))
+            .expect_err("repeated terminal checkpoint must fail");
+        assert!(terminal.to_string().contains("terminal"));
+        let calls = api.calls.lock().expect("calls");
+        assert!(calls.list_max_results.is_empty());
+        assert!(calls.draft_list_max_results.is_empty());
+    }
+
+    #[test]
+    fn gmail_bootstrap_portable_rejects_provider_page_token_cycle_on_resume() {
+        let api = Arc::new(FakeGmailApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.paged_message_ids.insert(
+                ("INBOX".to_string(), None),
+                GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: "inbox-msg-1".to_string(),
+                        thread_id: Some("thread-inbox-1".to_string()),
+                    }],
+                    next_page_token: Some("inbox-page-2".to_string()),
+                    result_size_estimate: Some(2),
+                },
+            );
+            calls.paged_message_ids.insert(
+                ("INBOX".to_string(), Some("inbox-page-2".to_string())),
+                GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: "inbox-msg-2".to_string(),
+                        thread_id: Some("thread-inbox-2".to_string()),
+                    }],
+                    next_page_token: Some("inbox-page-2".to_string()),
+                    result_size_estimate: Some(2),
+                },
+            );
+        }
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let request = |checkpoint| PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("gmail-connection"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("gmail")]),
+            checkpoint,
+            max_changes: 1,
+        };
+
+        let first = connector
+            .bootstrap_portable(request(None))
+            .expect("first portable page");
+        let error = connector
+            .bootstrap_portable(request(Some(first.next_checkpoint)))
+            .expect_err("repeated provider page token must fail");
+
+        assert!(error.to_string().contains("repeated page token"));
+        assert_eq!(
+            api.calls.lock().expect("calls").list_page_tokens,
+            vec![None, Some("inbox-page-2".to_string()),]
+        );
+    }
+
+    #[test]
+    fn gmail_bootstrap_portable_limits_provider_page_to_max_changes() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
 
         let batch = connector
             .bootstrap_portable(PortableBootstrapRequest {
                 source_connection_id: SourceConnectionId::new("gmail-connection"),
                 scope: PortableSourceScope::explicit_roots([RemoteId::new("gmail")]),
                 checkpoint: None,
-                max_changes: 2,
+                max_changes: 1,
             })
             .expect("portable bootstrap");
 
-        assert_eq!(batch.changes.len(), 2);
+        assert_eq!(batch.changes.len(), 1);
         assert!(!batch.completeness.is_complete());
         assert!(
             batch
                 .completeness
                 .incomplete_reasons()
-                .iter()
-                .any(|reason| matches!(
-                    reason,
-                    PortableIncompleteReason::ConnectorLimitation { code, remote_id }
-                        if code == "gmail_bootstrap_max_changes_exceeded"
-                            && remote_id.as_ref().is_some_and(|id| id == &RemoteId::new("gmail"))
-                ))
+                .contains(&PortableIncompleteReason::CheckpointContinuation)
         );
+        assert_eq!(api.calls.lock().expect("calls").list_max_results, vec![1]);
     }
 
     #[test]
-    fn gmail_bootstrap_portable_deduplicates_messages_seen_in_inbox_and_sent() {
+    fn gmail_bootstrap_portable_keeps_first_phase_path_for_shared_message() {
         let api = Arc::new(FakeGmailApi::default());
         {
             let mut calls = api.calls.lock().expect("calls");
@@ -2651,7 +2892,7 @@ mod tests {
             })
             .expect("portable bootstrap");
 
-        assert!(batch.completeness.is_complete());
+        assert!(!batch.completeness.is_complete());
         assert_eq!(batch.changes.len(), 1);
         assert_eq!(
             batch.changes[0].source_object.remote_id,
@@ -2665,6 +2906,83 @@ mod tests {
                 .as_str(),
             "inbox/1720900000000-hello-shared-msg.md"
         );
+    }
+
+    #[test]
+    fn gmail_bootstrap_portable_emits_shared_message_once_across_all_phases() {
+        let api = Arc::new(FakeGmailApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            for label in ["INBOX", "SENT"] {
+                calls.paged_message_ids.insert(
+                    (label.to_string(), None),
+                    GmailMessageList {
+                        messages: vec![GmailMessageRef {
+                            id: "shared-msg".to_string(),
+                            thread_id: Some("shared-thread".to_string()),
+                        }],
+                        next_page_token: None,
+                        result_size_estimate: Some(1),
+                    },
+                );
+            }
+            calls.paged_drafts.insert(
+                None,
+                GmailDraftList {
+                    drafts: Vec::new(),
+                    next_page_token: None,
+                    result_size_estimate: Some(0),
+                },
+            );
+            calls.message_labels.insert(
+                "shared-msg".to_string(),
+                vec!["INBOX".to_string(), "SENT".to_string()],
+            );
+        }
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
+        let request = |checkpoint, source_connection_id| PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new(source_connection_id),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("gmail")]),
+            checkpoint,
+            max_changes: 1,
+        };
+
+        let first = connector
+            .bootstrap_portable(request(None, "gmail-connection"))
+            .expect("inbox page");
+        let second = connector
+            .bootstrap_portable(request(Some(first.next_checkpoint), "gmail-connection"))
+            .expect("sent page");
+        let third = connector
+            .bootstrap_portable(request(Some(second.next_checkpoint), "gmail-connection"))
+            .expect("draft page");
+
+        assert_eq!(first.changes.len(), 1);
+        assert!(second.changes.is_empty());
+        assert!(third.changes.is_empty());
+        assert!(third.completeness.is_complete());
+    }
+
+    #[test]
+    fn gmail_bootstrap_portable_rejects_checkpoint_from_another_source() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let request = |checkpoint, source_connection_id| PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new(source_connection_id),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("gmail")]),
+            checkpoint,
+            max_changes: 1,
+        };
+
+        let first = connector
+            .bootstrap_portable(request(None, "gmail-a"))
+            .expect("first page");
+        let error = connector
+            .bootstrap_portable(request(Some(first.next_checkpoint), "gmail-b"))
+            .expect_err("cross-source checkpoint must fail");
+
+        assert!(error.to_string().contains("source connection"));
+        assert_eq!(api.calls.lock().expect("calls").list_max_results, vec![1]);
     }
 
     #[test]
@@ -2700,6 +3018,34 @@ mod tests {
                             && remote_id.as_ref().is_some_and(|id| id == &RemoteId::new("gmail"))
                 ))
         );
+        let calls = api.calls.lock().expect("calls");
+        assert!(calls.list_max_results.is_empty());
+        assert!(calls.draft_list_max_results.is_empty());
+    }
+
+    #[test]
+    fn gmail_bootstrap_portable_thread_view_rejects_malformed_checkpoint_without_provider_work() {
+        let api = Arc::new(FakeGmailApi::default());
+        let settings =
+            GmailMountSettings::default().with_view(crate::settings::GmailProjectionView::Threads);
+        let connector = GmailConnector::with_api(
+            GmailConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+
+        let error = connector
+            .bootstrap_portable(PortableBootstrapRequest {
+                source_connection_id: SourceConnectionId::new("gmail-connection"),
+                scope: PortableSourceScope::explicit_roots([RemoteId::new("gmail")]),
+                checkpoint: Some(PortableCheckpoint {
+                    format_version: 3,
+                    opaque: "not-json".to_string(),
+                }),
+                max_changes: 100,
+            })
+            .expect_err("malformed checkpoint must fail");
+
+        assert!(error.to_string().contains("checkpoint"));
         let calls = api.calls.lock().expect("calls");
         assert!(calls.list_max_results.is_empty());
         assert!(calls.draft_list_max_results.is_empty());

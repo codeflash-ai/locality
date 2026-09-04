@@ -23,7 +23,7 @@ use locality_core::model::{
 };
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind};
 use locality_core::portable::{
-    LogicalPath, ProjectionFileKind, SourceAction, SourceEdge, SourceObject,
+    LogicalPath, ProjectionFileKind, SourceAction, SourceConnectionId, SourceEdge, SourceObject,
 };
 use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::shadow::stable_hash;
@@ -51,7 +51,8 @@ const LOCAL_DRAFT_CONFERENCE_REQUEST_ID: &str = "locality-google-calendar-confer
 const EVENT_FILENAME_SLUG_MAX_LEN: usize = 96;
 const EVENT_FILENAME_HASH_LEN: usize = 16;
 const GOOGLE_CALENDAR_PORTABLE_SCOPE_ROOT_REMOTE_ID: &str = "google-calendar:primary";
-const GOOGLE_CALENDAR_PORTABLE_CHECKPOINT_VERSION: u16 = 1;
+const GOOGLE_CALENDAR_PORTABLE_CHECKPOINT_VERSION: u16 = 3;
+const GOOGLE_CALENDAR_PAGE_SIZE: u32 = 250;
 const GOOGLE_CALENDAR_PORTABLE_NATIVE_KIND: &str = "google_calendar_portable_event";
 
 #[derive(Clone, PartialEq, Eq)]
@@ -163,55 +164,56 @@ impl Connector for GoogleCalendarConnector {
                 "google calendar portable bootstrap requires the primary calendar scope root",
             ));
         }
-        if request.checkpoint.is_some() {
-            return Err(LocalityError::Unsupported(
-                "google calendar portable bootstrap does not accept checkpoints",
-            ));
-        }
         if request.max_changes == 0 {
             return Err(LocalityError::InvalidState(
                 "google calendar portable bootstrap max_changes must be greater than 0".to_string(),
             ));
         }
-        let date_window = required_portable_date_window(&self.config.settings)?;
-
-        let entries = list_primary_event_entries(
-            self.api.as_ref(),
-            &self.config.settings,
-            &MountId::new("google-calendar-portable"),
-            Path::new("events"),
+        let state = decode_google_calendar_portable_checkpoint(
+            request.checkpoint.as_ref(),
+            required_portable_date_window(&self.config.settings)?,
+            &request.source_connection_id,
         )?;
-        let mut changes = deduplicate_portable_google_calendar_changes(
+        let page = self.api.list_events_bounded(
+            PRIMARY_CALENDAR_ID,
+            &format!("{}T00:00:00Z", state.after),
+            &format!("{}T00:00:00Z", state.before),
+            request.max_changes.min(GOOGLE_CALENDAR_PAGE_SIZE),
+            state.page_token.as_deref(),
+        )?;
+        let entries = page
+            .items
+            .into_iter()
+            .filter(|event| event.status.as_deref() != Some("cancelled"))
+            .map(|event| {
+                event_entry(
+                    &MountId::new("google-calendar-portable"),
+                    Path::new("events"),
+                    PRIMARY_CALENDAR_ID,
+                    event,
+                )
+            })
+            .collect();
+        let changes = deduplicate_portable_google_calendar_changes(
             portable_google_calendar_changes(&request.source_connection_id, &scope_root, entries)?,
         )?;
-        changes.sort_by(|left, right| {
-            left.logical_path
-                .as_ref()
-                .map(LogicalPath::as_str)
-                .cmp(&right.logical_path.as_ref().map(LogicalPath::as_str))
-                .then_with(|| {
-                    left.source_object
-                        .remote_id
-                        .cmp(&right.source_object.remote_id)
-                })
-        });
-
-        let complete = changes.len() <= request.max_changes as usize;
-        if !complete {
-            changes.truncate(request.max_changes as usize);
+        if changes.len() > request.max_changes as usize {
+            return Err(LocalityError::InvalidState(
+                "google calendar portable bootstrap provider page exceeded max_changes".to_string(),
+            ));
         }
+        let next_state =
+            next_google_calendar_portable_checkpoint_state(state, page.next_page_token)?;
+        let complete = next_state.complete;
         let completeness = if complete {
             PortableCompleteness::complete()
         } else {
-            PortableCompleteness::incomplete(PortableIncompleteReason::ConnectorLimitation {
-                code: "google_calendar_bootstrap_max_changes_exceeded".to_string(),
-                remote_id: Some(scope_root.clone()),
-            })
+            PortableCompleteness::incomplete(PortableIncompleteReason::CheckpointContinuation)
         };
 
         Ok(PortableChangeBatch {
             changes,
-            next_checkpoint: google_calendar_portable_checkpoint(date_window, complete)?,
+            next_checkpoint: encode_google_calendar_portable_checkpoint(&next_state)?,
             completeness,
         })
     }
@@ -520,11 +522,17 @@ struct GoogleCalendarDraftNative {
     create_google_meet: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GoogleCalendarPortableCheckpoint {
     scope_root: String,
+    source_connection_id: String,
     after: String,
     before: String,
+    page_token: Option<String>,
+    #[serde(default)]
+    seen_page_tokens: Vec<String>,
+    #[serde(default)]
     complete: bool,
 }
 
@@ -700,17 +708,117 @@ fn portable_logical_path(path: &Path) -> LocalityResult<LogicalPath> {
     })
 }
 
-fn google_calendar_portable_checkpoint(
+fn decode_google_calendar_portable_checkpoint(
+    checkpoint: Option<&PortableCheckpoint>,
     window: &GoogleCalendarDateWindow,
-    complete: bool,
+    source_connection_id: &SourceConnectionId,
+) -> LocalityResult<GoogleCalendarPortableCheckpoint> {
+    let state = match checkpoint {
+        None => GoogleCalendarPortableCheckpoint {
+            scope_root: GOOGLE_CALENDAR_PORTABLE_SCOPE_ROOT_REMOTE_ID.to_string(),
+            source_connection_id: source_connection_id.as_str().to_string(),
+            after: window.after().as_str().to_string(),
+            before: window.before().as_str().to_string(),
+            page_token: None,
+            seen_page_tokens: Vec::new(),
+            complete: false,
+        },
+        Some(checkpoint) => {
+            if checkpoint.format_version != GOOGLE_CALENDAR_PORTABLE_CHECKPOINT_VERSION {
+                return Err(LocalityError::InvalidState(
+                    "google calendar portable bootstrap checkpoint format version is unsupported"
+                        .to_string(),
+                ));
+            }
+            serde_json::from_str(&checkpoint.opaque).map_err(|error| {
+                LocalityError::InvalidState(format!(
+                    "google calendar portable bootstrap checkpoint is malformed: {error}"
+                ))
+            })?
+        }
+    };
+    if state.scope_root != GOOGLE_CALENDAR_PORTABLE_SCOPE_ROOT_REMOTE_ID {
+        return Err(LocalityError::InvalidState(
+            "google calendar portable bootstrap checkpoint scope does not match request"
+                .to_string(),
+        ));
+    }
+    if state.source_connection_id != source_connection_id.as_str() {
+        return Err(LocalityError::InvalidState(
+            "google calendar portable bootstrap checkpoint source connection does not match request"
+                .to_string(),
+        ));
+    }
+    if state.complete {
+        return Err(LocalityError::InvalidState(
+            "google calendar portable bootstrap checkpoint is already terminal".to_string(),
+        ));
+    }
+    GoogleCalendarDateWindow::new(&state.after, &state.before).map_err(|error| {
+        LocalityError::InvalidState(format!(
+            "google calendar portable bootstrap checkpoint date window is malformed: {error}"
+        ))
+    })?;
+    if state.after != window.after().as_str() || state.before != window.before().as_str() {
+        return Err(LocalityError::InvalidState(
+            "google calendar portable bootstrap checkpoint date window does not match current settings"
+                .to_string(),
+        ));
+    }
+    let mut seen = BTreeSet::<String>::new();
+    for token in &state.seen_page_tokens {
+        if token.is_empty() || !seen.insert(token.clone()) {
+            return Err(LocalityError::InvalidState(
+                "google calendar portable bootstrap checkpoint contains repeated page token"
+                    .to_string(),
+            ));
+        }
+    }
+    if state
+        .page_token
+        .as_deref()
+        .is_some_and(|token| token.is_empty() || seen.contains(token))
+    {
+        return Err(LocalityError::InvalidState(
+            "google calendar portable bootstrap checkpoint contains a repeated page token"
+                .to_string(),
+        ));
+    }
+    Ok(state)
+}
+
+fn next_google_calendar_portable_checkpoint_state(
+    mut state: GoogleCalendarPortableCheckpoint,
+    next_page_token: Option<String>,
+) -> LocalityResult<GoogleCalendarPortableCheckpoint> {
+    match next_page_token {
+        Some(next) => {
+            if next.is_empty()
+                || state.page_token.as_deref() == Some(next.as_str())
+                || state.seen_page_tokens.iter().any(|seen| seen == &next)
+            {
+                return Err(LocalityError::InvalidState(
+                    "google calendar portable bootstrap provider pagination repeated page token"
+                        .to_string(),
+                ));
+            }
+            if let Some(current) = state.page_token.take() {
+                state.seen_page_tokens.push(current);
+            }
+            state.page_token = Some(next);
+        }
+        None => {
+            state.page_token = None;
+            state.complete = true;
+        }
+    }
+    Ok(state)
+}
+
+fn encode_google_calendar_portable_checkpoint(
+    checkpoint: &GoogleCalendarPortableCheckpoint,
 ) -> LocalityResult<PortableCheckpoint> {
-    let opaque = serde_json::to_string(&GoogleCalendarPortableCheckpoint {
-        scope_root: GOOGLE_CALENDAR_PORTABLE_SCOPE_ROOT_REMOTE_ID.to_string(),
-        after: window.after().as_str().to_string(),
-        before: window.before().as_str().to_string(),
-        complete,
-    })
-    .map_err(|error| {
+    let opaque = serde_json::to_string(checkpoint).map_err(|error| {
         LocalityError::Io(format!(
             "google calendar portable checkpoint encode failed: {error}"
         ))
@@ -1549,8 +1657,8 @@ mod tests {
     use locality_connector::{
         ApplyPlanRequest, ChildContainer, Connector, EnumerateRequest, FetchRequest,
         ListChildrenRequest, ObserveRequest, PORTABLE_SCOPE_ROOT_RELATIONSHIP,
-        PortableBootstrapRequest, PortableFetchReason, PortableFetchRequest,
-        PortableIncompleteReason, PortableRenderRequest, PortableSourceScope,
+        PortableBootstrapRequest, PortableCheckpoint, PortableFetchReason, PortableFetchRequest,
+        PortableRenderRequest, PortableSourceScope,
     };
     use locality_core::LocalityError;
     use locality_core::journal::{JournalApplyEffect, PushId, PushOperationId};
@@ -1656,7 +1764,7 @@ mod tests {
         );
         assert_eq!(
             batch.next_checkpoint.opaque,
-            r#"{"scope_root":"google-calendar:primary","after":"2026-07-01","before":"2026-07-31","complete":true}"#
+            r#"{"scope_root":"google-calendar:primary","source_connection_id":"calendar-connection","after":"2026-07-01","before":"2026-07-31","page_token":null,"seen_page_tokens":[],"complete":true}"#
         );
 
         assert_eq!(
@@ -1695,7 +1803,8 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_portable_rejects_non_primary_scope_and_checkpoints_without_provider_work() {
+    fn bootstrap_portable_rejects_non_primary_scope_and_unknown_checkpoints_without_provider_work()
+    {
         let api = Arc::new(FakeGoogleCalendarApi::default());
         let settings = GoogleCalendarMountSettings::with_date_window("2026-07-01", "2026-07-31")
             .expect("settings");
@@ -1730,17 +1839,13 @@ mod tests {
                 }),
                 max_changes: 100,
             })
-            .expect_err("checkpointed bootstrap must fail");
-        assert!(
-            checkpoint
-                .to_string()
-                .contains("does not accept checkpoints")
-        );
+            .expect_err("unknown checkpoint format must fail");
+        assert!(checkpoint.to_string().contains("format version"));
         assert!(api.calls.lock().expect("calls").list_events.is_empty());
     }
 
     #[test]
-    fn bootstrap_portable_marks_max_changes_truncation_incomplete() {
+    fn bootstrap_portable_rejects_provider_pages_larger_than_max_changes() {
         let api = Arc::new(FakeGoogleCalendarApi::default());
         {
             let mut calls = api.calls.lock().expect("calls");
@@ -1760,7 +1865,7 @@ mod tests {
             api,
         );
 
-        let batch = connector
+        let error = connector
             .bootstrap_portable(PortableBootstrapRequest {
                 source_connection_id: SourceConnectionId::new("calendar-connection"),
                 scope: PortableSourceScope::explicit_roots([RemoteId::new(
@@ -1769,15 +1874,277 @@ mod tests {
                 checkpoint: None,
                 max_changes: 1,
             })
-            .expect("portable bootstrap");
+            .expect_err("provider page larger than max_changes must fail");
 
-        assert_eq!(batch.changes.len(), 1);
+        assert!(error.to_string().contains("exceeded max_changes"));
+    }
+
+    #[test]
+    fn bootstrap_portable_rejects_legacy_api_before_initial_or_resumed_provider_work() {
+        let api = Arc::new(LegacyGoogleCalendarApi::default());
+        let settings = GoogleCalendarMountSettings::with_date_window("2026-07-01", "2026-07-31")
+            .expect("settings");
+        let connector = GoogleCalendarConnector::with_api(
+            GoogleCalendarConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+        let request = |checkpoint| PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("calendar-connection"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("google-calendar:primary")]),
+            checkpoint,
+            max_changes: 1,
+        };
+
+        let initial = connector
+            .bootstrap_portable(request(None))
+            .expect_err("legacy API must reject initial portable bootstrap");
+        assert!(initial.to_string().contains("bounded event listing"));
+
+        let resumed = connector
+            .bootstrap_portable(request(Some(PortableCheckpoint {
+                format_version: 3,
+                opaque: r#"{"scope_root":"google-calendar:primary","source_connection_id":"calendar-connection","after":"2026-07-01","before":"2026-07-31","page_token":"page-2","seen_page_tokens":[],"complete":false}"#.to_string(),
+            })))
+            .expect_err("legacy API must reject resumed portable bootstrap");
+        assert!(resumed.to_string().contains("bounded event listing"));
+        assert!(api.list_calls.lock().expect("calls").is_empty());
+    }
+
+    #[test]
+    fn bootstrap_portable_resumes_calendar_page_tokens_with_bounded_page_size() {
+        let api = Arc::new(FakeGoogleCalendarApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.pages.insert(
+                None,
+                CalendarEventList {
+                    items: vec![event_fixture("event-1")],
+                    next_page_token: Some("calendar-page-2".to_string()),
+                    next_sync_token: None,
+                },
+            );
+            calls.pages.insert(
+                Some("calendar-page-2".to_string()),
+                CalendarEventList {
+                    items: vec![event_fixture("event-2")],
+                    next_page_token: None,
+                    next_sync_token: None,
+                },
+            );
+        }
+        let settings = GoogleCalendarMountSettings::with_date_window("2026-07-01", "2026-07-31")
+            .expect("settings");
+        let connector = GoogleCalendarConnector::with_api(
+            GoogleCalendarConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+        let request = |checkpoint| PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("calendar-connection"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("google-calendar:primary")]),
+            checkpoint,
+            max_changes: 1,
+        };
+
+        let first = connector
+            .bootstrap_portable(request(None))
+            .expect("first portable page");
+        assert_eq!(first.changes.len(), 1);
+        assert!(!first.completeness.is_complete());
+
+        let second = connector
+            .bootstrap_portable(request(Some(first.next_checkpoint)))
+            .expect("resumed portable page");
+        assert_eq!(second.changes.len(), 1);
+        assert!(second.completeness.is_complete());
         assert_eq!(
-            batch.completeness.incomplete_reasons(),
-            &[PortableIncompleteReason::ConnectorLimitation {
-                code: "google_calendar_bootstrap_max_changes_exceeded".to_string(),
-                remote_id: Some(RemoteId::new("google-calendar:primary")),
-            }]
+            api.calls.lock().expect("calls").list_events,
+            vec![
+                ListEventsCall {
+                    calendar_id: "primary".to_string(),
+                    time_min: "2026-07-01T00:00:00Z".to_string(),
+                    time_max: "2026-07-31T00:00:00Z".to_string(),
+                    page_token: None,
+                },
+                ListEventsCall {
+                    calendar_id: "primary".to_string(),
+                    time_min: "2026-07-01T00:00:00Z".to_string(),
+                    time_max: "2026-07-31T00:00:00Z".to_string(),
+                    page_token: Some("calendar-page-2".to_string()),
+                },
+            ]
+        );
+        assert_eq!(
+            api.calls.lock().expect("calls").list_max_results,
+            vec![1, 1]
+        );
+    }
+
+    #[test]
+    fn bootstrap_portable_rejects_changed_window_before_resuming_provider_fetch() {
+        let api = Arc::new(FakeGoogleCalendarApi::default());
+        api.calls.lock().expect("calls").pages.insert(
+            None,
+            CalendarEventList {
+                items: vec![event_fixture("event-1")],
+                next_page_token: Some("page-2".to_string()),
+                next_sync_token: None,
+            },
+        );
+        let first_connector = GoogleCalendarConnector::with_api(
+            GoogleCalendarConfig::new("token").with_settings(
+                GoogleCalendarMountSettings::with_date_window("2026-07-01", "2026-07-31")
+                    .expect("first settings"),
+            ),
+            api.clone(),
+        );
+        let request = |checkpoint| PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("calendar-connection"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("google-calendar:primary")]),
+            checkpoint,
+            max_changes: 1,
+        };
+        let first = first_connector
+            .bootstrap_portable(request(None))
+            .expect("first page");
+        let changed_connector = GoogleCalendarConnector::with_api(
+            GoogleCalendarConfig::new("token").with_settings(
+                GoogleCalendarMountSettings::with_date_window("2026-08-01", "2026-08-31")
+                    .expect("changed settings"),
+            ),
+            api.clone(),
+        );
+
+        let error = changed_connector
+            .bootstrap_portable(request(Some(first.next_checkpoint)))
+            .expect_err("changed window must reject continuation");
+
+        assert!(error.to_string().contains("date window"));
+        assert_eq!(api.calls.lock().expect("calls").list_events.len(), 1);
+    }
+
+    #[test]
+    fn bootstrap_portable_rejects_checkpoint_from_another_source() {
+        let api = Arc::new(FakeGoogleCalendarApi::default());
+        let settings = GoogleCalendarMountSettings::with_date_window("2026-07-01", "2026-07-31")
+            .expect("settings");
+        let connector = GoogleCalendarConnector::with_api(
+            GoogleCalendarConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+        let request = |checkpoint, source_connection_id| PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new(source_connection_id),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("google-calendar:primary")]),
+            checkpoint,
+            max_changes: 1,
+        };
+        let first = connector
+            .bootstrap_portable(request(None, "calendar-a"))
+            .expect("first page");
+        let error = connector
+            .bootstrap_portable(request(Some(first.next_checkpoint), "calendar-b"))
+            .expect_err("cross-source checkpoint must fail");
+
+        assert!(error.to_string().contains("source connection"));
+        assert_eq!(api.calls.lock().expect("calls").list_events.len(), 1);
+    }
+
+    #[test]
+    fn bootstrap_portable_rejects_malformed_and_cyclic_checkpoints_before_provider_work() {
+        let api = Arc::new(FakeGoogleCalendarApi::default());
+        let settings = GoogleCalendarMountSettings::with_date_window("2026-07-01", "2026-07-31")
+            .expect("settings");
+        let connector = GoogleCalendarConnector::with_api(
+            GoogleCalendarConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+        let request = |opaque: &str| PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("calendar-connection"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("google-calendar:primary")]),
+            checkpoint: Some(PortableCheckpoint {
+                format_version: 3,
+                opaque: opaque.to_string(),
+            }),
+            max_changes: 1,
+        };
+
+        let malformed = connector
+            .bootstrap_portable(request("not-json"))
+            .expect_err("malformed checkpoint must fail");
+        assert!(malformed.to_string().contains("checkpoint"));
+        let mismatched = connector
+            .bootstrap_portable(request(r#"{"scope_root":"other","source_connection_id":"calendar-connection","after":"2026-07-01","before":"2026-07-31","page_token":null,"seen_page_tokens":[],"complete":false}"#))
+            .expect_err("mismatched checkpoint scope must fail");
+        assert!(mismatched.to_string().contains("scope"));
+        let cyclic = connector
+            .bootstrap_portable(request(r#"{"scope_root":"google-calendar:primary","source_connection_id":"calendar-connection","after":"2026-07-01","before":"2026-07-31","page_token":"again","seen_page_tokens":["again"]}"#))
+            .expect_err("cyclic checkpoint must fail");
+        assert!(cyclic.to_string().contains("repeated"));
+        let terminal = connector
+            .bootstrap_portable(request(r#"{"scope_root":"google-calendar:primary","source_connection_id":"calendar-connection","after":"2026-07-01","before":"2026-07-31","page_token":null,"seen_page_tokens":[],"complete":true}"#))
+            .expect_err("repeated terminal checkpoint must fail");
+        assert!(terminal.to_string().contains("terminal"));
+        assert!(api.calls.lock().expect("calls").list_events.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_portable_rejects_provider_page_token_cycle_on_resume() {
+        let api = Arc::new(FakeGoogleCalendarApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.pages.insert(
+                None,
+                CalendarEventList {
+                    items: vec![event_fixture("event-1")],
+                    next_page_token: Some("calendar-page-2".to_string()),
+                    next_sync_token: None,
+                },
+            );
+            calls.pages.insert(
+                Some("calendar-page-2".to_string()),
+                CalendarEventList {
+                    items: vec![event_fixture("event-2")],
+                    next_page_token: Some("calendar-page-2".to_string()),
+                    next_sync_token: None,
+                },
+            );
+        }
+        let settings = GoogleCalendarMountSettings::with_date_window("2026-07-01", "2026-07-31")
+            .expect("settings");
+        let connector = GoogleCalendarConnector::with_api(
+            GoogleCalendarConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+        let request = |checkpoint| PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("calendar-connection"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("google-calendar:primary")]),
+            checkpoint,
+            max_changes: 1,
+        };
+
+        let first = connector
+            .bootstrap_portable(request(None))
+            .expect("first portable page");
+        let error = connector
+            .bootstrap_portable(request(Some(first.next_checkpoint)))
+            .expect_err("repeated provider page token must fail");
+
+        assert!(error.to_string().contains("repeated page token"));
+        assert_eq!(
+            api.calls.lock().expect("calls").list_events,
+            vec![
+                ListEventsCall {
+                    calendar_id: "primary".to_string(),
+                    time_min: "2026-07-01T00:00:00Z".to_string(),
+                    time_max: "2026-07-31T00:00:00Z".to_string(),
+                    page_token: None,
+                },
+                ListEventsCall {
+                    calendar_id: "primary".to_string(),
+                    time_min: "2026-07-01T00:00:00Z".to_string(),
+                    time_max: "2026-07-31T00:00:00Z".to_string(),
+                    page_token: Some("calendar-page-2".to_string()),
+                },
+            ]
         );
     }
 
@@ -2000,7 +2367,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_portable_rejects_conflicting_duplicate_remote_id_versions() {
+    fn bootstrap_portable_defers_later_provider_pages_to_continuation() {
         let api = Arc::new(FakeGoogleCalendarApi::default());
         let mut changed = event_fixture("event-1");
         changed.updated = Some("2026-07-21T17:30:00Z".to_string());
@@ -2030,7 +2397,7 @@ mod tests {
             api,
         );
 
-        let error = connector
+        let batch = connector
             .bootstrap_portable(PortableBootstrapRequest {
                 source_connection_id: SourceConnectionId::new("calendar-connection"),
                 scope: PortableSourceScope::explicit_roots([RemoteId::new(
@@ -2039,13 +2406,10 @@ mod tests {
                 checkpoint: None,
                 max_changes: 100,
             })
-            .expect_err("conflicting duplicate remote id must fail");
+            .expect("first provider page");
 
-        assert!(
-            error
-                .to_string()
-                .contains("conflicting identity, version, or path")
-        );
+        assert_eq!(batch.changes.len(), 1);
+        assert!(!batch.completeness.is_complete());
     }
 
     #[test]
@@ -2732,9 +3096,50 @@ google_calendar:
         calls: Mutex<FakeCalls>,
     }
 
+    #[derive(Debug, Default)]
+    struct LegacyGoogleCalendarApi {
+        list_calls: Mutex<Vec<ListEventsCall>>,
+    }
+
+    impl GoogleCalendarApi for LegacyGoogleCalendarApi {
+        fn list_events(
+            &self,
+            calendar_id: &str,
+            time_min: &str,
+            time_max: &str,
+            page_token: Option<&str>,
+        ) -> locality_core::LocalityResult<CalendarEventList> {
+            self.list_calls.lock().expect("calls").push(ListEventsCall {
+                calendar_id: calendar_id.to_string(),
+                time_min: time_min.to_string(),
+                time_max: time_max.to_string(),
+                page_token: page_token.map(str::to_string),
+            });
+            Ok(CalendarEventList::default())
+        }
+
+        fn get_event(
+            &self,
+            _calendar_id: &str,
+            _event_id: &str,
+        ) -> locality_core::LocalityResult<CalendarEvent> {
+            unreachable!("not used by legacy portable bootstrap test")
+        }
+
+        fn insert_event(
+            &self,
+            _calendar_id: &str,
+            _request: CalendarEventCreateRequest,
+            _create_conference: bool,
+        ) -> locality_core::LocalityResult<CalendarEvent> {
+            unreachable!("not used by legacy portable bootstrap test")
+        }
+    }
+
     #[derive(Debug)]
     struct FakeCalls {
         list_events: Vec<ListEventsCall>,
+        list_max_results: Vec<u32>,
         get_events: Vec<(String, String)>,
         insert_events: Vec<(String, CalendarEventCreateRequest, bool)>,
         pages: BTreeMap<Option<String>, CalendarEventList>,
@@ -2746,6 +3151,7 @@ google_calendar:
         fn default() -> Self {
             Self {
                 list_events: Vec::new(),
+                list_max_results: Vec::new(),
                 get_events: Vec::new(),
                 insert_events: Vec::new(),
                 pages: BTreeMap::from([(
@@ -2770,7 +3176,19 @@ google_calendar:
             time_max: &str,
             page_token: Option<&str>,
         ) -> locality_core::LocalityResult<CalendarEventList> {
+            self.list_events_bounded(calendar_id, time_min, time_max, 250, page_token)
+        }
+
+        fn list_events_bounded(
+            &self,
+            calendar_id: &str,
+            time_min: &str,
+            time_max: &str,
+            max_results: u32,
+            page_token: Option<&str>,
+        ) -> locality_core::LocalityResult<CalendarEventList> {
             let mut calls = self.calls.lock().expect("calls");
+            calls.list_max_results.push(max_results);
             calls.list_events.push(ListEventsCall {
                 calendar_id: calendar_id.to_string(),
                 time_min: time_min.to_string(),
