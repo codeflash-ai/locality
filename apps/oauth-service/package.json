@@ -13,7 +13,7 @@
     "check": "npm run typecheck && npm test"
   },
   "dependencies": {
-    "hono": "^4.13.0"
+    "hono": "^4.13.5"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260721.1",
