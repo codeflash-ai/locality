@@ -23,7 +23,7 @@
   },
   "overrides": {
     "sharp": "0.35.3",
-    "undici": "^8.10.0"
+    "undici": "^8.12.3"
   },
   "engines": {
     "node": ">=22"
